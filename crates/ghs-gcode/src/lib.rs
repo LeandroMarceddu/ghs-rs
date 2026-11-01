@@ -60,6 +60,33 @@
 //! [`ParseErrorKind::UnsupportedCode`]. VIEW-02 adds an expression evaluator as
 //! a pre-pass over [`LexedLine`] words; [`Parser::parse_lexed`] is the hook.
 //!
+//! # Height-map compensation
+//!
+//! [`apply_height_compensation`] is the pure sender-side rewrite behind the
+//! explicit **Apply height map** action (PROBE-11). It parses a whole program,
+//! splits `G0`/`G1` moves and `G2`/`G3` arcs at a caller-supplied XY step,
+//! samples a callback in machine XY, adds the returned Z delta, and leaves
+//! non-motion content in place. The original text is not mutated, so the app
+//! can keep it for Revert.
+//!
+//! ```
+//! use ghs_gcode::{
+//!     HeightCompensationOptions, OutsideMap, apply_height_compensation,
+//! };
+//!
+//! let options = HeightCompensationOptions {
+//!     work_offset_xy_mm: [0.0, 0.0],
+//!     max_step_mm: 1.0,
+//!     outside: OutsideMap::Leave,
+//! };
+//! let result = apply_height_compensation("G21 G90\nG1 X2 F100\n", &options, |_x, _y| {
+//!     Some(0.1)
+//! })
+//! .expect("transform");
+//! assert_eq!(result.stats.compensated_motions, 2);
+//! assert!(result.source.contains("Z0.1"));
+//! ```
+//!
 //! # Coordinates
 //!
 //! Stored coordinates are millimetres. The display toolpath applies `G51`
@@ -74,6 +101,7 @@
 #![warn(missing_docs)]
 
 mod block;
+mod compensation;
 mod config;
 mod error;
 mod lexer;
@@ -82,6 +110,12 @@ mod planner;
 mod program;
 mod state;
 
+pub use compensation::{
+    HeightCompensatedProgram, HeightCompensationError, HeightCompensationOptions,
+    HeightCompensationStats, HeightCompensationWarning, HeightCompensationWarningKind,
+    MAX_COMPENSATED_OUTPUT_LINES, MAX_HEIGHT_MAP_STEP_MM, MIN_HEIGHT_MAP_STEP_MM, OutsideMap,
+    apply_height_compensation,
+};
 pub use config::{MAX_COORDINATE_MM, MIN_ARC_RADIUS_MM, ParserConfig};
 pub use error::{ParseError, ParseErrorKind, ParseWarning, WarningKind};
 pub use lexer::{DEFAULT_MAX_WORDS, LexedLine, Word, checksum_xor, lex_line};
