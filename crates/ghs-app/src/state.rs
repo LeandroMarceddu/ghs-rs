@@ -18,6 +18,8 @@ use ghs_engine::{
     StatusReport,
 };
 
+use crate::settings::SettingsModel;
+
 /// Connection state shown in the top-bar status pill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -361,25 +363,29 @@ impl Profile {
     }
 }
 
-/// Keypad owner. Tapping a DRO value, the MDI field, or RPM opens one sheet.
+/// Keypad owner. Tapping a DRO value, the MDI field, the RPM field, or a
+/// generated settings value opens the same sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeypadTarget {
     Dro(Axis),
     Mdi,
     Rpm,
+    /// A numeric setting row; the edit stays local until Apply.
+    Setting(u16),
 }
 
 impl KeypadTarget {
-    pub fn title(self) -> &'static str {
+    pub fn title(self) -> String {
         match self {
             KeypadTarget::Dro(axis) => match axis.index() {
-                0 => "SET X",
-                1 => "SET Y",
-                2 => "SET Z",
-                _ => "SET AXIS",
+                0 => "SET X".to_string(),
+                1 => "SET Y".to_string(),
+                2 => "SET Z".to_string(),
+                _ => "SET AXIS".to_string(),
             },
-            KeypadTarget::Mdi => "MDI TEXT",
-            KeypadTarget::Rpm => "SPINDLE RPM",
+            KeypadTarget::Mdi => "MDI TEXT".to_string(),
+            KeypadTarget::Rpm => "SPINDLE RPM".to_string(),
+            KeypadTarget::Setting(number) => format!("SETTING ${number}"),
         }
     }
 }
@@ -403,6 +409,8 @@ pub struct KeypadState {
     pub buffer: String,
     /// The first digit replaces the current value instead of appending.
     pub fresh: bool,
+    /// Optional range/unit hint for a settings value.
+    pub hint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -967,6 +975,8 @@ pub struct AppState {
     pub signals: Vec<Signal>,
     pub signal_caps: String,
     pub feed_rate: u32,
+    /// Generated settings editor, filled from `$ES`/`$EG` and `$$`.
+    pub settings: SettingsModel,
 }
 
 impl AppState {
@@ -1032,6 +1042,7 @@ impl AppState {
             signals,
             signal_caps: "HSDEP".to_string(),
             feed_rate: 1200,
+            settings: SettingsModel::default(),
         }
     }
 
@@ -1073,6 +1084,8 @@ impl AppState {
         self.feed_rate = 0;
         self.signals.clear();
         self.signal_caps.clear();
+        // Metadata belongs to the controller, never to the previous session.
+        self.settings = SettingsModel::default();
         self.push_console(ConsoleLevel::Info, message);
     }
 
@@ -1100,6 +1113,14 @@ impl AppState {
             self.machine_state,
             CoreSignals::NONE,
             true,
+        );
+        self.settings.set_axis_labels(
+            self.profile
+                .capabilities
+                .axes
+                .iter()
+                .map(|axis| axis.label().to_string())
+                .collect(),
         );
     }
 
@@ -1415,15 +1436,31 @@ impl AppState {
     }
 
     pub fn open_keypad(&mut self, target: KeypadTarget) {
-        let (buffer, fresh) = match target {
-            KeypadTarget::Dro(axis) => (format!("{:.3}", self.value(axis)), true),
-            KeypadTarget::Mdi => (self.mdi.clone(), false),
-            KeypadTarget::Rpm => (self.rpm.to_string(), true),
+        let (buffer, fresh, hint) = match target {
+            KeypadTarget::Dro(axis) => (format!("{:.3}", self.value(axis)), true, None),
+            KeypadTarget::Mdi => (self.mdi.clone(), false, None),
+            KeypadTarget::Rpm => (self.rpm.to_string(), true, Some("0 - 24000".to_string())),
+            KeypadTarget::Setting(number) => {
+                let Some(row) = self.settings.row(number) else {
+                    return;
+                };
+                let mut buffer = row.number_text().to_string();
+                if buffer.is_empty() {
+                    buffer = row.display_value();
+                }
+                let mut hint = row.range_text();
+                if let Some(unit) = &row.unit {
+                    hint.push_str(" | ");
+                    hint.push_str(unit);
+                }
+                (buffer, true, Some(hint))
+            }
         };
         self.keypad = Some(KeypadState {
             target,
             buffer,
             fresh,
+            hint,
         });
     }
 
@@ -1538,6 +1575,11 @@ impl AppState {
                 }
                 Err(_) => self.push_console(ConsoleLevel::Warn, "RPM must be numeric"),
             },
+            KeypadTarget::Setting(number) => {
+                if let Err(message) = self.settings.set_number_text(number, keypad.buffer.clone()) {
+                    self.push_console(ConsoleLevel::Warn, format!("Setting ${number}: {message}"));
+                }
+            }
         }
     }
 }

@@ -38,10 +38,11 @@ use ghs_engine::{
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla,
@@ -53,6 +54,7 @@ use gpui_kit::{
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
+use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
     Mode, ProgramKind, SignalState, format_elapsed, pause_reason_label,
@@ -82,6 +84,23 @@ struct JogHold {
 /// delivers a touch tap's mouse down and up together.
 const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
 
+/// What the shared settings text sheet is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsEntryPurpose {
+    /// Filter the generated form.
+    Search,
+    /// A `Text`, `Password`, or `IPv4` setting.
+    Text(u16),
+}
+
+/// One open settings text sheet.
+struct SettingsEntry {
+    purpose: SettingsEntryPurpose,
+    input: Entity<InputState>,
+    masked: bool,
+    error: Option<String>,
+}
+
 pub struct Shell {
     pub state: AppState,
     feed_slider: Entity<SliderState>,
@@ -102,6 +121,11 @@ pub struct Shell {
     demo_program: DemoProgram,
     demo_start: bool,
     demo_start_sent: bool,
+    settings_entry: Option<SettingsEntry>,
+    settings_demo_write: bool,
+    settings_demo_write_done: bool,
+    settings_demo_group: Option<String>,
+    settings_demo_group_done: bool,
     _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -171,6 +195,10 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--keypad") {
             state.open_keypad(KeypadTarget::Dro(Axis::X));
         }
+        // Screenshot switch: open the generated settings workspace directly.
+        if std::env::args().any(|arg| arg == "--settings") {
+            state.mode = Mode::Settings;
+        }
 
         // Screenshot/demo switches. They only select a bundled demo source or
         // press the same Start action a tap would; normal startup ignores them.
@@ -182,6 +210,11 @@ impl Shell {
             DemoProgram::Pocket
         };
         let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+        let settings_demo_write = std::env::args().any(|arg| arg == "--demo-settings-write");
+        let settings_demo_group = std::env::args().find_map(|arg| {
+            arg.strip_prefix("--settings-group=")
+                .map(std::string::ToString::to_string)
+        });
 
         let mut shell = Self {
             state,
@@ -203,6 +236,11 @@ impl Shell {
             demo_program,
             demo_start,
             demo_start_sent: false,
+            settings_entry: None,
+            settings_demo_write,
+            settings_demo_write_done: false,
+            settings_demo_group,
+            settings_demo_group_done: false,
             _poll_task: None,
             _subscriptions: subscriptions,
         };
@@ -237,6 +275,55 @@ impl Shell {
         let mut changed = false;
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
+        }
+        // Settings writes are idle-only and verified one at a time. Pump the
+        // next queued row after the previous `SettingWritten` arrived; stop the
+        // batch instead of resuming it automatically when the machine leaves
+        // Idle or the link drops.
+        if self.state.settings.has_queued_write() {
+            if self.settings_write_allowed() {
+                changed |= self.pump_settings_write();
+            } else if self
+                .state
+                .settings
+                .cancel_writes(self.settings_lock_reason())
+            {
+                changed = true;
+            }
+        }
+        if !self.ready() && self.state.settings.cancel_writes("not connected") {
+            changed = true;
+        }
+        if let Some(name) = self.settings_demo_group.clone()
+            && !self.settings_demo_group_done
+        {
+            let scope = self
+                .state
+                .settings
+                .rail()
+                .iter()
+                .find(|row| row.name.eq_ignore_ascii_case(&name))
+                .map(|row| row.scope);
+            if let Some(scope) = scope {
+                self.settings_demo_group_done = true;
+                self.state.settings.set_scope(scope);
+                changed = true;
+            } else if self.state.settings.rows().iter().any(|row| row.described) {
+                // Metadata is in; the controller simply has no such group.
+                self.settings_demo_group_done = true;
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("--settings-group: no group named {name}"),
+                );
+                changed = true;
+            }
+        }
+        if self.settings_demo_write
+            && !self.settings_demo_write_done
+            && self.settings_write_allowed()
+            && self.demo_settings_write(cx)
+        {
+            changed = true;
         }
         // A transport drop, alarm or mode change must not leave a jog running.
         if self.jog_hold.is_some() && !self.jog_allowed() {
@@ -422,6 +509,225 @@ impl Shell {
 
     fn send_mdi_line(&mut self, line: String) -> bool {
         self.send_command(Command::Mdi(line))
+    }
+
+    // ------------------------------------------------------- settings writes
+
+    /// Whether the generated form may write right now.
+    ///
+    /// The engine refuses setting writes unless the machine is Idle and no
+    /// job is running; mirror that gate in the UI so Apply is never a trap.
+    fn settings_write_allowed(&self) -> bool {
+        self.state.live
+            && self.ready()
+            && !self.locked()
+            && self.machine() == MachineState::Idle
+            && !self.state.job.is_active()
+    }
+
+    /// Short reason shown when Apply is disabled.
+    fn settings_lock_reason(&self) -> &'static str {
+        if !self.state.live {
+            "MOCK MODE"
+        } else if !self.ready() {
+            "NOT CONNECTED"
+        } else if self.locked() {
+            "ALARM OR DOOR"
+        } else if self.state.job.is_active() {
+            "JOB RUNNING"
+        } else if self.machine() != MachineState::Idle {
+            "CONTROLLER NOT IDLE"
+        } else {
+            "READY"
+        }
+    }
+
+    /// Send the next queued setting write, if one is ready.
+    fn pump_settings_write(&mut self) -> bool {
+        if !self.settings_write_allowed() {
+            return false;
+        }
+        let Some((number, value)) = self.state.settings.take_next_write() else {
+            return false;
+        };
+        match self.send_command_quiet(Command::SetSetting { number, value }) {
+            Ok(()) => true,
+            Err(EngineError::Busy) => {
+                // The streamer still has a line in flight. Keep the row queued
+                // and try again on the next poll instead of reporting a write
+                // failure that never reached the controller.
+                self.state.settings.requeue_write(number);
+                false
+            }
+            Err(error) => {
+                self.state
+                    .settings
+                    .mark_send_error(number, error.to_string());
+                self.state.push_console(
+                    ConsoleLevel::Error,
+                    format!("Setting ${number} rejected: {error}"),
+                );
+                true
+            }
+        }
+    }
+
+    /// Validate and queue every changed row. The engine verifies each write.
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.settings_write_allowed() {
+            let reason = self.settings_lock_reason();
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Settings writes are locked: {reason}"),
+            );
+            cx.notify();
+            return;
+        }
+        match self.state.settings.begin_apply() {
+            Ok(0) => self
+                .state
+                .push_console(ConsoleLevel::Info, "No changed settings to apply"),
+            Ok(count) => {
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!("Queued {count} setting write(s); waiting for read-back"),
+                );
+                self.pump_settings_write();
+            }
+            Err(message) => self.state.push_console(ConsoleLevel::Warn, message),
+        }
+        cx.notify();
+    }
+
+    /// Screenshot switch: change one safe demo setting through the real path.
+    ///
+    /// This is not a product feature. It only runs on the in-process demo
+    /// link, picks the first non-reboot integer row the controller reported,
+    /// and uses the same draft + Apply path as a tap.
+    fn demo_settings_write(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.link.as_ref().and_then(LiveLink::mode) != Some(&LinkMode::Demo) {
+            self.settings_demo_write_done = true;
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "--demo-settings-write only runs against the demo controller",
+            );
+            return true;
+        }
+        let candidate = self.state.settings.rows().iter().find_map(|row| {
+            let current = row.current.as_f64()?;
+            let max = row.max?;
+            (row.kind == SettingKind::Integer && !row.reboot && current + 1.0 <= max)
+                .then_some((row.number, current + 1.0))
+        });
+        let Some((number, target)) = candidate else {
+            // Values can arrive before `$ES`; retry on the next poll instead of
+            // giving up before the metadata exists.
+            return false;
+        };
+        self.settings_demo_write_done = true;
+        if self
+            .state
+            .settings
+            .set_number_text(number, format!("{target:.0}"))
+            .is_ok()
+        {
+            // The screenshot proves the read-back in the console as well as
+            // the APPLIED row; this is the demo switch, not a normal tab move.
+            self.state.left_tab = LeftTab::Console;
+            self.apply_settings(cx);
+        }
+        true
+    }
+
+    /// Open the keypad for one numeric setting row.
+    fn open_setting_keypad(&mut self, number: u16, cx: &mut Context<Self>) {
+        self.settings_entry = None;
+        self.state.open_keypad(KeypadTarget::Setting(number));
+        cx.notify();
+    }
+
+    /// Open the shared text sheet for search or one text setting.
+    fn open_settings_entry(
+        &mut self,
+        purpose: SettingsEntryPurpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.keypad = None;
+        let (value, masked, error) = match purpose {
+            SettingsEntryPurpose::Search => (self.state.settings.search().to_string(), false, None),
+            SettingsEntryPurpose::Text(number) => {
+                let Some(row) = self.state.settings.row(number) else {
+                    return;
+                };
+                (
+                    row.text_draft().to_string(),
+                    row.kind == SettingKind::Password,
+                    None,
+                )
+            }
+        };
+        let input = if let Some(entry) = self.settings_entry.as_ref() {
+            entry
+                .input
+                .update(cx, |state, cx| state.set_value(value, window, cx));
+            entry.input.clone()
+        } else {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(value)
+                    .masked(masked)
+            })
+        };
+        input.update(cx, |state, cx| {
+            state.set_masked(masked, window, cx);
+            state.focus(window, cx);
+        });
+        self.settings_entry = Some(SettingsEntry {
+            purpose,
+            input,
+            masked,
+            error,
+        });
+        cx.notify();
+    }
+
+    /// Read the text sheet and either filter the form or commit a text draft.
+    fn commit_settings_entry(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.settings_entry.as_ref() else {
+            return;
+        };
+        let value = entry.input.read(cx).value().to_string();
+        let purpose = entry.purpose;
+        if purpose == SettingsEntryPurpose::Search {
+            self.state.settings.set_search(value);
+            self.settings_entry = None;
+            cx.notify();
+            return;
+        }
+        let SettingsEntryPurpose::Text(number) = purpose else {
+            return;
+        };
+        match self.state.settings.set_text_draft(number, value) {
+            Ok(()) => {
+                self.settings_entry = None;
+                cx.notify();
+            }
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Setting ${number}: {message}"));
+                if let Some(entry) = self.settings_entry.as_mut() {
+                    entry.error = Some(message);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Close the text sheet without changing anything.
+    fn cancel_settings_entry(&mut self, cx: &mut Context<Self>) {
+        self.settings_entry = None;
+        cx.notify();
     }
 
     // ------------------------------------------------------------ UI gating
@@ -972,6 +1278,9 @@ impl Shell {
                         self.send_mdi_line(line);
                     }
                 }
+                // A settings value stays local until Apply; `AppState` already
+                // wrote it into the row draft.
+                KeypadTarget::Setting(_) => {}
             }
         }
         cx.notify();
@@ -1313,10 +1622,10 @@ impl Shell {
 
     /// Viewer card: fills the centre column's first row.
     fn viewer_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.state.mode == Mode::Job {
-            self.state.job_title().to_string()
-        } else {
-            "M2 preview".to_string()
+        let title = match self.state.mode {
+            Mode::Job => self.state.job_title().to_string(),
+            Mode::Settings => format!("{} settings from $ES/$EG", self.state.settings.total()),
+            _ => "M2 preview".to_string(),
         };
         let header = div()
             .h(px(48.0))
@@ -1399,6 +1708,10 @@ impl Shell {
                 .child(self.job_toolbar(p, cx))
                 .child(div().flex_1().min_h(px(0.0)).child(self.job_view(p, cx)))
                 .into_any_element()
+        } else if self.state.mode == Mode::Settings {
+            // The generated form owns the whole viewer body: rail, search, and
+            // a scrollable list. The top bar and the bottom controls stay put.
+            self.settings_view(p, cx).into_any_element()
         } else {
             self.mode_view(p, cx).into_any_element()
         };
@@ -1666,7 +1979,7 @@ impl Shell {
             Mode::Offset => self.offset_rows(p),
             Mode::Utility => self.utility_rows(p),
             Mode::Tools => self.tool_rows(p),
-            Mode::Settings => self.settings_placeholder(p),
+            Mode::Settings => unreachable!(),
         };
         let view = cx.entity();
         v_flex()
@@ -1838,71 +2151,539 @@ impl Shell {
             }))
     }
 
-    fn settings_placeholder(&self, p: Palette) -> Div {
-        let caps = &self.state.profile.capabilities;
-        let facts = [
-            format!("{} axes", caps.axes.len()),
-            format!("probe: {}", if caps.has_probe { "yes" } else { "no" }),
-            format!("tool table: {} entries", caps.tool_table_entries),
-            format!("units: {}", caps.units.label()),
-            format!(
-                "spindle: {}",
-                if caps.multi_spindle {
-                    "multi"
+    // ------------------------------------------------------- settings editor
+
+    /// Generated settings form: search toolbar, group rail, and row list.
+    fn settings_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let model = &self.state.settings;
+        let total = model.total();
+        let pending = model.pending_count();
+        let has_pending = model.has_pending();
+        let query = model.search().to_string();
+        let can_write = self.settings_write_allowed();
+        let lock_reason = self.settings_lock_reason();
+        let groups = model.rail().to_vec();
+        let scope = model.scope();
+        let scope_name = model.scope_name();
+        let rows: Vec<SettingRow> = model.visible_rows().into_iter().cloned().collect();
+        let axis_labels = model.axis_labels().to_vec();
+        let last_result = model.last_result().map(str::to_string);
+        let last_ok = model.last_result_ok();
+        let mono = self.mono.clone();
+        let view = cx.entity();
+
+        if total == 0 {
+            return self.settings_empty_state(p).into_any_element();
+        }
+
+        let search_view = view.clone();
+        let clear_view = view.clone();
+        let search_cell = div()
+            .id("settings-search")
+            .h(px(48.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .border_1()
+            .border_color(p.border)
+            .cursor_pointer()
+            .hover(|style| style.bg(p.raised_hover))
+            .on_click(move |_, window, cx| {
+                search_view.update(cx, |shell, cx| {
+                    shell.open_settings_entry(SettingsEntryPurpose::Search, window, cx);
+                });
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("SEARCH"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(13.0))
+                    .text_color(if query.is_empty() {
+                        p.text_faint
+                    } else {
+                        p.text
+                    })
+                    .child(if query.is_empty() {
+                        "number, name, or group".to_string()
+                    } else {
+                        query.clone()
+                    }),
+            );
+        let clear_button = (!query.is_empty()).then(|| {
+            let view = clear_view;
+            div()
+                .id("settings-search-clear")
+                .h(px(48.0))
+                .w(px(60.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .bg(p.panel_alt)
+                .border_1()
+                .border_color(p.border)
+                .text_size(px(10.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_dim)
+                .cursor_pointer()
+                .hover(|style| style.bg(p.raised_hover).text_color(p.text))
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |shell, cx| {
+                        shell.state.settings.set_search(String::new());
+                        cx.notify();
+                    });
+                })
+                .child("CLEAR")
+        });
+
+        let pending_chip = div()
+            .px_2()
+            .h(px(22.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .rounded(px(5.0))
+            .bg(if pending > 0 {
+                p.warning.opacity(0.16)
+            } else {
+                p.panel_alt
+            })
+            .border_1()
+            .border_color(p.border)
+            .text_size(px(10.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if pending > 0 { p.warning } else { p.text_dim })
+            .child(format!("{pending} PENDING"));
+
+        let apply_view = view.clone();
+        let reset_view = view.clone();
+        let toolbar = h_flex()
+            .h(px(56.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(search_cell)
+            .when_some(clear_button, |this, button| this.child(button))
+            .child(chip(&format!("{total} TOTAL"), p))
+            .child(pending_chip)
+            .child(
+                Button::new("settings-apply")
+                    .label("APPLY")
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(88.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .disabled(!can_write || pending == 0)
+                    .on_click(move |_, _, cx| {
+                        apply_view.update(cx, |shell, cx| shell.apply_settings(cx));
+                    }),
+            )
+            .child(
+                Button::new("settings-reset")
+                    .label("REVERT")
+                    .secondary()
+                    .h(px(48.0))
+                    .w(px(84.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .disabled(!has_pending)
+                    .on_click(move |_, _, cx| {
+                        reset_view.update(cx, |shell, cx| {
+                            shell.state.settings.reset_drafts();
+                            cx.notify();
+                        });
+                    }),
+            );
+
+        let rail = v_flex()
+            .id("settings-groups")
+            .w(px(190.0))
+            .flex_shrink_0()
+            .h_full()
+            .gap_1()
+            .p_1()
+            .overflow_y_scroll()
+            .children(
+                groups
+                    .into_iter()
+                    .map(|group| settings_group_row(group, scope, p, view.clone())),
+            );
+
+        let matching = rows.len();
+        let form_rows: Vec<AnyElement> = rows
+            .into_iter()
+            .map(|row| {
+                // Editing is local and always allowed; only Apply is gated by
+                // the controller's idle-only write rule. A queued or in-flight
+                // row locks itself inside the row renderer.
+                settings_row_view(row, p, view.clone(), mono.clone(), &axis_labels, true)
+            })
+            .collect();
+
+        let form_header = h_flex()
+            .h(px(36.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text)
+                    .child(scope_name),
+            )
+            .child(chip(&format!("{matching} SHOWN"), p))
+            .child(div().flex_1())
+            .child(chip(
+                if query.is_empty() {
+                    "$ES / $EG"
                 } else {
-                    "single"
+                    "SEARCH"
+                },
+                p,
+            ));
+
+        let list = v_flex()
+            .id("settings-form")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p_2()
+            .gap_1()
+            .when(matching == 0, |this| {
+                this.child(settings_no_rows(query.as_str(), p))
+            })
+            .children(form_rows);
+
+        let lock_text = if can_write {
+            "IDLE: WRITES ENABLED".to_string()
+        } else {
+            format!("WRITES LOCKED: {lock_reason}")
+        };
+        let footer = h_flex()
+            .h(px(30.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_t_1()
+            .border_color(p.border)
+            .text_size(px(9.0))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(if can_write { p.success } else { p.warning })
+                    .child(lock_text),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(p.text_faint)
+                    .child("ONE WRITE AT A TIME | READ-BACK VERIFIED"),
+            )
+            .child(div().flex_1())
+            .when_some(last_result, |this, result| {
+                this.child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_color(if last_ok { p.success } else { p.danger })
+                        .child(result),
+                )
+            });
+
+        let form = v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .border_l_1()
+            .border_color(p.border)
+            .child(form_header)
+            .child(list)
+            .child(footer);
+
+        v_flex()
+            .size_full()
+            .child(toolbar)
+            .child(h_flex().flex_1().min_h(px(0.0)).child(rail).child(form))
+            .into_any_element()
+    }
+
+    /// Honest empty state for mock mode and for a controller with no metadata.
+    fn settings_empty_state(&self, p: Palette) -> Div {
+        let (title, detail) = if !self.state.live {
+            (
+                "MOCK MODE: NO CONTROLLER SETTINGS",
+                "The generated editor is built from the controller's $$ values and $ES/$EG metadata. The design-review mock supplies neither. Start without --mock to connect the in-process FlexiHAL demo controller.",
+            )
+        } else if !self.ready() {
+            (
+                "WAITING FOR SETTINGS",
+                "The handshake has not reported $$, $ES, or $EG yet. The form appears as soon as the controller answers.",
+            )
+        } else {
+            (
+                "THE CONTROLLER REPORTED NO SETTINGS",
+                "$$ returned no values and $ES/$EG returned no metadata. The editor stays empty rather than inventing a setting list.",
+            )
+        };
+        let capabilities = &self.state.profile.capabilities;
+        let mut facts = vec![
+            format!("PROFILE: {}", self.state.profile.name),
+            capabilities.units.label().to_string(),
+            format!("{} AXES", capabilities.axes.len()),
+            format!(
+                "SPINDLES: {}",
+                if capabilities.multi_spindle {
+                    "MULTI"
+                } else {
+                    "SINGLE"
                 }
             ),
         ];
+        for (name, enabled) in capabilities.accessory_panels() {
+            facts.push(format!(
+                "{name}: {}",
+                if enabled { "reported" } else { "not reported" }
+            ));
+        }
+
         v_flex()
-            .gap_2()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_4()
             .child(
                 v_flex()
-                    .gap_1()
+                    .gap_2()
+                    .max_w(px(620.0))
                     .p_3()
                     .rounded_lg()
+                    .border_1()
+                    .border_color(p.border)
                     .bg(p.panel_alt)
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(13.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text)
-                            .child(format!(
-                                "PROFILE: {} | METADATA-DRIVEN SETTINGS",
-                                self.state.profile.name
-                            )),
+                            .child(title),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
                             .text_color(p.text_dim)
-                            .child("Forms are generated from $ES / $EG / $SED at M5. This shell hardcodes no setting list; the facts below come from the active profile."),
+                            .child(detail),
                     ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .max_w(px(620.0))
+                    .w_full()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_faint)
+                            .child("EXAMPLE SHAPE (NO VALUES ARE WRITTEN)"),
+                    )
+                    .child(settings_example_row(
+                        "Example boolean",
+                        "Switch maps to $ES type 0 | 0 = OFF, 1 = ON",
+                        "OFF",
+                        p,
+                    ))
+                    .child(settings_example_row(
+                        "Example decimal",
+                        "Numeric field and keypad | 0.000 .. 1000.000 | mm",
+                        "123.450",
+                        p,
+                    )),
             )
             .child(
                 h_flex()
                     .flex_wrap()
+                    .max_w(px(620.0))
                     .gap_1()
                     .children(facts.iter().map(|fact| chip(fact, p))),
             )
             .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(p.text_faint)
-                    .child("ACCESSORY HOOKS (post-v1.0 panels, not built)"),
+                h_flex().flex_wrap().max_w(px(620.0)).gap_1().children(
+                    [
+                        "BOOLEAN",
+                        "BITFIELD",
+                        "EXCLUSIVE",
+                        "RADIO",
+                        "AXIS MASK",
+                        "INTEGER",
+                        "DECIMAL",
+                        "TEXT",
+                        "PASSWORD",
+                        "IPV4",
+                    ]
+                    .into_iter()
+                    .map(|kind| chip(kind, p)),
+                ),
             )
-            .child(h_flex().flex_wrap().gap_1().children(
-                caps.accessory_panels().iter().map(|(name, enabled)| {
-                    chip(
-                        &format!(
-                            "{}: {}",
-                            name,
-                            if *enabled { "reported" } else { "not reported" }
-                        ),
-                        p,
+    }
+
+    /// Shared text sheet for search and text/password/IPv4 settings.
+    fn settings_entry_overlay(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(entry) = self.settings_entry.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let title = match entry.purpose {
+            SettingsEntryPurpose::Search => "SEARCH SETTINGS".to_string(),
+            SettingsEntryPurpose::Text(number) => self.state.settings.row(number).map_or_else(
+                || format!("SETTING ${number}"),
+                |row| format!("SETTING ${number} / {}", row.name),
+            ),
+        };
+        let hint = match entry.purpose {
+            SettingsEntryPurpose::Search => {
+                "Matches a setting number, its name, or its group name.".to_string()
+            }
+            SettingsEntryPurpose::Text(number) => self
+                .state
+                .settings
+                .row(number)
+                .map(|row| row.meta_line())
+                .unwrap_or_default(),
+        };
+        let masked = entry.masked;
+        let error = entry.error.clone();
+        let input = entry.input.clone();
+        let commit_view = view.clone();
+        let cancel_view = view.clone();
+        let scrim_view = view;
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("settings-entry-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_settings_entry(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(460.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(title),
                     )
-                }),
-            ))
+                    .child({
+                        let focus_input = input.clone();
+                        div()
+                            .h(px(48.0))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                focus_input.update(cx, |state, cx| state.focus(window, cx));
+                            })
+                            .child(
+                                Input::new(&input)
+                                    .with_size(Size::Large)
+                                    .w_full()
+                                    .text_size(px(16.0))
+                                    .when(masked, |this| this.mask_toggle()),
+                            )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(hint),
+                    )
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("settings-entry-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_settings_entry(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("settings-entry-commit")
+                                    .label(if masked { "SET" } else { "APPLY TEXT" })
+                                    .primary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        commit_view.update(cx, |shell, cx| {
+                                            shell.commit_settings_entry(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Tall right cell: Coolant, Macros, Signals and Work in one continuous
@@ -3404,6 +4185,9 @@ impl Render for Shell {
                 cx,
             ));
         }
+        if self.settings_entry.is_some() {
+            root = root.child(self.settings_entry_overlay(p, cx));
+        }
         if self.state.job.tool_change.is_some() {
             root = root.child(self.tool_change_overlay(p, cx));
         }
@@ -3711,6 +4495,720 @@ fn console_color(level: ConsoleLevel, p: Palette) -> Hsla {
         ConsoleLevel::Warn => p.warning,
         ConsoleLevel::Error => p.danger,
     }
+}
+
+// ------------------------------------------------------------ settings rows
+
+/// One group-rail row.
+fn settings_group_row(
+    group: GroupRow,
+    active: SettingsScope,
+    p: Palette,
+    view: Entity<Shell>,
+) -> impl IntoElement {
+    let selected = group.scope == active;
+    let scope = group.scope;
+    let key = match group.scope {
+        SettingsScope::All => "all".to_string(),
+        SettingsScope::General => "general".to_string(),
+        SettingsScope::Group(id) => format!("group-{id}"),
+    };
+    let indent = 8.0 + f32::from(group.depth) * 18.0;
+    div()
+        .id(format!("settings-group-{key}"))
+        .h(px(48.0))
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .pl(px(indent))
+        .pr_2()
+        .rounded(px(6.0))
+        .bg(if selected { p.accent_muted } else { p.panel })
+        .border_1()
+        .border_color(if selected { p.accent } else { p.panel })
+        .cursor_pointer()
+        .hover(|style| style.bg(p.raised_hover))
+        .on_click(move |_, _, cx| {
+            view.update(cx, |shell, cx| {
+                // Picking a group leaves search so the rail always has a
+                // visible effect; the operator can search again from there.
+                shell.state.settings.set_search(String::new());
+                shell.state.settings.set_scope(scope);
+                cx.notify();
+            });
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(11.0))
+                .font_weight(if selected {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if selected { p.accent } else { p.text_dim })
+                .child(group.name),
+        )
+        .when(group.pending > 0, |this| {
+            this.child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .flex_shrink_0()
+                    .rounded(px(999.0))
+                    .bg(p.warning),
+            )
+        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(9.0))
+                .text_color(if selected { p.accent } else { p.text_faint })
+                .child(group.count.to_string()),
+        )
+}
+
+/// One generated form row.
+fn settings_row_view(
+    row: SettingRow,
+    p: Palette,
+    view: Entity<Shell>,
+    mono: SharedString,
+    axis_labels: &[String],
+    enabled: bool,
+) -> AnyElement {
+    let pending = row.status.is_pending();
+    let status_color = match &row.status {
+        RowStatus::Synced => p.border,
+        RowStatus::Edited | RowStatus::Queued | RowStatus::Writing => p.warning,
+        RowStatus::Invalid | RowStatus::Failed(_) => p.danger,
+        RowStatus::Applied => p.success,
+    };
+    let background = match &row.status {
+        RowStatus::Synced => p.panel_alt,
+        RowStatus::Applied => p.success.opacity(0.06),
+        RowStatus::Invalid | RowStatus::Failed(_) => p.danger.opacity(0.07),
+        _ => p.warning.opacity(0.08),
+    };
+    let number = row.number;
+    // A queued or in-flight write owns the row until the engine answers.
+    let row_enabled = enabled && !matches!(row.status, RowStatus::Queued | RowStatus::Writing);
+    let status_label = row.status.label();
+    let note = row.note.clone();
+    let status_is_pending = pending;
+    let name = row.name.clone();
+    let meta_line = row.meta_line();
+    let reboot = row.reboot;
+    let kind = row.kind;
+    let unit = row.unit.clone();
+    let display_value = row.display_value();
+    let number_text = row.number_text().to_string();
+    let radio_value = row.radio_value();
+    let radio_values = radio_span(&row);
+
+    let control: AnyElement = match kind {
+        SettingKind::Boolean => {
+            settings_toggle(number, row.is_on(), p, view.clone(), row_enabled).into_any_element()
+        }
+        SettingKind::Radio => match radio_values {
+            Some(_) => chip(&format!("VALUE {display_value}"), p).into_any_element(),
+            None => settings_number_field(
+                number,
+                &number_text,
+                unit.as_deref(),
+                p,
+                view.clone(),
+                row_enabled,
+                mono.clone(),
+            )
+            .into_any_element(),
+        },
+        SettingKind::Integer | SettingKind::Decimal => settings_number_field(
+            number,
+            &number_text,
+            unit.as_deref(),
+            p,
+            view.clone(),
+            row_enabled,
+            mono.clone(),
+        )
+        .into_any_element(),
+        SettingKind::Text | SettingKind::Password | SettingKind::IpAddress => {
+            settings_text_field(number, &display_value, kind, p, view.clone(), row_enabled)
+                .into_any_element()
+        }
+        SettingKind::Bitfield | SettingKind::ExclusiveBitfield | SettingKind::AxisMask => {
+            chip(&format!("VALUE {}", row.bits()), p).into_any_element()
+        }
+        SettingKind::Unknown(code) => chip(&format!("TYPE {code}"), p).into_any_element(),
+    };
+
+    let header = h_flex()
+        .min_h(px(48.0))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(46.0))
+                .flex_shrink_0()
+                .font_family(mono)
+                .text_size(px(10.0))
+                .text_color(if status_is_pending {
+                    p.warning
+                } else {
+                    p.text_faint
+                })
+                .child(format!("${number}")),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(13.0))
+                                .text_color(p.text)
+                                .child(name),
+                        )
+                        .when(reboot, |this| {
+                            this.child(settings_tag("REBOOT", p.warning, p))
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(9.5))
+                        .text_color(p.text_faint)
+                        .child(meta_line),
+                ),
+        )
+        .when(!status_label.is_empty(), |this| {
+            this.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(status_color)
+                    .child(status_label),
+            )
+        })
+        .child(control);
+
+    let mut card = v_flex()
+        .gap_1()
+        .p_2()
+        .rounded_lg()
+        .bg(background)
+        .border_l(px(3.0))
+        .border_color(status_color)
+        .child(header);
+
+    match kind {
+        SettingKind::Bitfield | SettingKind::ExclusiveBitfield | SettingKind::AxisMask => {
+            card = card.child(settings_bits(
+                &row,
+                p,
+                view.clone(),
+                axis_labels,
+                row_enabled,
+            ));
+        }
+        SettingKind::Radio => {
+            if let Some((first, last)) = radio_values {
+                card = card.child(settings_radio(
+                    number,
+                    radio_value,
+                    first,
+                    last,
+                    p,
+                    view.clone(),
+                    row_enabled,
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(note) = note {
+        card = card.child(
+            div()
+                .pl(px(46.0))
+                .text_size(px(9.5))
+                .text_color(
+                    if matches!(row.status, RowStatus::Invalid | RowStatus::Failed(_)) {
+                        p.danger
+                    } else {
+                        p.warning
+                    },
+                )
+                .child(note),
+        );
+    }
+
+    card.into_any_element()
+}
+
+/// Boolean row control: a 48 px checkbox cell, not a 20 px switch.
+fn settings_toggle(
+    number: u16,
+    checked: bool,
+    p: Palette,
+    view: Entity<Shell>,
+    enabled: bool,
+) -> impl IntoElement {
+    let next = !checked;
+    let mut cell = div()
+        .id(format!("settings-bool-{number}"))
+        .h(px(48.0))
+        .min_w(px(72.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_2()
+        .rounded_lg()
+        .bg(if checked { p.accent_muted } else { p.panel })
+        .border_1()
+        .border_color(if checked { p.accent } else { p.border });
+    if enabled {
+        cell = cell.cursor_pointer().on_click(move |_, _, cx| {
+            view.update(cx, |shell, cx| {
+                shell.state.settings.set_bool(number, next);
+                cx.notify();
+            });
+        });
+    } else {
+        cell = cell.opacity(0.5);
+    }
+    cell.child(
+        div()
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex_shrink_0()
+            .rounded(px(3.0))
+            .border_1()
+            .border_color(if checked { p.accent } else { p.border_strong })
+            .bg(if checked { p.accent } else { p.panel })
+            .child(if checked {
+                div()
+                    .size_full()
+                    .p(px(4.0))
+                    .child(div().size_full().rounded(px(1.0)).bg(p.on_accent))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            }),
+    )
+    .child(
+        div()
+            .text_size(px(10.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if checked { p.accent } else { p.text_dim })
+            .child(if checked { "ON" } else { "OFF" }),
+    )
+}
+
+/// Bit/axis-mask checkbox column.
+fn settings_bits(
+    row: &SettingRow,
+    p: Palette,
+    view: Entity<Shell>,
+    axis_labels: &[String],
+    enabled: bool,
+) -> Div {
+    let bits = row.bits();
+    let exclusive = row.kind == SettingKind::ExclusiveBitfield;
+    let master_off = exclusive && bits & 1 == 0;
+    let count = if row.kind == SettingKind::AxisMask {
+        axis_labels.len().min(9)
+    } else {
+        row.bit_count()
+    };
+    let mut wrap = h_flex().flex_wrap().w_full().gap_1();
+    if count == 0 {
+        return wrap.child(
+            div()
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child("No axes reported by the controller"),
+        );
+    }
+    for bit in 0..count {
+        let checked = bits & (1_u64 << bit) != 0;
+        let label = if row.kind == SettingKind::AxisMask {
+            axis_labels
+                .get(bit)
+                .cloned()
+                .unwrap_or_else(|| format!("B{bit}"))
+        } else {
+            format!("B{bit}")
+        };
+        let cell_enabled = enabled && !(exclusive && bit > 0 && master_off);
+        wrap = wrap.child(settings_bit_cell(
+            row.number,
+            bit as u8,
+            label,
+            checked,
+            cell_enabled,
+            exclusive && bit == 0,
+            p,
+            view.clone(),
+        ));
+    }
+    wrap
+}
+
+/// One bit in a mask column.
+#[allow(clippy::too_many_arguments)]
+fn settings_bit_cell(
+    number: u16,
+    bit: u8,
+    label: String,
+    checked: bool,
+    enabled: bool,
+    master: bool,
+    p: Palette,
+    view: Entity<Shell>,
+) -> impl IntoElement {
+    let next = !checked;
+    let mut cell = div()
+        .id(format!("settings-bit-{number}-{bit}"))
+        .h(px(48.0))
+        .min_w(px(64.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .px_2()
+        .rounded(px(6.0))
+        .bg(if checked { p.accent_muted } else { p.panel })
+        .border_1()
+        .border_color(if master {
+            p.border_strong
+        } else if checked {
+            p.accent
+        } else {
+            p.border
+        });
+    if enabled {
+        cell = cell.cursor_pointer().on_click(move |_, _, cx| {
+            view.update(cx, |shell, cx| {
+                shell.state.settings.toggle_mask_bit(number, bit, next);
+                cx.notify();
+            });
+        });
+    } else {
+        cell = cell.opacity(0.45);
+    }
+    cell.child(
+        div()
+            .w(px(14.0))
+            .h(px(14.0))
+            .flex_shrink_0()
+            .rounded(px(3.0))
+            .border_1()
+            .border_color(if checked { p.accent } else { p.border_strong })
+            .bg(if checked { p.accent } else { p.panel }),
+    )
+    .child(
+        div()
+            .text_size(px(10.0))
+            .text_color(if checked { p.accent } else { p.text_dim })
+            .child(if master {
+                format!("{label} MASTER")
+            } else {
+                label
+            }),
+    )
+}
+
+/// Radio column for a small numeric span.
+fn settings_radio(
+    number: u16,
+    current: Option<i64>,
+    first: i64,
+    last: i64,
+    p: Palette,
+    view: Entity<Shell>,
+    enabled: bool,
+) -> impl IntoElement {
+    let mut row = h_flex().flex_wrap().w_full().gap_1();
+    for value in first..=last {
+        let selected = current == Some(value);
+        let mut cell = div()
+            .id(format!("settings-radio-{number}-{value}"))
+            .h(px(48.0))
+            .min_w(px(56.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_2()
+            .rounded(px(6.0))
+            .bg(if selected { p.accent_muted } else { p.panel })
+            .border_1()
+            .border_color(if selected { p.accent } else { p.border });
+        if enabled {
+            let view = view.clone();
+            cell = cell.cursor_pointer().on_click(move |_, _, cx| {
+                view.update(cx, |shell, cx| {
+                    shell.state.settings.set_radio(number, value);
+                    cx.notify();
+                });
+            });
+        } else {
+            cell = cell.opacity(0.5);
+        }
+        row = row.child(
+            cell.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(if selected { p.accent } else { p.text_dim })
+                    .child(value.to_string()),
+            ),
+        );
+    }
+    row
+}
+
+/// Numeric field: a 48 px tappable value that opens the in-app keypad.
+fn settings_number_field(
+    number: u16,
+    text: &str,
+    unit: Option<&str>,
+    p: Palette,
+    view: Entity<Shell>,
+    enabled: bool,
+    mono: SharedString,
+) -> impl IntoElement {
+    let mut field = div()
+        .id(format!("settings-number-{number}"))
+        .h(px(48.0))
+        .w(px(150.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap_1()
+        .px_2()
+        .rounded_lg()
+        .bg(p.panel)
+        .border_1()
+        .border_color(p.border_strong);
+    if enabled {
+        field = field.cursor_pointer().on_click(move |_, _, cx| {
+            view.update(cx, |shell, cx| shell.open_setting_keypad(number, cx));
+        });
+    } else {
+        field = field.opacity(0.6);
+    }
+    field
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .font_family(mono)
+                .text_size(px(16.0))
+                .text_color(if text.is_empty() {
+                    p.text_faint
+                } else {
+                    p.text
+                })
+                .child(if text.is_empty() {
+                    "0".to_string()
+                } else {
+                    text.to_string()
+                }),
+        )
+        .when_some(unit.map(str::to_string), |this, unit| {
+            this.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(9.0))
+                    .text_color(p.text_faint)
+                    .child(unit.to_uppercase()),
+            )
+        })
+}
+
+/// Text field: a 48 px tappable value that opens the text sheet.
+fn settings_text_field(
+    number: u16,
+    display: &str,
+    kind: SettingKind,
+    p: Palette,
+    view: Entity<Shell>,
+    enabled: bool,
+) -> impl IntoElement {
+    let mut field = div()
+        .id(format!("settings-text-{number}"))
+        .h(px(48.0))
+        .w(px(190.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .rounded_lg()
+        .bg(p.panel)
+        .border_1()
+        .border_color(p.border_strong);
+    if enabled {
+        field = field.cursor_pointer().on_click(move |_, window, cx| {
+            view.update(cx, |shell, cx| {
+                shell.open_settings_entry(SettingsEntryPurpose::Text(number), window, cx);
+            });
+        });
+    } else {
+        field = field.opacity(0.6);
+    }
+    field
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(12.0))
+                .text_color(if display.is_empty() {
+                    p.text_faint
+                } else {
+                    p.text
+                })
+                .child(if display.is_empty() {
+                    "(blank)".to_string()
+                } else {
+                    display.to_string()
+                }),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(8.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child(match kind {
+                    SettingKind::Password => "MASKED",
+                    SettingKind::IpAddress => "IPV4",
+                    _ => "EDIT",
+                }),
+        )
+}
+
+/// Small static metadata tag; not a touch target.
+fn settings_tag(text: &str, color: Hsla, p: Palette) -> Div {
+    div()
+        .px_1()
+        .h(px(16.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .rounded(px(4.0))
+        .bg(color.opacity(0.16))
+        .text_size(px(8.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(color)
+        .child(text.to_string())
+        .text_color(color)
+        .border_1()
+        .border_color(p.border)
+}
+
+/// Empty form notice for a group or a search with no matches.
+fn settings_no_rows(query: &str, p: Palette) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .p_4()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(p.text_dim)
+                .child(if query.is_empty() {
+                    "No settings in this group".to_string()
+                } else {
+                    format!("No setting matches \"{query}\"")
+                }),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child(if query.is_empty() {
+                    "Pick another group in the rail."
+                } else {
+                    "Search matches a number, name, or group. Clear the search to browse groups."
+                }),
+        )
+}
+
+/// Static row used only in the empty state.
+fn settings_example_row(name: &str, detail: &str, value: &str, p: Palette) -> Div {
+    h_flex()
+        .min_h(px(56.0))
+        .items_center()
+        .gap_2()
+        .p_2()
+        .rounded_lg()
+        .bg(p.panel_alt)
+        .border_1()
+        .border_color(p.border)
+        .opacity(0.75)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(p.text_dim)
+                        .child(name.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(p.text_faint)
+                        .child(detail.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .h(px(48.0))
+                .min_w(px(96.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_2()
+                .rounded_lg()
+                .bg(p.panel)
+                .border_1()
+                .border_color(p.border_strong)
+                .text_size(px(14.0))
+                .text_color(p.text_dim)
+                .child(value.to_string()),
+        )
+}
+
+/// Integer span for a radio control, when the reported range is small enough.
+fn radio_span(row: &SettingRow) -> Option<(i64, i64)> {
+    let first = row.min?.ceil() as i64;
+    let last = row.max?.floor() as i64;
+    (last >= first && last - first <= 7).then_some((first, last))
 }
 
 #[cfg(test)]

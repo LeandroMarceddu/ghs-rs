@@ -15,7 +15,8 @@ use std::sync::Arc;
 use ghs_demo::{SimProfile, SimSession};
 use ghs_engine::{
     Command, ConnectTarget, ControllerInfo, Engine, EngineConfig, EngineError, EngineEvent,
-    EngineHandle, JobAbortReason, LogLevel, MachineSnapshot, SerialConfig, StatusReport,
+    EngineHandle, JobAbortReason, LogLevel, MachineSnapshot, SerialConfig, Setting,
+    SettingDescription, SettingGroup, StatusReport,
 };
 
 use crate::state::{
@@ -135,6 +136,9 @@ pub struct LiveLink {
     last_info: Option<Arc<ControllerInfo>>,
     last_snapshot: Option<Arc<MachineSnapshot>>,
     last_status: Option<Arc<StatusReport>>,
+    last_settings: Option<Arc<Vec<Setting>>>,
+    last_descriptions: Option<Arc<Vec<SettingDescription>>>,
+    last_groups: Option<Arc<Vec<SettingGroup>>>,
 }
 
 impl LiveLink {
@@ -163,6 +167,9 @@ impl LiveLink {
             last_info: None,
             last_snapshot: None,
             last_status: None,
+            last_settings: None,
+            last_descriptions: None,
+            last_groups: None,
         };
         link.connect(mode)?;
         Ok(link)
@@ -333,6 +340,29 @@ impl LiveLink {
         }
 
         if ready {
+            // `$ES`/`$EG` and the `$$` dump also arrive as events; reading the
+            // shared snapshots here recovers a session whose events were
+            // drained before the UI existed, and costs nothing when the Arc is
+            // unchanged.
+            let descriptions = self.engine.setting_descriptions();
+            if option_arc_changed(&self.last_descriptions, &Some(Arc::clone(&descriptions))) {
+                state.settings.apply_descriptions(&descriptions);
+                self.last_descriptions = Some(descriptions);
+                changed = true;
+            }
+            let groups = self.engine.setting_groups();
+            if option_arc_changed(&self.last_groups, &Some(Arc::clone(&groups))) {
+                state.settings.apply_groups(&groups);
+                self.last_groups = Some(groups);
+                changed = true;
+            }
+            let settings = self.engine.settings();
+            if option_arc_changed(&self.last_settings, &Some(Arc::clone(&settings))) {
+                state.settings.apply_settings(&settings);
+                self.last_settings = Some(settings);
+                changed = true;
+            }
+
             let snapshot = self.engine.snapshot();
             let status = self.engine.last_status();
             let snapshot_changed = self
@@ -369,6 +399,7 @@ impl LiveLink {
                 state.connection = ConnectionState::Disconnected;
                 // Never leave a tool-change sheet behind a dead link.
                 state.job.interrupted();
+                state.settings.cancel_writes("disconnected");
                 state.push_console(
                     ConsoleLevel::Warn,
                     "Disconnected; the last telemetry is stale",
@@ -389,10 +420,23 @@ impl LiveLink {
             }
             EngineEvent::Alarm(code) => {
                 state.machine_state = "Alarm";
+                if let Some(number) = state.settings.inflight_number() {
+                    state
+                        .settings
+                        .mark_send_error(number, format!("ALARM:{code}"));
+                }
                 state.push_console(ConsoleLevel::Error, format!("ALARM:{code}"));
                 true
             }
             EngineEvent::Error(code) => {
+                if let Some(number) = state.settings.inflight_number() {
+                    let message = format!("controller error:{code}");
+                    state.settings.mark_send_error(number, message.clone());
+                    state.push_console(
+                        ConsoleLevel::Error,
+                        format!("Setting ${number} rejected: {message}"),
+                    );
+                }
                 state.push_console(ConsoleLevel::Error, format!("error:{code}"));
                 true
             }
@@ -412,10 +456,40 @@ impl LiveLink {
                 self.last_info = Some(info);
                 true
             }
-            EngineEvent::Settings(_)
-            | EngineEvent::CodeTables { .. }
-            | EngineEvent::Probe(_)
-            | EngineEvent::SettingWritten { .. } => false,
+            EngineEvent::Settings(settings) => {
+                state.settings.apply_settings(&settings);
+                self.last_settings = Some(settings);
+                true
+            }
+            EngineEvent::SettingMetadata {
+                descriptions,
+                groups,
+            } => {
+                state.settings.apply_metadata(&descriptions, &groups);
+                self.last_descriptions = Some(descriptions);
+                self.last_groups = Some(groups);
+                true
+            }
+            EngineEvent::SettingWritten {
+                number,
+                value,
+                verified,
+            } => {
+                state.settings.written(number, &value, verified);
+                if verified {
+                    state.push_console(
+                        ConsoleLevel::Ok,
+                        format!("Setting ${number} verified = {value}"),
+                    );
+                } else {
+                    state.push_console(
+                        ConsoleLevel::Error,
+                        format!("Setting ${number} read back as {value}; previous value kept"),
+                    );
+                }
+                true
+            }
+            EngineEvent::CodeTables { .. } | EngineEvent::Probe(_) => false,
             EngineEvent::JobLoaded {
                 name, total_lines, ..
             } => {
@@ -504,6 +578,9 @@ impl LiveLink {
         self.last_info = None;
         self.last_snapshot = None;
         self.last_status = None;
+        self.last_settings = None;
+        self.last_descriptions = None;
+        self.last_groups = None;
     }
 }
 

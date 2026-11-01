@@ -12,9 +12,13 @@
 //! stops at `M6 T2`; `--demo-m0` preloads the same pocket with an `M0` pause;
 //! `--demo-start` presses the job Start action once after the demo program
 //! loads (screenshot switch: it exercises the same path as the toolbar
-//! button). `--size WxH` (or `--size=WxH`) opens at an explicit logical size
-//! for layout review, e.g. `--size 1920x1080` or `--size 1080x1920`;
-//! `--fullscreen` pins the shell to the current output.
+//! button). `--settings` opens the generated settings workspace directly;
+//! `--settings-group=NAME` selects a reported group in that workspace;
+//! `--demo-settings-write` changes one safe integer through the normal
+//! pending/Apply/read-back path for the applied screenshot. `--size WxH` (or
+//! `--size=WxH`) opens at an explicit logical size for layout review, e.g.
+//! `--size 1920x1080` or `--size 1080x1920`; `--fullscreen` pins the shell to
+//! the current output.
 //!
 //! Window policy:
 //! - 1280x800 default (UX-01), 1920x1080 works by widening the centre column.
@@ -25,6 +29,7 @@
 mod connection;
 mod keypad;
 mod live;
+mod settings;
 mod shell;
 mod state;
 mod theme;
