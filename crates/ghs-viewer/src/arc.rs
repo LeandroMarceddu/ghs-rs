@@ -271,7 +271,8 @@ impl Arc {
     #[must_use]
     pub fn point_at_angle(&self, angle: f32) -> Point3 {
         let (sin, cos) = angle.sin_cos();
-        let uv = Point2::new(cos * self.radius, sin * self.radius);
+        let center = self.plane.project(self.center);
+        let uv = Point2::new(center.x + cos * self.radius, center.y + sin * self.radius);
         self.plane
             .unproject(uv, self.plane.normal_coordinate(self.center))
     }
@@ -502,6 +503,49 @@ mod tests {
         let bounds = arc.bounds();
         assert_point_near(bounds.min(), Point3::new(-3.0, -2.0, -3.0), 1.0e-4);
         assert_point_near(bounds.max(), Point3::new(5.0, 6.0, -3.0), 1.0e-4);
+    }
+
+    #[test]
+    fn point_at_angle_includes_the_arc_center() {
+        let xy = Arc::new(
+            ArcPlane::Xy,
+            Point3::new(10.0, -5.0, 2.0),
+            4.0,
+            0.0,
+            PI * 0.5,
+            false,
+        )
+        .expect("xy arc");
+        assert_point_near(xy.start_point(), Point3::new(14.0, -5.0, 2.0), 1.0e-5);
+        assert_point_near(xy.end_point(), Point3::new(10.0, -1.0, 2.0), 1.0e-5);
+        for point in xy.tessellate(0.01) {
+            let distance = point.xy().distance(Point2::new(10.0, -5.0));
+            assert!(approx(distance, 4.0, 1.0e-4), "point {point:?} off radius");
+        }
+
+        let zx = Arc::new(
+            ArcPlane::Xz,
+            Point3::new(1.0, 2.0, 3.0),
+            2.0,
+            0.0,
+            PI * 0.5,
+            false,
+        )
+        .expect("zx arc");
+        assert_point_near(zx.start_point(), Point3::new(1.0, 2.0, 5.0), 1.0e-5);
+        assert_point_near(zx.end_point(), Point3::new(3.0, 2.0, 3.0), 1.0e-5);
+
+        let yz = Arc::new(
+            ArcPlane::Yz,
+            Point3::new(1.0, 2.0, 3.0),
+            2.0,
+            0.0,
+            PI * 0.5,
+            false,
+        )
+        .expect("yz arc");
+        assert_point_near(yz.start_point(), Point3::new(1.0, 4.0, 3.0), 1.0e-5);
+        assert_point_near(yz.end_point(), Point3::new(1.0, 2.0, 5.0), 1.0e-5);
     }
 
     #[test]
