@@ -8,11 +8,14 @@
 //! path; a generic or extended controller can supply a different value without
 //! touching this module's consumers.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
-    Axis as CoreAxis, ControllerInfo, MachineSnapshot, Signals as CoreSignals, StatusReport,
+    Axis as CoreAxis, ControllerInfo, EngineEvent, JobAbortReason, JobInfo, JobPauseReason,
+    JobState, MachineSnapshot, Program, ProgramLine as EngineProgramLine, Signals as CoreSignals,
+    StatusReport,
 };
 
 /// Connection state shown in the top-bar status pill.
@@ -520,6 +523,400 @@ const PROGRAM: [(&str, ProgramKind); 30] = [
     ("(Line 13 is being streamed)", ProgramKind::Comment),
 ];
 
+/// A pending manual tool change shown in the modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolChangeView {
+    /// Requested tool number.
+    pub tool: u32,
+    /// 1-based source line carrying the `M6`.
+    pub line: u32,
+    /// Whether `0xA3` was requested. Resume stays locked until this is true.
+    pub acknowledged: bool,
+}
+
+/// Live job-runner view model.
+///
+/// Plain data updated from [`EngineEvent`] job events and
+/// [`ghs_engine::MachineSnapshot::job`]. It holds the parsed program so the
+/// Program tab can render real source lines without copying them. The shell
+/// never derives motion from this type: every action is a typed
+/// [`ghs_engine::Command`].
+#[derive(Clone, Debug, Default)]
+pub struct JobView {
+    program: Option<Arc<Program>>,
+    /// Program name supplied with `LoadProgram`.
+    pub name: String,
+    /// Job lifecycle state.
+    pub state: JobState,
+    /// Current 1-based source line; zero before the first line is resolved.
+    pub current_line: u32,
+    /// Source lines resolved so far (acknowledged or skipped).
+    pub completed: u32,
+    /// Source lines in this run, from the engine's parsed program.
+    pub total: u32,
+    /// Active job time; paused intervals are excluded.
+    pub elapsed: Duration,
+    /// Why the job paused, when the engine reported a reason.
+    pub pause_reason: Option<JobPauseReason>,
+    /// Pending manual tool change.
+    pub tool_change: Option<ToolChangeView>,
+}
+
+impl JobView {
+    /// Parsed program installed by `JobLoaded`.
+    pub fn program(&self) -> Option<&Arc<Program>> {
+        self.program.as_ref()
+    }
+
+    /// Whether a program is installed.
+    pub fn has_program(&self) -> bool {
+        self.program.is_some()
+    }
+
+    /// Number of parsed source lines, including lines after `M30`.
+    pub fn line_count(&self) -> usize {
+        self.program
+            .as_ref()
+            .map_or(0, |program| program.lines.len())
+    }
+
+    /// One parsed source line by zero-based index.
+    pub fn line(&self, index: usize) -> Option<&EngineProgramLine> {
+        self.program.as_ref()?.lines.get(index)
+    }
+
+    /// Source text for a 1-based line number.
+    pub fn line_source(&self, line: u32) -> Option<&str> {
+        let index = usize::try_from(line).ok()?.checked_sub(1)?;
+        self.line(index).map(|line| line.source.as_str())
+    }
+
+    /// Resolved fraction of the streamed lines, clamped to `0.0..=1.0`.
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.completed.min(self.total) as f32 / self.total as f32).clamp(0.0, 1.0)
+    }
+
+    /// Whether the runner is feeding or ready to feed lines.
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, JobState::Running | JobState::Paused)
+    }
+
+    /// Whether the runner is feeding lines.
+    pub fn is_running(&self) -> bool {
+        self.state == JobState::Running
+    }
+
+    /// Whether the runner is paused, including a pending tool change.
+    pub fn is_paused(&self) -> bool {
+        self.state == JobState::Paused
+    }
+
+    /// Whether a tool change awaits operator action.
+    pub fn tool_change_pending(&self) -> bool {
+        self.tool_change.is_some()
+    }
+
+    /// Whether the tool change was acknowledged with `0xA3`.
+    pub fn tool_change_acknowledged(&self) -> bool {
+        self.tool_change.is_some_and(|change| change.acknowledged)
+    }
+
+    /// Short status label for the job toolbar.
+    pub fn status_label(&self) -> &'static str {
+        if self.tool_change.is_some() {
+            return "TOOL CHANGE";
+        }
+        if self.state == JobState::Idle {
+            return if self.has_program() {
+                "LOADED"
+            } else {
+                "NO PROGRAM"
+            };
+        }
+        job_state_label(self.state)
+    }
+
+    /// Installs a parsed program from `JobLoaded`.
+    pub fn loaded(&mut self, name: String, program: Arc<Program>, total: u32) {
+        self.program = Some(program);
+        self.name = name;
+        self.state = JobState::Idle;
+        self.current_line = 0;
+        self.completed = 0;
+        self.total = total;
+        self.elapsed = Duration::ZERO;
+        self.pause_reason = None;
+        self.tool_change = None;
+    }
+
+    /// Records `JobStarted`.
+    pub fn started(&mut self, from_line: u32, total: u32) {
+        self.state = JobState::Running;
+        self.current_line = from_line;
+        self.completed = 0;
+        if total > 0 {
+            self.total = total;
+        }
+        self.elapsed = Duration::ZERO;
+        self.pause_reason = None;
+        self.tool_change = None;
+    }
+
+    /// Records `JobProgress`.
+    pub fn progress(&mut self, current_line: u32, completed: u32, total: u32, elapsed: Duration) {
+        self.current_line = current_line;
+        self.completed = completed;
+        if total > 0 {
+            self.total = total;
+        }
+        self.elapsed = elapsed;
+    }
+
+    /// Records `JobPaused`.
+    pub fn paused(&mut self, line: u32, reason: JobPauseReason) {
+        self.state = JobState::Paused;
+        if line > 0 {
+            self.current_line = line;
+        }
+        self.pause_reason = Some(reason);
+        self.tool_change = None;
+    }
+
+    /// Records `JobResumed`.
+    pub fn resumed(&mut self) {
+        self.state = JobState::Running;
+        self.pause_reason = None;
+        self.tool_change = None;
+    }
+
+    /// Records `JobCompleted`.
+    pub fn completed(&mut self, elapsed: Duration) {
+        self.state = JobState::Completed;
+        self.elapsed = elapsed;
+        self.completed = self.total;
+        if self.total > 0 {
+            self.current_line = self.total;
+        }
+        self.pause_reason = None;
+        self.tool_change = None;
+    }
+
+    /// Records `JobAborted`.
+    pub fn aborted(&mut self, line: u32, _reason: JobAbortReason) {
+        self.state = JobState::Aborted;
+        if line > 0 {
+            self.current_line = line;
+        }
+        self.pause_reason = None;
+        self.tool_change = None;
+    }
+
+    /// Records `JobError`. The controller rejected the line, so the runner is
+    /// aborted even before the next snapshot confirms it.
+    pub fn job_error(&mut self, line: u32) {
+        if line > 0 {
+            self.current_line = line;
+        }
+        self.state = JobState::Aborted;
+        self.pause_reason = None;
+        self.tool_change = None;
+    }
+
+    /// Marks the job interrupted after the link closed.
+    ///
+    /// The engine normally emits `JobAborted { reason: Disconnected }` first;
+    /// this also clears a tool-change sheet if that event was dropped.
+    pub fn interrupted(&mut self) {
+        if self.has_program() {
+            self.state = JobState::Interrupted;
+            self.pause_reason = None;
+            self.tool_change = None;
+        }
+    }
+
+    /// Records `ToolChangeRequired`.
+    pub fn tool_change_required(&mut self, tool: u32, line: u32) {
+        self.state = JobState::Paused;
+        if line > 0 {
+            self.current_line = line;
+        }
+        self.pause_reason = None;
+        self.tool_change = Some(ToolChangeView {
+            tool,
+            line,
+            acknowledged: false,
+        });
+    }
+
+    /// Marks the pending tool change acknowledged after `0xA3` was accepted.
+    ///
+    /// Returns `false` when no tool change is pending.
+    pub fn acknowledge_tool_change(&mut self) -> bool {
+        let Some(change) = self.tool_change.as_mut() else {
+            return false;
+        };
+        change.acknowledged = true;
+        true
+    }
+
+    /// Merges `MachineSnapshot.job`.
+    ///
+    /// Events carry the authoritative pause reason and tool change; the
+    /// snapshot is a cross-check that also recovers a missed event. A snapshot
+    /// that says the job is no longer paused clears a stale tool change.
+    pub fn apply_snapshot(&mut self, info: &JobInfo) -> bool {
+        let mut changed = false;
+        if let Some(name) = &info.name
+            && *name != self.name
+        {
+            self.name.clone_from(name);
+            changed = true;
+        }
+        if info.total_lines > 0 {
+            if info.total_lines != self.total {
+                self.total = info.total_lines;
+                changed = true;
+            }
+            if info.completed_lines != self.completed {
+                self.completed = info.completed_lines;
+                changed = true;
+            }
+            if let Some(line) = info.line
+                && line != self.current_line
+            {
+                self.current_line = line;
+                changed = true;
+            }
+        }
+        if info.state != self.state {
+            self.state = info.state;
+            changed = true;
+        }
+        if !matches!(info.state, JobState::Paused) {
+            if self.pause_reason.take().is_some() {
+                changed = true;
+            }
+            if self.tool_change.take().is_some() {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Applies one engine event. Non-job variants leave the view unchanged.
+    ///
+    /// Kept next to the setters so the job state machine is testable without
+    /// an engine thread. Console text stays in `live.rs`.
+    pub fn apply_event(&mut self, event: &EngineEvent) -> bool {
+        match event {
+            EngineEvent::JobLoaded {
+                name,
+                total_lines,
+                program,
+            } => {
+                self.loaded(name.clone(), Arc::clone(program), *total_lines);
+                true
+            }
+            EngineEvent::JobStarted {
+                from_line,
+                total_lines,
+            } => {
+                self.started(*from_line, *total_lines);
+                true
+            }
+            EngineEvent::JobProgress {
+                current_line,
+                completed,
+                total,
+                elapsed,
+            } => {
+                self.progress(*current_line, *completed, *total, *elapsed);
+                true
+            }
+            EngineEvent::JobPaused { line, reason } => {
+                self.paused(*line, *reason);
+                true
+            }
+            EngineEvent::JobResumed => {
+                self.resumed();
+                true
+            }
+            EngineEvent::JobCompleted { elapsed } => {
+                self.completed(*elapsed);
+                true
+            }
+            EngineEvent::JobAborted { line, reason } => {
+                self.aborted(*line, *reason);
+                true
+            }
+            EngineEvent::JobError { line, .. } => {
+                self.job_error(*line);
+                true
+            }
+            EngineEvent::ToolChangeRequired { tool, line } => {
+                self.tool_change_required(*tool, *line);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Short label for a job lifecycle state.
+pub fn job_state_label(state: JobState) -> &'static str {
+    match state {
+        JobState::Idle => "IDLE",
+        JobState::Running => "RUNNING",
+        JobState::Paused => "PAUSED",
+        JobState::Completed => "COMPLETED",
+        JobState::Aborted => "ABORTED",
+        JobState::Interrupted => "INTERRUPTED",
+    }
+}
+
+/// Short label for a pause reason.
+pub fn pause_reason_label(reason: JobPauseReason) -> &'static str {
+    match reason {
+        JobPauseReason::Operator => "operator",
+        JobPauseReason::FeedHold => "feed hold",
+        JobPauseReason::ProgramStop => "program stop (M0)",
+        JobPauseReason::OptionalStop => "optional stop (M1)",
+        JobPauseReason::SingleBlock => "single block",
+        JobPauseReason::Breakpoint => "breakpoint",
+        JobPauseReason::Watchdog => "status watchdog",
+    }
+}
+
+/// Short label for an abort reason.
+pub fn abort_reason_label(reason: JobAbortReason) -> &'static str {
+    match reason {
+        JobAbortReason::OperatorStop => "operator stop",
+        JobAbortReason::Alarm => "alarm",
+        JobAbortReason::Door => "safety door",
+        JobAbortReason::Disconnected => "disconnected",
+        JobAbortReason::SoftReset => "soft reset",
+        JobAbortReason::EmergencyStop => "E-stop",
+        JobAbortReason::ProgramError => "program error",
+        JobAbortReason::ControllerSleep => "controller sleep",
+    }
+}
+
+/// `MM:SS` (or `H:MM:SS` past an hour) for job time.
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 /// Everything the shell draws. Plain data, no GPUI types.
 pub struct AppState {
     pub profile: Profile,
@@ -529,7 +926,8 @@ pub struct AppState {
     pub connection: ConnectionState,
     pub live: bool,
     pub machine_state: &'static str,
-    pub job_name: &'static str,
+    /// Engine job runner state. Empty in `--mock` mode.
+    pub job: JobView,
     pub dro: Vec<f64>,
     pub mpos: Vec<f64>,
     pub wco: Vec<f64>,
@@ -577,7 +975,7 @@ impl AppState {
             connection: ConnectionState::Mock,
             live: false,
             machine_state: "Idle",
-            job_name: "shop-sign-pocket.nc",
+            job: JobView::default(),
             dro: dro.clone(),
             mpos: dro.clone(),
             wco: vec![0.0; axes],
@@ -639,7 +1037,10 @@ impl AppState {
         self.connection = ConnectionState::Connecting;
         self.profile = Profile::live_pending();
         self.machine_state = "Unknown";
-        self.job_name = "No job loaded (M3)";
+        // A fresh session starts without a program. Demo mode reloads its
+        // bundled source once the controller is ready; a serial reconnect has
+        // to send its program again (there is no program-read command).
+        self.job = JobView::default();
         self.active_line = 0;
         self.progress = 0.0;
         self.console.clear();
@@ -779,6 +1180,76 @@ impl AppState {
         } else {
             self.dtg.fill(0.0);
         }
+
+        self.job.apply_snapshot(&snapshot.job);
+    }
+
+    /// Program name shown in the viewer header.
+    pub fn job_title(&self) -> &str {
+        if !self.job.name.is_empty() {
+            self.job.name.as_str()
+        } else if self.live {
+            "No program loaded"
+        } else {
+            "shop-sign-pocket.nc"
+        }
+    }
+
+    /// Lines parsed in the Program tab: the engine program or the mock list.
+    pub fn display_program_lines(&self) -> usize {
+        if self.job.has_program() {
+            self.job.line_count()
+        } else if self.live {
+            0
+        } else {
+            self.program.len()
+        }
+    }
+
+    /// Current 1-based line for the Program tab and header counter.
+    pub fn display_line(&self) -> u32 {
+        if self.job.has_program() {
+            self.job.current_line
+        } else if self.live {
+            0
+        } else {
+            self.active_line as u32
+        }
+    }
+
+    /// Streamed line count for the header counter.
+    pub fn display_total(&self) -> u32 {
+        if self.job.has_program() {
+            self.job.total
+        } else if self.live {
+            0
+        } else {
+            self.program.len() as u32
+        }
+    }
+
+    /// Progress fraction for the header bar.
+    pub fn display_progress(&self) -> f32 {
+        if self.job.has_program() {
+            self.job.fraction()
+        } else if self.live {
+            0.0
+        } else {
+            self.progress
+        }
+    }
+
+    /// Job status label, including the mock program's "loaded" state.
+    pub fn display_job_status(&self) -> &'static str {
+        if !self.live && !self.job.has_program() && !self.program.is_empty() {
+            return match self.job.state {
+                JobState::Idle => "LOADED",
+                JobState::Running => "RUNNING",
+                JobState::Paused => "PAUSED",
+                other => job_state_label(other),
+            };
+        }
+        self.job.status_label()
     }
 
     pub fn axes(&self) -> &[Axis] {
@@ -1265,5 +1736,134 @@ mod tests {
         status.tool = Some(5);
         state.apply_snapshot(&snapshot, Some(&status));
         assert_eq!(state.tool, Some(5));
+    }
+
+    fn sample_program() -> Arc<Program> {
+        Arc::new(
+            ghs_gcode::parse_program("G21\nG0 X10\nM6 T2\nM30\n").expect("sample program parses"),
+        )
+    }
+
+    #[test]
+    fn job_view_maps_program_lines_and_progress() {
+        let program = sample_program();
+        let mut job = JobView::default();
+        assert!(job.apply_event(&EngineEvent::JobLoaded {
+            name: "sample.nc".into(),
+            total_lines: 4,
+            program: Arc::clone(&program),
+        }));
+        assert_eq!(job.status_label(), "LOADED");
+        assert_eq!(job.line_count(), 4);
+        assert_eq!(job.line_source(2), Some("G0 X10"));
+        assert_eq!(job.line_source(0), None);
+        assert_eq!(job.line_source(5), None);
+        assert_eq!(job.current_line, 0);
+
+        assert!(job.apply_event(&EngineEvent::JobStarted {
+            from_line: 1,
+            total_lines: 4,
+        }));
+        assert!(job.is_running());
+        assert!(job.apply_event(&EngineEvent::JobProgress {
+            current_line: 2,
+            completed: 1,
+            total: 4,
+            elapsed: Duration::from_secs(3),
+        }));
+        assert_eq!(job.current_line, 2);
+        assert!((job.fraction() - 0.25).abs() < f32::EPSILON);
+
+        assert!(job.apply_event(&EngineEvent::JobCompleted {
+            elapsed: Duration::from_secs(9),
+        }));
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.completed, 4);
+        assert_eq!(job.current_line, 4);
+        assert_eq!(job.fraction(), 1.0);
+        assert_eq!(format_elapsed(job.elapsed), "00:09");
+    }
+
+    #[test]
+    fn job_view_tracks_pause_resume_and_the_tool_change_handshake() {
+        let mut job = JobView::default();
+        job.loaded("sample.nc".into(), sample_program(), 4);
+        job.started(1, 4);
+
+        job.paused(3, JobPauseReason::ProgramStop);
+        assert!(job.is_paused());
+        assert_eq!(job.status_label(), "PAUSED");
+        assert_eq!(job.pause_reason, Some(JobPauseReason::ProgramStop));
+        assert_eq!(
+            pause_reason_label(JobPauseReason::ProgramStop),
+            "program stop (M0)"
+        );
+
+        job.resumed();
+        assert!(job.is_running());
+        assert!(job.pause_reason.is_none());
+
+        job.tool_change_required(2, 3);
+        assert_eq!(job.status_label(), "TOOL CHANGE");
+        assert!(job.tool_change_pending());
+        assert!(!job.tool_change_acknowledged());
+        assert_eq!(
+            job.tool_change,
+            Some(ToolChangeView {
+                tool: 2,
+                line: 3,
+                acknowledged: false,
+            })
+        );
+        assert!(job.acknowledge_tool_change());
+        assert!(job.tool_change_acknowledged());
+
+        job.resumed();
+        assert!(job.tool_change.is_none());
+        assert!(job.is_running());
+
+        job.job_error(3);
+        assert_eq!(job.state, JobState::Aborted);
+        assert_eq!(job.status_label(), "ABORTED");
+
+        job.loaded("sample.nc".into(), sample_program(), 4);
+        job.tool_change_required(2, 3);
+        job.interrupted();
+        assert_eq!(job.state, JobState::Interrupted);
+        assert!(job.tool_change.is_none(), "a link loss clears the sheet");
+    }
+
+    #[test]
+    fn job_snapshot_recovers_progress_and_clears_a_finished_tool_change() {
+        let mut job = JobView::default();
+        job.loaded("sample.nc".into(), sample_program(), 4);
+        job.tool_change_required(2, 3);
+
+        let mut info = JobInfo {
+            name: Some("sample.nc".into()),
+            state: JobState::Paused,
+            line: Some(3),
+            total_lines: 4,
+            completed_lines: 2,
+            ..JobInfo::default()
+        };
+        info.update_progress();
+        assert!(job.apply_snapshot(&info));
+        assert_eq!(job.total, 4);
+        assert_eq!(job.completed, 2);
+        assert_eq!(job.current_line, 3);
+        assert!(
+            job.tool_change_pending(),
+            "a paused snapshot keeps the prompt"
+        );
+
+        info.state = JobState::Running;
+        info.line = Some(4);
+        info.completed_lines = 3;
+        info.update_progress();
+        assert!(job.apply_snapshot(&info));
+        assert!(job.tool_change.is_none(), "a running snapshot clears it");
+        assert!(job.pause_reason.is_none());
+        assert_eq!(job.fraction(), 0.75);
     }
 }

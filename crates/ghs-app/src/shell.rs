@@ -29,11 +29,12 @@
 //! - Every panel keeps its 48 px targets in portrait; the dock scrolls rather
 //!   than shrinking controls.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ghs_engine::{
-    Axes, Axis as CoreAxis, Command, EngineError, JogCommand, MachineState, Position,
-    RealtimeCommand, SerialConfig,
+    Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
+    MachineState, Position, Program, RealtimeCommand, SerialConfig,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -43,17 +44,18 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::keypad;
-use crate::live::{LinkMode, LiveLink};
+use crate::live::{DemoProgram, LinkMode, LiveLink};
 use crate::state::{
-    AppState, Axis, ConnectionState, ConsoleLevel, KeypadAction, KeypadTarget, LeftTab, Mode,
-    ProgramKind, SignalState,
+    AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
+    Mode, ProgramKind, SignalState, format_elapsed, pause_reason_label,
 };
 use crate::theme::Palette;
 use crate::viewer;
@@ -94,6 +96,11 @@ pub struct Shell {
     feed_slider_active: bool,
     spindle_slider_active: bool,
     console_scroll: ScrollHandle,
+    program_scroll: UniformListScrollHandle,
+    last_job_line: u32,
+    demo_program: DemoProgram,
+    demo_start: bool,
+    demo_start_sent: bool,
     _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -164,6 +171,17 @@ impl Shell {
             state.open_keypad(KeypadTarget::Dro(Axis::X));
         }
 
+        // Screenshot/demo switches. They only select a bundled demo source or
+        // press the same Start action a tap would; normal startup ignores them.
+        let demo_program = if std::env::args().any(|arg| arg == "--demo-toolchange") {
+            DemoProgram::ToolChange
+        } else if std::env::args().any(|arg| arg == "--demo-m0") {
+            DemoProgram::ProgramStop
+        } else {
+            DemoProgram::Pocket
+        };
+        let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+
         let mut shell = Self {
             state,
             feed_slider,
@@ -178,6 +196,11 @@ impl Shell {
             feed_slider_active: false,
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
+            program_scroll: UniformListScrollHandle::new(),
+            last_job_line: 0,
+            demo_program,
+            demo_start,
+            demo_start_sent: false,
             _poll_task: None,
             _subscriptions: subscriptions,
         };
@@ -220,6 +243,27 @@ impl Shell {
         }
         if self.panel.poll() {
             changed = true;
+        }
+        // `--demo-start` presses the same action as the toolbar button, once.
+        if self.demo_start
+            && !self.demo_start_sent
+            && self.state.live
+            && self.state.job.has_program()
+            && self.job_start_allowed()
+        {
+            self.demo_start_sent = true;
+            self.start_job(cx);
+            changed = true;
+        }
+        // Follow the current line in the Program tab. Only a changed line
+        // scrolls, so manual scrolling is not fought every poll.
+        let line = self.state.display_line();
+        if self.state.job.has_program() && line != self.last_job_line {
+            self.last_job_line = line;
+            if line > 0 {
+                self.program_scroll
+                    .scroll_to_item(line as usize - 1, ScrollStrategy::Center);
+            }
         }
         if changed {
             if self.state.console.len() != console_before {
@@ -278,10 +322,11 @@ impl Shell {
     }
 
     fn connect_demo(&mut self, cx: &mut Context<Self>) {
+        let program = self.demo_program;
         let result = if let Some(link) = self.link.as_mut() {
-            link.connect_demo()
+            link.connect_demo_with(program)
         } else {
-            match LiveLink::start_demo() {
+            match LiveLink::start_demo_with(program) {
                 Ok(link) => {
                     self.link = Some(link);
                     Ok(())
@@ -431,6 +476,52 @@ impl Shell {
             MacroAction::ZeroXy | MacroAction::ZeroZ | MacroAction::SafeZ => self.mdi_allowed(),
             MacroAction::Coolant => self.aux_allowed(),
         }
+    }
+
+    // -------------------------------------------------------------- job gates
+
+    /// Whether the shell has a program to run (engine or mock).
+    fn job_loaded(&self) -> bool {
+        if self.state.live {
+            self.state.job.has_program()
+        } else {
+            !self.state.program.is_empty()
+        }
+    }
+
+    fn job_start_allowed(&self) -> bool {
+        if !self.ready() || self.locked() || !self.job_loaded() {
+            return false;
+        }
+        if !matches!(
+            self.state.job.state,
+            JobState::Idle | JobState::Completed | JobState::Aborted | JobState::Interrupted
+        ) {
+            return false;
+        }
+        if !self.state.live {
+            return true;
+        }
+        // The engine accepts StartProgram only in Idle.
+        self.machine() == MachineState::Idle
+    }
+
+    fn job_pause_allowed(&self) -> bool {
+        self.ready() && !self.locked() && self.state.job.is_running()
+    }
+
+    fn job_resume_allowed(&self) -> bool {
+        if !self.ready() || self.locked() || !self.state.job.is_paused() {
+            return false;
+        }
+        // A pending tool change owns its own acknowledge-then-resume flow, and
+        // the engine refuses a watchdog resume.
+        !self.state.job.tool_change_pending()
+            && self.state.job.pause_reason != Some(JobPauseReason::Watchdog)
+    }
+
+    fn job_stop_allowed(&self) -> bool {
+        self.ready() && !self.locked() && self.state.job.is_active()
     }
 
     // -------------------------------------------------------------- actions
@@ -692,6 +783,114 @@ impl Shell {
         }
         self.send_command(Command::Realtime(RealtimeCommand::Stop));
         cx.notify();
+    }
+
+    // ------------------------------------------------------------ job actions
+
+    fn start_job(&mut self, cx: &mut Context<Self>) {
+        if !self.job_start_allowed() {
+            return;
+        }
+        if !self.state.live {
+            self.state.job.state = JobState::Running;
+            self.state.active_line = 1;
+            self.state.progress = 0.0;
+            self.state
+                .push_console(ConsoleLevel::Info, "Mock job started (no controller)");
+            cx.notify();
+            return;
+        }
+        self.send_command(Command::StartProgram { from_line: None });
+        cx.notify();
+    }
+
+    fn pause_job(&mut self, cx: &mut Context<Self>) {
+        if !self.job_pause_allowed() {
+            return;
+        }
+        if !self.state.live {
+            self.state.job.state = JobState::Paused;
+            self.state
+                .push_console(ConsoleLevel::Info, "Mock job paused (no controller)");
+            cx.notify();
+            return;
+        }
+        self.send_command(Command::PauseProgram);
+        cx.notify();
+    }
+
+    fn resume_job(&mut self, cx: &mut Context<Self>) {
+        if !self.job_resume_allowed() {
+            return;
+        }
+        if !self.state.live {
+            self.state.job.state = JobState::Running;
+            self.state
+                .push_console(ConsoleLevel::Info, "Mock job resumed (no controller)");
+            cx.notify();
+            return;
+        }
+        self.send_command(Command::ResumeProgram);
+        cx.notify();
+    }
+
+    /// Stop the job for good.
+    ///
+    /// `reset: true` sends a soft reset after the runner aborts: it discards
+    /// the controller's buffered motion, so a queued block cannot execute after
+    /// the stop. The loaded program stays in the engine for a restart; the
+    /// top-bar STOP remains the gentler feed hold.
+    fn stop_job(&mut self, cx: &mut Context<Self>) {
+        if !self.job_stop_allowed() {
+            return;
+        }
+        if !self.state.live {
+            self.state.job.state = JobState::Idle;
+            self.state.active_line = 0;
+            self.state.progress = 0.0;
+            self.state
+                .push_console(ConsoleLevel::Info, "Mock job stopped (no controller)");
+            cx.notify();
+            return;
+        }
+        self.send_command(Command::StopProgram { reset: true });
+        cx.notify();
+    }
+
+    /// `0xA3` for the pending manual tool change.
+    ///
+    /// There is no completion event for the acknowledgement, so the view marks
+    /// it after the engine accepts the command. Resume remains a separate,
+    /// explicit action.
+    fn acknowledge_tool_change(&mut self, cx: &mut Context<Self>) {
+        if !self.job_tool_change_allowed() {
+            return;
+        }
+        if self.send_command(Command::AcknowledgeToolChange) {
+            self.state.job.acknowledge_tool_change();
+        }
+        cx.notify();
+    }
+
+    /// Continue a tool-change job after it was acknowledged.
+    fn resume_after_tool_change(&mut self, cx: &mut Context<Self>) {
+        if !self.state.live || !self.ready() || self.locked() {
+            return;
+        }
+        if !self.state.job.tool_change_pending() || !self.state.job.tool_change_acknowledged() {
+            return;
+        }
+        self.send_command(Command::ResumeProgram);
+        cx.notify();
+    }
+
+    /// Whether a tool change can be acknowledged right now.
+    fn job_tool_change_allowed(&self) -> bool {
+        self.state.live
+            && self.ready()
+            && !self.locked()
+            && self.state.job.tool_change_pending()
+            && !self.state.job.tool_change_acknowledged()
     }
 
     fn run_macro(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1023,7 +1222,14 @@ impl Shell {
                     .child(console_tab)
                     .child(program_tab),
             )
-            .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .overflow_hidden()
+                    .child(body),
+            )
             .child(
                 div()
                     .h(px(26.0))
@@ -1036,12 +1242,16 @@ impl Shell {
                     .border_color(p.border)
                     .text_size(px(10.0))
                     .text_color(p.text_faint)
-                    .child(format!("{} lines", self.state.program.len()))
-                    .child(format!(
-                        "line {} | {:.0}%",
-                        self.state.active_line,
-                        self.state.progress * 100.0
-                    )),
+                    .child(format!("{} lines", self.state.display_program_lines()))
+                    .child(if self.state.live && !self.state.job.has_program() {
+                        "no program".to_string()
+                    } else {
+                        format!(
+                            "line {} | {:.0}%",
+                            self.state.display_line(),
+                            self.state.display_progress() * 100.0
+                        )
+                    }),
             )
     }
 
@@ -1077,49 +1287,35 @@ impl Shell {
             }))
     }
 
-    fn program(&self, p: Palette) -> impl IntoElement {
-        v_flex()
-            .py_1()
-            .h_full()
-            .id("program-scroll")
-            .overflow_y_scroll()
-            .font_family(self.mono.clone())
-            .children(self.state.program.iter().map(|line| {
-                let active = line.number == self.state.active_line;
-                let text_color = match line.kind {
-                    ProgramKind::Comment => p.text_faint,
-                    ProgramKind::Setup => p.info,
-                    ProgramKind::Rapid => p.text_dim,
-                    ProgramKind::Cut => p.text,
-                    ProgramKind::Plunge => p.warning,
-                };
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(23.0))
-                    .px_2()
-                    .bg(if active { p.accent_muted } else { p.panel })
-                    .when(active, |this| this.border_l(px(3.0)).border_color(p.accent))
-                    .child(
-                        div()
-                            .w(px(26.0))
-                            .flex_shrink_0()
-                            .text_size(px(10.0))
-                            .text_color(if active { p.accent } else { p.text_faint })
-                            .child(format!("{}", line.number)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(11.5))
-                            .text_color(if active { p.accent } else { text_color })
-                            .child(line.text),
-                    )
-            }))
+    fn program(&self, p: Palette) -> AnyElement {
+        let source = if let Some(program) = self.state.job.program() {
+            ProgramSource::Engine(Arc::clone(program))
+        } else if self.state.live {
+            return empty_program_notice(p).into_any_element();
+        } else {
+            ProgramSource::Mock(self.state.program.clone())
+        };
+        let count = source.len();
+        let active_line = self.state.display_line();
+        uniform_list("program-list", count, move |range, _, _| {
+            range
+                .filter_map(|index| source.row(index, active_line))
+                .map(|row| program_row(row, p))
+                .collect::<Vec<_>>()
+        })
+        .flex_1()
+        .min_h(px(0.0))
+        .track_scroll(&self.program_scroll)
+        .into_any_element()
     }
 
     /// Viewer card: fills the centre column's first row.
     fn viewer_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = if self.state.mode == Mode::Job {
+            self.state.job_title().to_string()
+        } else {
+            "M2 preview".to_string()
+        };
         let header = div()
             .h(px(48.0))
             .flex_shrink_0()
@@ -1131,6 +1327,7 @@ impl Shell {
             .border_color(p.border)
             .child(
                 v_flex()
+                    .min_w(px(0.0))
                     .child(
                         div()
                             .text_size(px(10.0))
@@ -1138,17 +1335,19 @@ impl Shell {
                             .text_color(p.text_dim)
                             .child(self.state.mode.title()),
                     )
-                    .child(div().text_size(px(14.0)).text_color(p.text).child(
-                        if self.state.mode == Mode::Job {
-                            self.state.job_name
-                        } else {
-                            "M2 preview"
-                        },
-                    )),
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(p.text)
+                            .max_w(px(260.0))
+                            .truncate()
+                            .child(title),
+                    ),
             )
             .child(div().flex_1());
 
         let header = if self.state.mode == Mode::Job {
+            let progress = self.state.display_progress();
             header
                 .child(
                     h_flex()
@@ -1163,7 +1362,7 @@ impl Shell {
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(px(110.0 * self.state.progress))
+                                        .w(px(110.0 * progress))
                                         .rounded(px(999.0))
                                         .bg(p.accent),
                                 ),
@@ -1172,7 +1371,18 @@ impl Shell {
                             div()
                                 .text_size(px(10.0))
                                 .text_color(p.text_dim)
-                                .child(format!("{:.0}%", self.state.progress * 100.0)),
+                                .child(format!("{:.0}%", progress * 100.0)),
+                        )
+                        .child(
+                            div()
+                                .font_family(self.mono.clone())
+                                .text_size(px(10.0))
+                                .text_color(p.text_dim)
+                                .child(format!(
+                                    "{} / {}",
+                                    self.state.display_line(),
+                                    self.state.display_total()
+                                )),
                         ),
                 )
                 .child(chip(self.state.wcs(), p))
@@ -1182,7 +1392,11 @@ impl Shell {
         };
 
         let body = if self.state.mode == Mode::Job {
-            self.job_view(p).into_any_element()
+            v_flex()
+                .size_full()
+                .child(self.job_toolbar(p, cx))
+                .child(div().flex_1().min_h(px(0.0)).child(self.job_view(p)))
+                .into_any_element()
         } else {
             self.mode_view(p, cx).into_any_element()
         };
@@ -1199,6 +1413,136 @@ impl Shell {
             .overflow_hidden()
             .child(header)
             .child(div().flex_1().min_h(px(0.0)).child(body))
+    }
+
+    /// Slim toolbar inside the viewer: job state, elapsed time and the four
+    /// job controls. Keeping it here preserves the approved three-column grid.
+    fn job_toolbar(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let start_view = view.clone();
+        let pause_view = view.clone();
+        let resume_view = view.clone();
+        let stop_view = view;
+
+        let status = self.state.display_job_status();
+        let color = job_status_color(&self.state.job, p);
+        let detail = self
+            .state
+            .job
+            .pause_reason
+            .map(pause_reason_label)
+            .map(str::to_string);
+        let elapsed = format_elapsed(self.state.job.elapsed);
+        let start_ok = self.job_start_allowed();
+        let pause_ok = self.job_pause_allowed();
+        let resume_ok = self.job_resume_allowed();
+        let stop_ok = self.job_stop_allowed();
+
+        h_flex()
+            .h(px(56.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(22.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.0))
+                            .bg(color.opacity(0.16))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(color)
+                            .child(status),
+                    )
+                    .when_some(detail, |this, detail| {
+                        this.child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(10.0))
+                                .text_color(p.warning)
+                                .child(detail),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(self.mono.clone())
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(format!("TIME {elapsed}")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("job-start")
+                            .label("START")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(78.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!start_ok)
+                            .on_click(move |_, _, cx| {
+                                start_view.update(cx, |this, cx| this.start_job(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("job-pause")
+                            .label("PAUSE")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(78.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!pause_ok)
+                            .on_click(move |_, _, cx| {
+                                pause_view.update(cx, |this, cx| this.pause_job(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("job-resume")
+                            .label("RESUME")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(88.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!resume_ok)
+                            .on_click(move |_, _, cx| {
+                                resume_view.update(cx, |this, cx| this.resume_job(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("job-stop")
+                            .label("STOP")
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(68.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!stop_ok)
+                            .on_click(move |_, _, cx| {
+                                stop_view.update(cx, |this, cx| this.stop_job(cx));
+                            }),
+                    ),
+            )
     }
 
     fn job_view(&self, p: Palette) -> impl IntoElement {
@@ -2380,6 +2724,178 @@ impl Shell {
             )
     }
 
+    /// Manual tool-change sheet.
+    ///
+    /// It starts below the 56 px top bar so RESET and STOP stay visible and
+    /// reachable, and it never resumes the job without a second explicit press.
+    fn tool_change_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(change) = self.state.job.tool_change else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let ack_view = view.clone();
+        let resume_view = view.clone();
+        let stop_view = view;
+        let acknowledged = change.acknowledged;
+        let ack_ok = self.job_tool_change_allowed();
+        let resume_ok = self.state.live && self.ready() && !self.locked() && acknowledged;
+        let source = self
+            .state
+            .job
+            .line_source(change.line)
+            .unwrap_or("M6")
+            .to_string();
+
+        let sheet = v_flex()
+            .w(px(520.0))
+            .max_w_full()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.warning.opacity(0.6))
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.warning)
+                                    .child("TOOL CHANGE REQUIRED"),
+                            )
+                            .child(chip(&format!("T{}", change.tool), p)),
+                    )
+                    .child(chip(&format!("LINE {}", change.line), p)),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .font_family(self.mono.clone())
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(format!("{:>4}", change.line)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(12.0))
+                            .text_color(p.text)
+                            .child(source),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "Tool T{} is requested at line {}. Install it and set its offset, then acknowledge (0xA3) and resume (cycle start).",
+                        change.tool, change.line
+                    )),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "Jogging is allowed while the job waits; the Jog panel stays active. The job will not send another line until you resume. RESET and STOP above remain available.",
+            ))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("tool-ack")
+                            .label(if acknowledged {
+                                "ACKNOWLEDGED"
+                            } else {
+                                "1. ACKNOWLEDGE"
+                            })
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(180.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!ack_ok)
+                            .on_click(move |_, _, cx| {
+                                ack_view.update(cx, |this, cx| {
+                                    this.acknowledge_tool_change(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("tool-resume")
+                            .label("2. RESUME")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(140.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!resume_ok)
+                            .on_click(move |_, _, cx| {
+                                resume_view.update(cx, |this, cx| {
+                                    this.resume_after_tool_change(cx);
+                                });
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("tool-stop")
+                            .label("STOP JOB")
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(110.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                stop_view.update(cx, |this, cx| this.stop_job(cx));
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(if acknowledged { p.success } else { p.text_faint })
+                    .child(if acknowledged {
+                        "Acknowledged. Press Resume to continue the program."
+                    } else {
+                        "Acknowledge does not move any axis; it only confirms the tool change to the controller."
+                    }),
+            );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                // Dim, but do not occlude: jogging stays available while the
+                // job waits in Tool, and the sheet itself still takes clicks.
+                div()
+                    .id("tool-change-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
     // ------------------------------------------------------ connection panel
 
     /// Transport picker overlay. It starts below the 56 px top bar so RESET
@@ -2856,10 +3372,143 @@ impl Render for Shell {
                 cx,
             ));
         }
+        if self.state.job.tool_change.is_some() {
+            root = root.child(self.tool_change_overlay(p, cx));
+        }
         if self.panel.open {
             root = root.child(self.connection_overlay(p, cx));
         }
         root
+    }
+}
+
+/// Program rows for the Program tab: the engine's parsed program or the mock
+/// design-review list.
+enum ProgramSource {
+    Engine(Arc<Program>),
+    Mock(Vec<crate::state::ProgramLine>),
+}
+
+impl ProgramSource {
+    fn len(&self) -> usize {
+        match self {
+            ProgramSource::Engine(program) => program.lines.len(),
+            ProgramSource::Mock(lines) => lines.len(),
+        }
+    }
+
+    fn row(&self, index: usize, active_line: u32) -> Option<ProgramRow> {
+        match self {
+            ProgramSource::Engine(program) => {
+                let line = program.lines.get(index)?;
+                let number = u32::try_from(line.line).unwrap_or(u32::MAX);
+                let trimmed = line.source.trim_start();
+                Some(ProgramRow {
+                    number,
+                    text: line.source.clone(),
+                    comment: trimmed.starts_with('(') || trimmed.starts_with(';'),
+                    kind: None,
+                    active: active_line != 0 && number == active_line,
+                })
+            }
+            ProgramSource::Mock(lines) => {
+                let line = lines.get(index)?;
+                let number = u32::try_from(line.number).unwrap_or(u32::MAX);
+                Some(ProgramRow {
+                    number,
+                    text: line.text.to_string(),
+                    comment: line.kind == ProgramKind::Comment,
+                    kind: Some(line.kind),
+                    active: active_line != 0 && number == active_line,
+                })
+            }
+        }
+    }
+}
+
+/// One rendered Program tab row.
+struct ProgramRow {
+    number: u32,
+    text: String,
+    comment: bool,
+    kind: Option<ProgramKind>,
+    active: bool,
+}
+
+fn program_row(row: ProgramRow, p: Palette) -> Div {
+    let active = row.active;
+    let text_color = if active {
+        p.accent
+    } else if row.comment {
+        p.text_faint
+    } else {
+        match row.kind {
+            Some(ProgramKind::Comment) => p.text_faint,
+            Some(ProgramKind::Setup) => p.info,
+            Some(ProgramKind::Rapid) => p.text_dim,
+            Some(ProgramKind::Cut) => p.text,
+            Some(ProgramKind::Plunge) => p.warning,
+            None => p.text_dim,
+        }
+    };
+    h_flex()
+        .items_center()
+        .gap_2()
+        .h(px(23.0))
+        .px_2()
+        .bg(if active { p.accent_muted } else { p.panel })
+        .border_l(px(3.0))
+        .border_color(if active { p.accent } else { p.panel })
+        .child(
+            div()
+                .w(px(44.0))
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .text_color(if active { p.accent } else { p.text_faint })
+                .child(row.number.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_size(px(11.5))
+                .text_color(text_color)
+                .child(row.text),
+        )
+}
+
+fn empty_program_notice(p: Palette) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .p_3()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(p.text_dim)
+                .child("No program loaded"),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child("Demo mode sends a bundled program when the controller is ready."),
+        )
+}
+
+fn job_status_color(job: &JobView, p: Palette) -> Hsla {
+    if job.tool_change.is_some() {
+        return p.warning;
+    }
+    match job.state {
+        JobState::Running => p.accent,
+        JobState::Paused => p.warning,
+        JobState::Completed => p.success,
+        JobState::Aborted | JobState::Interrupted => p.danger,
+        JobState::Idle => p.text_dim,
     }
 }
 
@@ -3003,5 +3652,46 @@ fn console_color(level: ConsoleLevel, p: Palette) -> Hsla {
         ConsoleLevel::Ok => p.success,
         ConsoleLevel::Warn => p.warning,
         ConsoleLevel::Error => p.danger,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_rows_map_source_numbers_and_current_line() {
+        let mock = ProgramSource::Mock(vec![
+            crate::state::ProgramLine {
+                number: 1,
+                text: "G21",
+                kind: ProgramKind::Setup,
+            },
+            crate::state::ProgramLine {
+                number: 2,
+                text: "M30",
+                kind: ProgramKind::Setup,
+            },
+        ]);
+        let row = mock.row(1, 2).expect("second mock row");
+        assert_eq!(row.number, 2);
+        assert_eq!(row.text, "M30");
+        assert!(row.active);
+        assert!(!row.comment);
+        assert!(mock.row(2, 2).is_none());
+
+        let program = Arc::new(
+            ghs_gcode::parse_program("G21\n(Groove)\nM30\n").expect("sample program parses"),
+        );
+        let live = ProgramSource::Engine(program);
+        assert_eq!(live.len(), 3);
+        assert_eq!(live.row(0, 3).map(|row| row.number), Some(1));
+        let comment = live.row(1, 3).expect("comment row");
+        assert!(comment.comment);
+        assert!(!comment.active);
+        assert_eq!(comment.text, "(Groove)");
+        let current = live.row(2, 3).expect("current row");
+        assert!(current.active);
+        assert!(!current.comment);
     }
 }
