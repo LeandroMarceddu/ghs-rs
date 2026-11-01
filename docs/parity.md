@@ -22,8 +22,10 @@ documented, and is localized.
 | Simulator | Implemented | 80 tests; FlexiHAL fixture byte-for-byte, generic-full profile |
 | G-code | Implemented (M4 core) | 127 tests; expressions/flow control/extra axes deferred |
 | Viewer geometry | Implemented | 53 tests; 200k segments inside 60 fps budget |
-| Engine | Implemented (M2) | 45 tests incl. simulator-over-loopback; job runner is M3 |
-| App shell | Live demo | approved layout; live DRO/MDI/console; serial picker in progress |
+| Engine | Implemented (M3) | M2 session + job runner; 20 job tests, simulator-over-loopback |
+| App shell | Live demo + job UI in progress | approved layout; live DRO/MDI/console; serial picker |
+| Program UI | In progress | parsed program list, job controls, tool-change modal |
+| Viewer UI | Not started | synthetic canvas; real toolpath is M4 |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
 
 Rows below are the feature-level checklist. A protocol/simulator row can be
