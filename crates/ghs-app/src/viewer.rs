@@ -139,15 +139,72 @@ pub trait HasViewer {
     fn viewer_handle(&self) -> &ViewerHandle;
 }
 
+/// One measured height-map cell projected into the viewer's work frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeightCell {
+    /// Lower-left work-coordinate corner, in millimetres.
+    pub min: Point2,
+    /// Upper-right work-coordinate corner, in millimetres.
+    pub max: Point2,
+    /// Measured machine Z, or `None` for a missing/failed cell.
+    pub z_mm: Option<f64>,
+}
+
+/// Measured height map ready for the 2D canvas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightOverlay {
+    /// One cell per grid point, including missing cells.
+    pub cells: Vec<HeightCell>,
+    /// Lowest measured machine Z in the map.
+    pub min_z_mm: f64,
+    /// Highest measured machine Z in the map.
+    pub max_z_mm: f64,
+    /// Grid's nominal surface, in machine millimetres.
+    pub nominal_z_mm: f64,
+}
+
+/// Number of colour steps in the height-map overlay legend.
+pub const HEIGHT_OVERLAY_STEPS: usize = 5;
+
+/// One legend swatch colour, low to high.
+#[must_use]
+pub fn height_overlay_color(index: usize, palette: Palette) -> Hsla {
+    let colors = [
+        palette.info,
+        palette.accent,
+        palette.success,
+        palette.warning,
+        palette.danger,
+    ];
+    colors[index.min(HEIGHT_OVERLAY_STEPS - 1)]
+}
+
+/// Colour step for a measured Z within a map's range.
+///
+/// A flat map (or a map with one measured point) uses the middle step, so a
+/// nominal surface does not look like either an error or a high spot.
+#[must_use]
+pub fn height_overlay_step(z_mm: f64, min_z_mm: f64, max_z_mm: f64) -> usize {
+    let span = max_z_mm - min_z_mm;
+    if !z_mm.is_finite() || !span.is_finite() || span.abs() <= 1.0e-9 {
+        return HEIGHT_OVERLAY_STEPS / 2;
+    }
+    let t = ((z_mm - min_z_mm) / span).clamp(0.0, 1.0);
+    (t * (HEIGHT_OVERLAY_STEPS - 1) as f64).round() as usize
+}
+
 /// Draws the interactive job canvas.
 ///
 /// `program` is the parsed program from `JobLoaded`; `None` draws the synthetic
-/// preview. `marker` is the tool position in world millimetres.
+/// preview. `marker` is the tool position in world millimetres. `overlay` is a
+/// measured height map already converted into the same work frame; it is drawn
+/// above the toolpath and below the marker.
 pub fn view<T: HasViewer + 'static>(
     handle: &ViewerHandle,
     palette: Palette,
     program: Option<Arc<Program>>,
     marker: Option<Point2>,
+    overlay: Option<HeightOverlay>,
     view: Entity<T>,
 ) -> impl IntoElement {
     let canvas_element = {
@@ -158,7 +215,15 @@ pub fn view<T: HasViewer + 'static>(
                 measure.inner.borrow_mut().rect = Some(bounds);
             },
             move |bounds: Bounds<Pixels>, (), window: &mut Window, _| {
-                paint(bounds, &paint_handle, program, marker, palette, window);
+                paint(
+                    bounds,
+                    &paint_handle,
+                    program.clone(),
+                    marker,
+                    overlay.clone(),
+                    palette,
+                    window,
+                );
             },
         )
         .size_full()
@@ -405,6 +470,7 @@ fn paint(
     handle: &ViewerHandle,
     program: Option<Arc<Program>>,
     marker: Option<Point2>,
+    overlay: Option<HeightOverlay>,
     palette: Palette,
     window: &mut Window,
 ) {
@@ -422,6 +488,9 @@ fn paint(
         paint_envelope(&camera, viewer.path_bounds, bounds, palette, window);
     }
     paint_plan(bounds, &viewer.cache.plan, palette, window);
+    if let Some(overlay) = overlay.as_ref() {
+        paint_height_overlay(&camera, bounds, overlay, palette, window);
+    }
     if let Some(marker) = marker {
         paint_marker(&camera, bounds, marker, palette, window);
     }
@@ -536,6 +605,69 @@ fn paint_envelope(
     outline.line_to(point(px(x0), px(y1)));
     outline.close();
     paint_path(outline, palette.border_strong, window);
+}
+
+/// Paints measured height cells in the work frame.
+///
+/// A valid cell is a translucent filled square coloured by its measured Z; a
+/// missing cell is only a dashed outline, so it is visibly not a measurement.
+/// The overlay is projected through the same camera as the toolpath and never
+/// contributes to the plan cache or the fitted bounds.
+fn paint_height_overlay(
+    camera: &Camera2D,
+    bounds: Bounds<Pixels>,
+    overlay: &HeightOverlay,
+    palette: Palette,
+    window: &mut Window,
+) {
+    let left = f32::from(bounds.origin.x);
+    let top = f32::from(bounds.origin.y);
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+
+    for cell in &overlay.cells {
+        let min = camera.world_to_screen(cell.min);
+        let max = camera.world_to_screen(cell.max);
+        if !min.is_finite() || !max.is_finite() {
+            continue;
+        }
+        // Screen Y is flipped, so the world minimum is the bottom-left corner.
+        let x0 = left + min.x.min(max.x);
+        let x1 = left + min.x.max(max.x);
+        let y0 = top + min.y.min(max.y);
+        let y1 = top + min.y.max(max.y);
+        if x1 < left || x0 > left + width || y1 < top || y0 > top + height {
+            continue;
+        }
+        let cell_bounds = Bounds::new(
+            point(px(x0), px(y0)),
+            size(px((x1 - x0).max(1.0)), px((y1 - y0).max(1.0))),
+        );
+        match cell.z_mm {
+            Some(z_mm) => {
+                let step = height_overlay_step(z_mm, overlay.min_z_mm, overlay.max_z_mm);
+                let color = height_overlay_color(step, palette);
+                window.paint_quad(fill(cell_bounds, color.alpha(0.32)).corner_radii(px(1.0)));
+                let mut outline = PathBuilder::stroke(px(1.0));
+                outline.move_to(point(px(x0), px(y0)));
+                outline.line_to(point(px(x1), px(y0)));
+                outline.line_to(point(px(x1), px(y1)));
+                outline.line_to(point(px(x0), px(y1)));
+                outline.close();
+                paint_path(outline, color.alpha(0.85), window);
+                paint_dot(window, color, (x0 + x1) * 0.5, (y0 + y1) * 0.5, 1.8);
+            }
+            None => {
+                let mut outline = PathBuilder::stroke(px(1.0)).dash_array(&[px(3.0), px(3.0)]);
+                outline.move_to(point(px(x0), px(y0)));
+                outline.line_to(point(px(x1), px(y0)));
+                outline.line_to(point(px(x1), px(y1)));
+                outline.line_to(point(px(x0), px(y1)));
+                outline.close();
+                paint_path(outline, palette.text_faint.alpha(0.7), window);
+            }
+        }
+    }
 }
 
 /// Paints the render plan, one GPUI path per motion style.

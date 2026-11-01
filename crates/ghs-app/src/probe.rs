@@ -26,16 +26,22 @@
 //! answered so the WCS conversion is real. The engine safety gateway remains
 //! the final authority; nothing here sends motion.
 
+use std::path::PathBuf;
+
 use ghs_core::Units;
 use ghs_engine::{Axis as CoreAxis, MachineState, Position, ProbeResult, Wcs};
 use ghs_probe::{
-    CornerProbe, EdgeMode, EdgeSpec, MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM,
-    MAX_PLATE_THICKNESS_MM, MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN, MAX_RADIUS_MM,
-    MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES, ProbeAxis,
-    ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue, RotationProbe, Sign,
+    CornerProbe, EdgeMode, EdgeSpec, HeightMap, HeightMapEstimate, HeightMapGrid,
+    MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM, MAX_HEIGHT_MAP_AXIS_POINTS,
+    MAX_HEIGHT_MAP_POINTS, MAX_PLATE_THICKNESS_MM, MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN,
+    MAX_RADIUS_MM, MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES,
+    ProbeAxis, ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue, RotationProbe, Sign,
+    XyPoint,
 };
+use ghs_viewer::Point2;
 
 use crate::state::Units as DisplayUnits;
+use crate::viewer::{HeightCell, HeightOverlay};
 
 /// One editable numeric preflight field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,11 +80,28 @@ pub enum ProbeField {
     Separation,
     /// Tool-length reference surface Z, in machine millimetres.
     ReferenceZ,
+    /// Height-map grid origin X, in **work** millimetres.
+    OriginX,
+    /// Height-map grid origin Y, in **work** millimetres.
+    OriginY,
+    /// Height-map column spacing, in millimetres.
+    StepX,
+    /// Height-map row spacing, in millimetres.
+    StepY,
+    /// Height-map column count.
+    Columns,
+    /// Height-map row count.
+    Rows,
+    /// Lowest expected surface Z, in machine millimetres.
+    SurfaceZ,
 }
 
 impl ProbeField {
+    /// Number of editable fields.
+    pub const COUNT: usize = 24;
+
     /// Every field, in edit order.
-    pub const ALL: [ProbeField; 17] = [
+    pub const ALL: [ProbeField; ProbeField::COUNT] = [
         ProbeField::SafeZ,
         ProbeField::Search,
         ProbeField::Feed,
@@ -96,6 +119,13 @@ impl ProbeField {
         ProbeField::Touches,
         ProbeField::Separation,
         ProbeField::ReferenceZ,
+        ProbeField::OriginX,
+        ProbeField::OriginY,
+        ProbeField::StepX,
+        ProbeField::StepY,
+        ProbeField::Columns,
+        ProbeField::Rows,
+        ProbeField::SurfaceZ,
     ];
 
     /// Stable zero-based index for the input array.
@@ -118,6 +148,13 @@ impl ProbeField {
             ProbeField::Touches => 14,
             ProbeField::Separation => 15,
             ProbeField::ReferenceZ => 16,
+            ProbeField::OriginX => 17,
+            ProbeField::OriginY => 18,
+            ProbeField::StepX => 19,
+            ProbeField::StepY => 20,
+            ProbeField::Columns => 21,
+            ProbeField::Rows => 22,
+            ProbeField::SurfaceZ => 23,
         }
     }
 
@@ -141,6 +178,13 @@ impl ProbeField {
             ProbeField::Touches => "TOUCHES",
             ProbeField::Separation => "SEPARATION",
             ProbeField::ReferenceZ => "REFERENCE Z",
+            ProbeField::OriginX => "ORIGIN X WORK",
+            ProbeField::OriginY => "ORIGIN Y WORK",
+            ProbeField::StepX => "STEP X",
+            ProbeField::StepY => "STEP Y",
+            ProbeField::Columns => "COLUMNS",
+            ProbeField::Rows => "ROWS",
+            ProbeField::SurfaceZ => "SURFACE Z MACH",
         }
     }
 
@@ -164,16 +208,35 @@ impl ProbeField {
             ProbeField::Touches => "touches",
             ProbeField::Separation => "separation",
             ProbeField::ReferenceZ => "reference-z",
+            ProbeField::OriginX => "origin-x",
+            ProbeField::OriginY => "origin-y",
+            ProbeField::StepX => "step-x",
+            ProbeField::StepY => "step-y",
+            ProbeField::Columns => "columns",
+            ProbeField::Rows => "rows",
+            ProbeField::SurfaceZ => "surface-z",
         }
     }
 
     /// Unit suffix shown in the keypad hint.
     pub const fn unit(self) -> &'static str {
         match self {
-            ProbeField::Touches => "",
+            ProbeField::Touches
+            | ProbeField::Columns
+            | ProbeField::Rows
+            | ProbeField::StepX
+            | ProbeField::StepY => "",
             ProbeField::Feed => "mm/min",
             _ => "mm",
         }
+    }
+
+    /// Whether the field only accepts a whole number.
+    pub const fn is_integer(self) -> bool {
+        matches!(
+            self,
+            ProbeField::Touches | ProbeField::Columns | ProbeField::Rows
+        )
     }
 
     /// Inclusive bounds applied while editing.
@@ -188,6 +251,8 @@ impl ProbeField {
             ProbeField::Radius => (0.0, MAX_RADIUS_MM),
             ProbeField::Touches => (MIN_CIRCLE_TOUCHES as f64, MAX_CIRCLE_TOUCHES as f64),
             ProbeField::Separation => (0.0, MAX_SEPARATION_MM),
+            ProbeField::StepX | ProbeField::StepY => (0.0, MAX_COORDINATE_MM),
+            ProbeField::Columns | ProbeField::Rows => (2.0, MAX_HEIGHT_MAP_AXIS_POINTS as f64),
             _ => (-MAX_COORDINATE_MM, MAX_COORDINATE_MM),
         }
     }
@@ -212,6 +277,13 @@ impl ProbeField {
             ProbeField::Touches => "4".to_string(),
             ProbeField::Separation => "50.000".to_string(),
             ProbeField::ReferenceZ => "-5.000".to_string(),
+            ProbeField::OriginX => "0.000".to_string(),
+            ProbeField::OriginY => "0.000".to_string(),
+            ProbeField::StepX => "10.000".to_string(),
+            ProbeField::StepY => "10.000".to_string(),
+            ProbeField::Columns => "4".to_string(),
+            ProbeField::Rows => "4".to_string(),
+            ProbeField::SurfaceZ => "5.000".to_string(),
         }
     }
 }
@@ -274,7 +346,7 @@ impl ProbeCard {
             ProbeCard::CenterCircle => "Radial touches around a bore/boss; fits centre + radius.",
             ProbeCard::Rotation => "Two points on an X edge; reports angle, apply deferred.",
             ProbeCard::ToolLength => "Down onto the reference; reports delta, TLO apply deferred.",
-            ProbeCard::HeightMap => "Grid of Z touches; UI and compensation deferred.",
+            ProbeCard::HeightMap => "Bounded Z grid; measured map overlay, no job compensation.",
         }
     }
 
@@ -310,20 +382,15 @@ impl ProbeCard {
                  Applying TLO or `$TLR` is deferred until the tool-change workflow owns it."
             }
             ProbeCard::HeightMap => {
-                "A bounded grid of Z touches with per-point validity and bilinear interpolation. The \
-                 grid editor, progress sheet, overlay and compensation are not implemented here."
+                "Row-major grid of Z touches with a retract between points. Missing cells stay \
+                 invalid; this build measures and exports the map but does not compensate the job."
             }
         }
     }
 
-    /// Whether this card is an explicit deferred state.
+    /// Whether this card has an explicitly deferred apply step.
     pub const fn deferred_note(self) -> Option<&'static str> {
         match self {
-            ProbeCard::HeightMap => Some(
-                "Height mapping is deferred in this build. ghs-probe already has a bounded \
-                 HeightMapGrid, per-point validity and bilinear interpolation, but this UI does \
-                 not generate a grid, stream it, or draw/compensate a map. No fake map is shown.",
-            ),
             ProbeCard::Rotation => Some(
                 "The rotation cycle runs and reports the measured angle. Applying work rotation is \
                  controller/app dependent and is deferred; no G10 rotation word is sent.",
@@ -409,7 +476,20 @@ impl ProbeCard {
                 ProbeField::Diameter,
                 ProbeField::ReferenceZ,
             ],
-            ProbeCard::HeightMap => &[],
+            ProbeCard::HeightMap => &[
+                ProbeField::OriginX,
+                ProbeField::OriginY,
+                ProbeField::StepX,
+                ProbeField::StepY,
+                ProbeField::Columns,
+                ProbeField::Rows,
+                ProbeField::SurfaceZ,
+                ProbeField::SafeZ,
+                ProbeField::Search,
+                ProbeField::Feed,
+                ProbeField::Retract,
+                ProbeField::Diameter,
+            ],
         }
     }
 }
@@ -496,15 +576,26 @@ pub enum RowState {
     Bad,
 }
 
+/// What a probe plan measures.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProbeTarget {
+    /// A single-geometry cycle from `ghs-probe`.
+    Cycle(ProbeCycle),
+    /// A rectangular height-map grid.
+    HeightMap(HeightMapGrid),
+}
+
 /// A plan plus the offset snapshot it was built against.
 #[derive(Clone, Debug)]
 pub struct ProbeSetup {
     /// Shared parameters.
     pub params: ProbeParams,
-    /// Cycle geometry.
-    pub cycle: ProbeCycle,
+    /// Cycle geometry or height-map grid.
+    pub target: ProbeTarget,
     /// Validated program.
     pub plan: ProbePlan,
+    /// Height-map point/time estimate, for the preflight sheet.
+    pub estimate: Option<HeightMapEstimate>,
     /// Stored WCS value at preflight, in millimetres.
     pub wcs_value_mm: Position,
     /// G92 at preflight, in millimetres.
@@ -558,8 +649,15 @@ pub struct ProbeRun {
     pub results: Vec<ProbeResult>,
     /// Formatted raw `PRB` lines for audit.
     pub raw: Vec<String>,
-    /// Computed outcome once the run completed.
+    /// Computed outcome once a standard cycle completed.
     pub outcome: Option<ProbeOutcome>,
+    /// Measured height map, complete or partial.
+    ///
+    /// `None` for standard cycles. Missing cells stay `None` inside the map;
+    /// they are never interpolated.
+    pub map: Option<HeightMap>,
+    /// Result of the last explicit CSV export.
+    pub export: Option<HeightMapExport>,
     /// Failure text; never auto-resumed.
     pub error: Option<String>,
     /// Run lifecycle.
@@ -585,6 +683,17 @@ pub struct ProbeRun {
     pub checkpoints: Vec<u32>,
     /// The probe index after which the job is paused, if any.
     pub paused_after_probe: Option<usize>,
+    /// A failed height-map point asked the shell to stop the job once.
+    pub stop_requested: bool,
+}
+
+/// Written CSV result for a measured height map.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightMapExport {
+    /// Full path the app wrote.
+    pub path: PathBuf,
+    /// Data row count, or the write error.
+    pub rows: Result<usize, String>,
 }
 
 impl ProbeRun {
@@ -595,6 +704,8 @@ impl ProbeRun {
             results: Vec::new(),
             raw: Vec::new(),
             outcome: None,
+            map: None,
+            export: None,
             error: None,
             phase: ProbePhase::Running,
             loaded: false,
@@ -605,6 +716,7 @@ impl ProbeRun {
             applied_line: None,
             checkpoints,
             paused_after_probe: None,
+            stop_requested: false,
         }
     }
 
@@ -619,13 +731,42 @@ impl ProbeRun {
     pub fn expected(&self) -> usize {
         self.setup.plan.expected_probes
     }
+
+    /// Whether this run measures a height map.
+    #[must_use]
+    pub fn is_height_map(&self) -> bool {
+        matches!(self.setup.target, ProbeTarget::HeightMap(_))
+    }
+}
+
+/// Validated height-map inputs, before the full G-code plan is built.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightMapDraft {
+    /// Grid in machine coordinates.
+    pub grid: HeightMapGrid,
+    /// Shared probe parameters.
+    pub params: ProbeParams,
+    /// Point/time estimate.
+    pub estimate: HeightMapEstimate,
+    /// Operator-entered grid origin in work coordinates.
+    pub origin_work_mm: XyPoint,
+}
+
+/// One inline field problem for the editor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldProblem {
+    /// Field to show the message under, when it maps to one.
+    pub field: Option<ProbeField>,
+    /// Operator-facing message.
+    pub message: String,
 }
 
 /// The probe workspace model.
 #[derive(Clone, Debug)]
 pub struct ProbeModel {
     card: Option<ProbeCard>,
-    fields: [String; 17],
+    fields: [String; ProbeField::COUNT],
+    field_errors: [Option<String>; ProbeField::COUNT],
     /// Explicit `probe connected` confirmation for controllers without `PC`.
     pub probe_connected_confirmed: bool,
     /// X edge approach direction.
@@ -650,9 +791,11 @@ pub struct ProbeModel {
 impl Default for ProbeModel {
     fn default() -> Self {
         let fields = std::array::from_fn(|_| String::new());
+        let field_errors = std::array::from_fn(|_| None);
         let mut model = ProbeModel {
             card: None,
             fields,
+            field_errors,
             probe_connected_confirmed: false,
             edge_x_approach: Sign::Positive,
             edge_y_approach: Sign::Positive,
@@ -713,12 +856,21 @@ impl ProbeModel {
             .map_or("", std::string::String::as_str)
     }
 
+    /// Last inline validation error for a field, if any.
+    #[must_use]
+    pub fn field_error(&self, field: ProbeField) -> Option<&str> {
+        self.field_errors
+            .get(field.index())
+            .and_then(Option::as_deref)
+    }
+
     /// Validate and store one field from the shared keypad.
     ///
     /// # Errors
     ///
     /// Returns a message for a non-numeric, non-finite or out-of-range value.
-    /// The stored text is left unchanged on error.
+    /// The stored text is left unchanged on error, but the message is retained
+    /// so the editor can show it under the field.
     pub fn set_field_text(
         &mut self,
         field: ProbeField,
@@ -726,6 +878,19 @@ impl ProbeModel {
     ) -> Result<(), String> {
         let text = text.into();
         let trimmed = text.trim();
+        let result = self.validate_field_text(field, trimmed);
+        if let Some(slot) = self.field_errors.get_mut(field.index()) {
+            *slot = result.as_ref().err().cloned();
+        }
+        if result.is_ok()
+            && let Some(slot) = self.fields.get_mut(field.index())
+        {
+            *slot = trimmed.to_string();
+        }
+        result
+    }
+
+    fn validate_field_text(&self, field: ProbeField, trimmed: &str) -> Result<(), String> {
         let value = trimmed
             .parse::<f64>()
             .map_err(|_| format!("{} must be numeric", field.label()))?;
@@ -740,11 +905,8 @@ impl ProbeModel {
                 field.unit()
             ));
         }
-        if field == ProbeField::Touches && (value.fract() != 0.0) {
-            return Err("TOUCHES must be a whole number".to_string());
-        }
-        if let Some(slot) = self.fields.get_mut(field.index()) {
-            *slot = trimmed.to_string();
+        if field.is_integer() && value.fract() != 0.0 {
+            return Err(format!("{} must be a whole number", field.label()));
         }
         Ok(())
     }
@@ -780,6 +942,8 @@ impl ProbeModel {
         if !z_mm.is_finite() || !x_mm.is_finite() || !y_mm.is_finite() {
             return;
         }
+        let work_x_mm = ctx.work_pos_mm.get(CoreAxis::X);
+        let work_y_mm = ctx.work_pos_mm.get(CoreAxis::Y);
         let seeds = [
             (ProbeField::SafeZ, z_mm + 10.0),
             (ProbeField::Search, 5.0),
@@ -796,7 +960,18 @@ impl ProbeModel {
             (ProbeField::CenterY, y_mm),
             (ProbeField::Radius, 20.0),
             (ProbeField::ReferenceZ, z_mm - 5.0),
+            // The grid origin is entered in work coordinates and converted
+            // with the active offset when the plan is built.
+            (ProbeField::OriginX, work_x_mm),
+            (ProbeField::OriginY, work_y_mm),
+            (ProbeField::StepX, 10.0),
+            (ProbeField::StepY, 10.0),
+            // A conservative, self-consistent starting grid: safe Z is ten
+            // millimetres up, the nominal surface is five below safe Z, and
+            // the default search covers exactly that travel.
+            (ProbeField::SurfaceZ, z_mm + 5.0),
         ];
+        self.field_errors = std::array::from_fn(|_| None);
         for (field, value) in seeds {
             if let Some(slot) = self.fields.get_mut(field.index()) {
                 *slot = format!("{value:.3}");
@@ -807,6 +982,12 @@ impl ProbeModel {
         }
         if let Some(slot) = self.fields.get_mut(ProbeField::Separation.index()) {
             *slot = "50.000".to_string();
+        }
+        if let Some(slot) = self.fields.get_mut(ProbeField::Columns.index()) {
+            *slot = "4".to_string();
+        }
+        if let Some(slot) = self.fields.get_mut(ProbeField::Rows.index()) {
+            *slot = "4".to_string();
         }
     }
 
@@ -852,7 +1033,7 @@ impl ProbeModel {
             .card
             .ok_or_else(|| "select a probe cycle".to_string())?;
         if card == ProbeCard::HeightMap {
-            return Err("height mapping is deferred in this build".to_string());
+            return self.prepare_height_map(ctx);
         }
         let safe_z_mm = self.field_value(ProbeField::SafeZ)?;
         let search_distance_mm = self.field_value(ProbeField::Search)?;
@@ -883,12 +1064,202 @@ impl ProbeModel {
         let plan = cycle.plan(&params).map_err(|error| error.to_string())?;
         Ok(ProbeSetup {
             params,
-            cycle,
+            target: ProbeTarget::Cycle(cycle),
             plan,
+            estimate: None,
             wcs_value_mm: ctx.wcs_value_mm,
             g92_mm: ctx.g92_mm,
             tlo_z_mm: ctx.tlo_z_mm,
         })
+    }
+
+    /// Validate the height-map editor without building the G-code program.
+    ///
+    /// The UI calls this on every frame, so it deliberately stops at
+    /// [`HeightMapGrid::validate_with_params`] and [`HeightMapGrid::estimate`];
+    /// the full plan is built only after the operator presses RUN.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first invalid field or the `ghs-probe` grid validation
+    /// message.
+    pub fn height_map_draft(&self, ctx: &ProbeContext) -> Result<HeightMapDraft, String> {
+        let safe_z_mm = self.field_value(ProbeField::SafeZ)?;
+        let search_distance_mm = self.field_value(ProbeField::Search)?;
+        let feed_mm_min = self.field_value(ProbeField::Feed)?;
+        let retract_mm = self.field_value(ProbeField::Retract)?;
+        let probe_diameter_mm = self.field_value(ProbeField::Diameter)?;
+        let origin_work_mm = XyPoint::new(
+            self.field_value(ProbeField::OriginX)?,
+            self.field_value(ProbeField::OriginY)?,
+        );
+        let step_x_mm = self.field_value(ProbeField::StepX)?;
+        let step_y_mm = self.field_value(ProbeField::StepY)?;
+        let columns = self.field_u16(ProbeField::Columns)?;
+        let rows = self.field_u16(ProbeField::Rows)?;
+        let surface_z_mm = self.field_value(ProbeField::SurfaceZ)?;
+        let offset = ctx.offset_mm();
+        let grid = HeightMapGrid {
+            origin_mm: XyPoint::new(
+                origin_work_mm.x_mm + offset.get(CoreAxis::X),
+                origin_work_mm.y_mm + offset.get(CoreAxis::Y),
+            ),
+            step_x_mm,
+            step_y_mm,
+            columns,
+            rows,
+            surface_z_mm,
+        };
+        let params = ProbeParams {
+            safe_z_mm,
+            search_distance_mm,
+            feed_mm_min,
+            retract_mm,
+            probe_diameter_mm,
+            edge_offset_mm: 0.0,
+            position: None,
+            center: None,
+            radius_mm: None,
+            wcs_offset_mm: offset,
+            wcs: ctx.wcs,
+            units: Units::Mm,
+        };
+        // Explicit grid checks first, with messages that name the operator
+        // fields. The crate repeats them during validation; this only makes
+        // the inline editor and preflight reason clearer.
+        if safe_z_mm <= surface_z_mm {
+            return Err(format!(
+                "SAFE Z {:.3} mm must be above SURFACE Z {:.3} mm",
+                safe_z_mm, surface_z_mm
+            ));
+        }
+        let travel_mm = safe_z_mm - surface_z_mm;
+        if travel_mm > search_distance_mm {
+            return Err(format!(
+                "height-map travel {:.3} mm exceeds SEARCH {:.3} mm",
+                travel_mm, search_distance_mm
+            ));
+        }
+        grid.validate_with_params(&params)
+            .map_err(|error| error.to_string())?;
+        let estimate = grid.estimate(&params).map_err(|error| error.to_string())?;
+        Ok(HeightMapDraft {
+            grid,
+            params,
+            estimate,
+            origin_work_mm,
+        })
+    }
+
+    /// Validate inline field problems for the current card.
+    ///
+    /// Per-field syntax/range errors come from [`ProbeModel::set_field_text`];
+    /// height-map cross-field errors are attached to the field named by the
+    /// `ghs-probe` validation message.
+    #[must_use]
+    pub fn field_problems(&self, ctx: &ProbeContext) -> Vec<FieldProblem> {
+        let mut problems = Vec::new();
+        for field in ProbeField::ALL {
+            if let Some(message) = self.field_error(field) {
+                problems.push(FieldProblem {
+                    field: Some(field),
+                    message: message.to_string(),
+                });
+            }
+        }
+        if self.card == Some(ProbeCard::HeightMap)
+            && let Err(message) = self.height_map_draft(ctx)
+        {
+            let field = height_map_error_field(&message);
+            if !problems
+                .iter()
+                .any(|problem| problem.field == field && problem.message == message)
+            {
+                problems.push(FieldProblem { field, message });
+            }
+        }
+        problems
+    }
+
+    /// Parsed height-map dimensions, even when the grid is not yet valid.
+    #[must_use]
+    pub fn height_map_point_count(&self) -> Option<(u16, u16, usize)> {
+        let columns =
+            u16::try_from(self.field_value(ProbeField::Columns).ok()?.round() as i64).ok()?;
+        let rows = u16::try_from(self.field_value(ProbeField::Rows).ok()?.round() as i64).ok()?;
+        let count = usize::from(columns).checked_mul(usize::from(rows))?;
+        Some((columns, rows, count))
+    }
+
+    /// Measured height overlay in the viewer's work frame.
+    ///
+    /// Missing cells are included with `z_mm: None` so the overlay can mark
+    /// them instead of silently filling them in.
+    #[must_use]
+    pub fn height_overlay(&self) -> Option<HeightOverlay> {
+        let run = self.run.as_ref()?;
+        let map = run.map.as_ref()?;
+        Some(height_map_overlay(map, run.setup.params.wcs_offset_mm))
+    }
+
+    /// CSV text for the measured map, or an error when no map exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message before a height-map run produced any cells.
+    pub fn height_map_csv(&self) -> Result<String, String> {
+        let run = self
+            .run
+            .as_ref()
+            .ok_or_else(|| "no probe run to export".to_string())?;
+        let map = run
+            .map
+            .as_ref()
+            .ok_or_else(|| "this run has no measured height map".to_string())?;
+        Ok(height_map_csv(map))
+    }
+
+    /// Record the result of an explicit CSV export.
+    pub fn mark_height_export(&mut self, path: PathBuf, rows: Result<usize, String>) {
+        if let Some(run) = self.run.as_mut() {
+            run.export = Some(HeightMapExport { path, rows });
+        }
+    }
+
+    /// Take a pending stop request from a failed height-map point.
+    pub fn take_stop_request(&mut self) -> bool {
+        let Some(run) = self.run.as_mut() else {
+            return false;
+        };
+        let requested = run.stop_requested;
+        run.stop_requested = false;
+        requested
+    }
+
+    fn prepare_height_map(&self, ctx: &ProbeContext) -> Result<ProbeSetup, String> {
+        let draft = self.height_map_draft(ctx)?;
+        let plan = draft
+            .grid
+            .plan(&draft.params)
+            .map_err(|error| error.to_string())?;
+        Ok(ProbeSetup {
+            params: draft.params,
+            target: ProbeTarget::HeightMap(draft.grid),
+            plan,
+            estimate: Some(draft.estimate),
+            wcs_value_mm: ctx.wcs_value_mm,
+            g92_mm: ctx.g92_mm,
+            tlo_z_mm: ctx.tlo_z_mm,
+        })
+    }
+
+    fn field_u16(&self, field: ProbeField) -> Result<u16, String> {
+        let value = self.field_value(field)?;
+        if value.fract() != 0.0 {
+            return Err(format!("{} must be a whole number", field.label()));
+        }
+        u16::try_from(value.round() as i64)
+            .map_err(|_| format!("{} is out of range", field.label()))
     }
 
     fn geometry(&self, card: ProbeCard, ctx: &ProbeContext) -> Result<GeometryInput, String> {
@@ -964,7 +1335,9 @@ impl ProbeModel {
                 approach: self.rotation_approach,
                 expected_edge_mm: self.field_value(ProbeField::ExpectedY)?,
             }),
-            ProbeCard::HeightMap => return Err("height mapping is deferred".to_string()),
+            ProbeCard::HeightMap => {
+                return Err("height maps use the grid editor, not a cycle plan".to_string());
+            }
         })
     }
 
@@ -1208,11 +1581,64 @@ impl ProbeModel {
                     format!("{:.3} mm", setup.params.retract_mm),
                     RowState::Info,
                 );
-                push(
-                    "EXPECTED",
-                    expected_text(&setup.cycle, &setup.params),
-                    RowState::Info,
-                );
+                match &setup.target {
+                    ProbeTarget::Cycle(cycle) => {
+                        push(
+                            "EXPECTED",
+                            expected_text(cycle, &setup.params),
+                            RowState::Info,
+                        );
+                    }
+                    ProbeTarget::HeightMap(grid) => {
+                        let travel = setup.params.safe_z_mm - grid.surface_z_mm;
+                        push(
+                            "GRID",
+                            format!(
+                                "{} cols x {} rows = {} points (max {})",
+                                grid.columns,
+                                grid.rows,
+                                grid.point_count(),
+                                MAX_HEIGHT_MAP_POINTS
+                            ),
+                            RowState::Ok,
+                        );
+                        push(
+                            "SURFACE Z",
+                            format!("{:.3} mm machine", grid.surface_z_mm),
+                            RowState::Info,
+                        );
+                        push(
+                            "GRID ORIGIN",
+                            format!(
+                                "X {:.3} Y {:.3} mm machine",
+                                grid.origin_mm.x_mm, grid.origin_mm.y_mm
+                            ),
+                            RowState::Info,
+                        );
+                        push(
+                            "MAP TRAVEL",
+                            format!(
+                                "{:.3} mm from safe Z (search {:.3} mm)",
+                                travel, setup.params.search_distance_mm
+                            ),
+                            RowState::Ok,
+                        );
+                        if let Some(estimate) = &setup.estimate {
+                            push("ESTIMATE", format_estimate(estimate), RowState::Info);
+                        }
+                        push(
+                            "SAFE Z NOTE",
+                            "safe Z must clear the highest surface point; every probe descends from it"
+                                .to_string(),
+                            RowState::Warn,
+                        );
+                        push(
+                            "COMPENSATION",
+                            "measurement only; the map is not applied to the job".to_string(),
+                            RowState::Warn,
+                        );
+                    }
+                }
                 push(
                     "TRAVEL",
                     format!(
@@ -1357,6 +1783,19 @@ impl ProbeModel {
         } else {
             run.unexpected_results = run.unexpected_results.saturating_add(1);
         }
+        // A failed point ends the map. G38.2 normally raises a controller alarm
+        // and aborts the job; the app must also refuse to resume its demo
+        // checkpoint or bind any later point.
+        if run.is_height_map() && (!result.success || !result.position.is_finite()) {
+            let index = run.results.len().saturating_sub(1) + 1;
+            run.phase = ProbePhase::Failed;
+            run.error = Some(format!(
+                "probe point {index} failed; the height map stops here and never continues"
+            ));
+            run.paused_after_probe = None;
+            run.stop_requested = true;
+            run.map = partial_height_map(&run.setup.target, &run.results);
+        }
         true
     }
 
@@ -1381,14 +1820,40 @@ impl ProbeModel {
             ));
             return true;
         }
-        match ProbeOutcome::from_results(&run.setup.cycle, &run.setup.params, &run.results) {
-            Ok(outcome) => {
-                run.outcome = Some(outcome);
-                run.phase = ProbePhase::Complete;
+        match &run.setup.target {
+            ProbeTarget::Cycle(cycle) => {
+                match ProbeOutcome::from_results(cycle, &run.setup.params, &run.results) {
+                    Ok(outcome) => {
+                        run.outcome = Some(outcome);
+                        run.phase = ProbePhase::Complete;
+                    }
+                    Err(error) => {
+                        run.phase = ProbePhase::Failed;
+                        run.error = Some(error.to_string());
+                    }
+                }
             }
-            Err(error) => {
-                run.phase = ProbePhase::Failed;
-                run.error = Some(error.to_string());
+            ProbeTarget::HeightMap(grid) => {
+                match HeightMap::from_results(grid.clone(), &run.results) {
+                    Ok(map) => {
+                        let complete = run.results.len() == run.setup.plan.expected_probes;
+                        run.map = Some(map);
+                        if complete {
+                            run.phase = ProbePhase::Complete;
+                        } else {
+                            run.phase = ProbePhase::Failed;
+                            run.error = Some(format!(
+                                "job completed with {} of {} probe results; missing cells stay invalid",
+                                run.results.len(),
+                                run.setup.plan.expected_probes
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        run.phase = ProbePhase::Failed;
+                        run.error = Some(error.to_string());
+                    }
+                }
             }
         }
         true
@@ -1398,7 +1863,8 @@ impl ProbeModel {
     ///
     /// Only a running probe is failed; a value that already completed stays
     /// visible for audit, while Apply is gated by the live machine state.
-    /// Keeps the partial raw results and never resumes.
+    /// Keeps the partial raw results, builds a partial height map when cells
+    /// were already measured, and never resumes.
     pub fn fail(&mut self, reason: impl Into<String>) -> bool {
         let reason = reason.into();
         let Some(run) = self.run.as_mut() else {
@@ -1407,9 +1873,13 @@ impl ProbeModel {
         if run.phase != ProbePhase::Running {
             return false;
         }
+        if run.is_height_map() && run.map.is_none() {
+            run.map = partial_height_map(&run.setup.target, &run.results);
+        }
         run.phase = ProbePhase::Failed;
         run.error = Some(reason);
         run.apply_confirm = false;
+        run.paused_after_probe = None;
         true
     }
 
@@ -1508,6 +1978,206 @@ impl ProbeModel {
             run.kept = false;
         }
     }
+}
+
+/// Build a partial height map from however many ordered results were bound.
+fn partial_height_map(target: &ProbeTarget, results: &[ProbeResult]) -> Option<HeightMap> {
+    let ProbeTarget::HeightMap(grid) = target else {
+        return None;
+    };
+    HeightMap::from_results(grid.clone(), results).ok()
+}
+
+/// Counts, ranges and compensation spread for a measured map.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightMapSummary {
+    /// Total cells.
+    pub total: usize,
+    /// Valid measured cells.
+    pub valid: usize,
+    /// Cells without a valid measurement.
+    pub missing: usize,
+    /// Every cell has a measurement.
+    pub complete: bool,
+    /// Lowest measured machine Z.
+    pub min_z_mm: Option<f64>,
+    /// Highest measured machine Z.
+    pub max_z_mm: Option<f64>,
+    /// Lowest compensation (`measured - nominal surface`).
+    pub min_compensation_mm: Option<f64>,
+    /// Highest compensation (`measured - nominal surface`).
+    pub max_compensation_mm: Option<f64>,
+    /// Nominal surface Z from the grid.
+    pub nominal_z_mm: f64,
+}
+
+/// Summarise a height map without filling any missing cell.
+#[must_use]
+pub fn height_map_summary(map: &HeightMap) -> HeightMapSummary {
+    let (min_z, max_z) = map
+        .z_range()
+        .map_or((None, None), |(low, high)| (Some(low), Some(high)));
+    let nominal = map.grid().surface_z_mm;
+    let mut min_comp: Option<f64> = None;
+    let mut max_comp: Option<f64> = None;
+    for z in map.samples().iter().flatten() {
+        let compensation = z - nominal;
+        min_comp = Some(min_comp.map_or(compensation, |value| value.min(compensation)));
+        max_comp = Some(max_comp.map_or(compensation, |value| value.max(compensation)));
+    }
+    HeightMapSummary {
+        total: map.len(),
+        valid: map.valid_count(),
+        missing: map.missing_count(),
+        complete: map.is_complete(),
+        min_z_mm: min_z,
+        max_z_mm: max_z,
+        min_compensation_mm: min_comp,
+        max_compensation_mm: max_comp,
+        nominal_z_mm: nominal,
+    }
+}
+
+/// CSV export of every cell in machine coordinates.
+///
+/// Rows are emitted for missing cells too, with an empty Z and `false` in the
+/// validity column, so a consumer never mistakes a gap for a measurement.
+#[must_use]
+pub fn height_map_csv(map: &HeightMap) -> String {
+    let grid = map.grid();
+    let mut text = String::from(
+        "column,row,machine_x_mm,machine_y_mm,measured_machine_z_mm,compensation_mm,valid\n",
+    );
+    for row in 0..grid.rows {
+        for column in 0..grid.columns {
+            let Some(point) = grid.point(column, row) else {
+                continue;
+            };
+            let z = map.z(column, row);
+            let (z_text, compensation_text, valid) = match z {
+                Some(value) => (
+                    format_mm(value),
+                    format_mm(value - grid.surface_z_mm),
+                    "true",
+                ),
+                None => (String::new(), String::new(), "false"),
+            };
+            text.push_str(&format!(
+                "{column},{row},{},{},{z_text},{compensation_text},{valid}\n",
+                format_mm(point.x_mm),
+                format_mm(point.y_mm)
+            ));
+        }
+    }
+    text
+}
+
+/// Project a measured map into the viewer's work-coordinate overlay.
+///
+/// `offset_mm` is the active work offset at the run
+/// (`machine = work + offset`). Every grid point becomes one cell of half a
+/// step in each direction; missing cells are retained with `z_mm: None`.
+#[must_use]
+pub fn height_map_overlay(map: &HeightMap, offset_mm: Position) -> HeightOverlay {
+    let grid = map.grid();
+    let offset_x = offset_mm.get(CoreAxis::X);
+    let offset_y = offset_mm.get(CoreAxis::Y);
+    let half_x = grid.step_x_mm * 0.5;
+    let half_y = grid.step_y_mm * 0.5;
+    let mut cells = Vec::with_capacity(grid.point_count());
+    for row in 0..grid.rows {
+        for column in 0..grid.columns {
+            let Some(point) = grid.point(column, row) else {
+                continue;
+            };
+            let x = point.x_mm - offset_x;
+            let y = point.y_mm - offset_y;
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
+            cells.push(HeightCell {
+                min: Point2::new((x - half_x) as f32, (y - half_y) as f32),
+                max: Point2::new((x + half_x) as f32, (y + half_y) as f32),
+                z_mm: map.z(column, row),
+            });
+        }
+    }
+    let (min_z_mm, max_z_mm) = map
+        .z_range()
+        .unwrap_or((grid.surface_z_mm, grid.surface_z_mm));
+    HeightOverlay {
+        cells,
+        min_z_mm,
+        max_z_mm,
+        nominal_z_mm: grid.surface_z_mm,
+    }
+}
+
+/// Compact estimate text for the grid editor and preflight sheet.
+#[must_use]
+pub fn format_estimate(estimate: &HeightMapEstimate) -> String {
+    format!(
+        "{} points | {} mm probe travel | {}",
+        estimate.points,
+        format_mm(estimate.probing_distance_mm),
+        format_duration(estimate.total_seconds)
+    )
+}
+
+/// Format a duration in seconds as `m:ss`, clamped to non-negative input.
+#[must_use]
+pub fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "0:00".to_string();
+    }
+    let total = seconds.round().clamp(0.0, 359_999.0) as u64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// Best-effort mapping from a `ghs-probe` validation message to an editor
+/// field, so a cross-field grid error can be shown inline.
+fn height_map_error_field(message: &str) -> Option<ProbeField> {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("grid") && lower.contains("exceeds") {
+        return Some(ProbeField::Columns);
+    }
+    if lower.contains("columns") || lower.contains("point limit") {
+        return Some(ProbeField::Columns);
+    }
+    if lower.contains("rows") {
+        return Some(ProbeField::Rows);
+    }
+    if lower.contains("step_x") || lower.contains("grid x span") {
+        return Some(ProbeField::StepX);
+    }
+    if lower.contains("step_y") || lower.contains("grid y span") {
+        return Some(ProbeField::StepY);
+    }
+    if lower.contains("origin x") || lower.contains("grid maximum x") {
+        return Some(ProbeField::OriginX);
+    }
+    if lower.contains("origin y") || lower.contains("grid maximum y") {
+        return Some(ProbeField::OriginY);
+    }
+    if lower.contains("surface") {
+        return Some(ProbeField::SurfaceZ);
+    }
+    if lower.contains("search") {
+        return Some(ProbeField::Search);
+    }
+    if lower.contains("travel") || lower.contains("safe_z") {
+        return Some(ProbeField::SafeZ);
+    }
+    if lower.contains("feed") {
+        return Some(ProbeField::Feed);
+    }
+    if lower.contains("retract") {
+        return Some(ProbeField::Retract);
+    }
+    if lower.contains("diameter") {
+        return Some(ProbeField::Diameter);
+    }
+    None
 }
 
 /// Offset targets for a computed value: `(axis, machine coordinate)`.
@@ -2059,8 +2729,305 @@ mod tests {
         assert!(rotation.apply_lines().is_err());
 
         let height = model(ProbeCard::HeightMap);
-        assert!(height.prepare(&ctx).is_err());
-        assert!(ProbeCard::HeightMap.deferred_note().is_some());
+        assert!(
+            height.prepare(&ctx).is_ok(),
+            "a default height grid must produce a valid plan"
+        );
+        assert!(ProbeCard::HeightMap.deferred_note().is_none());
+    }
+
+    fn set_height_grid(model: &mut ProbeModel, columns: u16, rows: u16) {
+        for (field, text) in [
+            (ProbeField::OriginX, "0.000"),
+            (ProbeField::OriginY, "0.000"),
+            (ProbeField::StepX, "10.000"),
+            (ProbeField::StepY, "10.000"),
+            (ProbeField::SurfaceZ, "0.000"),
+            (ProbeField::SafeZ, "5.000"),
+            (ProbeField::Search, "5.000"),
+            (ProbeField::Feed, "100.000"),
+            (ProbeField::Retract, "2.000"),
+            (ProbeField::Diameter, "3.000"),
+        ] {
+            model
+                .set_field_text(field, text)
+                .unwrap_or_else(|error| panic!("{field:?}: {error}"));
+        }
+        model
+            .set_field_text(ProbeField::Columns, columns.to_string())
+            .expect("columns");
+        model
+            .set_field_text(ProbeField::Rows, rows.to_string())
+            .expect("rows");
+    }
+
+    #[test]
+    fn height_grid_validates_through_the_crate_and_shows_field_errors() {
+        let ctx = context();
+        let mut model = model(ProbeCard::HeightMap);
+        set_height_grid(&mut model, 4, 4);
+
+        let draft = model.height_map_draft(&ctx).expect("valid draft");
+        assert_eq!(draft.grid.point_count(), 16);
+        // work origin 0,0 + active offset (5+1, 6+2) = machine (6, 8).
+        assert_eq!(draft.grid.origin_mm, XyPoint::new(6.0, 8.0));
+
+        let setup = model.prepare(&ctx).expect("height plan");
+        assert_eq!(setup.plan.expected_probes, 16);
+        assert_eq!(setup.plan.name, "height-map");
+        assert_eq!(
+            setup
+                .plan
+                .probes
+                .iter()
+                .map(|probe| probe.label.as_str())
+                .take(5)
+                .collect::<Vec<_>>(),
+            vec!["p0-c0", "p0-c1", "p0-c2", "p0-c3", "p1-c0"]
+        );
+
+        // A bad whole-number field keeps its old text and shows inline.
+        assert!(model.set_field_text(ProbeField::Columns, "1").is_err());
+        assert_eq!(model.field_text(ProbeField::Columns), "4");
+        assert!(
+            model
+                .field_error(ProbeField::Columns)
+                .is_some_and(|error| error.contains("COLUMNS"))
+        );
+
+        model
+            .set_field_text(ProbeField::Columns, "65")
+            .expect("per-axis bound allows 65");
+        model
+            .set_field_text(ProbeField::Rows, "64")
+            .expect("per-axis bound allows 64");
+        let error = model.prepare(&ctx).expect_err("4160 points is too many");
+        assert!(error.contains("4096"), "unexpected message: {error}");
+        assert!(model.field_problems(&ctx).iter().any(|problem| {
+            problem.field == Some(ProbeField::Columns) && problem.message.contains("4096")
+        }));
+
+        model
+            .set_field_text(ProbeField::Columns, "4")
+            .expect("columns");
+        model.set_field_text(ProbeField::Rows, "4").expect("rows");
+        model
+            .set_field_text(ProbeField::Search, "4.000")
+            .expect("search");
+        let error = model.prepare(&ctx).expect_err("travel exceeds search");
+        assert!(error.contains("travel"), "unexpected message: {error}");
+
+        model
+            .set_field_text(ProbeField::SurfaceZ, "0.000")
+            .expect("surface");
+        model
+            .set_field_text(ProbeField::SafeZ, "0.000")
+            .expect("safe Z");
+        let error = model
+            .prepare(&ctx)
+            .expect_err("safe Z is not above surface");
+        assert!(
+            error.contains("above SURFACE Z"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn height_estimate_text_is_compact_and_bounded() {
+        let ctx = context();
+        let mut model = model(ProbeCard::HeightMap);
+        set_height_grid(&mut model, 4, 4);
+        let draft = model.height_map_draft(&ctx).expect("draft");
+        assert_eq!(draft.estimate.points, 16);
+        assert_eq!(draft.estimate.probing_distance_mm, 80.0);
+        assert_eq!(draft.estimate.total_seconds, 96.0);
+        assert_eq!(
+            format_estimate(&draft.estimate),
+            "16 points | 80.000 mm probe travel | 1:36"
+        );
+        assert_eq!(format_duration(65.0), "1:05");
+        assert_eq!(format_duration(0.0), "0:00");
+        assert_eq!(format_duration(-1.0), "0:00");
+        assert_eq!(format_duration(f64::NAN), "0:00");
+    }
+
+    #[test]
+    fn height_results_bind_in_order_and_a_stop_keeps_a_partial_map() {
+        let ctx = context();
+        let mut model = model(ProbeCard::HeightMap);
+        set_height_grid(&mut model, 2, 2);
+        let setup = model.prepare(&ctx).expect("plan");
+        model.begin(setup);
+        assert!(model.on_job_loaded("height-map"));
+        assert!(model.on_job_started());
+        // Machine points are work 0/0 and 10/0 plus the active offset (6, 8).
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(6.0, 8.0, 0.0))));
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(16.0, 8.0, -1.0))));
+        model.fail("operator stopped the probe");
+
+        let run = model.run().expect("run");
+        assert_eq!(run.phase, ProbePhase::Failed);
+        let map = run.map.as_ref().expect("partial map");
+        assert_eq!(map.valid_count(), 2);
+        assert_eq!(map.missing_count(), 2);
+        assert_eq!(map.z(0, 0), Some(0.0));
+        assert_eq!(map.z(1, 0), Some(-1.0));
+        assert_eq!(map.z(0, 1), None);
+        // A missing row is not bridged, not even in the middle of a cell.
+        assert_eq!(map.height_at(11.0, 13.0), None);
+        assert_eq!(map.height_at(6.0, 18.0), None);
+        assert_eq!(map.height_at(16.0, 8.0), Some(-1.0));
+    }
+
+    #[test]
+    fn a_failed_height_point_stops_the_run_and_never_binds_later_points() {
+        let ctx = context();
+        let mut model = model(ProbeCard::HeightMap);
+        set_height_grid(&mut model, 2, 2);
+        let setup = model.prepare(&ctx).expect("plan");
+        model.begin(setup);
+        assert!(model.on_job_loaded("height-map"));
+        assert!(model.on_job_started());
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(6.0, 8.0, 0.0))));
+        assert!(model.bind_result(ProbeResult::new(false, Position::xyz(16.0, 8.0, -5.0))));
+        assert!(
+            model
+                .run()
+                .and_then(|run| run.error.as_deref())
+                .is_some_and(|text| text.contains("stops here"))
+        );
+        assert!(model.take_stop_request());
+        assert!(!model.take_stop_request(), "stop request is consumed once");
+        assert!(!model.needs_resume());
+        let run = model.run().expect("run");
+        assert_eq!(run.phase, ProbePhase::Failed);
+        // The failed point is an invalid cell, and later PRB events are refused.
+        assert_eq!(run.map.as_ref().and_then(|map| map.z(1, 0)), None);
+        assert!(!model.bind_result(ProbeResult::new(true, Position::xyz(6.0, 18.0, 0.0))));
+    }
+
+    #[test]
+    fn height_summary_and_overlay_mark_missing_cells_without_bridging() {
+        let grid = HeightMapGrid {
+            origin_mm: XyPoint::new(10.0, 20.0),
+            step_x_mm: 4.0,
+            step_y_mm: 6.0,
+            columns: 2,
+            rows: 2,
+            surface_z_mm: 0.0,
+        };
+        let map = HeightMap::from_samples(grid, vec![Some(1.0), None, Some(3.0), Some(4.0)])
+            .expect("map");
+        let summary = height_map_summary(&map);
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.valid, 3);
+        assert_eq!(summary.missing, 1);
+        assert!(!summary.complete);
+        assert_eq!(summary.min_z_mm, Some(1.0));
+        assert_eq!(summary.max_z_mm, Some(4.0));
+        assert_eq!(summary.min_compensation_mm, Some(1.0));
+        assert_eq!(summary.max_compensation_mm, Some(4.0));
+
+        let overlay = height_map_overlay(&map, Position::xyz(5.0, 6.0, 3.0));
+        assert_eq!(overlay.cells.len(), 4);
+        // Machine (10,20) minus offset (5,6) = work (5,14); half a 4x6 step.
+        assert_eq!(overlay.cells[0].min, Point2::new(3.0, 11.0));
+        assert_eq!(overlay.cells[0].max, Point2::new(7.0, 17.0));
+        assert_eq!(overlay.cells[0].z_mm, Some(1.0));
+        assert_eq!(overlay.cells[1].z_mm, None);
+        assert_eq!(overlay.cells[3].z_mm, Some(4.0));
+        assert_eq!(overlay.cells[3].min, Point2::new(7.0, 17.0));
+        assert_eq!(overlay.cells[3].max, Point2::new(11.0, 23.0));
+    }
+
+    #[test]
+    fn height_preflight_refuses_bad_travel_count_and_busy_machine() {
+        let ctx = context();
+        let mut valid = model(ProbeCard::HeightMap);
+        set_height_grid(&mut valid, 4, 4);
+        let sheet = valid.preflight(&ctx);
+        assert!(sheet.blockers.is_empty(), "{:?}", sheet.blockers);
+        assert!(sheet.setup.is_some());
+        let labels: Vec<&str> = sheet.rows.iter().map(|row| row.label).collect();
+        for required in [
+            "GRID",
+            "SURFACE Z",
+            "GRID ORIGIN",
+            "MAP TRAVEL",
+            "ESTIMATE",
+            "SAFE Z NOTE",
+            "COMPENSATION",
+        ] {
+            assert!(labels.contains(&required), "missing {required}");
+        }
+        assert!(
+            sheet
+                .rows
+                .iter()
+                .any(|row| row.label == "GRID" && row.value.contains("16 points"))
+        );
+
+        let mut too_long = model(ProbeCard::HeightMap);
+        set_height_grid(&mut too_long, 4, 4);
+        too_long
+            .set_field_text(ProbeField::Search, "4.000")
+            .expect("search");
+        let refused = too_long.preflight(&ctx);
+        assert!(refused.setup.is_none());
+        assert!(
+            refused
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("SEARCH"))
+        );
+
+        let mut too_many = model(ProbeCard::HeightMap);
+        set_height_grid(&mut too_many, 65, 64);
+        let refused = too_many.preflight(&ctx);
+        assert!(refused.setup.is_none());
+        assert!(
+            refused
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("4096"))
+        );
+
+        let mut busy = model(ProbeCard::HeightMap);
+        set_height_grid(&mut busy, 4, 4);
+        let mut busy_ctx = context();
+        busy_ctx.spindle_on = true;
+        assert!(busy.preflight(&busy_ctx).setup.is_none());
+        assert!(
+            busy.preflight(&busy_ctx)
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("spindle"))
+        );
+    }
+
+    #[test]
+    fn height_csv_lists_every_cell_including_missing_ones() {
+        let grid = HeightMapGrid {
+            origin_mm: XyPoint::new(10.0, 20.0),
+            step_x_mm: 4.0,
+            step_y_mm: 6.0,
+            columns: 2,
+            rows: 2,
+            surface_z_mm: 0.0,
+        };
+        let map = HeightMap::from_samples(grid, vec![Some(1.5), None, Some(3.0), Some(4.0)])
+            .expect("map");
+        let csv = height_map_csv(&map);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 5, "header plus one row per cell");
+        assert_eq!(
+            lines[0],
+            "column,row,machine_x_mm,machine_y_mm,measured_machine_z_mm,compensation_mm,valid"
+        );
+        assert_eq!(lines[1], "0,0,10.000,20.000,1.500,1.500,true");
+        assert_eq!(lines[2], "1,0,14.000,20.000,,,false");
+        assert_eq!(lines[3], "0,1,10.000,26.000,3.000,3.000,true");
+        assert_eq!(lines[4], "1,1,14.000,26.000,4.000,4.000,true");
     }
 
     #[test]
@@ -2159,6 +3126,7 @@ mod tests {
             ProbeCard::CenterCircle,
             ProbeCard::Rotation,
             ProbeCard::ToolLength,
+            ProbeCard::HeightMap,
         ] {
             let model = model(card);
             let setup = model

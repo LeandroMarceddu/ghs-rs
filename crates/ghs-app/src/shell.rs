@@ -29,6 +29,8 @@
 //! - Every panel keeps its 48 px targets in portrait; the dock scrolls rather
 //!   than shrinking controls.
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,8 +61,9 @@ use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
 use crate::offsets::OffsetStatus;
 use crate::probe::{
-    PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight, ProbeRun,
-    RowState, outcome_summary,
+    FieldProblem, PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight,
+    ProbeRun, ProbeTarget, RowState, format_duration, format_estimate, format_mm,
+    height_map_summary, outcome_summary,
 };
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::state::{
@@ -214,6 +217,12 @@ pub struct Shell {
     demo_probe_run_done: bool,
     demo_probe_apply: bool,
     demo_probe_apply_done: bool,
+    demo_height_map: bool,
+    demo_height_map_done: bool,
+    demo_height_map_export: bool,
+    demo_height_map_export_done: bool,
+    /// Toolpath captured before a height-map probe replaced the job program.
+    height_map_base_program: Option<Arc<ghs_gcode::Program>>,
     _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -332,8 +341,19 @@ impl Shell {
             state.mode = Mode::Probe;
         }
         let demo_probe_apply = std::env::args().any(|arg| arg == "--demo-probe-apply");
-        let demo_probe_run =
-            demo_probe_apply || std::env::args().any(|arg| arg == "--demo-probe-run");
+        let demo_height_map = std::env::args().any(|arg| {
+            arg == "--demo-height-map"
+                || arg == "--demo-height-map-result"
+                || arg == "--demo-height-map-export"
+        });
+        let demo_height_map_result = std::env::args().any(|arg| arg == "--demo-height-map-result");
+        let demo_height_map_export = std::env::args().any(|arg| arg == "--demo-height-map-export");
+        if demo_height_map {
+            state.mode = Mode::Probe;
+        }
+        let demo_probe_run = demo_probe_apply
+            || demo_height_map_result
+            || std::env::args().any(|arg| arg == "--demo-probe-run");
 
         let mut shell = Self {
             state,
@@ -373,13 +393,21 @@ impl Shell {
             demo_probe_run_done: false,
             demo_probe_apply,
             demo_probe_apply_done: false,
+            demo_height_map,
+            demo_height_map_done: false,
+            demo_height_map_export,
+            demo_height_map_export_done: false,
+            height_map_base_program: None,
             _poll_task: None,
             _subscriptions: subscriptions,
         };
         if !mock {
             shell.connect_demo(cx);
         }
-        if shell.demo_probe_run || std::env::args().any(|arg| arg == "--demo-probe-check") {
+        if shell.demo_probe_run
+            || shell.demo_height_map
+            || std::env::args().any(|arg| arg == "--demo-probe-check")
+        {
             // The reference board has no PC signal; the screenshot switch
             // stands in for the operator's explicit "probe connected" check.
             // Applied after `connect_demo` because `begin_live` resets the
@@ -414,6 +442,13 @@ impl Shell {
         let mut changed = false;
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
+        }
+        // A failed height-map point must stop the job once, even if the
+        // controller did not raise its own alarm yet. Never resume it.
+        if self.state.probe.take_stop_request()
+            && self.send_command(Command::StopProgram { reset: false })
+        {
+            changed = true;
         }
         // Resume only after a planned probe checkpoint whose PRB was bound.
         // This pacing exists for the in-process simulator only; a serial
@@ -560,6 +595,19 @@ impl Shell {
         }
         // Screenshot switch: open one probe card once live telemetry and `$#`
         // are available, so the preflight shows real poses and offsets.
+        // The height-map switch also seeds a small, explicit 4x4 demo grid; it
+        // is a capture aid, not a product cap or a persisted setup.
+        if self.demo_height_map
+            && !self.demo_height_map_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.offsets.reported()
+            && self.state.job.has_program()
+        {
+            self.demo_height_map_done = true;
+            self.state.mode = Mode::Probe;
+            self.seed_demo_height_map();
+            changed = true;
+        }
         if let Some(name) = self.probe_card_demo.clone()
             && !self.probe_card_demo_done
             && self.state.connection == ConnectionState::Ready
@@ -605,6 +653,20 @@ impl Shell {
         {
             self.demo_probe_apply_done = true;
             self.confirm_probe_apply(cx);
+            changed = true;
+        }
+        // Screenshot switch: press the same explicit CSV export action once the
+        // map exists, so the capture shows the fixed path and the write result.
+        if self.demo_height_map_export
+            && !self.demo_height_map_export_done
+            && self
+                .state
+                .probe
+                .run()
+                .is_some_and(|run| run.map.is_some() && run.export.is_none())
+        {
+            self.demo_height_map_export_done = true;
+            self.export_height_map(cx);
             changed = true;
         }
         // Follow the current line in the Program tab. Only a changed line
@@ -1757,7 +1819,14 @@ impl Shell {
         };
         let name = setup.plan.name.clone();
         let source = setup.plan.program.clone();
-        let summary = format!(
+        // Keep the work toolpath for the height-map overlay. A second run must
+        // not capture its own probe program as the base path.
+        if self.state.probe.card() == Some(ProbeCard::HeightMap)
+            && !self.state.probe.owns_program(&self.state.job.name)
+        {
+            self.height_map_base_program = self.state.job.program().cloned();
+        }
+        let mut summary = format!(
             "Probe {}: {} lines, {} probes, {:.3} mm total search, safe Z {:.3} mm",
             name,
             source.lines().count(),
@@ -1765,6 +1834,9 @@ impl Shell {
             setup.plan.total_search_travel_mm(),
             setup.plan.safe_z_mm
         );
+        if let Some(estimate) = &setup.estimate {
+            summary.push_str(&format!(", estimate {}", format_estimate(estimate)));
+        }
         self.state.probe.begin(setup);
         self.state.left_tab = LeftTab::Console;
         self.state.push_console(ConsoleLevel::Info, summary);
@@ -1823,6 +1895,90 @@ impl Shell {
             .probe
             .fail("operator stopped the probe".to_string());
         self.send_command(Command::StopProgram { reset: false });
+        cx.notify();
+    }
+
+    /// Seed the explicit, small demo grid used by the screenshot switches.
+    ///
+    /// This is capture aid only: a user grid is never capped, and none of
+    /// these values are written to the controller configuration.
+    fn seed_demo_height_map(&mut self) {
+        let ctx = self.probe_context();
+        if !self.state.probe.select_card(ProbeCard::HeightMap, &ctx) {
+            return;
+        }
+        for (field, text) in [
+            (ProbeField::OriginX, "0.000"),
+            (ProbeField::OriginY, "0.000"),
+            (ProbeField::StepX, "10.000"),
+            (ProbeField::StepY, "10.000"),
+            (ProbeField::Columns, "4"),
+            (ProbeField::Rows, "4"),
+            (ProbeField::SurfaceZ, "-1.000"),
+            (ProbeField::SafeZ, "5.000"),
+            (ProbeField::Search, "10.000"),
+            (ProbeField::Feed, "100.000"),
+            (ProbeField::Retract, "2.000"),
+            (ProbeField::Diameter, "3.000"),
+        ] {
+            if let Err(message) = self.state.probe.set_field_text(field, text) {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("--demo-height-map: {message}"));
+            }
+        }
+    }
+
+    /// Fixed CSV path under the app configuration directory.
+    fn height_map_export_path(&self) -> Option<PathBuf> {
+        self.state
+            .config
+            .store_root()
+            .map(|root| root.join("exports").join("height-map.csv"))
+    }
+
+    /// Write the measured map as CSV and record the full path in the result.
+    fn export_height_map(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.height_map_export_path() else {
+            self.state.push_console(
+                ConsoleLevel::Error,
+                "Height-map export: the app configuration directory is unavailable",
+            );
+            cx.notify();
+            return;
+        };
+        let csv = match self.state.probe.height_map_csv() {
+            Ok(csv) => csv,
+            Err(message) => {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Height-map export refused: {message}"),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let write = (|| -> Result<usize, String> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::write(&path, csv.as_bytes()).map_err(|error| error.to_string())?;
+            Ok(csv.lines().count().saturating_sub(1))
+        })();
+        match &write {
+            Ok(rows) => {
+                self.state.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Height map exported: {} ({rows} cells)", path.display()),
+                );
+            }
+            Err(message) => {
+                self.state.push_console(
+                    ConsoleLevel::Error,
+                    format!("Height-map export failed: {}: {message}", path.display()),
+                );
+            }
+        }
+        self.state.probe.mark_height_export(path, write);
         cx.notify();
     }
 
@@ -2798,7 +2954,14 @@ impl Shell {
             .relative()
             .size_full()
             .bg(p.bg)
-            .child(viewer::view(&self.viewer, p, program, marker, cx.entity()))
+            .child(viewer::view(
+                &self.viewer,
+                p,
+                program,
+                marker,
+                None,
+                cx.entity(),
+            ))
             .child(
                 div()
                     .absolute()
@@ -2966,18 +3129,14 @@ impl Shell {
     ) -> impl IntoElement {
         let deferred = card.deferred_note().is_some();
         let partial = matches!(card, ProbeCard::Rotation | ProbeCard::ToolLength);
-        let status = if card == ProbeCard::HeightMap {
-            "DEFERRED"
-        } else if partial {
+        let status = if partial {
             "APPLY DEFERRED"
         } else if ctx.ready && ctx.has_probe {
             "READY"
         } else {
             "SETUP"
         };
-        let status_color = if card == ProbeCard::HeightMap {
-            p.warning
-        } else if partial {
+        let status_color = if partial {
             p.info
         } else if ctx.ready && ctx.has_probe {
             p.success
@@ -3060,11 +3219,7 @@ impl Shell {
                     "probe-configure-{}",
                     card.title().to_lowercase().replace(' ', "-")
                 ))
-                .label(if card == ProbeCard::HeightMap {
-                    "VIEW"
-                } else {
-                    "CONFIGURE"
-                })
+                .label("CONFIGURE")
                 .secondary()
                 .h(px(48.0))
                 .w_full()
@@ -3088,11 +3243,8 @@ impl Shell {
         let preflight = self.state.probe.preflight(ctx);
         let running = self.state.probe.is_running();
         let back_view = cx.entity();
-        let height_only = card == ProbeCard::HeightMap;
         let status = if let Some(run) = self.state.probe.run() {
             run.phase.label()
-        } else if height_only {
-            "DEFERRED"
         } else if preflight.setup.is_some() {
             "PREFLIGHT OK"
         } else {
@@ -3104,8 +3256,6 @@ impl Shell {
                 ProbePhase::Complete => p.success,
                 ProbePhase::Failed => p.danger,
             }
-        } else if height_only {
-            p.warning
         } else if preflight.setup.is_some() {
             p.success
         } else {
@@ -3113,25 +3263,18 @@ impl Shell {
         };
 
         let body: AnyElement = if let Some(run) = self.state.probe.run() {
+            let mut content = v_flex().gap_2().p_2();
+            if run.map.is_some() {
+                content = content.child(self.height_map_result_panel(p, cx, run));
+            } else {
+                content = content.child(self.probe_run_panel(p, cx, run));
+            }
             div()
                 .id("probe-result-scroll")
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .p_2()
-                        .child(self.probe_run_panel(p, cx, run)),
-                )
-                .into_any_element()
-        } else if card == ProbeCard::HeightMap {
-            div()
-                .id("probe-deferred-scroll")
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .child(v_flex().gap_2().p_2().child(probe_deferred_panel(card, p)))
+                .child(content)
                 .into_any_element()
         } else {
             let form_pane = div()
@@ -3144,14 +3287,16 @@ impl Shell {
                     v_flex()
                         .gap_2()
                         .p_2()
-                        .child(
-                            div()
-                                .text_size(px(9.5))
-                                .line_height(px(13.0))
-                                .text_color(p.text_dim)
-                                .child(card.detail()),
-                        )
-                        .child(self.probe_form(p, cx, card)),
+                        .when(card != ProbeCard::HeightMap, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .line_height(px(13.0))
+                                    .text_color(p.text_dim)
+                                    .child(card.detail()),
+                            )
+                        })
+                        .child(self.probe_form(p, cx, card, ctx)),
                 );
             let preflight_pane = div()
                 .id("probe-preflight-scroll")
@@ -3240,16 +3385,27 @@ impl Shell {
                     .child(chip(self.state.unit(), p)),
             )
             .child(body)
-            .child(self.probe_footer(p, cx, card, &preflight, running))
+            .child(self.probe_footer(p, cx, &preflight, running))
     }
 
-    fn probe_form(&self, p: Palette, cx: &mut Context<Self>, card: ProbeCard) -> Div {
+    fn probe_form(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        card: ProbeCard,
+        ctx: &ProbeContext,
+    ) -> Div {
         let fields = card.fields();
+        let problems = self.state.probe.field_problems(ctx);
         let mut cells = Vec::new();
         for field in fields {
-            cells.push(self.probe_field_cell(*field, p, cx));
+            let inline = problems
+                .iter()
+                .find(|problem| problem.field == Some(*field))
+                .map(|problem| problem.message.clone());
+            cells.push(self.probe_field_cell(*field, p, cx, inline));
         }
-        v_flex()
+        let mut form = v_flex()
             .w_full()
             .gap_2()
             .p_2()
@@ -3268,12 +3424,21 @@ impl Shell {
                             .text_color(p.text_faint)
                             .child("millimetres; tap a value to edit"),
                     ),
-            )
-            .child(h_flex().w(px(288.0)).flex_wrap().gap_1().children(cells))
+            );
+        if card == ProbeCard::HeightMap {
+            form = form.child(self.height_map_grid_summary(p, ctx, &problems));
+        }
+        form.child(h_flex().w(px(288.0)).flex_wrap().gap_1().children(cells))
             .child(self.probe_controls(p, cx, card))
     }
 
-    fn probe_field_cell(&self, field: ProbeField, p: Palette, cx: &mut Context<Self>) -> Div {
+    fn probe_field_cell(
+        &self,
+        field: ProbeField,
+        p: Palette,
+        cx: &mut Context<Self>,
+        error: Option<String>,
+    ) -> Div {
         let view = cx.entity();
         let unit = field.unit();
         let label = if unit.is_empty() {
@@ -3282,7 +3447,7 @@ impl Shell {
             format!("{} ({})", field.label(), unit)
         };
         let value = self.state.probe.field_text(field).to_string();
-        v_flex()
+        let mut cell = v_flex()
             .w(px(140.0))
             .gap_1()
             .child(
@@ -3307,14 +3472,109 @@ impl Shell {
                             .active(p.accent_muted),
                     )
                     .border_1()
-                    .border_color(p.border)
+                    .border_color(if error.is_some() { p.danger } else { p.border })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
                             this.state.open_keypad(KeypadTarget::ProbeField(field));
                             cx.notify();
                         });
                     }),
-            )
+            );
+        if let Some(error) = error {
+            cell = cell.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+        cell
+    }
+
+    /// Point count, estimate and cross-field validation for the grid editor.
+    fn height_map_grid_summary(
+        &self,
+        p: Palette,
+        ctx: &ProbeContext,
+        problems: &[FieldProblem],
+    ) -> Div {
+        let draft = self.state.probe.height_map_draft(ctx);
+        let points = self.state.probe.height_map_point_count();
+        let points_text = points.map_or_else(
+            || "--".to_string(),
+            |(columns, rows, count)| format!("{columns} x {rows} = {count} points"),
+        );
+        let mut summary =
+            v_flex()
+                .w_full()
+                .gap_1()
+                .p_2()
+                .rounded(px(6.0))
+                .bg(p.panel)
+                .border_1()
+                .border_color(p.border)
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(section_label("GRID SUMMARY", p))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.accent)
+                                .child(points_text),
+                        )
+                        .child(div().text_size(px(9.0)).text_color(p.text_dim).child(
+                            match &draft {
+                                Ok(draft) => format!(
+                                    "{} mm | {}",
+                                    format_mm(draft.estimate.probing_distance_mm),
+                                    format_duration(draft.estimate.total_seconds)
+                                ),
+                                Err(_) => "--".to_string(),
+                            },
+                        )),
+                );
+        match &draft {
+            Ok(draft) => {
+                summary = summary.child(
+                    div()
+                        .font_family(self.mono.clone())
+                        .text_size(px(8.5))
+                        .line_height(px(11.0))
+                        .text_color(p.text_dim)
+                        .child(format!(
+                            "work {}/{} -> mach {}/{} | safe {} | surf {} | travel {}/{} mm",
+                            format_mm(draft.origin_work_mm.x_mm),
+                            format_mm(draft.origin_work_mm.y_mm),
+                            format_mm(draft.grid.origin_mm.x_mm),
+                            format_mm(draft.grid.origin_mm.y_mm),
+                            format_mm(draft.params.safe_z_mm),
+                            format_mm(draft.grid.surface_z_mm),
+                            format_mm(draft.params.safe_z_mm - draft.grid.surface_z_mm),
+                            format_mm(draft.params.search_distance_mm),
+                        )),
+                );
+            }
+            Err(message) => {
+                summary = summary.child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(p.danger)
+                        .child(message.clone()),
+                );
+            }
+        }
+        if !problems.is_empty() {
+            summary = summary.child(div().text_size(px(8.5)).text_color(p.danger).child(format!(
+                "{} field problem(s); correct the red fields before RUN",
+                problems.len()
+            )));
+        }
+        summary
     }
 
     fn probe_controls(&self, p: Palette, cx: &mut Context<Self>, card: ProbeCard) -> Div {
@@ -3687,6 +3947,20 @@ impl Shell {
                     ),
             );
 
+        let is_height_map = preflight
+            .setup
+            .as_ref()
+            .is_some_and(|setup| matches!(setup.target, ProbeTarget::HeightMap(_)));
+        if is_height_map {
+            panel = panel.child(probe_notice(
+                "SAFE Z",
+                "Safe Z must clear the highest point on the stock; every grid probe descends \
+                 from it. SEARCH must cover SAFE Z - SURFACE Z.",
+                p.warning,
+                p,
+            ));
+        }
+
         if !preflight.blockers.is_empty() {
             let mut list = v_flex()
                 .gap_1()
@@ -3711,16 +3985,28 @@ impl Shell {
         panel = panel.child(h_flex().flex_wrap().gap_1().children(cells));
 
         if let Some(setup) = &preflight.setup {
+            let height_map = matches!(setup.target, ProbeTarget::HeightMap(_));
+            let limit = if height_map { Some(8) } else { None };
             panel = panel
-                .child(self.probe_travel_summary(&setup.plan, p))
-                .child(probe_program_block(&setup.plan.program, p));
+                .child(self.probe_travel_summary(&setup.plan, limit, p))
+                .child(probe_program_block(
+                    &setup.plan.program,
+                    if height_map { Some(80) } else { None },
+                    p,
+                ));
         }
         panel
     }
 
-    fn probe_travel_summary(&self, plan: &ghs_probe::ProbePlan, p: Palette) -> Div {
+    fn probe_travel_summary(
+        &self,
+        plan: &ghs_probe::ProbePlan,
+        limit: Option<usize>,
+        p: Palette,
+    ) -> Div {
         let mut lines = v_flex().gap_1();
-        for probe in &plan.probes {
+        let shown = limit.map_or(plan.probes.len(), |limit| limit.min(plan.probes.len()));
+        for probe in plan.probes.iter().take(shown) {
             lines = lines.child(
                 div()
                     .font_family(self.mono.clone())
@@ -3729,6 +4015,17 @@ impl Shell {
                     .child(format!(
                         "{}  {} -> {}  |  {:.3} mm @ {:.0} mm/min",
                         probe.label, probe.from, probe.to, probe.travel_mm, probe.feed_mm_min
+                    )),
+            );
+        }
+        if shown < plan.probes.len() {
+            lines = lines.child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(p.text_faint)
+                    .child(format!(
+                        "{} more probe(s) are in the generated program",
+                        plan.probes.len() - shown
                     )),
             );
         }
@@ -3897,37 +4194,48 @@ impl Shell {
         }
 
         if !run.raw.is_empty() {
-            let mut raw = v_flex().gap_0();
-            for line in &run.raw {
-                raw = raw.child(
-                    div()
-                        .font_family(self.mono.clone())
-                        .text_size(px(9.5))
-                        .text_color(p.text_dim)
-                        .child(line.clone()),
+            if run.is_height_map() {
+                panel = panel.child(div().text_size(px(9.5)).text_color(p.text_dim).child(
+                    format!(
+                        "{} raw PRB result(s); the console carries every line for audit",
+                        run.raw.len()
+                    ),
+                ));
+            } else {
+                let mut raw = v_flex().gap_0();
+                for line in &run.raw {
+                    raw = raw.child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(9.5))
+                            .text_color(p.text_dim)
+                            .child(line.clone()),
+                    );
+                }
+                panel = panel.child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel)
+                        .border_1()
+                        .border_color(p.border)
+                        .child(section_label("RAW PRB (machine mm)", p))
+                        .child(
+                            div()
+                                .id("probe-raw-scroll")
+                                .max_h(px(86.0))
+                                .overflow_y_scroll()
+                                .child(raw),
+                        ),
                 );
             }
-            panel = panel.child(
-                v_flex()
-                    .gap_1()
-                    .p_2()
-                    .rounded(px(6.0))
-                    .bg(p.panel)
-                    .border_1()
-                    .border_color(p.border)
-                    .child(section_label("RAW PRB (machine mm)", p))
-                    .child(
-                        div()
-                            .id("probe-raw-scroll")
-                            .max_h(px(86.0))
-                            .overflow_y_scroll()
-                            .child(raw),
-                    ),
-            );
         }
 
         if run.phase == ProbePhase::Complete {
-            panel = panel.child(self.probe_apply_section(p, cx, run));
+            if run.map.is_none() {
+                panel = panel.child(self.probe_apply_section(p, cx, run));
+            }
         } else if run.phase == ProbePhase::Failed {
             let retry_view = cx.entity();
             panel = panel.child(
@@ -3953,6 +4261,251 @@ impl Shell {
         }
 
         panel
+    }
+
+    /// Result sheet and viewer overlay for a measured height map.
+    fn height_map_result_panel(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
+        let Some(map) = run.map.as_ref() else {
+            return div();
+        };
+        let summary = height_map_summary(map);
+        let overlay = self.state.probe.height_overlay();
+        let program = self
+            .height_map_base_program
+            .clone()
+            .or_else(|| self.state.job.program().cloned());
+        let marker = viewer::marker_mm(self.state.profile.capabilities.units, &self.state.dro);
+        let export_view = cx.entity();
+        let export_path = self.height_map_export_path();
+        let path_text = export_path.as_ref().map_or_else(
+            || "CONFIG DIR UNAVAILABLE".to_string(),
+            |path| format!("{}", path.display()),
+        );
+        let export_result = run.export.as_ref().map(|export| match &export.rows {
+            Ok(rows) => format!("EXPORTED {rows} cells to {}", export.path.display()),
+            Err(message) => format!("EXPORT FAILED: {}: {message}", export.path.display()),
+        });
+        let export_chip = run.export.as_ref().map(|export| match &export.rows {
+            Ok(rows) => (format!("EXPORTED {rows}"), p.success),
+            Err(_) => ("FAILED".to_string(), p.danger),
+        });
+        let min_z = summary.min_z_mm.map_or_else(|| "--".to_string(), format_mm);
+        let max_z = summary.max_z_mm.map_or_else(|| "--".to_string(), format_mm);
+        let compensation = match (summary.min_compensation_mm, summary.max_compensation_mm) {
+            (Some(low), Some(high)) => {
+                format!("{} .. {} mm", format_mm(low), format_mm(high))
+            }
+            _ => "--".to_string(),
+        };
+        let partial = if summary.complete {
+            "COMPLETE"
+        } else {
+            "PARTIAL"
+        };
+        let partial_color = if summary.complete {
+            p.success
+        } else {
+            p.warning
+        };
+
+        let stats = v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("HEIGHT MAP RESULT", p))
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(partial_color.opacity(0.16))
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(partial_color)
+                            .child(partial),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.warning)
+                    .child("MEASUREMENT ONLY"),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(9.0))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "{} / {} results | {} | phase {}",
+                        run.bound(),
+                        run.expected(),
+                        run.setup.plan.name,
+                        run.phase.label()
+                    )),
+            )
+            .when_some(run.error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(p.danger)
+                        .child(format!("STOPPED: {error}")),
+                )
+            })
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        probe_detail_cell(
+                            "VALID CELLS",
+                            &format!("{} / {}", summary.valid, summary.total),
+                            p,
+                        )
+                        .w(px(144.0)),
+                    )
+                    .child(
+                        probe_detail_cell("MISSING CELLS", &summary.missing.to_string(), p)
+                            .w(px(144.0)),
+                    )
+                    .child(
+                        probe_detail_cell("MIN MEASURED Z", &format!("{min_z} mm"), p).w(px(144.0)),
+                    )
+                    .child(
+                        probe_detail_cell("MAX MEASURED Z", &format!("{max_z} mm"), p).w(px(144.0)),
+                    )
+                    .child(probe_detail_cell("COMPENSATION RANGE", &compensation, p).w(px(144.0)))
+                    .child(
+                        probe_detail_cell(
+                            "NOMINAL SURFACE",
+                            &format!("{} mm", format_mm(summary.nominal_z_mm)),
+                            p,
+                        )
+                        .w(px(144.0)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .line_height(px(11.0))
+                    .text_color(p.text_dim)
+                    .child(
+                        "Missing cells are invalid and never interpolated. This map is not \
+                         applied to the job; streamed compensation is out of scope.",
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("height-map-export")
+                                    .label("EXPORT CSV")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .w(px(130.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .disabled(export_path.is_none())
+                                    .on_click(move |_, _, cx| {
+                                        export_view.update(cx, |this, cx| {
+                                            this.export_height_map(cx);
+                                        });
+                                    }),
+                            )
+                            .when_some(export_chip.clone(), |this, (text, color)| {
+                                this.child(
+                                    div()
+                                        .px_2()
+                                        .h(px(18.0))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(4.0))
+                                        .bg(color.opacity(0.16))
+                                        .text_size(px(8.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(color)
+                                        .child(text),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(8.0))
+                                    .line_height(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child(path_text),
+                            ),
+                    )
+                    .when_some(export_result, |this, result| {
+                        this.child(
+                            div()
+                                .font_family(self.mono.clone())
+                                .text_size(px(8.5))
+                                .line_height(px(11.0))
+                                .text_color(
+                                    if matches!(
+                                        &run.export,
+                                        Some(export) if export.rows.is_err()
+                                    ) {
+                                        p.danger
+                                    } else {
+                                        p.text_dim
+                                    },
+                                )
+                                .child(result),
+                        )
+                    }),
+            );
+
+        let viewer_pane = v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .gap_1()
+            .child(
+                div()
+                    .h(px(220.0))
+                    .w_full()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border)
+                    .overflow_hidden()
+                    .child(viewer::view(
+                        &self.viewer,
+                        p,
+                        program,
+                        marker,
+                        overlay,
+                        cx.entity(),
+                    )),
+            )
+            .child(height_map_overlay_legend(p));
+
+        h_flex()
+            .items_stretch()
+            .gap_2()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(div().w(px(300.0)).flex_shrink_0().child(stats))
+            .child(viewer_pane)
     }
 
     fn probe_apply_section(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
@@ -4191,11 +4744,10 @@ impl Shell {
         &self,
         p: Palette,
         cx: &mut Context<Self>,
-        card: ProbeCard,
         preflight: &ProbePreflight,
         running: bool,
     ) -> Div {
-        let can_run = preflight.setup.is_some() && !running && card != ProbeCard::HeightMap;
+        let can_run = preflight.setup.is_some() && !running;
         let (title, title_color, detail) = if running {
             (
                 "PROBE PROGRAM RUNNING".to_string(),
@@ -4204,6 +4756,11 @@ impl Shell {
             )
         } else if let Some(run) = self.state.probe.run() {
             match run.phase {
+                ProbePhase::Complete if run.map.is_some() => (
+                    "HEIGHT MAP COMPLETE: measurement only".to_string(),
+                    p.success,
+                    "No compensation is applied to the job; the map can be exported as CSV",
+                ),
                 ProbePhase::Complete if !self.state.probe.apply_supported() => (
                     "PROBE COMPLETE: result reported, apply deferred".to_string(),
                     p.success,
@@ -4213,6 +4770,11 @@ impl Shell {
                     "PROBE COMPLETE: review APPLY or KEEP".to_string(),
                     p.success,
                     "Nothing is applied automatically; RUN AGAIN needs a fresh preflight",
+                ),
+                ProbePhase::Failed if run.map.is_some() => (
+                    "HEIGHT MAP STOPPED: partial map shown".to_string(),
+                    p.warning,
+                    "Missing cells are invalid; no auto-resume and no interpolation",
                 ),
                 ProbePhase::Failed => (
                     "PROBE FAILED: recover, then retry the preflight".to_string(),
@@ -4225,21 +4787,22 @@ impl Shell {
                     "The engine owns motion; ABORT stops the job and never resumes",
                 ),
             }
-        } else if card == ProbeCard::HeightMap {
-            (
-                "HEIGHT MAP IS DEFERRED".to_string(),
-                p.warning,
-                "No motion is generated by this card and no result is faked",
-            )
         } else if let Some(setup) = &preflight.setup {
             let count = setup.plan.expected_probes;
+            let estimate = setup
+                .estimate
+                .as_ref()
+                .map_or_else(String::new, |estimate| {
+                    format!(" | {}", format_estimate(estimate))
+                });
             (
                 format!(
-                    "READY: {} probe{}, {:.3} mm search, safe Z {:.3} mm",
+                    "READY: {} probe{}, {:.3} mm search, safe Z {:.3} mm{}",
                     count,
                     if count == 1 { "" } else { "s" },
                     setup.plan.total_search_travel_mm(),
-                    setup.plan.safe_z_mm
+                    setup.plan.safe_z_mm,
+                    estimate
                 ),
                 p.success,
                 "RUN is the only action that starts motion; there is no auto-start",
@@ -7537,91 +8100,6 @@ fn probe_notice(title: &str, body: &str, color: Hsla, p: Palette) -> Div {
         )
 }
 
-fn probe_deferred_panel(card: ProbeCard, p: Palette) -> Div {
-    let note = card
-        .deferred_note()
-        .unwrap_or("This cycle is deferred in this build.");
-    let mut panel = v_flex()
-        .gap_2()
-        .p_3()
-        .rounded_lg()
-        .border_1()
-        .border_color(p.warning.opacity(0.5))
-        .bg(p.warning.opacity(0.08))
-        .child(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .px_2()
-                        .h(px(20.0))
-                        .flex()
-                        .items_center()
-                        .rounded(px(4.0))
-                        .bg(p.warning.opacity(0.18))
-                        .text_size(px(9.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(p.warning)
-                        .child("DEFERRED"),
-                )
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(p.text)
-                        .child(card.title()),
-                ),
-        )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .line_height(px(16.0))
-                .text_color(p.text_dim)
-                .child(note),
-        );
-    if card == ProbeCard::HeightMap {
-        panel = panel
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(p.text_faint)
-                    .child("IMPLEMENTED IN ghs-probe"),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .text_size(px(10.5))
-                    .text_color(p.text_dim)
-                    .child("Bounded row-major `HeightMapGrid` program with a `G38.2` per point")
-                    .child("Safe-Z rapid plane, per-point retract, invalid-cell tracking")
-                    .child("Bilinear interpolation that refuses to cross an invalid sample"),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(p.text_faint)
-                    .child("NOT IMPLEMENTED HERE"),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .text_size(px(10.5))
-                    .text_color(p.text_dim)
-                    .child("Grid editor, point/time estimate and progress sheet")
-                    .child("2D height overlay and program compensation/export"),
-            );
-    }
-    panel.child(
-        div()
-            .text_size(px(10.0))
-            .text_color(p.warning)
-            .child("No motion is generated by this card and no result is faked."),
-    )
-}
-
 fn probe_preflight_row(row: &PreflightRow, p: Palette) -> Div {
     let color = match row.state {
         RowState::Ok => p.success,
@@ -7656,7 +8134,21 @@ fn probe_preflight_row(row: &PreflightRow, p: Palette) -> Div {
         )
 }
 
-fn probe_program_block(program: &str, p: Palette) -> Div {
+fn probe_program_block(program: &str, limit: Option<usize>, p: Palette) -> Div {
+    let total = program.lines().count();
+    let shown = limit.map_or(total, |limit| limit.min(total));
+    let mut lines: Vec<Div> = program
+        .lines()
+        .take(shown)
+        .map(|line| div().child(line.to_string()))
+        .collect();
+    if shown < total {
+        lines.push(
+            div()
+                .text_color(p.text_faint)
+                .child(format!("... {} more line(s)", total - shown)),
+        );
+    }
     v_flex()
         .gap_1()
         .child(section_label("GENERATED PROGRAM", p))
@@ -7673,7 +8165,7 @@ fn probe_program_block(program: &str, p: Palette) -> Div {
                 .font_family("monospace")
                 .text_size(px(9.5))
                 .text_color(p.text_dim)
-                .children(program.lines().map(|line| div().child(line.to_string()))),
+                .children(lines),
         )
 }
 
@@ -7812,6 +8304,50 @@ fn stale_badge(p: Palette) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(p.danger)
         .child("STALE")
+}
+
+/// Compact legend for the measured-map overlay.
+fn height_map_overlay_legend(p: Palette) -> Div {
+    let mut swatches = h_flex().items_center().gap_1();
+    for index in 0..viewer::HEIGHT_OVERLAY_STEPS {
+        swatches = swatches.child(
+            div()
+                .w(px(22.0))
+                .h(px(10.0))
+                .rounded(px(2.0))
+                .bg(viewer::height_overlay_color(index, p)),
+        );
+    }
+    h_flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded(px(6.0))
+        .bg(p.panel)
+        .border_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .text_size(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("MEASURED Z"),
+        )
+        .child(div().text_size(px(9.0)).text_color(p.text_dim).child("LOW"))
+        .child(swatches)
+        .child(
+            div()
+                .text_size(px(9.0))
+                .text_color(p.text_dim)
+                .child("HIGH"),
+        )
+        .child(
+            div()
+                .text_size(px(9.0))
+                .text_color(p.text_faint)
+                .child("dashed = missing"),
+        )
 }
 
 fn legend(color: Hsla, text: &'static str, p: Palette) -> Div {
