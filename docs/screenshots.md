@@ -69,7 +69,21 @@ pgrep -a ghs-app || true
 
 A verified run produced `/tmp/opencode/ghs-shot-test3.png` at 1280×800.
 `/tmp/opencode/ghs-shots/start-nested.sh` is the app agent's equivalent
-long-lived helper if you need repeated captures.
+long-lived helper if you need repeated captures. Prefer wrapping the whole
+`dbus-run-session` in `timeout 60` and never leave a helper sleeping for an
+hour; an orphan `dbus-run-session` leaves a private session bus behind.
+
+If you suspect leftovers, check:
+
+```sh
+pgrep -af 'kwin_wayland --virtual|ghs-app|spectacle|dbus-daemon --nofork --print-address'
+```
+
+Kill only nested `kwin_wayland --virtual`, the test `ghs-app`, `spectacle`, and
+private `dbus-daemon --nofork --print-address` processes with no children.
+Never kill the host `kwin_wayland`, its Xwayland, or the session bus from your
+real desktop. A private bus from `dbus-run-session` is normally reaped when its
+wrapper exits; a long-lived `sleep` inside the wrapper prevents that.
 
 The `--no-lockscreen` flag matters: if the host session is locked, the nested
 virtual output shows the host lock screen instead of the app.
