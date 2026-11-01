@@ -37,8 +37,9 @@ Kit. Read these first, in order:
   orchestrator reviews and commits.
 - If a task needs an interface change in another crate, stop and report the
   needed change instead of editing that crate.
-- Use `CARGO_TARGET_DIR=/tmp/opencode/ghs-target-<role>` when building or testing
-  in parallel to avoid Cargo lock contention.
+- Build and test with the default `target/` directory in the repository. Never
+  set `CARGO_TARGET_DIR`; extra target directories are forgotten and waste disk.
+  Parallel agents share Cargo's lock, so serialize heavy builds when needed.
 - Prefer small, reviewable changes over broad refactors.
 
 ## Code standards
