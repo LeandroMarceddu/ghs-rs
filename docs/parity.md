@@ -28,7 +28,7 @@ documented, and is localized.
 | Viewer UI | Implemented (M4) | real toolpath, camera, marker, pan/zoom; 31 app tests |
 | Settings UI | Implemented (M5) | generated from `$ES`/`$EG`; verified writes |
 | Offsets/tools | Implemented (M5) | live `$#`, G10 L20 edits, app-side persisted tool table |
-| Probing | Plans done, UI in progress | `ghs-probe` 76 tests; Probe mode agent running |
+| Probing | Cycles implemented; height map pending | `ghs-probe` 76 tests; Z/edge/corner/center cards with preflight and apply |
 | Config/backup | Implemented (M5) | app/controller profiles, atomic saves, backup bundles |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
 

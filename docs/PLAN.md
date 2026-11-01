@@ -1,6 +1,6 @@
 # ghs-rs — implementation plan
 
-**Status:** M6 — probing UI; M5 settings/offsets/tools/profiles complete
+**Status:** M6 — height map; probe cycles and M5 core complete
 **Updated:** 2026-11-01
 **Reference hardware:** FlexiHAL / STM32F446, grblHAL `1.1f.20240604`
 
@@ -11,9 +11,11 @@ table, and profile/backup wiring are implemented. The approved touch shell runs
 live against the in-process simulator with serial connect, hold-to-jog, a real
 program list, job controls, progress, the tool-change sheet, the parsed
 toolpath, generated settings, offsets, and a persisted app-side tool table. The
-M6 probe plans are implemented and the Probe UI is in progress. Macros/startup
-lines/keymap editing, start-from-line, check mode, height-map UI, and hardware
-validation remain.
+M6 probe plans and the Probe workspace (Z plate, edge X/Y, corner, center
+circle, rotation and tool-length reporting) are implemented with mandatory
+preflight, PRB correlation, and confirmed `G10 L2` application. The height-map
+UI and compensation, macros/startup lines/keymap editing, start-from-line,
+check mode, and hardware validation remain.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
 it parses every status field, real-time command, system command, and runtime
