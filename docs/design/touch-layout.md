@@ -20,45 +20,47 @@ Observed at 2048×1152:
 - Top mode tabs are ~40 px, below the 48 px touch target.
 - Signals/Work labels are ~10 px, below the comfortable touch reading size.
 
-## Confirmed layout: three aligned columns
+## Confirmed layout: asymmetric three-column grid
 
-Confirmed with the user's sketch. Work sits directly below the Signals card,
-and Spindle sits below Work. The three columns share the same horizontal
-guides:
-
-- The bottom of Console/Program and Viewer aligns with the bottom of the
-  Coolant/Macros/Signals stack.
-- The MDI/DRO row aligns with the Work card.
-- The Feed/Jog row aligns with the Spindle card.
-
-The bottom controls are not a separate full-width strip; they are the bottom of
-each column.
+C1 and C2 have three rows. C3 has two rows: its top cell spans C1/C2 rows 1–2
+and holds Coolant → Macros → Signals → Work as one continuous area, with **no
+row separator between Signals and Work**. Its bottom cell is Spindle, aligned
+with the Feed/Jog row.
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│ TOP BAR: logo | Job Probe Offset Utility Tools Settings | status | RESET │
-├────────────────┬───────────────────────────────────────┬─────────────────┤
-│ CONSOLE        │ VIEWER                                │ COOLANT         │
-│ / PROGRAM      │                                       │ MACROS          │
-│ (flex)         │ (flex)                                │ SIGNALS         │
-├────────────────┼───────────────────────────────────────┼─────────────────┤
-│ MDI            │ DRO                                   │ WORK            │
-├────────────────┼───────────────────────────────────────┼─────────────────┤
-│ FEED           │ JOG                                   │ SPINDLE         │
-└────────────────┴───────────────────────────────────────┴─────────────────┘
+┌────────────────┬──────────────────────────────┬─────────────────┐
+│ Console/Program│ Viewer                       │ Coolant         │
+│                │                              │ Macros          │
+│                │                              │ Signals         │
+│                │                              │ Work            │
+├────────────────┼──────────────────────────────┤                 │
+│ MDI            │ DRO                          │                 │
+├────────────────┼──────────────────────────────┼─────────────────┤
+│ Feed           │ Jog                          │ Spindle         │
+└────────────────┴──────────────────────────────┴─────────────────┘
 ```
 
-- Left column: console/program on top, then MDI, then Feed.
-- Center column: viewer on top, then DRO, then Jog.
-- Right column: coolant/macros/signals stacked on top, then Work, then Spindle.
-- The right-hand top stack must end on the same line as the console/viewer.
-  If Coolant/Macros/Signals overflow, scroll inside the stack; never push Work
-  or Spindle down.
-- Every bottom card in a row has the **same height**. Every card fills its
-  grid cell; no fixed pixel widths.
-- MDI now aligns exactly under the console, which fixes the disproportion.
-- Work is no longer in the bottom deck; it is the right-column card between
-  Signals and Spindle.
+Shared guides:
+
+- C1/C2 row 2 ends where C3's tall top cell ends.
+- C1/C2 row 3 ends where C3's Spindle ends.
+- C3 has no guide between Signals and Work; the tall top cell is continuous.
+- MDI aligns under the console; DRO under the viewer; Feed under MDI; Jog under
+  DRO.
+- Spindle is exactly the height of the Feed/Jog row.
+
+Rules:
+
+- Left column: console/program (flex), MDI (112 px), Feed (112 px).
+- Center column: viewer (flex), DRO (112 px), Jog (112 px).
+- Right column: one flex cell containing Coolant, Macros, Signals, Work with no
+  divider between Signals and Work; then Spindle (112 px).
+- The right flex cell must end on the MDI/DRO bottom line. If its content
+  overflows, scroll inside it; never push Spindle down.
+- Work finally gets the height of rows 1+2, so its four rows can breathe.
+- Every card fills its grid cell; no fixed pixel widths.
+- The bottom controls are not a separate full-width strip; they are the bottom
+  of each column.
 
 ## Grid and tokens
 
@@ -66,7 +68,8 @@ each column.
 |---|---|
 | Top bar | 56 px |
 | Mode tabs | min 48 px height, 56 px min width |
-| Bottom card row | 112 px (min 104, max 120) |
+| MDI/DRO and Feed/Jog rows | 112 px (min 104, max 120) |
+| Right top cell | spans rows 1–2; bottom aligns with DRO |
 | Card gap | 12 px |
 | Card padding | 12 px horizontal, 10 px vertical |
 | Card radius | 8 px |
@@ -79,7 +82,7 @@ each column.
 Column widths:
 
 - 1920×1080: left 400, right 260, center flexible.
-- 1280×800: left 340, right 220, center flexible. Deck rows 104 px.
+- 1280×800: left 340, right 220, center flexible. MDI/DRO and Feed/Jog rows 104 px.
 - Portrait: top bar; viewer ~45% height; console collapsible; bottom controls
   become a 2×2 or 2×3 grid. Test 1080×1920.
 
@@ -116,13 +119,17 @@ Column widths:
 ### Spindle
 
 - On/off switch, RPM field, CW/CCW segmented control, override slider and value.
-- Height 112 px; width = right column.
+- Height 112 px; width = right column; aligns with Feed/Jog.
 
 ### Work
 
+- Lives in the tall right top cell, directly below Signals, with no divider
+  between the two.
 - Key/value rows in a 2-column grid: Origin X/Y/Z and Feed.
-- 11–12 px labels, 14 px values; no clipping. Height 112 px.
-- If it does not fit at 1280×800, move the long feed value to a second line.
+- 11–12 px labels, 14 px values; no clipping. Use the extra height; do not
+  squeeze it into a 112 px card.
+- If it does not fit at 1280×800, let the right top cell scroll internally
+  before shrinking the text below 11 px.
 
 ### Console, viewer, right rail
 
@@ -150,6 +157,7 @@ Before approval, capture at least:
 3. 1080×1920 portrait.
 
 For each: no clipped text, no horizontal scroll, no card with a different
-height than its row, all touch targets ≥48 px, console and MDI aligned, viewer
-still usable. The style is already right; this is a layout/pacing pass, not a
-redesign.
+height than its row (except the intentional C3 top cell spanning rows 1–2),
+all touch targets ≥48 px, console and MDI aligned, C3's top cell ending on the
+DRO baseline, viewer still usable. The style is already right; this is a
+layout/pacing pass, not a redesign.
