@@ -9,8 +9,9 @@ The goal is a touch-first CNC sender with the ergonomics of
 feature set of [ioSender](https://github.com/terjeio/ioSender) — on Windows,
 macOS, and Linux, with a single native binary.
 
-> **Status: pre-alpha.** The repository is at M0 (bootstrap). It cannot control
-> a machine yet. See [docs/PLAN.md](docs/PLAN.md).
+> **Status: pre-alpha, M2.** The shell drives a live in-process grblHAL
+> simulator and has a serial connection panel; job streaming, probing, and
+> hardware validation are still in progress. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
 

@@ -855,7 +855,7 @@ impl Shell {
                         div()
                             .text_size(px(9.0))
                             .text_color(p.text_faint)
-                            .child("grblHAL touch"),
+                            .child("grblHAL Sender"),
                     ),
             )
             .child(div().flex().items_center().gap_1().children(modes))
@@ -1142,7 +1142,7 @@ impl Shell {
                         if self.state.mode == Mode::Job {
                             self.state.job_name
                         } else {
-                            "M0 preview"
+                            "M2 preview"
                         },
                     )),
             )
@@ -1314,7 +1314,7 @@ impl Shell {
                             .text_color(p.text)
                             .child(self.state.mode.title()),
                     )
-                    .child(chip("M0 PREVIEW", p)),
+                    .child(chip("M2 PREVIEW", p)),
             )
             .child(body)
             .child(div().flex_1())

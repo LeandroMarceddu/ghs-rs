@@ -1,4 +1,4 @@
-//! ghs-rs touch shell.
+//! ghs-rs grblHAL Sender.
 //!
 //! Run with `cargo run -p ghs-app`. The default startup is the M2 vertical
 //! slice: an in-process FlexiHal simulator, one engine thread, and live DRO,
@@ -57,7 +57,7 @@ fn main() {
             }),
             window_min_size: Some(size(px(1024.0), px(600.0))),
             titlebar: Some(TitlebarOptions {
-                title: Some("ghs-rs - grblHAL touch shell (M2)".into()),
+                title: Some("ghs-rs - grblHAL Sender".into()),
                 ..Default::default()
             }),
             app_id: Some("ghs-rs".into()),
