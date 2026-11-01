@@ -85,6 +85,30 @@ Never kill the host `kwin_wayland`, its Xwayland, or the session bus from your
 real desktop. A private bus from `dbus-run-session` is normally reaped when its
 wrapper exits; a long-lived `sleep` inside the wrapper prevents that.
 
+### Portal and secret-service leftovers
+
+Each isolated XDG environment can also start an `xdg-desktop-portal` and
+`ksecretd` bound to that environment. They outlive the app and recreate
+`data/kwalletd` after the directory is deleted, which looks like temp dirs
+"popping back". Use the repo helper after a capture session:
+
+```sh
+python3 tools/cleanup-test-sessions.py          # show what would be killed
+python3 tools/cleanup-test-sessions.py --apply  # kill test-only daemons + remove env dirs
+```
+
+The script acts only on processes whose `/proc/<pid>/environ` contains an
+`XDG_*` path under `/tmp/opencode/ghs-*`; the real desktop's portal/secret daemons are
+untouched. Run it when no capture is in progress, then verify:
+
+```sh
+pgrep -af 'xdg-desktop-por|ksecretd'
+ls -d /tmp/opencode/ghs-m5-* /tmp/opencode/ghs-m6-* 2>/dev/null
+```
+
+The host's normal `xdg-desktop-portal`/`ksecretd` processes may remain; only the
+ones with the temp XDG prefix are test leftovers.
+
 The `--no-lockscreen` flag matters: if the host session is locked, the nested
 virtual output shows the host lock screen instead of the app.
 
