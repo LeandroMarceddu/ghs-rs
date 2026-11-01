@@ -32,14 +32,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ghs_config::ToolRecord;
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
-    MachineState, Position, Program, RealtimeCommand, SerialConfig,
+    MachineState, Position, Program, RealtimeCommand, SerialConfig, SystemCommand, Wcs,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Sizable as _, Size, h_flex, v_flex};
@@ -54,12 +56,14 @@ use gpui_kit::{
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
+use crate::offsets::OffsetStatus;
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
     Mode, ProgramKind, SignalState, format_elapsed, pause_reason_label,
 };
 use crate::theme::Palette;
+use crate::tools::{ToolField, ToolTableModel};
 use crate::viewer;
 
 const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -91,6 +95,8 @@ enum SettingsEntryPurpose {
     Search,
     /// A `Text`, `Password`, or `IPv4` setting.
     Text(u16),
+    /// The name field of the open tool sheet.
+    ToolName,
 }
 
 /// One open settings text sheet.
@@ -99,6 +105,70 @@ struct SettingsEntry {
     input: Entity<InputState>,
     masked: bool,
     error: Option<String>,
+}
+
+/// Text fields of one open tool add/edit sheet.
+///
+/// Numeric fields are strings so the shared keypad can seed and edit them
+/// without a second parsing layer. Nothing is persisted until `SAVE TOOL`,
+/// and nothing reaches the controller from this sheet.
+#[derive(Clone, Debug)]
+struct ToolEditor {
+    /// Tool number being edited; `None` for a new record.
+    original: Option<u32>,
+    number: String,
+    name: String,
+    diameter: String,
+    length: String,
+    pocket: String,
+    error: Option<String>,
+}
+
+impl ToolEditor {
+    fn new() -> Self {
+        Self {
+            original: None,
+            number: String::new(),
+            name: String::new(),
+            diameter: String::new(),
+            length: String::new(),
+            pocket: String::new(),
+            error: None,
+        }
+    }
+
+    fn from_record(record: &ToolRecord) -> Self {
+        Self {
+            original: Some(record.number),
+            number: record.number.to_string(),
+            name: record.name.clone(),
+            diameter: format!("{:.3}", record.diameter_mm),
+            length: format!("{:.3}", record.length_mm),
+            pocket: record
+                .pocket
+                .map(|pocket| pocket.to_string())
+                .unwrap_or_default(),
+            error: None,
+        }
+    }
+
+    fn value(&self, field: ToolField) -> &str {
+        match field {
+            ToolField::Number => &self.number,
+            ToolField::Diameter => &self.diameter,
+            ToolField::Length => &self.length,
+            ToolField::Pocket => &self.pocket,
+        }
+    }
+
+    fn value_mut(&mut self, field: ToolField) -> &mut String {
+        match field {
+            ToolField::Number => &mut self.number,
+            ToolField::Diameter => &mut self.diameter,
+            ToolField::Length => &mut self.length,
+            ToolField::Pocket => &mut self.pocket,
+        }
+    }
 }
 
 pub struct Shell {
@@ -122,10 +192,17 @@ pub struct Shell {
     demo_start: bool,
     demo_start_sent: bool,
     settings_entry: Option<SettingsEntry>,
+    tool_editor: Option<ToolEditor>,
+    offset_refresh_sent: bool,
+    backup_import_armed: bool,
     settings_demo_write: bool,
     settings_demo_write_done: bool,
     settings_demo_group: Option<String>,
     settings_demo_group_done: bool,
+    demo_tools: bool,
+    demo_tools_done: bool,
+    demo_offsets_write: bool,
+    demo_offsets_write_done: bool,
     _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -183,7 +260,17 @@ impl Shell {
         let mut state = AppState::new();
         // Demo-only switches used for screenshots and manual reviews. They do
         // not affect normal startup and never touch the controller.
-        state.dark = !std::env::args().any(|arg| arg == "--light");
+        let forced_light = std::env::args().any(|arg| arg == "--light");
+        state.dark = if forced_light {
+            false
+        } else {
+            match state.config.app().theme {
+                ghs_config::ThemeMode::Dark => true,
+                ghs_config::ThemeMode::Light => false,
+                ghs_config::ThemeMode::System => true,
+            }
+        };
+        crate::theme::apply(state.dark, cx);
         let mock = std::env::args().any(|arg| arg == "--mock");
         if mock {
             state.connection = ConnectionState::Mock;
@@ -215,6 +302,17 @@ impl Shell {
             arg.strip_prefix("--settings-group=")
                 .map(std::string::ToString::to_string)
         });
+        if std::env::args().any(|arg| arg == "--offsets") {
+            state.mode = Mode::Offset;
+        }
+        if std::env::args().any(|arg| arg == "--tools") {
+            state.mode = Mode::Tools;
+        }
+        if std::env::args().any(|arg| arg == "--utility") {
+            state.mode = Mode::Utility;
+        }
+        let demo_tools = std::env::args().any(|arg| arg == "--demo-tools");
+        let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
 
         let mut shell = Self {
             state,
@@ -237,10 +335,17 @@ impl Shell {
             demo_start,
             demo_start_sent: false,
             settings_entry: None,
+            tool_editor: None,
+            offset_refresh_sent: false,
+            backup_import_armed: false,
             settings_demo_write,
             settings_demo_write_done: false,
             settings_demo_group,
             settings_demo_group_done: false,
+            demo_tools,
+            demo_tools_done: false,
+            demo_offsets_write,
+            demo_offsets_write_done: false,
             _poll_task: None,
             _subscriptions: subscriptions,
         };
@@ -275,6 +380,16 @@ impl Shell {
         let mut changed = false;
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
+        }
+        // A G10 write is followed by a read-only `$#`. The engine may still be
+        // streaming the MDI line, so retry quietly until it accepts the
+        // refresh instead of pretending the table changed.
+        if self.state.offsets.status().is_pending() {
+            if !self.offset_refresh_sent {
+                changed |= self.pump_offset_refresh();
+            }
+        } else {
+            self.offset_refresh_sent = false;
         }
         // Settings writes are idle-only and verified one at a time. Pump the
         // next queued row after the previous `SettingWritten` arrived; stop the
@@ -342,6 +457,49 @@ impl Shell {
         {
             self.demo_start_sent = true;
             self.start_job(cx);
+            changed = true;
+        }
+        // Screenshot switch: seed the app-side table once the controller
+        // profile has loaded, so the profile loader cannot replace it.
+        if self.demo_tools
+            && !self.demo_tools_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_tools_done = true;
+            for (number, name, diameter, length) in [
+                (1, "6 mm flat", 6.0, 35.0),
+                (2, "3 mm ball", 3.0, 32.5),
+                (3, "6 mm ball", 6.0, 34.0),
+                (4, "90 deg V", 9.525, 30.0),
+            ] {
+                let _ = self.state.tools.insert(ToolRecord {
+                    number,
+                    name: name.to_string(),
+                    diameter_mm: diameter,
+                    length_mm: length,
+                    pocket: Some(number),
+                });
+            }
+            self.state.tools.set_status("DEMO TABLE (UNSAVED)");
+            changed = true;
+        }
+        // Screenshot switch: one real G10 write through the normal path.
+        if self.demo_offsets_write
+            && !self.demo_offsets_write_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+            && self.state.offsets.reported()
+            && self.mdi_allowed()
+        {
+            self.demo_offsets_write_done = true;
+            self.state.mode = Mode::Offset;
+            self.state.left_tab = LeftTab::Console;
+            self.state.console.clear();
+            self.state.push_console(
+                ConsoleLevel::Info,
+                "Demo: G10 L20 write through the normal MDI path",
+            );
+            self.send_offset_value(Wcs::G54, Axis::X, 12.5, cx);
             changed = true;
         }
         // Follow the current line in the Program tab. Only a changed line
@@ -666,6 +824,14 @@ impl Shell {
                     None,
                 )
             }
+            SettingsEntryPurpose::ToolName => (
+                self.tool_editor
+                    .as_ref()
+                    .map(|editor| editor.name.clone())
+                    .unwrap_or_default(),
+                false,
+                None,
+            ),
         };
         let input = if let Some(entry) = self.settings_entry.as_ref() {
             entry
@@ -705,6 +871,15 @@ impl Shell {
             cx.notify();
             return;
         }
+        if purpose == SettingsEntryPurpose::ToolName {
+            if let Some(editor) = self.tool_editor.as_mut() {
+                editor.name = value.trim().to_string();
+                editor.error = None;
+            }
+            self.settings_entry = None;
+            cx.notify();
+            return;
+        }
         let SettingsEntryPurpose::Text(number) = purpose else {
             return;
         };
@@ -727,6 +902,279 @@ impl Shell {
     /// Close the text sheet without changing anything.
     fn cancel_settings_entry(&mut self, cx: &mut Context<Self>) {
         self.settings_entry = None;
+        cx.notify();
+    }
+
+    // -------------------------------------------------------- tools/profile
+
+    fn open_tool_editor(&mut self, record: Option<&ToolRecord>, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.settings_entry = None;
+        self.tool_editor = Some(
+            record
+                .map(ToolEditor::from_record)
+                .unwrap_or_else(ToolEditor::new),
+        );
+        cx.notify();
+    }
+
+    fn open_tool_field(&mut self, field: ToolField, cx: &mut Context<Self>) {
+        let Some(editor) = self.tool_editor.as_ref() else {
+            return;
+        };
+        let buffer = editor.value(field).to_string();
+        self.state.keypad = Some(crate::state::KeypadState {
+            target: KeypadTarget::Tool(field),
+            buffer,
+            fresh: true,
+            hint: Some(field.title().to_string()),
+        });
+        cx.notify();
+    }
+
+    fn open_tool_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_entry(SettingsEntryPurpose::ToolName, window, cx);
+    }
+
+    fn save_tool_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.tool_editor.clone() else {
+            return;
+        };
+        let record = match ToolTableModel::record_from_text(
+            &editor.number,
+            &editor.name,
+            &editor.diameter,
+            &editor.length,
+            &editor.pocket,
+        ) {
+            Ok(record) => record,
+            Err(message) => {
+                if let Some(editor) = self.tool_editor.as_mut() {
+                    editor.error = Some(message);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(original) = editor.original
+            && original != record.number
+            && self.state.tools.get(record.number).is_some()
+        {
+            if let Some(editor) = self.tool_editor.as_mut() {
+                editor.error = Some(format!("T{} already exists", record.number));
+            }
+            cx.notify();
+            return;
+        }
+        if editor.original.is_none() && self.state.tools.get(record.number).is_some() {
+            if let Some(editor) = self.tool_editor.as_mut() {
+                editor.error = Some(format!(
+                    "T{} already exists; edit that row instead",
+                    record.number
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        let number = record.number;
+        if let Err(error) = self.state.tools.insert(record) {
+            if let Some(editor) = self.tool_editor.as_mut() {
+                editor.error = Some(error.to_string());
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(original) = editor.original
+            && original != number
+        {
+            self.state.tools.remove(original);
+        }
+        self.tool_editor = None;
+        self.settings_entry = None;
+        self.state.push_console(
+            ConsoleLevel::Info,
+            format!("Tool T{number} updated in the app table (unsaved)"),
+        );
+        cx.notify();
+    }
+
+    fn delete_tool(&mut self, number: u32, cx: &mut Context<Self>) {
+        if self.state.tools.remove(number) {
+            self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Tool T{number} removed from the app table (unsaved)"),
+            );
+            if self.tool_editor.as_ref().and_then(|editor| editor.original) == Some(number) {
+                self.tool_editor = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Save tools, offsets, and the settings snapshot into the local profile.
+    fn save_profile(&mut self, cx: &mut Context<Self>) {
+        if self.state.config.has_pending_profile() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Confirm or discard the unverified profile data in Utility before saving",
+            );
+            cx.notify();
+            return;
+        }
+        let tools = self.state.tools.table().clone();
+        let offsets = self.state.profile_offset_snapshot();
+        let settings = self.state.profile_settings_snapshot();
+        match self.state.config.save_profile(&tools, &offsets, settings) {
+            Ok(path) => {
+                self.state.tools.mark_saved(path.clone());
+                self.state.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Local profile saved: {}", path.display()),
+                );
+            }
+            Err(message) => {
+                self.state.tools.set_error(message.clone());
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("Profile save: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn save_app_config(&mut self, cx: &mut Context<Self>) {
+        match self.state.config.save_app() {
+            Ok(path) => self.state.push_console(
+                ConsoleLevel::Ok,
+                format!("App settings saved: {}", path.display()),
+            ),
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("App settings: {message}")),
+        }
+        cx.notify();
+    }
+
+    fn use_pending_profile(&mut self, cx: &mut Context<Self>) {
+        if let Some(tools) = self.state.config.use_pending_profile() {
+            let path = self.state.config.profile_path();
+            let count = tools.len();
+            self.state
+                .tools
+                .adopt(tools, path, "UNVERIFIED, APPLIED BY OPERATOR");
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Unverified profile applied locally: {count} tool(s)"),
+            );
+        }
+        cx.notify();
+    }
+
+    fn export_backup(&mut self, cx: &mut Context<Self>) {
+        let tools = self.state.tools.table().clone();
+        let offsets = self.state.profile_offset_snapshot();
+        let settings = self.state.profile_settings_snapshot();
+        match self.state.config.export_backup(&tools, &offsets, settings) {
+            Ok(path) => self.state.push_console(
+                ConsoleLevel::Ok,
+                format!("Backup exported: {}", path.display()),
+            ),
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Backup export: {message}")),
+        }
+        cx.notify();
+    }
+
+    fn validate_backup(&mut self, cx: &mut Context<Self>) {
+        match self.state.config.validate_backup() {
+            Ok(preview) => {
+                let text = format!(
+                    "Backup {}: {} tools, {} WCS | identity {}{}",
+                    preview.path.display(),
+                    preview.tools,
+                    preview.work_offsets,
+                    preview.identity.as_ref().map_or_else(
+                        || "not checked".to_string(),
+                        std::string::ToString::to_string
+                    ),
+                    preview
+                        .warning
+                        .as_ref()
+                        .map_or_else(String::new, |warning| { format!(" | WARNING: {warning}") })
+                );
+                self.state.push_console(
+                    if preview.warning.is_some() {
+                        ConsoleLevel::Warn
+                    } else {
+                        ConsoleLevel::Ok
+                    },
+                    text,
+                );
+            }
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Backup validation: {message}")),
+        }
+        cx.notify();
+    }
+
+    fn import_backup(&mut self, cx: &mut Context<Self>) {
+        if !self.backup_import_armed {
+            match self.state.config.validate_backup() {
+                Ok(preview) if preview.warning.is_some() => {
+                    self.backup_import_armed = true;
+                    self.state.push_console(
+                        ConsoleLevel::Warn,
+                        format!(
+                            "Backup needs confirmation: {}; press IMPORT again",
+                            preview.warning.unwrap_or_default()
+                        ),
+                    );
+                    cx.notify();
+                    return;
+                }
+                Ok(_) => {}
+                Err(message) => {
+                    self.state
+                        .push_console(ConsoleLevel::Error, format!("Backup validation: {message}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let allow_warning = self.backup_import_armed;
+        self.backup_import_armed = false;
+        match self.state.config.import_backup(allow_warning) {
+            Ok(import) => {
+                if let Some(tools) = import.tools {
+                    let count = tools.len();
+                    let profile_path = self.state.config.profile_path();
+                    self.state.tools.adopt(tools, profile_path, "IMPORTED");
+                    self.state.push_console(
+                        ConsoleLevel::Ok,
+                        format!(
+                            "Backup imported from {}: {} tool(s)",
+                            import.path.display(),
+                            count
+                        ),
+                    );
+                } else {
+                    self.state.push_console(
+                        ConsoleLevel::Warn,
+                        format!(
+                            "Imported {} for another controller; current session unchanged",
+                            import.key.display_name()
+                        ),
+                    );
+                }
+                if let Some(warning) = import.warning {
+                    self.state.push_console(ConsoleLevel::Warn, warning);
+                }
+            }
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Backup import: {message}")),
+        }
         cx.notify();
     }
 
@@ -961,18 +1409,136 @@ impl Shell {
         }));
     }
 
+    fn pump_offset_refresh(&mut self) -> bool {
+        if !self.state.live || !self.ready() {
+            return false;
+        }
+        match self.send_command_quiet(Command::System(SystemCommand::Offsets)) {
+            Ok(()) => {
+                self.offset_refresh_sent = true;
+                true
+            }
+            Err(EngineError::Busy) => false,
+            Err(error) => {
+                self.state.offsets.failed(error.to_string());
+                self.offset_refresh_sent = false;
+                true
+            }
+        }
+    }
+
+    /// Ask for a read-only `$#` refresh of the offsets view.
+    fn request_offset_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state
+                .push_console(ConsoleLevel::Warn, "Offsets need a live controller");
+            cx.notify();
+            return;
+        }
+        if !self.ready() {
+            self.state
+                .push_console(ConsoleLevel::Warn, "Offsets refresh requires a connection");
+            cx.notify();
+            return;
+        }
+        self.state.offsets.refresh_requested();
+        self.offset_refresh_sent = false;
+        self.pump_offset_refresh();
+        cx.notify();
+    }
+
+    /// Send one `G10 L20` line for a display-unit value.
+    ///
+    /// The line changes a stored offset; it never moves an axis. The engine
+    /// gateway still decides whether MDI is allowed in the current state.
+    fn send_offset_value(&mut self, wcs: Wcs, axis: Axis, value: f64, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state
+                .push_console(ConsoleLevel::Warn, "Offset edits require a live controller");
+            cx.notify();
+            return;
+        }
+        if !self.mdi_allowed() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Offset writes require the controller to be Idle",
+            );
+            cx.notify();
+            return;
+        }
+        match self.state.offsets.g10_command(wcs, axis, value) {
+            Ok(line) => {
+                if self.send_mdi_line(line.clone()) {
+                    self.state.offsets.command_sent(line);
+                    self.offset_refresh_sent = false;
+                } else {
+                    self.state.offsets.failed("engine rejected the G10 line");
+                }
+            }
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Offset: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn zero_offset_axis(&mut self, wcs: Wcs, axis: Axis, cx: &mut Context<Self>) {
+        self.send_offset_value(wcs, axis, 0.0, cx);
+    }
+
+    fn zero_offset_all(&mut self, wcs: Wcs, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state
+                .push_console(ConsoleLevel::Warn, "Offset edits require a live controller");
+            cx.notify();
+            return;
+        }
+        if !self.mdi_allowed() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Offset writes require the controller to be Idle",
+            );
+            cx.notify();
+            return;
+        }
+        match self.state.offsets.zero_all_command(wcs) {
+            Ok(line) => {
+                if self.send_mdi_line(line.clone()) {
+                    self.state.offsets.command_sent(line);
+                    self.offset_refresh_sent = false;
+                } else {
+                    self.state.offsets.failed("engine rejected the G10 line");
+                }
+            }
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Offset: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
     fn zero_axis(&mut self, axis: Axis, cx: &mut Context<Self>) {
         if !self.state.live {
             self.state.zero_axis(axis);
             cx.notify();
             return;
         }
-        let line = format!(
-            "G10 L20 P{} {}0",
-            self.state.wcs_program_number(),
-            axis.label()
-        );
-        self.send_mdi_line(line);
+        let Some(wcs) = Wcs::from_index(self.state.wcs_index) else {
+            return;
+        };
+        match self.state.offsets.zero_axis_command(wcs, axis) {
+            Ok(line) => {
+                if self.send_mdi_line(line.clone()) {
+                    self.state.offsets.command_sent(line);
+                    self.offset_refresh_sent = false;
+                }
+            }
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Warn, format!("Offset: {message}")),
+        }
         cx.notify();
     }
 
@@ -987,10 +1553,10 @@ impl Shell {
                 cx.notify();
                 return;
             }
-            self.state.wcs_index = index;
+            self.state.set_wcs_index(index);
             self.send_mdi_line(AppState::wcs_at(index).to_string());
         } else {
-            self.state.wcs_index = index;
+            self.state.set_wcs_index(index);
         }
         cx.notify();
     }
@@ -1257,30 +1823,45 @@ impl Shell {
             .then(|| self.state.keypad.clone())
             .flatten();
         self.state.keypad_action(action);
-        if self.state.live
-            && let Some(keypad) = submitted
-        {
-            match keypad.target {
-                KeypadTarget::Mdi => {}
-                KeypadTarget::Rpm => {
-                    if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
-                        let rpm = value.clamp(0.0, 24_000.0).round() as u32;
-                        self.send_mdi_line(format!("S{rpm}"));
-                    }
+        if let Some(keypad) = submitted {
+            if let KeypadTarget::Tool(field) = keypad.target {
+                if let Some(editor) = self.tool_editor.as_mut() {
+                    *editor.value_mut(field) = keypad.buffer.trim().to_string();
+                    editor.error = None;
                 }
-                KeypadTarget::Dro(axis) => {
-                    if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
-                        let line = format!(
-                            "G10 L20 P{} {}{value:.3}",
-                            self.state.wcs_program_number(),
-                            axis.label()
-                        );
-                        self.send_mdi_line(line);
+            } else if self.state.live {
+                match keypad.target {
+                    KeypadTarget::Mdi => {}
+                    KeypadTarget::Rpm => {
+                        if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
+                            let rpm = value.clamp(0.0, 24_000.0).round() as u32;
+                            self.send_mdi_line(format!("S{rpm}"));
+                        }
                     }
+                    KeypadTarget::Dro(axis) => {
+                        if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
+                            let Some(wcs) = Wcs::from_index(self.state.wcs_index) else {
+                                return;
+                            };
+                            self.send_offset_value(wcs, axis, value, cx);
+                        }
+                    }
+                    KeypadTarget::WorkOffset { wcs, axis } => {
+                        if let (Some(wcs), Ok(value)) =
+                            (Wcs::from_index(wcs), keypad.buffer.trim().parse::<f64>())
+                        {
+                            self.send_offset_value(wcs, axis, value, cx);
+                        } else {
+                            self.state.push_console(
+                                ConsoleLevel::Warn,
+                                format!("'{}' is not a number", keypad.buffer),
+                            );
+                        }
+                    }
+                    // A settings value stays local until Apply; `AppState`
+                    // already wrote it into the row draft.
+                    KeypadTarget::Setting(_) | KeypadTarget::Tool(_) => {}
                 }
-                // A settings value stays local until Apply; `AppState` already
-                // wrote it into the row draft.
-                KeypadTarget::Setting(_) => {}
             }
         }
         cx.notify();
@@ -1405,6 +1986,7 @@ impl Shell {
                         theme_view.update(cx, |this, cx| {
                             this.state.dark = dark;
                             Palette::new(dark).apply(cx);
+                            this.state.config.set_theme(dark);
                             cx.notify();
                         });
                     }),
@@ -1625,7 +2207,8 @@ impl Shell {
         let title = match self.state.mode {
             Mode::Job => self.state.job_title().to_string(),
             Mode::Settings => format!("{} settings from $ES/$EG", self.state.settings.total()),
-            _ => "M2 preview".to_string(),
+            _ if self.state.live => "M5 live workspace".to_string(),
+            _ => "M5 preview".to_string(),
         };
         let header = div()
             .h(px(48.0))
@@ -1974,14 +2557,16 @@ impl Shell {
                         ("Probe cycles hidden", "CAP"),
                     ]
                 };
-                v_flex().gap_2().child(self.list_rows(p, items))
+                v_flex()
+                    .gap_2()
+                    .child(self.list_rows(p, items))
+                    .into_any_element()
             }
-            Mode::Offset => self.offset_rows(p),
-            Mode::Utility => self.utility_rows(p),
-            Mode::Tools => self.tool_rows(p),
+            Mode::Offset => self.offsets_view(p, cx).into_any_element(),
+            Mode::Utility => self.utility_view(p, cx).into_any_element(),
+            Mode::Tools => self.tools_view(p, cx).into_any_element(),
             Mode::Settings => unreachable!(),
         };
-        let view = cx.entity();
         v_flex()
             .gap_2()
             .p_3()
@@ -1997,25 +2582,9 @@ impl Shell {
                             .text_color(p.text)
                             .child(self.state.mode.title()),
                     )
-                    .child(chip("M2 PREVIEW", p)),
+                    .child(chip(if self.state.live { "LIVE" } else { "MOCK" }, p)),
             )
-            .child(body)
-            .child(div().flex_1())
-            .child(
-                Button::new("mode-back")
-                    .label("Back to Job")
-                    .h(px(48.0))
-                    .w(px(140.0))
-                    .rounded_lg()
-                    .text_size(px(12.0))
-                    .secondary()
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.state.mode = Mode::Job;
-                            cx.notify();
-                        });
-                    }),
-            )
+            .child(div().flex_1().min_h(px(0.0)).child(body))
     }
 
     fn list_rows(&self, p: Palette, items: &[(&str, &str)]) -> Div {
@@ -2026,129 +2595,691 @@ impl Shell {
         )
     }
 
-    fn offset_rows(&self, p: Palette) -> Div {
-        const ROWS: [(&str, &str, &str, &str); 6] = [
-            ("G54", "-123.450", "-87.200", "-2.000"),
-            ("G55", "0.000", "0.000", "0.000"),
-            ("G56", "-500.000", "-320.000", "0.000"),
-            ("G57", "0.000", "0.000", "0.000"),
-            ("G58", "0.000", "0.000", "0.000"),
-            ("G59", "0.000", "0.000", "0.000"),
-        ];
-        v_flex()
-            .gap_1()
-            .p_1()
-            .children(ROWS.iter().map(|(wcs, x, y, z)| {
-                let active = *wcs == self.state.wcs();
-                h_flex()
-                    .items_center()
-                    .h(px(34.0))
-                    .gap_2()
-                    .px_2()
-                    .rounded(px(6.0))
-                    .bg(if active { p.accent_muted } else { p.panel_alt })
-                    .child(
-                        div()
-                            .w(px(48.0))
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if active { p.accent } else { p.text_dim })
-                            .child(*wcs),
-                    )
-                    .child(num_cell(x, p))
-                    .child(num_cell(y, p))
-                    .child(num_cell(z, p))
-            }))
-    }
+    fn offsets_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let model = &self.state.offsets;
+        let rows = model.wcs_rows();
+        let named = model.named_rows();
+        let can_edit = self.state.live && self.mdi_allowed();
+        let active_wcs = Wcs::from_index(self.state.wcs_index).unwrap_or(Wcs::G54);
+        let refresh_view = view.clone();
+        let zero_active_view = view.clone();
 
-    fn utility_rows(&self, p: Palette) -> Div {
-        const ITEMS: [(&str, &str); 4] = [
-            ("Surface stock", "Generate a facing program"),
-            ("Square gantry", "Two-edge alignment routine"),
-            ("Calibrate steps", "Move, measure, correct"),
-            ("Outline check", "Bounds before a run"),
-        ];
-        v_flex()
-            .gap_2()
-            .children(ITEMS.iter().map(|(name, detail)| {
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .p_2()
-                    .rounded_lg()
-                    .bg(p.panel_alt)
-                    .child(
-                        v_flex()
-                            .child(div().text_size(px(13.0)).text_color(p.text).child(*name))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(p.text_faint)
-                                    .child(*detail),
-                            ),
-                    )
-                    .child(chip("M7", p))
-            }))
-    }
-
-    fn tool_rows(&self, p: Palette) -> Div {
-        let caps = &self.state.profile.capabilities;
-        let tools: &[(&str, &str, &str)] = if caps.has_tool_table {
-            &[
-                ("T1", "6 mm flat", "0.000"),
-                ("T2", "3 mm flat", "0.000"),
-                ("T3", "6 mm ball", "0.000"),
-                ("T4", "90 deg V", "0.000"),
-            ]
-        } else {
-            &[]
+        let (status_color, status_text) = match model.status() {
+            OffsetStatus::Idle if !model.reported() => (p.text_faint, "WAITING FOR $#".to_string()),
+            OffsetStatus::Idle => (p.success, "READY".to_string()),
+            OffsetStatus::Refreshing => (p.warning, "REFRESHING AFTER WRITE".to_string()),
+            OffsetStatus::Refreshed => (p.success, "REFRESHED FROM $#".to_string()),
+            OffsetStatus::Failed(message) => (p.danger, format!("FAILED: {message}")),
         };
-        v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(p.text_faint)
-                    .child(format!(
-                        "APP-SIDE TABLE | controller reports {} entries{}",
-                        caps.tool_table_entries,
-                        if caps.has_tool_table {
-                            ""
-                        } else {
-                            " | capability not reported"
-                        }
-                    )),
-            )
-            .children(tools.iter().map(|(tool, kind, offset)| {
+
+        let mut list = v_flex().id("offset-wcs-list").gap_1();
+        for row in rows {
+            let row_view = view.clone();
+            let zero_all_view = view.clone();
+            let wcs = row.wcs;
+            let active = row.active;
+            let mut line = h_flex()
+                .items_center()
+                .gap_1()
+                .h(px(48.0))
+                .px_1()
+                .rounded(px(6.0))
+                .bg(if active { p.accent_muted } else { p.panel_alt });
+            line = line.child(
+                Button::new(format!("wcs-{}", wcs.as_str()))
+                    .label(wcs.as_str())
+                    .h(px(44.0))
+                    .w(px(64.0))
+                    .rounded(px(6.0))
+                    .text_size(px(12.0))
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(if active { p.accent_muted } else { p.panel_alt })
+                            .foreground(if active { p.accent } else { p.text_dim })
+                            .hover(p.raised_hover)
+                            .active(p.accent_muted),
+                    )
+                    .disabled(!self.mdi_allowed())
+                    .on_click(move |_, _, cx| {
+                        row_view.update(cx, |this, cx| {
+                            this.select_wcs(wcs.index(), cx);
+                        });
+                    }),
+            );
+            for axis in [Axis::X, Axis::Y, Axis::Z] {
+                let value = row.values.get(axis.index()).copied().flatten();
+                let text = model.format_optional(value);
+                let value_view = view.clone();
+                let zero_view = view.clone();
+                line = line
+                    .child(
+                        Button::new(format!("off-{}-{}", wcs.as_str(), axis.label()))
+                            .label(format!("{text:>9}"))
+                            .h(px(44.0))
+                            .w(px(92.0))
+                            .rounded(px(6.0))
+                            .text_size(px(13.0))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(p.panel)
+                                    .foreground(if value.is_some() {
+                                        p.text
+                                    } else {
+                                        p.text_faint
+                                    })
+                                    .hover(p.raised_hover)
+                                    .active(p.accent_muted),
+                            )
+                            .border_1()
+                            .border_color(p.border)
+                            .disabled(!can_edit)
+                            .on_click(move |_, _, cx| {
+                                value_view.update(cx, |this, cx| {
+                                    this.state.open_keypad(KeypadTarget::WorkOffset {
+                                        wcs: wcs.index(),
+                                        axis,
+                                    });
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(format!("off0-{}-{}", wcs.as_str(), axis.label()))
+                            .label("0")
+                            .h(px(44.0))
+                            .w(px(34.0))
+                            .rounded(px(6.0))
+                            .text_size(px(12.0))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(p.panel_alt)
+                                    .foreground(p.warning)
+                                    .hover(p.raised_hover)
+                                    .active(p.raised),
+                            )
+                            .disabled(!can_edit)
+                            .on_click(move |_, _, cx| {
+                                zero_view.update(cx, |this, cx| {
+                                    this.zero_offset_axis(wcs, axis, cx);
+                                });
+                            }),
+                    );
+            }
+            line = line.child(
+                Button::new(format!("off-all-{}", wcs.as_str()))
+                    .label("ZERO ALL")
+                    .h(px(44.0))
+                    .w(px(80.0))
+                    .rounded(px(6.0))
+                    .text_size(px(10.0))
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(p.panel_alt)
+                            .foreground(p.warning)
+                            .hover(p.raised_hover)
+                            .active(p.raised),
+                    )
+                    .disabled(!can_edit)
+                    .on_click(move |_, _, cx| {
+                        zero_all_view.update(cx, |this, cx| {
+                            this.zero_offset_all(wcs, cx);
+                        });
+                    }),
+            );
+            list = list.child(line);
+        }
+
+        let mut named_list = v_flex().gap_1().pt_2();
+        named_list = named_list.child(
+            div()
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child("READ-ONLY $# PARAMETERS"),
+        );
+        for row in named {
+            let value_color = if row.note == Some("NON-PERSISTENT") {
+                p.warning
+            } else {
+                p.text
+            };
+            named_list = named_list.child(
                 h_flex()
                     .items_center()
-                    .gap_3()
-                    .h(px(40.0))
-                    .px_2()
-                    .rounded(px(6.0))
-                    .bg(p.panel_alt)
+                    .gap_2()
+                    .h(px(24.0))
+                    .px_1()
                     .child(
                         div()
-                            .w(px(34.0))
-                            .text_size(px(12.0))
+                            .w(px(52.0))
+                            .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(p.accent)
-                            .child(*tool),
+                            .text_color(p.text_dim)
+                            .child(row.label),
                     )
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
+                            .font_family(self.mono.clone())
                             .text_size(px(12.0))
-                            .text_color(p.text)
-                            .child(*kind),
+                            .text_color(value_color)
+                            .child(row.value),
+                    )
+                    .when_some(row.note, |this, note| this.child(chip(note, p))),
+            );
+        }
+
+        v_flex()
+            .id("offset-mode-scroll")
+            .gap_2()
+            .size_full()
+            .overflow_y_scrollbar()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(chip(&format!("ACTIVE {}", active_wcs.as_str()), p))
+                            .child(chip(self.state.unit(), p))
+                            .child(chip("G10 L20", p)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("offset-refresh")
+                                    .label("REFRESH $#")
+                                    .secondary()
+                                    .h(px(44.0))
+                                    .w(px(112.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .disabled(!self.state.live || !self.ready())
+                                    .on_click(move |_, _, cx| {
+                                        refresh_view.update(cx, |this, cx| {
+                                            this.request_offset_refresh(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("offset-zero-active")
+                                    .label("ZERO ACTIVE")
+                                    .warning()
+                                    .h(px(44.0))
+                                    .w(px(118.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .disabled(!can_edit)
+                                    .on_click(move |_, _, cx| {
+                                        zero_active_view.update(cx, |this, cx| {
+                                            this.zero_offset_all(active_wcs, cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "Tap a value to set G10 L20 for that WCS; 0 zeroes one axis. \
+                         Zeroing changes the stored offset only and never moves an axis.",
+            ))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .h(px(20.0))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(7.0))
+                                    .h(px(7.0))
+                                    .rounded(px(999.0))
+                                    .bg(status_color),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(status_color)
+                                    .child(status_text),
+                            ),
+                    )
+                    .child(
+                        div().text_size(px(10.0)).text_color(p.text_faint).child(
+                            model
+                                .last_line()
+                                .unwrap_or("No offset write yet")
+                                .to_string(),
+                        ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(24.0))
+                    .px_1()
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("WCS"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(p.text_dim)
-                            .child(format!("TLO {offset}")),
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("X / Y / Z IN DISPLAY UNITS"),
+                    ),
+            )
+            .child(list)
+            .child(named_list)
+            .into_any_element()
+    }
+
+    fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let config = &self.state.config;
+        let profile_path = config
+            .profile_path()
+            .map_or_else(|| "--".to_string(), |path| path.display().to_string());
+        let backup_path = config
+            .backup_path()
+            .map_or_else(|| "--".to_string(), |path| path.display().to_string());
+        let identity = config.identity_line();
+        let result = config.last_result().map(|result| {
+            (
+                if result.ok { p.success } else { p.danger },
+                result.text.clone(),
+            )
+        });
+        let app_error = config.app_error().map(std::string::ToString::to_string);
+        let profile_error = config.profile_error().map(std::string::ToString::to_string);
+        let has_pending = config.has_pending_profile();
+        let unverified = config.unverified_identity();
+        let corrupt = config.corrupt_profile();
+        let import_armed = self.backup_import_armed;
+
+        let save_view = view.clone();
+        let app_view = view.clone();
+        let pending_view = view.clone();
+        let export_view = view.clone();
+        let validate_view = view.clone();
+        let import_view = view;
+
+        let profile_card = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(section_label("CONTROLLER PROFILE", p))
+                    .child(chip(
+                        if corrupt {
+                            "CORRUPT"
+                        } else if unverified {
+                            "UNVERIFIED"
+                        } else if has_pending {
+                            "PENDING CONFIRMATION"
+                        } else if config.key().is_some() {
+                            "LOCAL ONLY"
+                        } else {
+                            "NO CONTROLLER"
+                        },
+                        p,
+                    )),
+            )
+            .child(div().text_size(px(13.0)).text_color(p.text).child(identity))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(format!("FILE   {profile_path}")),
+            )
+            .when_some(profile_error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.warning).child(error))
+            })
+            .when_some(app_error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("profile-save")
+                            .label("SAVE PROFILE")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(140.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(corrupt)
+                            .on_click(move |_, _, cx| {
+                                save_view.update(cx, |this, cx| this.save_profile(cx));
+                            }),
                     )
-            }))
+                    .child(
+                        Button::new("profile-app-save")
+                            .label("SAVE APP")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(110.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                app_view.update(cx, |this, cx| this.save_app_config(cx));
+                            }),
+                    )
+                    .when(has_pending, |this| {
+                        this.child(
+                            Button::new("profile-use-pending")
+                                .label("USE LOCAL DATA")
+                                .warning()
+                                .h(px(48.0))
+                                .w(px(150.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .on_click(move |_, _, cx| {
+                                    pending_view.update(cx, |this, cx| {
+                                        this.use_pending_profile(cx);
+                                    });
+                                }),
+                        )
+                    }),
+            );
+
+        let backup_card = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(section_label("BACKUP BUNDLE", p))
+                    .child(chip("JSON / V1", p)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(format!("PATH   {backup_path}")),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "Export writes app prefs, identity, settings, offsets, and tools; \
+                         import validates before writing and never pushes to the controller.",
+            ))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("backup-export")
+                            .label("EXPORT")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(104.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                export_view.update(cx, |this, cx| this.export_backup(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("backup-validate")
+                            .label("VALIDATE")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(104.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                validate_view.update(cx, |this, cx| this.validate_backup(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("backup-import")
+                            .label(if import_armed {
+                                "CONFIRM IMPORT"
+                            } else {
+                                "IMPORT"
+                            })
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(if import_armed { 160.0 } else { 104.0 }))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                import_view.update(cx, |this, cx| this.import_backup(cx));
+                            }),
+                    ),
+            )
+            .when_some(result, |this, (color, text)| {
+                this.child(div().text_size(px(10.0)).text_color(color).child(text))
+            });
+
+        v_flex()
+            .id("utility-scroll")
+            .gap_2()
+            .size_full()
+            .overflow_y_scrollbar()
+            .child(profile_card)
+            .child(backup_card)
+            .into_any_element()
+    }
+
+    fn tools_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let model = &self.state.tools;
+        let table = model.table();
+        let path = model.path().map_or_else(
+            || "NO PROFILE PATH".to_string(),
+            |path| path.display().to_string(),
+        );
+        let new_view = view.clone();
+        let save_view = view.clone();
+        let count = model.len();
+        let dirty = model.dirty();
+        let error = model.error().map(std::string::ToString::to_string);
+        let status = model.file().status.clone();
+
+        let rows = table.tools.clone();
+        let mut list = v_flex().id("tool-table-list").gap_1();
+        if model.is_empty() {
+            list = list.child(
+                div()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(p.panel_alt)
+                    .text_size(px(12.0))
+                    .text_color(p.text_dim)
+                    .child(
+                        "No tools in the app table. Add one so the M6 sheet can show a \
+                         name, diameter, and length instead of only the number.",
+                    ),
+            );
+        }
+        for record in rows {
+            let row_view = view.clone();
+            let delete_view = view.clone();
+            let number = record.number;
+            let name = ToolTableModel::display_name(&record);
+            let summary = ToolTableModel::summary(&record);
+            let row = record.clone();
+            list = list.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(48.0))
+                    .px_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .w(px(40.0))
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.accent)
+                            .child(format!("T{number}")),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(p.text)
+                                    .truncate()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_faint)
+                                    .child(summary),
+                            ),
+                    )
+                    .child(
+                        Button::new(format!("tool-edit-{number}"))
+                            .label("EDIT")
+                            .secondary()
+                            .h(px(40.0))
+                            .w(px(62.0))
+                            .rounded(px(6.0))
+                            .text_size(px(10.0))
+                            .on_click(move |_, window, cx| {
+                                row_view.update(cx, |this, cx| {
+                                    this.open_tool_editor(Some(&row), cx);
+                                    let _ = window;
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(format!("tool-delete-{number}"))
+                            .label("DEL")
+                            .warning()
+                            .h(px(40.0))
+                            .w(px(54.0))
+                            .rounded(px(6.0))
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                delete_view.update(cx, |this, cx| {
+                                    this.delete_tool(number, cx);
+                                });
+                            }),
+                    ),
+            );
+        }
+
+        v_flex()
+            .id("tools-mode-scroll")
+            .gap_2()
+            .size_full()
+            .overflow_y_scrollbar()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(chip(&format!("{count} TOOLS"), p))
+                            .when(dirty, |this| this.child(chip("UNSAVED", p)))
+                            .child(chip(
+                                if self.state.profile.capabilities.has_tool_table {
+                                    "CONTROLLER TABLE"
+                                } else {
+                                    "APP TABLE"
+                                },
+                                p,
+                            ))
+                            .child(chip(
+                                &format!(
+                                    "CTRL {} ENTRIES",
+                                    self.state.profile.capabilities.tool_table_entries
+                                ),
+                                p,
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("tool-new")
+                                    .label("NEW TOOL")
+                                    .primary()
+                                    .h(px(44.0))
+                                    .w(px(108.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .on_click(move |_, _, cx| {
+                                        new_view.update(cx, |this, cx| {
+                                            this.open_tool_editor(None, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("tool-save")
+                                    .label("SAVE")
+                                    .secondary()
+                                    .h(px(44.0))
+                                    .w(px(82.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .on_click(move |_, _, cx| {
+                                        save_view.update(cx, |this, cx| this.save_profile(cx));
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_0()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(format!("FILE   {path}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(if error.is_some() {
+                                p.danger
+                            } else {
+                                p.text_faint
+                            })
+                            .child(format!("STATUS {status}")),
+                    ),
+            )
+            .when_some(error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "The app owns this table; it persists in the per-controller profile. \
+                         Controller [T:] entries stay read-only in the console and are never \
+                         merged silently.",
+            ))
+            .child(list)
+            .into_any_element()
     }
 
     // ------------------------------------------------------- settings editor
@@ -2566,6 +3697,7 @@ impl Shell {
                 || format!("SETTING ${number}"),
                 |row| format!("SETTING ${number} / {}", row.name),
             ),
+            SettingsEntryPurpose::ToolName => "TOOL NAME".to_string(),
         };
         let hint = match entry.purpose {
             SettingsEntryPurpose::Search => {
@@ -2577,6 +3709,9 @@ impl Shell {
                 .row(number)
                 .map(|row| row.meta_line())
                 .unwrap_or_default(),
+            SettingsEntryPurpose::ToolName => {
+                "Display name for the M6 sheet; 128 characters, no control characters.".to_string()
+            }
         };
         let masked = entry.masked;
         let error = entry.error.clone();
@@ -3531,6 +4666,208 @@ impl Shell {
             )
     }
 
+    /// Add or edit one app-side tool. The sheet never touches the controller.
+    fn tool_editor_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.tool_editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let save_view = view.clone();
+        let scrim_view = view.clone();
+        let title = match editor.original {
+            Some(number) => format!("EDIT TOOL T{number}"),
+            None => "NEW TOOL".to_string(),
+        };
+        let original = editor.original;
+        let error = editor.error.clone();
+
+        let mut fields = v_flex().gap_2();
+        for field in ToolField::ALL {
+            let field_view = view.clone();
+            let name_view = view.clone();
+            let value = editor.value(field).to_string();
+            let display = if value.trim().is_empty() {
+                "--".to_string()
+            } else {
+                value
+            };
+            let label = match field {
+                ToolField::Number => "TOOL NUMBER",
+                ToolField::Diameter => "DIAMETER (MM)",
+                ToolField::Length => "LENGTH (MM)",
+                ToolField::Pocket => "POCKET",
+            };
+            let line = h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(112.0))
+                        .text_size(px(10.0))
+                        .text_color(p.text_dim)
+                        .child(label),
+                )
+                .child(
+                    Button::new(format!("tool-field-{}", label.replace(' ', "-")))
+                        .label(display)
+                        .secondary()
+                        .h(px(48.0))
+                        .flex_1()
+                        .rounded_lg()
+                        .text_size(px(14.0))
+                        .on_click(move |_, _, cx| {
+                            if field == ToolField::Number {
+                                field_view.update(cx, |this, cx| {
+                                    this.open_tool_field(ToolField::Number, cx);
+                                });
+                            } else {
+                                field_view.update(cx, |this, cx| {
+                                    this.open_tool_field(field, cx);
+                                });
+                            }
+                        }),
+                );
+            fields = fields.child(line);
+            if field == ToolField::Number {
+                // The name is text, not numeric; it gets its own row below.
+                let name_value = self
+                    .tool_editor
+                    .as_ref()
+                    .map(|editor| editor.name.clone())
+                    .unwrap_or_default();
+                fields = fields.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(112.0))
+                                .text_size(px(10.0))
+                                .text_color(p.text_dim)
+                                .child("NAME"),
+                        )
+                        .child(
+                            Button::new("tool-field-name")
+                                .label(if name_value.trim().is_empty() {
+                                    "--".to_string()
+                                } else {
+                                    name_value
+                                })
+                                .secondary()
+                                .h(px(48.0))
+                                .flex_1()
+                                .rounded_lg()
+                                .text_size(px(14.0))
+                                .on_click(move |_, window, cx| {
+                                    name_view.update(cx, |this, cx| {
+                                        this.open_tool_name(window, cx);
+                                    });
+                                }),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("tool-editor-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| {
+                            shell.tool_editor = None;
+                            shell.state.keypad = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(560.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(title),
+                            )
+                            .child(chip(
+                                original.map_or("NEW RECORD", |_| "REPLACES BY NUMBER"),
+                                p,
+                            )),
+                    )
+                    .child(fields)
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    })
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                        "Local table only. Save writes the per-controller profile; \
+                                 it never writes the controller tool table.",
+                    ))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("tool-editor-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.tool_editor = None;
+                                            this.state.keypad = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("tool-editor-save")
+                                    .label("SAVE TOOL")
+                                    .primary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        save_view.update(cx, |this, cx| {
+                                            this.save_tool_editor(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Manual tool-change sheet.
     ///
     /// It starts below the 56 px top bar so RESET and STOP stay visible and
@@ -3552,6 +4889,17 @@ impl Shell {
             .line_source(change.line)
             .unwrap_or("M6")
             .to_string();
+        let tool_record = self.state.tools.get(change.tool).cloned();
+        let tool_detail = tool_record.as_ref().map_or_else(
+            || "Not in the app tool table; M6 still sends only the tool number.".to_string(),
+            |record| {
+                format!(
+                    "{} | {}",
+                    ToolTableModel::display_name(record),
+                    ToolTableModel::summary(record)
+                )
+            },
+        );
 
         let sheet = v_flex()
             .w(px(520.0))
@@ -3603,6 +4951,28 @@ impl Shell {
                             .text_size(px(12.0))
                             .text_color(p.text)
                             .child(source),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("APP TOOL"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(12.0))
+                            .text_color(if tool_record.is_some() { p.text } else { p.text_faint })
+                            .child(tool_detail),
                     ),
             )
             .child(
@@ -4175,6 +5545,9 @@ impl Render for Shell {
             .child(content);
 
         let keypad_state = self.state.keypad.clone();
+        if self.tool_editor.is_some() {
+            root = root.child(self.tool_editor_overlay(p, cx));
+        }
         if let Some(keypad) = keypad_state.as_ref() {
             root = root.child(keypad::overlay(
                 keypad,
@@ -4477,14 +5850,6 @@ fn info_row(name: &str, milestone: &str, p: Palette) -> Div {
                 .child(name.to_string()),
         )
         .child(chip(milestone, p))
-}
-
-fn num_cell(value: &str, p: Palette) -> Div {
-    div()
-        .flex_1()
-        .text_size(px(11.0))
-        .text_color(p.text_dim)
-        .child(value.to_string())
 }
 
 fn console_color(level: ConsoleLevel, p: Palette) -> Hsla {

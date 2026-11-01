@@ -8,17 +8,21 @@
 //! path; a generic or extended controller can supply a different value without
 //! touching this module's consumers.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, ControllerInfo, EngineEvent, JobAbortReason, JobInfo, JobPauseReason,
-    JobState, MachineSnapshot, Program, ProgramLine as EngineProgramLine, Signals as CoreSignals,
-    StatusReport,
+    JobState, MachineSnapshot, Offsets, Program, ProgramLine as EngineProgramLine, SettingValue,
+    Signals as CoreSignals, StatusReport, Wcs,
 };
 
-use crate::settings::SettingsModel;
+use crate::config::ConfigModel;
+use crate::offsets::OffsetModel;
+use crate::settings::{SettingKind, SettingsModel};
+use crate::tools::{ToolField, ToolTableModel};
 
 /// Connection state shown in the top-bar status pill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,6 +376,15 @@ pub enum KeypadTarget {
     Rpm,
     /// A numeric setting row; the edit stays local until Apply.
     Setting(u16),
+    /// One work-offset axis in a specific coordinate system.
+    WorkOffset {
+        /// Zero-based WCS index (`G54` is 0).
+        wcs: usize,
+        /// Axis to set.
+        axis: Axis,
+    },
+    /// One numeric field in the tool sheet.
+    Tool(ToolField),
 }
 
 impl KeypadTarget {
@@ -386,6 +399,10 @@ impl KeypadTarget {
             KeypadTarget::Mdi => "MDI TEXT".to_string(),
             KeypadTarget::Rpm => "SPINDLE RPM".to_string(),
             KeypadTarget::Setting(number) => format!("SETTING ${number}"),
+            KeypadTarget::WorkOffset { wcs, axis } => {
+                format!("{} {} OFFSET", AppState::wcs_at(wcs), axis.label())
+            }
+            KeypadTarget::Tool(field) => field.title().to_string(),
         }
     }
 }
@@ -977,15 +994,23 @@ pub struct AppState {
     pub feed_rate: u32,
     /// Generated settings editor, filled from `$ES`/`$EG` and `$$`.
     pub settings: SettingsModel,
+    /// Live `$#` offsets, formatted for the offsets workspace.
+    pub offsets: OffsetModel,
+    /// Application-owned tool table and its profile state.
+    pub tools: ToolTableModel,
+    /// Local app preferences, controller profile, and backup helpers.
+    pub config: ConfigModel,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        let profile = Profile::mock_reference();
+        let config = ConfigModel::platform();
+        let mut profile = Profile::mock_reference();
+        profile.capabilities.units = Units::from_core(config.app().units);
         let dro = initial_dro(&profile.capabilities.axes);
         let signals = build_signals(&profile.capabilities, "Idle", CoreSignals::NONE, false);
         let axes = profile.capabilities.axes.len();
-        Self {
+        let mut state = Self {
             profile,
             mode: Mode::Job,
             left_tab: LeftTab::Console,
@@ -1043,7 +1068,12 @@ impl AppState {
             signal_caps: "HSDEP".to_string(),
             feed_rate: 1200,
             settings: SettingsModel::default(),
-        }
+            offsets: OffsetModel::default(),
+            tools: ToolTableModel::new(),
+            config,
+        };
+        state.sync_offset_context();
+        state
     }
 
     /// Switch to the live engine view model.
@@ -1086,6 +1116,12 @@ impl AppState {
         self.signal_caps.clear();
         // Metadata belongs to the controller, never to the previous session.
         self.settings = SettingsModel::default();
+        // Offsets and the tool table are reloaded after `$I+`; never show the
+        // previous machine's data as if it belonged to this one.
+        self.offsets = OffsetModel::default();
+        self.sync_offset_context();
+        self.tools = ToolTableModel::new();
+        self.config.begin_connection();
         self.push_console(ConsoleLevel::Info, message);
     }
 
@@ -1122,6 +1158,36 @@ impl AppState {
                 .map(|axis| axis.label().to_string())
                 .collect(),
         );
+        self.sync_offset_context();
+        if let Some(load) = self.config.on_controller(info) {
+            let unverified = load.unverified;
+            let corrupt = self.config.corrupt_profile();
+            let status = if corrupt {
+                "PROFILE CORRUPT".to_string()
+            } else if unverified {
+                "UNVERIFIED - CONFIRM IN UTILITY".to_string()
+            } else {
+                format!("{} TOOLS, SAVED", self.config.data().tools.len())
+            };
+            if let Some(tools) = load.tools {
+                self.tools.adopt(tools, load.path, status);
+            } else {
+                self.tools.set_path(load.path);
+                self.tools.set_status(status);
+            }
+            let level = if load.unverified || corrupt {
+                ConsoleLevel::Warn
+            } else {
+                ConsoleLevel::Info
+            };
+            self.push_console(level, load.notice);
+            if let Some(error) = self.config.profile_error()
+                && !load.unverified
+                && !corrupt
+            {
+                self.push_console(ConsoleLevel::Warn, error.to_string());
+            }
+        }
     }
 
     /// Apply one engine snapshot plus the raw status fields that are not in
@@ -1159,7 +1225,11 @@ impl AppState {
         }
 
         self.machine_state = snapshot.state.as_str();
+        let previous_wcs = self.wcs_index;
         self.wcs_index = snapshot.wcs.index();
+        if previous_wcs != self.wcs_index {
+            self.sync_offset_context();
+        }
         if !self.feed_override_active {
             self.feed_override = snapshot.overrides.feed;
         }
@@ -1306,6 +1376,68 @@ impl AppState {
     /// Apply a unit-mode change from the parser state.
     pub fn set_units(&mut self, units: CoreUnits) {
         self.profile.capabilities.units = Units::from_core(units);
+        self.sync_offset_context();
+        self.config.set_units(units);
+    }
+
+    /// Install the latest engine `$#` snapshot.
+    pub fn apply_offsets(&mut self, offsets: &Offsets) {
+        self.sync_offset_context();
+        self.offsets.apply_engine(offsets);
+    }
+
+    /// Update the active WCS used by the offsets workspace.
+    pub fn set_wcs_index(&mut self, index: usize) {
+        self.wcs_index = index.min(Wcs::ALL.len().saturating_sub(1));
+        self.sync_offset_context();
+    }
+
+    /// Keep the offsets view's units, axes, and active WCS in sync.
+    pub fn sync_offset_context(&mut self) {
+        let units = self.profile.capabilities.units;
+        let axes = self.profile.capabilities.axes.clone();
+        self.offsets.set_context(units, &axes, self.wcs_index);
+    }
+
+    /// Settings snapshot for a local profile or backup.
+    ///
+    /// Password and unknown-type values are omitted; `ghs-config` documents
+    /// that the caller must filter secrets before constructing a snapshot.
+    #[must_use]
+    pub fn settings_snapshot(&self) -> BTreeMap<u16, SettingValue> {
+        self.settings
+            .rows()
+            .iter()
+            .filter(|row| !matches!(row.kind, SettingKind::Password | SettingKind::Unknown(_)))
+            .map(|row| (row.number, row.current.clone()))
+            .collect()
+    }
+
+    /// Offsets for a local save or backup.
+    ///
+    /// Before `$#` has answered, the stored profile's snapshot is kept rather
+    /// than replacing it with an empty one.
+    #[must_use]
+    pub fn profile_offset_snapshot(&self) -> ghs_config::OffsetSnapshot {
+        if self.offsets.reported() {
+            self.offsets.snapshot()
+        } else {
+            self.config.data().offsets.clone()
+        }
+    }
+
+    /// Settings for a local save or backup.
+    ///
+    /// A controller that has not reported settings yet keeps the stored
+    /// snapshot instead of clearing it.
+    #[must_use]
+    pub fn profile_settings_snapshot(&self) -> BTreeMap<u16, SettingValue> {
+        let live = self.settings_snapshot();
+        if live.is_empty() {
+            self.config.data().settings.clone()
+        } else {
+            live
+        }
     }
 
     fn set_value(&mut self, axis: Axis, value: f64) {
@@ -1455,6 +1587,19 @@ impl AppState {
                 }
                 (buffer, true, Some(hint))
             }
+            KeypadTarget::WorkOffset { wcs, axis } => {
+                let value = self
+                    .offsets
+                    .wcs_row(wcs)
+                    .and_then(|row| row.values.get(axis.index()).copied().flatten())
+                    .map_or_else(String::new, |value| self.offsets.format_value(value));
+                (
+                    value,
+                    true,
+                    Some("G10 L20 changes the offset; it does not move an axis".to_string()),
+                )
+            }
+            KeypadTarget::Tool(field) => (String::new(), true, Some(field.title().to_string())),
         };
         self.keypad = Some(KeypadState {
             target,
@@ -1579,6 +1724,24 @@ impl AppState {
                 if let Err(message) = self.settings.set_number_text(number, keypad.buffer.clone()) {
                     self.push_console(ConsoleLevel::Warn, format!("Setting ${number}: {message}"));
                 }
+            }
+            KeypadTarget::WorkOffset { wcs, axis } => {
+                if self.live {
+                    // The shell sends the G10 line and waits for `$#`; a
+                    // rejected command must not move the displayed value.
+                } else if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
+                    self.push_console(
+                        ConsoleLevel::Warn,
+                        format!(
+                            "{} {} offset edit requires a live controller (mock: {value})",
+                            AppState::wcs_at(wcs),
+                            axis.label()
+                        ),
+                    );
+                }
+            }
+            KeypadTarget::Tool(_) => {
+                // The tool sheet owns this draft; the shell applies it.
             }
         }
     }

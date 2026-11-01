@@ -92,10 +92,18 @@ pub fn overlay(
                     KeypadTarget::Mdi => "TOKENS + DIGITS".to_string(),
                     KeypadTarget::Rpm => "0 - 24000".to_string(),
                     KeypadTarget::Dro(_) => format!("{} UNITS", unit.to_uppercase()),
+                    KeypadTarget::WorkOffset { .. } => keypad
+                        .hint
+                        .clone()
+                        .unwrap_or_else(|| "G10 L20 | DISPLAY UNITS".to_string()),
                     KeypadTarget::Setting(_) => keypad
                         .hint
                         .clone()
                         .unwrap_or_else(|| "RANGE N/A".to_string()),
+                    KeypadTarget::Tool(_) => keypad
+                        .hint
+                        .clone()
+                        .unwrap_or_else(|| "TOOL FIELD".to_string()),
                 }),
         );
 

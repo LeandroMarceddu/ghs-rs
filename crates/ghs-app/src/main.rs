@@ -15,10 +15,13 @@
 //! button). `--settings` opens the generated settings workspace directly;
 //! `--settings-group=NAME` selects a reported group in that workspace;
 //! `--demo-settings-write` changes one safe integer through the normal
-//! pending/Apply/read-back path for the applied screenshot. `--size WxH` (or
-//! `--size=WxH`) opens at an explicit logical size for layout review, e.g.
-//! `--size 1920x1080` or `--size 1080x1920`; `--fullscreen` pins the shell to
-//! the current output.
+//! pending/Apply/read-back path for the applied screenshot. `--offsets`,
+//! `--tools`, and `--utility` open those M5 workspaces directly. `--demo-tools`
+//! seeds the app-side tool table after the controller profile loads.
+//! `--demo-offsets-write` sends one real `G10 L20` through MDI and refreshes
+//! `$#` for the applied-offsets screenshot. `--size WxH` (or `--size=WxH`)
+//! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
+//! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
 //!
 //! Window policy:
 //! - 1280x800 default (UX-01), 1920x1080 works by widening the centre column.
@@ -26,13 +29,16 @@
 //! - Resizable, so a developer can drag it to portrait and inspect the reflow
 //!   plan documented at the top of `shell.rs`.
 
+mod config;
 mod connection;
 mod keypad;
 mod live;
+mod offsets;
 mod settings;
 mod shell;
 mod state;
 mod theme;
+mod tools;
 mod viewer;
 
 use gpui_kit::*;

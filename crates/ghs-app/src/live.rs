@@ -136,6 +136,7 @@ pub struct LiveLink {
     last_info: Option<Arc<ControllerInfo>>,
     last_snapshot: Option<Arc<MachineSnapshot>>,
     last_status: Option<Arc<StatusReport>>,
+    last_offsets: Option<Arc<ghs_engine::Offsets>>,
     last_settings: Option<Arc<Vec<Setting>>>,
     last_descriptions: Option<Arc<Vec<SettingDescription>>>,
     last_groups: Option<Arc<Vec<SettingGroup>>>,
@@ -167,6 +168,7 @@ impl LiveLink {
             last_info: None,
             last_snapshot: None,
             last_status: None,
+            last_offsets: None,
             last_settings: None,
             last_descriptions: None,
             last_groups: None,
@@ -376,6 +378,13 @@ impl LiveLink {
                 self.last_status = status;
                 changed = true;
             }
+
+            let offsets = self.engine.offsets();
+            if option_arc_changed(&self.last_offsets, &Some(Arc::clone(&offsets))) {
+                state.apply_offsets(&offsets);
+                self.last_offsets = Some(offsets);
+                changed = true;
+            }
         }
 
         changed
@@ -400,6 +409,9 @@ impl LiveLink {
                 // Never leave a tool-change sheet behind a dead link.
                 state.job.interrupted();
                 state.settings.cancel_writes("disconnected");
+                if state.offsets.status().is_pending() {
+                    state.offsets.failed("disconnected");
+                }
                 state.push_console(
                     ConsoleLevel::Warn,
                     "Disconnected; the last telemetry is stale",
@@ -420,6 +432,9 @@ impl LiveLink {
             }
             EngineEvent::Alarm(code) => {
                 state.machine_state = "Alarm";
+                if state.offsets.status().is_pending() {
+                    state.offsets.failed(format!("ALARM:{code}"));
+                }
                 if let Some(number) = state.settings.inflight_number() {
                     state
                         .settings
@@ -429,6 +444,9 @@ impl LiveLink {
                 true
             }
             EngineEvent::Error(code) => {
+                if state.offsets.status().is_pending() {
+                    state.offsets.failed(format!("error:{code}"));
+                }
                 if let Some(number) = state.settings.inflight_number() {
                     let message = format!("controller error:{code}");
                     state.settings.mark_send_error(number, message.clone());
@@ -578,6 +596,7 @@ impl LiveLink {
         self.last_info = None;
         self.last_snapshot = None;
         self.last_status = None;
+        self.last_offsets = None;
         self.last_settings = None;
         self.last_descriptions = None;
         self.last_groups = None;
@@ -602,13 +621,23 @@ fn log_level(level: LogLevel) -> ConsoleLevel {
     }
 }
 
-/// Drop the per-setting `$110=...` dump from discovery.
+/// Drop routine per-setting and `$#` dump lines from the console.
 ///
-/// A controller can return hundreds of settings during the handshake. They are
-/// real controller output and remain in the engine's settings snapshot, but
-/// they would otherwise evict the banner, identity and every user command from
-/// the bounded 200-line console before the first screen is drawn.
+/// A controller can return hundreds of settings during the handshake and a
+/// fifteen-line `$#` block on every offset refresh. They are real controller
+/// output and remain available as typed snapshots, but they would otherwise
+/// evict the banner, identity and every user command from the bounded 200-line
+/// console. The offsets tab shows the parsed values.
 fn discovery_noise(text: &str) -> bool {
+    if text == "> $#" {
+        return true;
+    }
+    if ["$# G", "$# HOME", "$# TLO", "$# TLR"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+    {
+        return true;
+    }
     text.strip_prefix('$')
         .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
 }
