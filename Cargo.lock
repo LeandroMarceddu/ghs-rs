@@ -1940,6 +1940,7 @@ dependencies = [
  "ghs-core",
  "ghs-demo",
  "ghs-engine",
+ "ghs-serial",
  "gpui-kit",
 ]
 
@@ -1970,6 +1971,7 @@ dependencies = [
  "crossbeam-channel",
  "ghs-core",
  "ghs-demo",
+ "ghs-gcode",
  "ghs-proto",
  "ghs-serial",
  "ghs-sim",

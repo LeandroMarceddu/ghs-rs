@@ -222,6 +222,9 @@ impl LiveLink {
             | EngineEvent::CodeTables { .. }
             | EngineEvent::Probe(_)
             | EngineEvent::SettingWritten { .. } => false,
+            // Engine events are non-exhaustive; new job/probe events land here
+            // until the matching UI panel consumes them.
+            _ => false,
         }
     }
 

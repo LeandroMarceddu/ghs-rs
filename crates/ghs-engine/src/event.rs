@@ -26,6 +26,7 @@ pub enum LogLevel {
 /// oldest event when the queue is full, so a UI that stops draining can never
 /// stall the control loop.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EngineEvent {
     /// The handshake completed and telemetry is flowing.
     Connected,
