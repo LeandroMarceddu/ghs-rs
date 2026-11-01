@@ -2004,6 +2004,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghs-probe"
+version = "0.1.0"
+dependencies = [
+ "ghs-core",
+ "ghs-viewer",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ghs-proto"
 version = "0.1.0"
 dependencies = [
