@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 ghs-core.workspace = true
 ghs-proto.workspace = true
-serde.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
