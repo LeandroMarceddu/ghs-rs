@@ -14,7 +14,8 @@ report the path **and** verify its pixel size with `identify`.
   `XDG_RUNTIME_DIR` (mode 700) so the KWin script does not run inside the test
   compositor.
 - The app flags are `--size WxH`, `--fullscreen`, `--mock`, `--light`,
-  `--keypad`, and (when present) `--connection-panel=serial`.
+  `--keypad`, `--connection-panel=serial`, `--demo-start`, `--demo-m0`, and
+  `--demo-toolchange`.
 - Always verify the PNG with `identify`; a capture command can exit 0 and write
   nothing.
 - Kill the app and the compositor in a `trap`/cleanup step. Check
@@ -49,7 +50,7 @@ export W H OUT
 dbus-run-session -- bash -c '
   export WAYLAND_DISPLAY=wayland-0
   export XDG_CURRENT_DESKTOP=KDE
-  kwin_wayland --virtual --width "$W" --height "$H" --scale 1 \
+  kwin_wayland --virtual --no-lockscreen --width "$W" --height "$H" --scale 1 \
     --socket wayland-0 >"$XDG_RUNTIME_DIR/kwin.log" 2>&1 &
   KWIN=$!
   sleep 2
@@ -69,6 +70,24 @@ pgrep -a ghs-app || true
 A verified run produced `/tmp/opencode/ghs-shot-test3.png` at 1280×800.
 `/tmp/opencode/ghs-shots/start-nested.sh` is the app agent's equivalent
 long-lived helper if you need repeated captures.
+
+The `--no-lockscreen` flag matters: if the host session is locked, the nested
+virtual output shows the host lock screen instead of the app.
+
+### Demo-job captures
+
+The M3 job UI has review flags:
+
+- `--demo-start` presses Start once after the demo program loads.
+- `--demo-m0` loads the program with an `M0` pause, giving a stable mid-job
+  frame with progress and the current line.
+- `--demo-toolchange` loads the two-tool program and stops at `M6 T2`, giving
+  a stable tool-change sheet.
+
+A short program can be acknowledged faster than the 50 ms UI poll, so a
+"RUNNING" frame is not reliably capturable. Do not fake it; capture the M0 or
+tool-change pause and label it correctly. The integration tests cover the
+running state and the exact Start/Acknowledge/Resume/Stop commands.
 
 Notes:
 
