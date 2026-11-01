@@ -161,3 +161,8 @@ height than its row (except the intentional C3 top cell spanning rows 1–2),
 all touch targets ≥48 px, console and MDI aligned, C3's top cell ending on the
 DRO baseline, viewer still usable. The style is already right; this is a
 layout/pacing pass, not a redesign.
+
+Environment note: the development desktop runs a KWin script that remembers
+and restores window sizes, so it can override the requested 1280×800. Use Xvfb
+or a nested X server at the target screen size for deterministic captures; do
+not add an app-side workaround for the window manager.
