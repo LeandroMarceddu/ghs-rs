@@ -57,6 +57,9 @@ use gpui_kit::{
 };
 
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
+use crate::height_compensation::{
+    HeightApplyGate, HeightApplyPreview, HeightMapApplyStatus, HeightMapSnapshot,
+};
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
 use crate::offsets::OffsetStatus;
@@ -221,6 +224,14 @@ pub struct Shell {
     demo_height_map_done: bool,
     demo_height_map_export: bool,
     demo_height_map_export_done: bool,
+    demo_height_map_apply: bool,
+    demo_height_map_apply_done: bool,
+    demo_height_map_revert: bool,
+    demo_height_map_revert_done: bool,
+    demo_height_map_confirm: bool,
+    demo_height_map_confirm_done: bool,
+    demo_height_map_job: bool,
+    demo_height_map_job_done: bool,
     /// Toolpath captured before a height-map probe replaced the job program.
     height_map_base_program: Option<Arc<ghs_gcode::Program>>,
     _poll_task: Option<Task<()>>,
@@ -345,14 +356,27 @@ impl Shell {
             arg == "--demo-height-map"
                 || arg == "--demo-height-map-result"
                 || arg == "--demo-height-map-export"
+                || arg == "--demo-height-map-apply"
+                || arg == "--demo-height-map-revert"
+                || arg == "--demo-height-map-confirm"
+                || arg == "--demo-height-map-job"
         });
         let demo_height_map_result = std::env::args().any(|arg| arg == "--demo-height-map-result");
         let demo_height_map_export = std::env::args().any(|arg| arg == "--demo-height-map-export");
+        let demo_height_map_revert = std::env::args().any(|arg| arg == "--demo-height-map-revert");
+        let demo_height_map_confirm =
+            std::env::args().any(|arg| arg == "--demo-height-map-confirm");
+        let demo_height_map_job = std::env::args().any(|arg| arg == "--demo-height-map-job");
+        let demo_height_map_apply = demo_height_map_revert
+            || demo_height_map_job
+            || std::env::args().any(|arg| arg == "--demo-height-map-apply");
         if demo_height_map {
             state.mode = Mode::Probe;
         }
         let demo_probe_run = demo_probe_apply
             || demo_height_map_result
+            || demo_height_map_confirm
+            || demo_height_map_apply
             || std::env::args().any(|arg| arg == "--demo-probe-run");
 
         let mut shell = Self {
@@ -397,6 +421,14 @@ impl Shell {
             demo_height_map_done: false,
             demo_height_map_export,
             demo_height_map_export_done: false,
+            demo_height_map_apply,
+            demo_height_map_apply_done: false,
+            demo_height_map_revert,
+            demo_height_map_revert_done: false,
+            demo_height_map_confirm,
+            demo_height_map_confirm_done: false,
+            demo_height_map_job,
+            demo_height_map_job_done: false,
             height_map_base_program: None,
             _poll_task: None,
             _subscriptions: subscriptions,
@@ -668,6 +700,72 @@ impl Shell {
             self.demo_height_map_export_done = true;
             self.export_height_map(cx);
             changed = true;
+        }
+        // Screenshot switch: open the same confirmation step without confirming.
+        if self.demo_height_map_confirm && !self.demo_height_map_confirm_done {
+            let snapshot = self.state.probe.run().and_then(HeightMapSnapshot::from_run);
+            if let Some(snapshot) = snapshot
+                && snapshot.complete
+                && self.state.height_map.pending().is_none()
+                && self.state.height_map.applied().is_none()
+                && self.machine() == MachineState::Idle
+                && !self.state.job.is_active()
+            {
+                let gate = HeightApplyGate::from_context(&self.probe_context());
+                if self.state.height_map.blockers(&snapshot, &gate).is_empty() {
+                    self.demo_height_map_confirm_done = true;
+                    self.request_height_map_apply(cx);
+                    changed = true;
+                }
+            }
+        }
+        // Screenshot switch: press the same Apply + Confirm actions after a
+        // complete map and only when every live gate passes. Simulator only.
+        if self.demo_height_map_apply && !self.demo_height_map_apply_done {
+            let snapshot = self.state.probe.run().and_then(HeightMapSnapshot::from_run);
+            if let Some(snapshot) = snapshot
+                && snapshot.complete
+                && self.state.height_map.applied().is_none()
+                && self.state.height_map.pending().is_none()
+                && self.machine() == MachineState::Idle
+                && !self.state.job.is_active()
+            {
+                let gate = HeightApplyGate::from_context(&self.probe_context());
+                if self.state.height_map.blockers(&snapshot, &gate).is_empty() {
+                    self.demo_height_map_apply_done = true;
+                    self.request_height_map_apply(cx);
+                    if self.state.height_map.pending().is_some() {
+                        self.confirm_height_map_apply(cx);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        // Screenshot switch: reveal the Job workspace marker after Apply.
+        if self.demo_height_map_job
+            && !self.demo_height_map_job_done
+            && self.state.height_map.is_applied_for(&self.state.job.name)
+        {
+            self.demo_height_map_job_done = true;
+            self.state.mode = Mode::Job;
+            changed = true;
+        }
+        // Screenshot switch: press Revert once the compensated load is visible.
+        if self.demo_height_map_revert && !self.demo_height_map_revert_done {
+            let applied_name = self
+                .state
+                .height_map
+                .applied()
+                .map(|applied| applied.program_name.clone());
+            if let Some(name) = applied_name
+                && self.state.job.name == name
+                && self.machine() == MachineState::Idle
+                && !self.state.job.is_active()
+            {
+                self.demo_height_map_revert_done = true;
+                self.revert_height_map(cx);
+                changed = true;
+            }
         }
         // Follow the current line in the Program tab. Only a changed line
         // scrolls, so manual scrolling is not fought every poll.
@@ -1837,6 +1935,10 @@ impl Shell {
         if let Some(estimate) = &setup.estimate {
             summary.push_str(&format!(", estimate {}", format_estimate(estimate)));
         }
+        // Any probe run replaces the loaded job; a previous compensation is no
+        // longer the loaded program. Keep the original source for the next
+        // Apply, but drop the stale applied state.
+        self.state.height_map.on_probe_run_started();
         self.state.probe.begin(setup);
         self.state.left_tab = LeftTab::Console;
         self.state.push_console(ConsoleLevel::Info, summary);
@@ -1910,8 +2012,10 @@ impl Shell {
         for (field, text) in [
             (ProbeField::OriginX, "0.000"),
             (ProbeField::OriginY, "0.000"),
-            (ProbeField::StepX, "10.000"),
-            (ProbeField::StepY, "10.000"),
+            // 4x4 at 15 mm covers the bundled 40 mm pocket for the Apply
+            // screenshot; with OutsideMap::Reject a smaller grid would refuse.
+            (ProbeField::StepX, "15.000"),
+            (ProbeField::StepY, "15.000"),
             (ProbeField::Columns, "4"),
             (ProbeField::Rows, "4"),
             (ProbeField::SurfaceZ, "-1.000"),
@@ -1993,6 +2097,142 @@ impl Shell {
     fn cancel_probe_apply(&mut self, cx: &mut Context<Self>) {
         if let Some(run) = self.state.probe.run_mut() {
             run.apply_confirm = false;
+        }
+        cx.notify();
+    }
+
+    /// Validate the map and prepare a compensated program for confirmation.
+    ///
+    /// Nothing is loaded and nothing starts: this only builds the preview the
+    /// confirmation step shows.
+    fn request_height_map_apply(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.state.probe.run().and_then(HeightMapSnapshot::from_run);
+        let Some(snapshot) = snapshot else {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Height map Apply refused: no measured map",
+            );
+            cx.notify();
+            return;
+        };
+        let gate = HeightApplyGate::from_context(&self.probe_context());
+        match self.state.height_map.request_apply(&snapshot, &gate) {
+            Ok(()) => {
+                let cells = snapshot.map.len();
+                let step = snapshot
+                    .map
+                    .grid()
+                    .step_x_mm
+                    .min(snapshot.map.grid().step_y_mm);
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "Height map ready to apply: {cells} cells, {} mm step. Confirm to load \
+                         the compensated program; the job is not started.",
+                        crate::probe::format_mm(step)
+                    ),
+                );
+            }
+            Err(blockers) => {
+                for blocker in blockers {
+                    self.state.push_console(
+                        ConsoleLevel::Warn,
+                        format!("Height map Apply refused: {blocker}"),
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_height_map_apply(&mut self, cx: &mut Context<Self>) {
+        self.state.height_map.cancel_pending();
+        cx.notify();
+    }
+
+    /// Load the confirmed compensated program. Never starts it.
+    fn confirm_height_map_apply(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.state.height_map.pending().cloned() else {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Height map Apply refused: no confirmation is pending",
+            );
+            cx.notify();
+            return;
+        };
+        // Re-check the live gates: telemetry can change between the preview and
+        // the operator's confirmation.
+        let snapshot = self.state.probe.run().and_then(HeightMapSnapshot::from_run);
+        if let Some(snapshot) = snapshot {
+            let gate = HeightApplyGate::from_context(&self.probe_context());
+            let blockers = self.state.height_map.blockers(&snapshot, &gate);
+            if !blockers.is_empty() {
+                for blocker in blockers {
+                    self.state.push_console(
+                        ConsoleLevel::Warn,
+                        format!("Height map Apply refused: {blocker}"),
+                    );
+                }
+                cx.notify();
+                return;
+            }
+        } else {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Height map Apply refused: the measured map is no longer available",
+            );
+            cx.notify();
+            return;
+        }
+        let name = preview.program_name.clone();
+        let load = preview.load();
+        if self.send_command(load.command()) {
+            self.state.height_map.mark_applied(preview);
+            self.state.push_console(
+                ConsoleLevel::Ok,
+                format!(
+                    "Height map applied: {name} loaded (not started); original kept for Revert"
+                ),
+            );
+        } else {
+            self.state.height_map.fail(format!(
+                "the engine rejected the compensated program load: {name}"
+            ));
+        }
+        cx.notify();
+    }
+
+    /// Load the original program again. Never starts it.
+    fn revert_height_map(&mut self, cx: &mut Context<Self>) {
+        if self.state.job.is_active() || self.machine() != MachineState::Idle {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Height map Revert requires Idle and no active job",
+            );
+            cx.notify();
+            return;
+        }
+        let load = match self.state.height_map.revert_load() {
+            Ok(load) => load,
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Revert refused: {message}"));
+                self.state.height_map.fail(message);
+                cx.notify();
+                return;
+            }
+        };
+        let name = load.name.clone();
+        if self.send_command(load.command()) {
+            self.state.height_map.mark_reverted();
+            self.state.push_console(
+                ConsoleLevel::Ok,
+                format!("Height map reverted: original program {name} restored (not started)"),
+            );
+        } else {
+            self.state
+                .height_map
+                .fail("the engine rejected the original program load");
         }
         cx.notify();
     }
@@ -2856,6 +3096,24 @@ impl Shell {
                                 .text_size(px(10.0))
                                 .text_color(p.warning)
                                 .child(detail),
+                        )
+                    })
+                    .when(self.state.job_compensated(), |this| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .h(px(22.0))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .rounded(px(5.0))
+                                .bg(p.accent.opacity(0.16))
+                                .border_1()
+                                .border_color(p.accent.opacity(0.5))
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.accent)
+                                .child("HEIGHT MAP / COMPENSATED"),
                         )
                     })
                     .child(
@@ -4269,6 +4527,19 @@ impl Shell {
             return div();
         };
         let summary = height_map_summary(map);
+        let snapshot = HeightMapSnapshot::from_run(run);
+        let status = self.state.height_map.status(snapshot.as_ref());
+        let (status_text, status_color) = match status {
+            HeightMapApplyStatus::MeasurementOnly => {
+                (HeightMapApplyStatus::MeasurementOnly.label(), p.warning)
+            }
+            HeightMapApplyStatus::ReadyToApply => {
+                (HeightMapApplyStatus::ReadyToApply.label(), p.accent)
+            }
+            HeightMapApplyStatus::Applied => (HeightMapApplyStatus::Applied.label(), p.success),
+            HeightMapApplyStatus::Reverted => (HeightMapApplyStatus::Reverted.label(), p.text_dim),
+        };
+        let last_error = self.state.height_map.last_error().map(str::to_string);
         let overlay = self.state.probe.height_overlay();
         let program = self
             .height_map_base_program
@@ -4331,10 +4602,10 @@ impl Shell {
             )
             .child(
                 div()
-                    .text_size(px(15.0))
+                    .text_size(px(14.0))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(p.warning)
-                    .child("MEASUREMENT ONLY"),
+                    .text_color(status_color)
+                    .child(status_text),
             )
             .child(
                 div()
@@ -4357,36 +4628,42 @@ impl Shell {
                         .child(format!("STOPPED: {error}")),
                 )
             })
+            .when_some(last_error, |this, error| {
+                this.child(
+                    div()
+                        .text_size(px(9.0))
+                        .line_height(px(11.0))
+                        .text_color(p.danger)
+                        .child(error),
+                )
+            })
+            .child(self.height_map_apply_section(p, cx, snapshot.as_ref()))
             .child(
                 h_flex()
                     .flex_wrap()
                     .gap_1()
                     .child(
-                        probe_detail_cell(
-                            "VALID CELLS",
+                        height_map_detail_cell(
+                            "VALID",
                             &format!("{} / {}", summary.valid, summary.total),
                             p,
                         )
-                        .w(px(144.0)),
+                        .w(px(96.0)),
                     )
                     .child(
-                        probe_detail_cell("MISSING CELLS", &summary.missing.to_string(), p)
-                            .w(px(144.0)),
+                        height_map_detail_cell("MISSING", &summary.missing.to_string(), p)
+                            .w(px(96.0)),
                     )
+                    .child(height_map_detail_cell("MIN Z", &format!("{min_z} mm"), p).w(px(96.0)))
+                    .child(height_map_detail_cell("MAX Z", &format!("{max_z} mm"), p).w(px(96.0)))
+                    .child(height_map_detail_cell("COMP RANGE", &compensation, p).w(px(96.0)))
                     .child(
-                        probe_detail_cell("MIN MEASURED Z", &format!("{min_z} mm"), p).w(px(144.0)),
-                    )
-                    .child(
-                        probe_detail_cell("MAX MEASURED Z", &format!("{max_z} mm"), p).w(px(144.0)),
-                    )
-                    .child(probe_detail_cell("COMPENSATION RANGE", &compensation, p).w(px(144.0)))
-                    .child(
-                        probe_detail_cell(
-                            "NOMINAL SURFACE",
+                        height_map_detail_cell(
+                            "SURFACE",
                             &format!("{} mm", format_mm(summary.nominal_z_mm)),
                             p,
                         )
-                        .w(px(144.0)),
+                        .w(px(96.0)),
                     ),
             )
             .child(
@@ -4394,10 +4671,25 @@ impl Shell {
                     .text_size(px(9.0))
                     .line_height(px(11.0))
                     .text_color(p.text_dim)
-                    .child(
-                        "Missing cells are invalid and never interpolated. This map is not \
-                         applied to the job; streamed compensation is out of scope.",
-                    ),
+                    .child(match status {
+                        HeightMapApplyStatus::MeasurementOnly => {
+                            if snapshot.as_ref().is_some_and(|snapshot| snapshot.complete) {
+                                "A complete map is available, but no part-program \
+                                 snapshot is kept; run the map again."
+                            } else {
+                                "Missing cells are invalid; Apply is refused for an incomplete map."
+                            }
+                        }
+                        HeightMapApplyStatus::ReadyToApply => {
+                            "A static rewrite of the loaded program; nothing starts automatically."
+                        }
+                        HeightMapApplyStatus::Applied => {
+                            "Loaded only, never started. The original is kept for Revert."
+                        }
+                        HeightMapApplyStatus::Reverted => {
+                            "The original program is loaded again; Apply is available again."
+                        }
+                    }),
             )
             .child(
                 v_flex()
@@ -4506,6 +4798,280 @@ impl Shell {
             .bg(p.panel_alt)
             .child(div().w(px(300.0)).flex_shrink_0().child(stats))
             .child(viewer_pane)
+    }
+
+    /// Explicit Apply/Confirm/Revert controls for one completed height map.
+    ///
+    /// The map stays measurement-only until every gate passes. The action only
+    /// loads a program; it never starts the job.
+    fn height_map_apply_section(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        snapshot: Option<&HeightMapSnapshot>,
+    ) -> Div {
+        let status = self.state.height_map.status(snapshot);
+        let applied = self.state.height_map.applied();
+        let pending = self.state.height_map.pending();
+        let blockers = if applied.is_some() {
+            Vec::new()
+        } else {
+            snapshot
+                .map(|snapshot| {
+                    let gate = HeightApplyGate::from_context(&self.probe_context());
+                    self.state.height_map.blockers(snapshot, &gate)
+                })
+                .unwrap_or_default()
+        };
+        let can_apply = applied.is_none()
+            && pending.is_none()
+            && matches!(
+                status,
+                HeightMapApplyStatus::ReadyToApply | HeightMapApplyStatus::Reverted
+            )
+            && blockers.is_empty();
+        let mut section = v_flex().gap_1().pt_1().border_t_1().border_color(p.border);
+
+        if let Some(preview) = pending {
+            let cancel_view = cx.entity();
+            let confirm_view = cx.entity();
+            return section
+                .child(section_label("CONFIRM APPLY", p))
+                .child(compact_stat_row("PROGRAM", preview.program_name.clone(), p))
+                .child(compact_stat_row(
+                    "MAP",
+                    format!(
+                        "{} / {} cells, {} x {} mm step",
+                        preview.valid_cells,
+                        preview.cells,
+                        format_mm(preview.step_x_mm),
+                        format_mm(preview.step_y_mm)
+                    ),
+                    p,
+                ))
+                .child(compact_stat_row(
+                    "OFFSET XY",
+                    format!(
+                        "X{} Y{} mm (WCS + G92)",
+                        format_mm(preview.work_offset_xy_mm[0]),
+                        format_mm(preview.work_offset_xy_mm[1])
+                    ),
+                    p,
+                ))
+                .child(compact_stat_row(
+                    "COVERAGE",
+                    if preview.is_fully_covered() {
+                        format!(
+                            "WHOLE PROGRAM - 0 of {} moves uncompensated",
+                            preview.stats.output_motion_blocks
+                        )
+                    } else {
+                        format!(
+                            "PARTIAL - {} move(s) uncompensated",
+                            preview.stats.uncompensated_motions
+                        )
+                    },
+                    p,
+                ))
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .line_height(px(11.0))
+                        .text_color(p.warning)
+                        .child(
+                            "OutsideMap::Reject: any move outside the map refuses the whole \
+                             transform; nothing runs uncompensated. The program is loaded only, \
+                             never started.",
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("height-map-cancel")
+                                .label("CANCEL")
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(96.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .on_click(move |_, _, cx| {
+                                    cancel_view.update(cx, |this, cx| {
+                                        this.cancel_height_map_apply(cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("height-map-confirm")
+                                .label("CONFIRM APPLY")
+                                .primary()
+                                .h(px(48.0))
+                                .w(px(160.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .on_click(move |_, _, cx| {
+                                    confirm_view.update(cx, |this, cx| {
+                                        this.confirm_height_map_apply(cx);
+                                    });
+                                }),
+                        ),
+                );
+        }
+
+        if let Some(preview) = applied {
+            let revert_view = cx.entity();
+            return section
+                .child(
+                    h_flex()
+                        .h(px(48.0))
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .gap_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(9.0))
+                                        .line_height(px(11.0))
+                                        .text_color(p.text)
+                                        .child(preview.program_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(7.5))
+                                        .line_height(px(9.0))
+                                        .text_color(p.text_dim)
+                                        .child(format!(
+                                            "ORIGINAL {} ({} source)",
+                                            preview.original.name,
+                                            if preview.original.exact {
+                                                "verbatim"
+                                            } else {
+                                                "reconstructed"
+                                            }
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new("height-map-revert")
+                                .label("REVERT")
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(96.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .disabled(
+                                    self.state.job.is_active()
+                                        || self.machine() != MachineState::Idle,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    revert_view.update(cx, |this, cx| this.revert_height_map(cx));
+                                }),
+                        ),
+                )
+                .child(self.height_map_transform_stats(p, preview));
+        }
+
+        let apply_view = cx.entity();
+        section = section.child(
+            Button::new("height-map-apply")
+                .label("APPLY HEIGHT MAP")
+                .primary()
+                .h(px(48.0))
+                .w(px(168.0))
+                .rounded_lg()
+                .text_size(px(10.0))
+                .disabled(!can_apply)
+                .on_click(move |_, _, cx| {
+                    apply_view.update(cx, |this, cx| this.request_height_map_apply(cx));
+                }),
+        );
+        if status == HeightMapApplyStatus::Reverted
+            && let Some(original) = self.state.height_map.original()
+        {
+            section = section.child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(8.5))
+                    .text_color(p.text_dim)
+                    .child(format!("ORIGINAL RESTORED: {}", original.name)),
+            );
+        }
+        for blocker in blockers.iter().take(4) {
+            section = section.child(
+                div()
+                    .text_size(px(9.0))
+                    .line_height(px(11.0))
+                    .text_color(p.warning)
+                    .child(format!("REFUSED: {blocker}")),
+            );
+        }
+        section
+    }
+
+    /// Compact counters and warnings from one completed transform.
+    fn height_map_transform_stats(&self, p: Palette, preview: &HeightApplyPreview) -> Div {
+        let stats = &preview.stats;
+        let compensation = match (stats.min_compensation_mm, stats.max_compensation_mm) {
+            (Some(low), Some(high)) => {
+                format!("{}..{} mm", format_mm(low), format_mm(high))
+            }
+            _ => "--".to_string(),
+        };
+        let rows = [
+            (
+                "LINES",
+                format!("{} / {} out", stats.input_lines, stats.output_lines),
+                "SPLIT",
+                stats.split_motions.to_string(),
+            ),
+            (
+                "COMP",
+                format!(
+                    "{} / {}",
+                    stats.compensated_motions, stats.output_motion_blocks
+                ),
+                "UNCOMP",
+                stats.uncompensated_motions.to_string(),
+            ),
+            ("ARCS", stats.arc_motions.to_string(), "RANGE", compensation),
+            (
+                "OUT STEP",
+                format!("{} mm", format_mm(stats.max_output_step_mm)),
+                "WARN",
+                preview.warnings.len().to_string(),
+            ),
+        ];
+        let mut block = v_flex().gap_0();
+        for (left_label, left_value, right_label, right_value) in rows {
+            block = block.child(
+                h_flex()
+                    .gap_2()
+                    .w_full()
+                    .child(compact_stat_pair(left_label, left_value, p))
+                    .child(compact_stat_pair(right_label, right_value, p)),
+            );
+        }
+        for warning in preview.warnings.iter().take(2) {
+            block = block.child(
+                div()
+                    .text_size(px(8.0))
+                    .line_height(px(9.5))
+                    .text_color(p.warning)
+                    .child(if warning.line == 0 {
+                        format!("WARN: {}", warning.message)
+                    } else {
+                        format!("WARN line {}: {}", warning.line, warning.message)
+                    }),
+            );
+        }
+        block
     }
 
     fn probe_apply_section(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
@@ -4756,11 +5322,44 @@ impl Shell {
             )
         } else if let Some(run) = self.state.probe.run() {
             match run.phase {
-                ProbePhase::Complete if run.map.is_some() => (
-                    "HEIGHT MAP COMPLETE: measurement only".to_string(),
-                    p.success,
-                    "No compensation is applied to the job; the map can be exported as CSV",
-                ),
+                ProbePhase::Complete if run.map.is_some() => {
+                    let complete = run.map.as_ref().is_some_and(|map| map.is_complete());
+                    match self.state.height_map.status_for(complete) {
+                        HeightMapApplyStatus::Applied => (
+                            self.state.height_map.applied().map_or_else(
+                                || "HEIGHT MAP APPLIED".to_string(),
+                                |applied| format!("HEIGHT MAP APPLIED: {}", applied.program_name),
+                            ),
+                            p.success,
+                            "Loaded, never started; REVERT restores the original source",
+                        ),
+                        HeightMapApplyStatus::Reverted => (
+                            "HEIGHT MAP REVERTED: original restored".to_string(),
+                            p.success,
+                            "Apply is available again from the same measured map",
+                        ),
+                        HeightMapApplyStatus::ReadyToApply => (
+                            "HEIGHT MAP COMPLETE: ready to apply".to_string(),
+                            p.success,
+                            "Apply rewrites the loaded program; nothing starts automatically",
+                        ),
+                        HeightMapApplyStatus::MeasurementOnly => {
+                            if complete {
+                                (
+                                    "HEIGHT MAP COMPLETE: no part-program snapshot".to_string(),
+                                    p.warning,
+                                    "Run the map again with the current program before Apply",
+                                )
+                            } else {
+                                (
+                                    "HEIGHT MAP COMPLETE: measurement only".to_string(),
+                                    p.warning,
+                                    "Missing cells are invalid; Apply is refused for an incomplete map",
+                                )
+                            }
+                        }
+                    }
+                }
                 ProbePhase::Complete if !self.state.probe.apply_supported() => (
                     "PROBE COMPLETE: result reported, apply deferred".to_string(),
                     p.success,
@@ -8189,6 +8788,82 @@ fn probe_detail_cell(label: &str, value: &str, p: Palette) -> Div {
             div()
                 .font_family("monospace")
                 .text_size(px(11.0))
+                .text_color(p.text)
+                .child(value.to_string()),
+        )
+}
+
+/// One compact label/value row for the height-map transform stats.
+fn compact_stat_row(label: &str, value: String, p: Palette) -> Div {
+    h_flex()
+        .justify_between()
+        .gap_2()
+        .w_full()
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(8.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .font_family("monospace")
+                .text_size(px(8.5))
+                .text_color(p.text)
+                .child(value),
+        )
+}
+
+/// One inline label/value pair in the two-column transform grid.
+fn compact_stat_pair(label: &str, value: String, p: Palette) -> Div {
+    h_flex()
+        .flex_1()
+        .min_w(px(0.0))
+        .gap_1()
+        .font_family("monospace")
+        .text_size(px(8.0))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(p.text_faint)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(p.text)
+                .child(value),
+        )
+}
+
+/// Compact measurement cell used by the height-map result sheet.
+fn height_map_detail_cell(label: &str, value: &str, p: Palette) -> Div {
+    v_flex()
+        .gap_0()
+        .px_2()
+        .py(px(2.0))
+        .rounded(px(5.0))
+        .bg(p.panel)
+        .border_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .text_size(px(7.5))
+                .line_height(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .font_family("monospace")
+                .text_size(px(10.0))
+                .line_height(px(12.0))
                 .text_color(p.text)
                 .child(value.to_string()),
         )

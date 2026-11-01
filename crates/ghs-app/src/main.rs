@@ -24,7 +24,12 @@
 //! telemetry and `$#` are available; `--demo-probe-check` stands in for the
 //! operator's "probe connected" confirmation on a board without `PC`;
 //! `--demo-probe-run` and `--demo-probe-apply` press the same explicit RUN and
-//! Apply/Confirm actions for simulator evidence. `--size WxH` (or `--size=WxH`)
+//! Apply/Confirm actions for simulator evidence. `--demo-height-map-apply` and
+//! `--demo-height-map-revert` press the same explicit height-map Apply/Confirm
+//! and Revert actions after the 4x4 demo map completes.
+//! `--demo-height-map-confirm` opens the confirmation step without confirming;
+//! `--demo-height-map-job` switches to the Job workspace marker. Normal startup
+//! never applies or starts anything. `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
 //!
@@ -36,6 +41,7 @@
 
 mod config;
 mod connection;
+mod height_compensation;
 mod keypad;
 mod live;
 mod offsets;

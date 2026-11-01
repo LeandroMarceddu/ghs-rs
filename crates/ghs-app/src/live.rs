@@ -308,6 +308,11 @@ impl LiveLink {
         // connection after the handshake, never on every poll.
         if ready && let Some(program) = self.demo_pending.take() {
             let name = program.name().to_string();
+            // `JobLoaded` only carries the parsed program; register the exact
+            // text first so the height-map workflow can keep it for Revert.
+            state
+                .height_map
+                .remember_exact_source(name.clone(), program.source().to_string());
             if let Err(error) = self.send(Command::LoadProgram {
                 name,
                 source: program.source().to_string(),
@@ -517,9 +522,16 @@ impl LiveLink {
                 true
             }
             EngineEvent::JobLoaded {
-                name, total_lines, ..
+                name,
+                total_lines,
+                program,
             } => {
                 state.probe.on_job_loaded(&name);
+                state.height_map.on_job_loaded(
+                    &name,
+                    program.as_ref(),
+                    state.probe.owns_program(&name),
+                );
                 // Loading is an explicit "show me the job" action for the demo
                 // and future file picker; reveal the parsed list immediately.
                 // A probe program keeps the console in front: the generated

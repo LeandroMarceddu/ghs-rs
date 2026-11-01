@@ -346,7 +346,9 @@ impl ProbeCard {
             ProbeCard::CenterCircle => "Radial touches around a bore/boss; fits centre + radius.",
             ProbeCard::Rotation => "Two points on an X edge; reports angle, apply deferred.",
             ProbeCard::ToolLength => "Down onto the reference; reports delta, TLO apply deferred.",
-            ProbeCard::HeightMap => "Bounded Z grid; measured map overlay, no job compensation.",
+            ProbeCard::HeightMap => {
+                "Bounded Z grid; measured map overlay and explicit Apply/Revert."
+            }
         }
     }
 
@@ -1634,8 +1636,9 @@ impl ProbeModel {
                         );
                         push(
                             "COMPENSATION",
-                            "measurement only; the map is not applied to the job".to_string(),
-                            RowState::Warn,
+                            "explicit Apply after a complete map; the probe run never applies it"
+                                .to_string(),
+                            RowState::Info,
                         );
                     }
                 }

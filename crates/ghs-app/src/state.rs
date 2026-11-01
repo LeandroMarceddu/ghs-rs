@@ -20,6 +20,7 @@ use ghs_engine::{
 };
 
 use crate::config::ConfigModel;
+use crate::height_compensation::HeightMapCompensation;
 use crate::offsets::OffsetModel;
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
@@ -1007,6 +1008,8 @@ pub struct AppState {
     pub offsets: OffsetModel,
     /// Probe preflight, run binding and apply model.
     pub probe: ProbeModel,
+    /// Original source and applied state for the explicit height-map workflow.
+    pub height_map: HeightMapCompensation,
     /// Asserted `Pn` input bits from the last snapshot, for probe gating.
     pub signals_raw: CoreSignals,
     /// Application-owned tool table and its profile state.
@@ -1083,6 +1086,7 @@ impl AppState {
             settings: SettingsModel::default(),
             offsets: OffsetModel::default(),
             probe: ProbeModel::default(),
+            height_map: HeightMapCompensation::default(),
             signals_raw: CoreSignals::NONE,
             tools: ToolTableModel::new(),
             config,
@@ -1138,6 +1142,7 @@ impl AppState {
         self.sync_offset_context();
         self.tools = ToolTableModel::new();
         self.probe = ProbeModel::default();
+        self.height_map.reset();
         self.config.begin_connection();
         self.push_console(ConsoleLevel::Info, message);
     }
@@ -1370,6 +1375,14 @@ impl AppState {
             };
         }
         self.job.status_label()
+    }
+
+    /// Whether the loaded job is a height-map compensated program.
+    ///
+    /// The job toolbar uses this to show the `HEIGHT MAP / COMPENSATED` marker;
+    /// a normal program with the same text in its name is never marked.
+    pub fn job_compensated(&self) -> bool {
+        self.height_map.is_applied_for(&self.job.name)
     }
 
     pub fn axes(&self) -> &[Axis] {
