@@ -878,14 +878,9 @@ impl ProbeModel {
             units: Units::Mm,
         };
         let cycle = self.cycle(card, ctx)?;
-        let mut plan = cycle.plan(&params).map_err(|error| error.to_string())?;
-        // `ghs-gcode` currently treats a bare `G91` line while `G38.2` is the
-        // modal motion as a probe move with no axis word, so the engine would
-        // reject the retract block. Merge `G91` with the relative Z lift: the
-        // motion is identical (`G91 G0 Z<retract>`), the parser sees an axis
-        // word, and the following `G90` restores absolute mode. Reported to the
-        // orchestrator as a parser bug; this is the only plan normalization.
-        plan.program = plan.program.replace("\nG91\nG0 Z", "\nG91 G0 Z");
+        // The plan is emitted verbatim: `ghs-probe` owns the G-code, and the
+        // parser accepts its bare `G91` retract blocks after a modal `G38.2`.
+        let plan = cycle.plan(&params).map_err(|error| error.to_string())?;
         Ok(ProbeSetup {
             params,
             cycle,
