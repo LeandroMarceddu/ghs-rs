@@ -20,10 +20,19 @@ Observed at 2048×1152:
 - Top mode tabs are ~40 px, below the 48 px touch target.
 - Signals/Work labels are ~10 px, below the comfortable touch reading size.
 
-## Target layout: three aligned columns
+## Confirmed layout: three aligned columns
 
-Use the same three vertical columns for the whole shell. The bottom controls
-are not a separate full-width strip; they are the bottom of each column.
+Confirmed with the user's sketch. Work sits directly below the Signals card,
+and Spindle sits below Work. The three columns share the same horizontal
+guides:
+
+- The bottom of Console/Program and Viewer aligns with the bottom of the
+  Coolant/Macros/Signals stack.
+- The MDI/DRO row aligns with the Work card.
+- The Feed/Jog row aligns with the Spindle card.
+
+The bottom controls are not a separate full-width strip; they are the bottom of
+each column.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -41,10 +50,15 @@ are not a separate full-width strip; they are the bottom of each column.
 
 - Left column: console/program on top, then MDI, then Feed.
 - Center column: viewer on top, then DRO, then Jog.
-- Right column: coolant/macros/signals on top, then Work, then Spindle.
+- Right column: coolant/macros/signals stacked on top, then Work, then Spindle.
+- The right-hand top stack must end on the same line as the console/viewer.
+  If Coolant/Macros/Signals overflow, scroll inside the stack; never push Work
+  or Spindle down.
 - Every bottom card in a row has the **same height**. Every card fills its
   grid cell; no fixed pixel widths.
 - MDI now aligns exactly under the console, which fixes the disproportion.
+- Work is no longer in the bottom deck; it is the right-column card between
+  Signals and Spindle.
 
 ## Grid and tokens
 
