@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::TransportError;
 use crate::transport::{Transport, TransportEvent};
@@ -12,8 +11,9 @@ use crate::transport::{Transport, TransportEvent};
 /// Creates two connected in-process transport endpoints.
 ///
 /// Bytes sent on one endpoint are delivered as [`TransportEvent::Bytes`] on the
-/// other. Closing or dropping one endpoint publishes [`TransportEvent::Closed`]
-/// to its peer. No operating-system resources are used.
+/// other endpoint's [`Transport::events`] receiver. Closing or dropping one
+/// endpoint publishes [`TransportEvent::Closed`] to both its peer and its own
+/// receiver. No operating-system resources are used.
 #[must_use]
 pub fn loopback_pair() -> (LoopbackTransport, LoopbackTransport) {
     let (sender_a, receiver_a) = unbounded();
@@ -24,13 +24,15 @@ pub fn loopback_pair() -> (LoopbackTransport, LoopbackTransport) {
 
     let endpoint_a = LoopbackTransport {
         inbound: receiver_a,
-        outbound: Some(sender_b),
+        outbound: Some(sender_b.clone()),
+        self_tx: Some(sender_a.clone()),
         state: Arc::clone(&state_a),
         peer_state: Arc::clone(&state_b),
     };
     let endpoint_b = LoopbackTransport {
         inbound: receiver_b,
         outbound: Some(sender_a),
+        self_tx: Some(sender_b),
         state: state_b,
         peer_state: state_a,
     };
@@ -49,6 +51,7 @@ struct EndpointState {
 pub struct LoopbackTransport {
     inbound: Receiver<TransportEvent>,
     outbound: Option<Sender<TransportEvent>>,
+    self_tx: Option<Sender<TransportEvent>>,
     state: Arc<EndpointState>,
     peer_state: Arc<EndpointState>,
 }
@@ -59,7 +62,16 @@ impl LoopbackTransport {
     }
 
     fn notify_peer(&mut self) {
+        if self.peer_state.closed.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(sender) = self.outbound.take() {
+            let _ = sender.send(TransportEvent::Closed);
+        }
+    }
+
+    fn notify_self(&mut self) {
+        if let Some(sender) = self.self_tx.take() {
             let _ = sender.send(TransportEvent::Closed);
         }
     }
@@ -86,25 +98,15 @@ impl Transport for LoopbackTransport {
         }
     }
 
-    fn recv_timeout(&self, timeout: Duration) -> Result<TransportEvent, TransportError> {
-        if self.is_locally_closed() {
-            return Ok(TransportEvent::Closed);
-        }
-
-        match self.inbound.recv_timeout(timeout) {
-            Ok(event) => Ok(event),
-            Err(RecvTimeoutError::Timeout) => Err(TransportError::Timeout(timeout)),
-            Err(RecvTimeoutError::Disconnected) => {
-                self.peer_state.closed.store(true, Ordering::Release);
-                Ok(TransportEvent::Closed)
-            }
-        }
+    fn events(&self) -> &Receiver<TransportEvent> {
+        &self.inbound
     }
 
     fn close(&mut self) {
         if self.state.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.notify_self();
         self.notify_peer();
     }
 
@@ -121,10 +123,15 @@ impl Drop for LoopbackTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use crossbeam_channel::RecvTimeoutError;
+
     use super::*;
 
     fn recv(transport: &LoopbackTransport) -> TransportEvent {
         transport
+            .events()
             .recv_timeout(Duration::from_secs(1))
             .expect("an event")
     }
@@ -160,6 +167,7 @@ mod tests {
 
         assert!(!left.is_open());
         assert!(!right.is_open());
+        assert_eq!(recv(&left), TransportEvent::Closed);
         assert_eq!(recv(&right), TransportEvent::Closed);
         assert!(matches!(left.send(b"x"), Err(TransportError::Closed)));
     }
@@ -179,18 +187,62 @@ mod tests {
         let (mut left, right) = loopback_pair();
         left.send(b"").expect("empty send");
         assert!(matches!(
-            right.recv_timeout(Duration::from_millis(30)),
-            Err(TransportError::Timeout(_))
+            right.events().recv_timeout(Duration::from_millis(30)),
+            Err(RecvTimeoutError::Timeout)
         ));
     }
 
     #[test]
-    fn recv_timeout_reports_timeout() {
+    fn events_receive_timeout_is_reported() {
         let (_left, right) = loopback_pair();
-        let started = std::time::Instant::now();
-        let result = right.recv_timeout(Duration::from_millis(40));
-        assert!(matches!(result, Err(TransportError::Timeout(_))));
+        let started = Instant::now();
+        let result = right.events().recv_timeout(Duration::from_millis(40));
+        assert!(matches!(result, Err(RecvTimeoutError::Timeout)));
         assert!(started.elapsed() >= Duration::from_millis(35));
+    }
+
+    #[test]
+    fn events_work_with_select() {
+        let (mut left, right) = loopback_pair();
+        left.send(b"x").expect("send");
+
+        let events = right.events();
+        crossbeam_channel::select! {
+            recv(events) -> event => {
+                assert_eq!(event.expect("event"), TransportEvent::Bytes(b"x".to_vec()));
+            }
+        }
+    }
+
+    #[test]
+    fn select_can_send_in_the_handler() {
+        let (mut left, mut right) = loopback_pair();
+        right.send(b"in").expect("seed the left inbox");
+
+        crossbeam_channel::select! {
+            recv(left.events()) -> event => {
+                assert_eq!(event.expect("event"), TransportEvent::Bytes(b"in".to_vec()));
+                left.send(b"out").expect("send from the handler");
+            }
+        }
+
+        assert_eq!(recv(&right), TransportEvent::Bytes(b"out".to_vec()));
+    }
+
+    #[test]
+    fn boxed_transport_can_select_and_send() {
+        let (left, mut right) = loopback_pair();
+        right.send(b"in").expect("seed the inbox");
+        let mut transport: Box<dyn Transport> = Box::new(left);
+
+        crossbeam_channel::select! {
+            recv(transport.events()) -> event => {
+                assert_eq!(event.expect("event"), TransportEvent::Bytes(b"in".to_vec()));
+                transport.send(b"out").expect("send from the handler");
+            }
+        }
+
+        assert_eq!(recv(&right), TransportEvent::Bytes(b"out".to_vec()));
     }
 
     #[test]
@@ -198,6 +250,7 @@ mod tests {
         let (mut left, right) = loopback_pair();
         left.close();
         left.close();
+        assert_eq!(recv(&left), TransportEvent::Closed);
         assert_eq!(recv(&right), TransportEvent::Closed);
         // A second close must not panic or resurrect the endpoint.
         let (mut left, _right) = loopback_pair();

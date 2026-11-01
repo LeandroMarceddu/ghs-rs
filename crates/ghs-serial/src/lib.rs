@@ -5,17 +5,27 @@
 //! provides an in-process loopback pair for tests and simulator demo mode; it
 //! never opens a network transport.
 //!
-//! # Event channels
+//! # Receive path
 //!
-//! [`SerialTransport::open`] returns the transport plus a
-//! [`Receiver<TransportEvent>`](crossbeam_channel::Receiver). A reader thread
+//! [`SerialTransport::open`] returns the transport, and
+//! [`Transport::events`] returns the one event receiver. A reader thread
 //! publishes [`TransportEvent::Bytes`] for every chunk read from the port,
 //! [`TransportEvent::Error`] for a link error, and exactly one
-//! [`TransportEvent::Closed`] when the link stops.
+//! [`TransportEvent::Closed`] when the link stops. The receiver is suitable for
+//! `crossbeam_channel::select!`:
 //!
-//! The transport also implements [`Transport::recv_timeout`] over the same
-//! queue, for callers that do not need `select!`. Use one consumption style
-//! per link; both draw from the same queue.
+//! ```no_run
+//! # use ghs_serial::{SerialConfig, SerialTransport, Transport};
+//! # fn example(config: SerialConfig) -> Result<(), Box<dyn std::error::Error>> {
+//! let transport = SerialTransport::open(config)?;
+//! let events = transport.events();
+//! // crossbeam_channel::select! {
+//! //     recv(events) -> event => { /* handle TransportEvent */ }
+//! // }
+//! # let _ = events;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Loopback
 //!
@@ -26,7 +36,10 @@
 //!
 //! let (mut sender, receiver) = loopback_pair();
 //! sender.send(b"$I+\r\n").expect("send");
-//! let event = receiver.recv_timeout(Duration::from_secs(1)).expect("event");
+//! let event = receiver
+//!     .events()
+//!     .recv_timeout(Duration::from_secs(1))
+//!     .expect("event");
 //! assert_eq!(event, TransportEvent::Bytes(b"$I+\r\n".to_vec()));
 //! ```
 
@@ -43,7 +56,7 @@ mod transport;
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 pub use error::TransportError;
 pub use loopback::{LoopbackTransport, loopback_pair};
-pub use ports::{PortInfo, list_ports, watch_ports};
+pub use ports::{PortInfo, PortWatcher, list_ports, watch_ports};
 pub use serial::SerialTransport;
 pub use transport::{Transport, TransportEvent};
 

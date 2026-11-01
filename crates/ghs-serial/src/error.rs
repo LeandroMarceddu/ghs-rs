@@ -1,7 +1,5 @@
 //! Typed errors for the serial transport.
 
-use std::time::Duration;
-
 /// Errors produced while enumerating ports or using a [`crate::Transport`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -22,19 +20,11 @@ pub enum TransportError {
     #[error("transport is closed")]
     Closed,
 
-    /// No event arrived within the requested timeout.
-    #[error("timed out after {0:?} waiting for transport data")]
-    Timeout(Duration),
+    /// DTR/RTS control was requested for a port with line control disabled.
+    #[error("line control is disabled for this port")]
+    LineControlDisabled,
 
     /// Internal state was poisoned by a panicking writer.
     #[error("transport state is poisoned: {0}")]
     Poisoned(&'static str),
-}
-
-impl TransportError {
-    /// Returns `true` when this error only means that no event arrived in time.
-    #[must_use]
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Timeout(_))
-    }
 }

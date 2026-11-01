@@ -93,8 +93,8 @@ impl FlowControl {
 /// Settings used to open a serial port.
 ///
 /// The default is 115200 baud, 8 data bits, no parity, one stop bit, no flow
-/// control, with DTR and RTS asserted. The port name is empty, so call
-/// [`Self::new`] or set [`Self::port`] before opening.
+/// control, modem line control disabled, and DTR/RTS not requested. The port
+/// name is empty, so call [`Self::new`] or set [`Self::port`] before opening.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SerialConfig {
     /// Operating system port name, for example `/dev/ttyUSB0` or `COM3`.
@@ -109,12 +109,23 @@ pub struct SerialConfig {
     pub stop_bits: StopBits,
     /// Flow control mode.
     pub flow_control: FlowControl,
-    /// Assert the DTR line after opening the port.
+    /// Enable modem-control ioctls for DTR and RTS.
     ///
-    /// Many boards wire DTR to reset. Setting this to `false` keeps the line
-    /// deasserted; the transport never pulses DTR itself.
+    /// When `false` (the default), opening the port does not touch DTR or RTS
+    /// and [`crate::SerialTransport::set_dtr`] /
+    /// [`crate::SerialTransport::pulse_dtr`] return
+    /// [`TransportError::LineControlDisabled`]. This is required for virtual or
+    /// Bluetooth serial ports that do not implement the modem-control ioctls.
+    pub line_control: bool,
+    /// Drive DTR to this level after opening when `line_control` is enabled.
+    ///
+    /// `true` asserts DTR. Many boards wire DTR to reset; asserting it on open
+    /// can reset the controller, which is why the default is `false`.
     pub dtr: bool,
-    /// Assert the RTS line after opening the port.
+    /// Drive RTS to this level after opening when `line_control` is enabled.
+    ///
+    /// Ignored when [`Self::flow_control`] is [`FlowControl::Hardware`]: the
+    /// driver owns RTS in that mode.
     pub rts: bool,
 }
 
@@ -127,8 +138,9 @@ impl Default for SerialConfig {
             parity: Parity::None,
             stop_bits: StopBits::One,
             flow_control: FlowControl::None,
-            dtr: true,
-            rts: true,
+            line_control: false,
+            dtr: false,
+            rts: false,
         }
     }
 }
@@ -146,7 +158,8 @@ impl SerialConfig {
     /// Checks that the configuration can be handed to the operating system.
     ///
     /// Enum-valued settings are always valid; this rejects an empty port name,
-    /// a port name containing a NUL byte, and a zero baud rate.
+    /// a port name containing a NUL byte, a zero baud rate, and `dtr`/`rts`
+    /// requests while `line_control` is disabled.
     ///
     /// # Errors
     ///
@@ -168,6 +181,11 @@ impl SerialConfig {
                 "baud rate must be greater than zero".into(),
             ));
         }
+        if !self.line_control && (self.dtr || self.rts) {
+            return Err(TransportError::InvalidConfig(
+                "DTR/RTS requests require line_control".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -177,15 +195,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_115200_8n1() {
+    fn defaults_are_115200_8n1_without_line_control() {
         let config = SerialConfig::default();
         assert_eq!(config.baud, 115_200);
         assert_eq!(config.data_bits, DataBits::Eight);
         assert_eq!(config.parity, Parity::None);
         assert_eq!(config.stop_bits, StopBits::One);
         assert_eq!(config.flow_control, FlowControl::None);
-        assert!(config.dtr);
-        assert!(config.rts);
+        assert!(!config.line_control);
+        assert!(!config.dtr);
+        assert!(!config.rts);
         assert!(config.port.is_empty());
     }
 
@@ -215,6 +234,32 @@ mod tests {
             config.validate(),
             Err(TransportError::InvalidConfig(_))
         ));
+
+        let config = SerialConfig {
+            dtr: true,
+            ..SerialConfig::new("/dev/ttyUSB0")
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(TransportError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn validation_accepts_line_control_levels() {
+        let config = SerialConfig {
+            line_control: true,
+            dtr: true,
+            rts: true,
+            ..SerialConfig::new("/dev/ttyUSB0")
+        };
+        assert!(config.validate().is_ok());
+
+        let config = SerialConfig {
+            line_control: true,
+            ..SerialConfig::new("/dev/ttyUSB0")
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
