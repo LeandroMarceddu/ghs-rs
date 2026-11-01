@@ -13,6 +13,22 @@ A row is `done` only when it works against the simulator, has automated tests,
 has been verified on the FlexiHAL board, is usable without a mouse, is
 documented, and is localized.
 
+## Layer status (2026-11-01)
+
+| Layer | State | Evidence |
+|---|---|---|
+| Protocol/domain | Implemented | 155 tests + proptests; full grblHAL status/realtime/system/enumeration surface |
+| Serial | Implemented | 38 tests + PTY; hardware modem-control/unplug validation pending |
+| Simulator | Implemented | 80 tests; FlexiHAL fixture byte-for-byte, generic-full profile |
+| G-code | Implemented (M4 core) | 127 tests; expressions/flow control/extra axes deferred |
+| Viewer geometry | Implemented | 53 tests; 200k segments inside 60 fps budget |
+| Engine | Implemented (M2) | 45 tests incl. simulator-over-loopback; job runner is M3 |
+| App shell | Live demo | approved layout; live DRO/MDI/console; serial picker in progress |
+| Hardware | Pending | board offline in the shed; simulator-first validation |
+
+Rows below are the feature-level checklist. A protocol/simulator row can be
+implemented before its UI or hardware validation row is complete.
+
 ## Communication and protocol
 
 | ID | Capability | Milestone | Status | Notes |
