@@ -41,6 +41,12 @@ Recorded from the machine's `$I+` response (see
 The simulator must reproduce this profile by default, and every UI panel must
 be capability-gated so other grblHAL boards degrade gracefully.
 
+> **Hardware access note.** The controller lives offline in a garden shed, so
+> M1 is simulator-first. Hardware-in-the-loop validation is a gate at M2/M3
+> once the board is reachable. The first hardware session will be captured with
+> a standalone capture tool into one file, brought back on a USB stick, and
+> imported as a fixture. No feature depends on internet access at the machine.
+
 ## 3. Scope
 
 ### In scope
@@ -257,6 +263,7 @@ interlocks, and check mode promoted in the UI. See [SAFETY.md](SAFETY.md).
 | 3D performance in a 2D painter | Software projection first; decimation/caching; wgpu fallback |
 | Streaming correctness | Sans-IO core, property tests, simulator, hardware early |
 | Real-machine safety | Interlocks, dry runs, HIL checklist, conservative defaults |
+| Intermittent hardware access | Simulator-first M1; recorded fixtures; HIL gate when the board is reachable |
 | Scope creep | Explicit exclusions; parity checklist; v1.0 gate |
 | Long GPUI compile times | Shared target cache for orchestrator; per-agent target dirs |
 | Serial quirks (DTR/RTS, permissions) | Dedicated transport tests; document dialout setup |
