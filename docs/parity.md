@@ -23,9 +23,9 @@ documented, and is localized.
 | G-code | Implemented (M4 core) | 127 tests; expressions/flow control/extra axes deferred |
 | Viewer geometry | Implemented | 53 tests; 200k segments inside 60 fps budget |
 | Engine | Implemented (M3) | M2 session + job runner; 20 job tests, simulator-over-loopback |
-| App shell | Live demo + job UI in progress | approved layout; live DRO/MDI/console; serial picker |
-| Program UI | In progress | parsed program list, job controls, tool-change modal |
-| Viewer UI | Not started | synthetic canvas; real toolpath is M4 |
+| App shell | Live demo + job UI | approved layout; live DRO/MDI/console; serial picker |
+| Program UI | Implemented (M3) | real parsed list, progress/current line, job controls, tool-change sheet |
+| Viewer UI | In progress | synthetic canvas; M4 real toolpath pass running |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
 
 Rows below are the feature-level checklist. A protocol/simulator row can be
