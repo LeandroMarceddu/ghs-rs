@@ -5,7 +5,10 @@
 //! [`KeypadState`] and sends [`KeypadAction`] values back to the shell.
 
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::{App, Entity, IntoElement, ParentElement as _, SharedString, Styled as _, div, px};
+use gpui_kit::{
+    App, Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    SharedString, Styled as _, div, px,
+};
 
 use crate::shell::Shell;
 use crate::state::{KeypadAction, KeypadState, KeypadTarget};
@@ -187,9 +190,14 @@ pub fn overlay(
     }
     sheet = sheet.child(grid);
 
+    // Consuming scrim: it owns the hitbox over the whole workspace below the
+    // top bar, blocks clicks from reaching the controls underneath, and closes
+    // the sheet when tapped. Without `.occlude()` a tap outside the sheet fell
+    // through to the DRO/MDI control below.
+    let scrim_view = view.clone();
     div()
         .absolute()
-        .top(px(64.0))
+        .top(px(56.0))
         .left(px(0.0))
         .right(px(0.0))
         .bottom(px(0.0))
@@ -197,6 +205,19 @@ pub fn overlay(
         .items_end()
         .justify_end()
         .p_4()
-        .child(div().absolute().inset_0().bg(palette.scrim))
+        .child(
+            div()
+                .id("keypad-scrim")
+                .absolute()
+                .inset_0()
+                .bg(palette.scrim)
+                .occlude()
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    scrim_view.update(cx, |shell, cx| {
+                        shell.state.keypad_action(KeypadAction::Cancel);
+                        cx.notify();
+                    });
+                }),
+        )
         .child(sheet)
 }

@@ -5,7 +5,10 @@
 //! in-app keypad can be reviewed on Linux before M1 lands.
 //!
 //! Demo flags: `--light` starts in the light theme, `--keypad` opens the X
-//! keypad at startup. Neither flag changes normal operation.
+//! keypad at startup. Neither flag changes normal operation. `--size WxH`
+//! (or `--size=WxH`) opens at an explicit logical size for layout review, e.g.
+//! `--size 1920x1080` or `--size 1080x1920`; `--fullscreen` pins the shell to
+//! the current output.
 //!
 //! Window policy:
 //! - 1280x800 default (UX-01), 1920x1080 works by widening the centre column.
@@ -30,11 +33,24 @@ fn main() {
         let light = std::env::args().any(|arg| arg == "--light");
         theme::apply(!light, cx);
 
+        // Screenshot/layout-review override; defaults to the UX-01 size.
+        let (width, height) = window_size_override().unwrap_or((1280.0, 800.0));
+        // `--fullscreen` pins the shell to the output for kiosk-style review
+        // captures; it also makes headless (nested compositor) sizes exact.
+        let fullscreen = std::env::args().any(|arg| arg == "--fullscreen");
+        let bounds = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(width), px(height)),
+        };
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(80.0), px(60.0)),
-                size: size(px(1280.0), px(800.0)),
-            })),
+            window_bounds: Some(if fullscreen {
+                WindowBounds::Fullscreen(bounds)
+            } else {
+                WindowBounds::Windowed(Bounds {
+                    origin: point(px(80.0), px(60.0)),
+                    size: size(px(width), px(height)),
+                })
+            }),
             window_min_size: Some(size(px(1024.0), px(600.0))),
             titlebar: Some(TitlebarOptions {
                 title: Some("ghs-rs - grblHAL touch shell (M0)".into()),
@@ -50,4 +66,30 @@ fn main() {
             cx.quit();
         }
     });
+}
+
+/// Read `--size WxH` or `--size=WxH` from the process arguments.
+///
+/// Returns `None` for a missing or malformed value so the caller keeps the
+/// default 1280x800 window. Values below 320 px are ignored: the shell cannot
+/// render anything useful below that.
+fn window_size_override() -> Option<(f32, f32)> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let raw = if arg == "--size" {
+            args.next()?
+        } else if let Some(value) = arg.strip_prefix("--size=") {
+            value.to_string()
+        } else {
+            continue;
+        };
+        let (width, height) = raw.split_once(['x', 'X'])?;
+        let width = width.parse::<f32>().ok()?;
+        let height = height.parse::<f32>().ok()?;
+        if width >= 320.0 && height >= 320.0 {
+            return Some((width, height));
+        }
+        return None;
+    }
+    None
 }

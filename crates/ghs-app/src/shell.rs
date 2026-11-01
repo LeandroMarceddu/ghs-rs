@@ -1,20 +1,33 @@
 //! Touch shell layout for the M0 spike.
 //!
-//! Fixed panels, 48 px targets, and a single always-visible Reset/Stop pair in
-//! the top bar. The layout targets 1280x800 (UX-01) and scales to 1920x1080
-//! (UX-02) because the centre column and jog card absorb the extra width.
+//! Asymmetric three-column grid (see `docs/design/touch-layout.md`):
+//!
+//! ```text
+//! +----------------+------------------------------+-----------------+
+//! | Console/Program| Viewer                       | Coolant         |
+//! |                |                              | Macros          |
+//! |                |                              | Signals         |
+//! |                |                              | Work            |
+//! +----------------+------------------------------+                 |
+//! | MDI            | DRO                          |                 |
+//! +----------------+------------------------------+-----------------+
+//! | Feed           | Jog                          | Spindle         |
+//! +----------------+------------------------------+-----------------+
+//! ```
+//!
+//! The columns are plain flex stacks with a shared 12 px gap and 112 px
+//! bottom rows, so the guides line up without a grid layout: the right column
+//! has one flexible cell plus a 112 px Spindle cell, which makes its tall cell
+//! end exactly on the MDI/DRO baseline.
 //!
 //! Portrait / narrow behaviour plan (UX-03, deferred to M7):
-//! - At < 1120 px the right rail collapses behind a vertical "AUX" tab and the
-//!   left rail narrows to 300 px.
+//! - At < 1120 px the right rail collapses and the centre column takes the
+//!   space; the layout stays landscape-shaped.
 //! - At < 760 px the window should reflow to a single column: mode bar, active
 //!   workspace, then a paged bottom dock (DRO / Jog / MDI / Spindle). The
 //!   keypad becomes a full-width bottom sheet.
 //! - Every panel keeps its 48 px targets in portrait; the dock scrolls rather
 //!   than shrinking controls.
-//!
-//! For M0 only the right-rail collapse is implemented, because a 1024x600
-//! landscape minimum is the only supported touch size.
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -25,7 +38,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, div, px,
 };
 
@@ -37,6 +50,11 @@ use crate::theme::Palette;
 use crate::viewer;
 
 const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
+
+/// Height of the MDI/DRO and Feed/Jog/Spindle rows.
+const ROW_H: f32 = 112.0;
+/// Gap between cards and between columns.
+const GAP: f32 = 12.0;
 
 pub struct Shell {
     pub state: AppState,
@@ -118,7 +136,8 @@ impl Shell {
         let stop_view = view.clone();
 
         div()
-            .h(px(64.0))
+            .h(px(56.0))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .gap_3()
@@ -150,7 +169,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .h(px(40.0))
+                    .h(px(36.0))
                     .px_3()
                     .rounded(px(999.0))
                     .bg(p.panel_alt)
@@ -227,7 +246,43 @@ impl Shell {
             )
     }
 
-    fn left_rail(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Left column: console/program (flex), MDI, Feed.
+    fn left_column(&self, p: Palette, cx: &mut Context<Self>, width: f32) -> impl IntoElement {
+        v_flex()
+            .w(px(width))
+            .flex_shrink_0()
+            .h_full()
+            .gap(px(GAP))
+            .child(self.console_card(p, cx))
+            .child(self.mdi_card(p, cx))
+            .child(self.feed_card(p, cx))
+    }
+
+    /// Centre column: viewer (flex), DRO, Jog.
+    fn center_column(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .gap(px(GAP))
+            .child(self.viewer_card(p, cx))
+            .child(self.dro_card(p, cx))
+            .child(self.jog_card(p, cx))
+    }
+
+    /// Right column: Coolant/Macros/Signals/Work as one cell spanning rows 1-2,
+    /// then Spindle on the Feed/Jog row.
+    fn aux_column(&self, p: Palette, cx: &mut Context<Self>, width: f32) -> impl IntoElement {
+        v_flex()
+            .w(px(width))
+            .flex_shrink_0()
+            .h_full()
+            .gap(px(GAP))
+            .child(self.aux_panel(p, cx))
+            .child(self.spindle_card(p, cx))
+    }
+
+    fn console_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let console_tab = tab_button(
             cx,
@@ -250,8 +305,8 @@ impl Shell {
         };
 
         div()
-            .w(px(356.0))
-            .h_full()
+            .flex_1()
+            .min_h(px(0.0))
             .flex()
             .flex_col()
             .rounded_lg()
@@ -268,10 +323,11 @@ impl Shell {
                     .child(console_tab)
                     .child(program_tab),
             )
-            .child(div().flex_1().overflow_hidden().child(body))
+            .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body))
             .child(
                 div()
                     .h(px(26.0))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -305,7 +361,7 @@ impl Shell {
                         div()
                             .flex_shrink_0()
                             .w(px(34.0))
-                            .text_size(px(9.0))
+                            .text_size(px(10.0))
                             .text_color(p.text_faint)
                             .child(line.time),
                     )
@@ -313,7 +369,7 @@ impl Shell {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_size(px(10.5))
+                            .text_size(px(11.5))
                             .text_color(console_color(line.level, p))
                             .child(line.text.clone()),
                     )
@@ -347,23 +403,25 @@ impl Shell {
                         div()
                             .w(px(26.0))
                             .flex_shrink_0()
-                            .text_size(px(9.0))
+                            .text_size(px(10.0))
                             .text_color(if active { p.accent } else { p.text_faint })
                             .child(format!("{}", line.number)),
                     )
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(10.5))
+                            .text_size(px(11.5))
                             .text_color(if active { p.accent } else { text_color })
                             .child(line.text),
                     )
             }))
     }
 
-    fn center(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Viewer card: fills the centre column's first row.
+    fn viewer_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let header = div()
             .h(px(48.0))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .gap_3()
@@ -430,7 +488,7 @@ impl Shell {
 
         div()
             .flex_1()
-            .h_full()
+            .min_h(px(0.0))
             .flex()
             .flex_col()
             .rounded_lg()
@@ -552,7 +610,7 @@ impl Shell {
             .child(
                 Button::new("mode-back")
                     .label("Back to Job")
-                    .h(px(44.0))
+                    .h(px(48.0))
                     .w(px(140.0))
                     .rounded_lg()
                     .text_size(px(12.0))
@@ -630,7 +688,7 @@ impl Shell {
                             .child(div().text_size(px(13.0)).text_color(p.text).child(*name))
                             .child(
                                 div()
-                                    .text_size(px(10.0))
+                                    .text_size(px(11.0))
                                     .text_color(p.text_faint)
                                     .child(*detail),
                             ),
@@ -655,7 +713,7 @@ impl Shell {
             .gap_1()
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(11.0))
                     .text_color(p.text_faint)
                     .child(format!(
                         "APP-SIDE TABLE | controller reports {} entries{}",
@@ -671,7 +729,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_3()
-                    .h(px(36.0))
+                    .h(px(40.0))
                     .px_2()
                     .rounded(px(6.0))
                     .bg(p.panel_alt)
@@ -748,7 +806,7 @@ impl Shell {
             )
             .child(
                 div()
-                    .text_size(px(9.0))
+                    .text_size(px(10.0))
                     .text_color(p.text_faint)
                     .child("ACCESSORY HOOKS (post-v1.0 panels, not built)"),
             )
@@ -766,7 +824,11 @@ impl Shell {
             ))
     }
 
-    fn right_rail(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Tall right cell: Coolant, Macros, Signals and Work in one continuous
+    /// card. There is deliberately no divider between Signals and Work, and the
+    /// card's bottom edge is the MDI/DRO baseline (the Spindle card below it is
+    /// exactly one row tall).
+    fn aux_panel(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let coolant = self
             .state
@@ -796,7 +858,7 @@ impl Shell {
                     .flex_1()
                     .h(px(48.0))
                     .rounded(px(6.0))
-                    .text_size(px(10.0))
+                    .text_size(px(11.0))
                     .custom(variant)
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
@@ -808,7 +870,7 @@ impl Shell {
 
         let macro_view = view.clone();
         let macro_rows = (0..4).map(|row| {
-            div().flex().gap_1().children((0..2).map(|col| {
+            h_flex().gap_1().children((0..2).map(|col| {
                 let index = row * 2 + col;
                 let macro_view = macro_view.clone();
                 let Some(mac) = self.state.macros.get(index) else {
@@ -819,7 +881,7 @@ impl Shell {
                     .flex_1()
                     .h(px(48.0))
                     .rounded(px(6.0))
-                    .text_size(px(10.0))
+                    .text_size(px(11.0))
                     .custom(
                         ButtonCustomVariant::new(cx)
                             .color(p.panel_alt)
@@ -838,7 +900,7 @@ impl Shell {
         });
 
         let signal_rows = (0..3).map(|row| {
-            div().flex().gap_1().children((0..2).map(|col| {
+            h_flex().gap_2().children((0..2).map(|col| {
                 let index = row * 2 + col;
                 let Some(signal) = self.state.signals.get(index) else {
                     return div().into_any_element();
@@ -852,12 +914,13 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_1()
-                    .w(px(96.0))
-                    .h(px(20.0))
-                    .child(div().w(px(6.0)).h(px(6.0)).rounded(px(999.0)).bg(color))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h(px(22.0))
+                    .child(div().w(px(7.0)).h(px(7.0)).rounded(px(999.0)).bg(color))
                     .child(
                         div()
-                            .text_size(px(8.5))
+                            .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(text)
                             .child(signal.label.clone()),
@@ -866,66 +929,99 @@ impl Shell {
             }))
         });
 
-        div()
-            .w(px(220.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .id("right-rail-scroll")
-            .overflow_y_scroll()
+        let work_rows = [
+            ("Origin X", "-123.450".to_string()),
+            ("Origin Y", "-87.200".to_string()),
+            ("Origin Z", "-2.000".to_string()),
+            (
+                "Feed",
+                format!("{} {}/min", self.state.feed_rate, self.state.unit()),
+            ),
+        ];
+
+        card(&p)
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .gap_2()
             .child(
-                card(&p)
+                v_flex()
                     .gap_1()
+                    .flex_shrink_0()
                     .child(section_label("COOLANT", p))
-                    .child(div().flex().gap_1().children(coolant)),
+                    .child(h_flex().gap_1().children(coolant)),
             )
             .child(
-                card(&p)
+                v_flex()
                     .gap_1()
+                    .flex_shrink_0()
                     .child(section_label("MACROS", p))
-                    .child(div().flex().flex_col().gap_1().children(macro_rows)),
+                    .child(v_flex().gap_1().children(macro_rows)),
             )
             .child(
-                card(&p)
+                v_flex()
                     .gap_1()
+                    .flex_shrink_0()
                     .child(section_label("SIGNALS", p))
-                    .child(div().flex().flex_col().gap_1().children(signal_rows))
+                    .child(v_flex().gap_1().children(signal_rows))
                     .child(
                         div()
-                            .text_size(px(8.0))
+                            .text_size(px(10.0))
                             .text_color(p.text_faint)
                             .child("HSDEP | no probe-connected pin"),
                     ),
             )
-    }
-
-    fn bottom_dock(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .h(px(326.0))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_2()
-            .pb_2()
+            // No divider: the extra height of the tall cell simply spaces the
+            // Work rows below Signals.
             .child(
-                h_flex()
-                    .gap_2()
-                    .h(px(138.0))
-                    .child(self.mdi_card(p, cx))
-                    .child(self.dro_card(p, cx))
-                    .child(self.params_card(p)),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
+                v_flex()
                     .flex_1()
-                    .child(self.feed_card(p))
-                    .child(self.jog_card(p, cx))
-                    .child(self.spindle_card(p, cx)),
+                    .min_h(px(0.0))
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(section_label("WORK", p))
+                            .child(chip(self.state.wcs(), p)),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .justify_between()
+                            .gap_1()
+                            .children(work_rows.iter().map(|(name, value)| {
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .h(px(24.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(p.text_faint)
+                                            .child(*name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(14.0))
+                                            .font_family(self.mono.clone())
+                                            .text_color(p.text)
+                                            .child(value.clone()),
+                                    )
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(chip("G21", p))
+                            .child(chip("G90", p))
+                            .child(chip("G17", p)),
+                    ),
             )
     }
 
+    /// MDI: one 48 px field plus a Send button on a single row, one hint line.
     fn mdi_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let empty = self.state.mdi.trim().is_empty();
@@ -933,64 +1029,49 @@ impl Shell {
         let send_view = view.clone();
 
         card(&p)
-            .flex_1()
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(section_label("MDI", p))
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(p.text_faint)
-                            .child("tap field for keypad"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("mdi-field")
-                    .flex()
-                    .items_center()
-                    .h(px(48.0))
-                    .w_full()
-                    .px_3()
-                    .rounded(px(7.0))
-                    .bg(p.panel_alt)
-                    .border_1()
-                    .border_color(p.border)
-                    .font_family(self.mono.clone())
-                    .text_size(px(16.0))
-                    .text_color(if empty { p.text_faint } else { p.text })
-                    .cursor_pointer()
-                    .child(if empty {
-                        "G-code or numeric input".to_string()
-                    } else {
-                        self.state.mdi.clone()
-                    })
-                    .on_click(move |_, _, cx| {
-                        field_view.update(cx, |this, cx| {
-                            this.state.open_keypad(KeypadTarget::Mdi);
-                            cx.notify();
-                        });
-                    }),
-            )
+            .h(px(ROW_H))
+            .flex_shrink_0()
+            .justify_center()
             .child(
                 h_flex()
                     .items_center()
                     .gap_2()
+                    .child(section_label("MDI", p))
                     .child(
                         div()
+                            .id("mdi-field")
                             .flex_1()
-                            .text_size(px(9.0))
-                            .text_color(p.text_faint)
-                            .child("Mock send appends to console"),
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .h(px(48.0))
+                            .px_3()
+                            .rounded(px(7.0))
+                            .bg(p.panel_alt)
+                            .border_1()
+                            .border_color(p.border)
+                            .font_family(self.mono.clone())
+                            .text_size(px(17.0))
+                            .text_color(if empty { p.text_faint } else { p.text })
+                            .cursor_pointer()
+                            .child(if empty {
+                                "G-code or numeric input".to_string()
+                            } else {
+                                self.state.mdi.clone()
+                            })
+                            .on_click(move |_, _, cx| {
+                                field_view.update(cx, |this, cx| {
+                                    this.state.open_keypad(KeypadTarget::Mdi);
+                                    cx.notify();
+                                });
+                            }),
                     )
                     .child(
                         Button::new("mdi-send")
                             .label("SEND")
                             .primary()
                             .h(px(48.0))
-                            .w(px(88.0))
+                            .w(px(80.0))
                             .rounded_lg()
                             .text_size(px(12.0))
                             .on_click(move |_, _, cx| {
@@ -1001,17 +1082,35 @@ impl Shell {
                             }),
                     ),
             )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(p.text_faint)
+                            .child("Mock send appends to console"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("TAP FIELD FOR KEYPAD"),
+                    ),
+            )
     }
 
+    /// DRO: three equal X/Y/Z cells with a 26 px value and a 48 px zero button.
     fn dro_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let wcs_view = view.clone();
         let wcs_menu = Button::new("wcs-menu")
             .label(self.state.wcs())
-            .h(px(30.0))
-            .w(px(74.0))
+            .h(px(22.0))
+            .w(px(58.0))
             .rounded(px(6.0))
-            .text_size(px(11.0))
+            .text_size(px(10.0))
             .custom(
                 ButtonCustomVariant::new(cx)
                     .color(p.panel_alt)
@@ -1042,139 +1141,108 @@ impl Shell {
             let value = format!("{:>8.3}", self.state.value(axis));
             div()
                 .flex_1()
-                .min_w(px(112.0))
+                .min_w(px(0.0))
+                .h_full()
                 .flex()
-                .flex_col()
+                .items_center()
                 .gap_1()
+                .p_1()
+                .rounded(px(6.0))
+                .bg(p.panel_alt)
+                .border_1()
+                .border_color(p.border)
                 .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(p.text_dim)
-                                .child(axis.label()),
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(p.text_dim)
+                                        .child(axis.label()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(p.text_faint)
+                                        .child(self.state.unit()),
+                                ),
                         )
                         .child(
-                            div()
-                                .text_size(px(8.0))
-                                .text_color(p.text_faint)
-                                .child(self.state.unit()),
+                            h_flex().w_full().justify_end().child(
+                                div()
+                                    .id(format!("dro-{}", axis.label()))
+                                    .cursor_pointer()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(26.0))
+                                    .text_color(p.text)
+                                    .child(value)
+                                    .on_click(move |_, _, cx| {
+                                        value_view.update(cx, |this, cx| {
+                                            this.state.open_keypad(KeypadTarget::Dro(axis));
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
                         ),
                 )
                 .child(
-                    h_flex()
-                        .gap_1()
+                    Button::new(format!("zero-{}", axis.label()))
+                        .label("0")
                         .h(px(48.0))
-                        .child(
-                            div()
-                                .id(format!("dro-{}", axis.label()))
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .px_2()
-                                .rounded(px(7.0))
-                                .bg(p.panel_alt)
-                                .border_1()
-                                .border_color(p.border)
-                                .cursor_pointer()
-                                .font_family(self.mono.clone())
-                                .text_size(px(19.0))
-                                .text_color(p.text)
-                                .child(value)
-                                .on_click(move |_, _, cx| {
-                                    value_view.update(cx, |this, cx| {
-                                        this.state.open_keypad(KeypadTarget::Dro(axis));
-                                        cx.notify();
-                                    });
-                                }),
+                        .w(px(48.0))
+                        .rounded(px(7.0))
+                        .text_size(px(16.0))
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(p.panel_alt)
+                                .foreground(p.warning)
+                                .hover(p.raised_hover)
+                                .active(p.raised),
                         )
-                        .child(
-                            Button::new(format!("zero-{}", axis.label()))
-                                .label("0")
-                                .h(px(48.0))
-                                .w(px(48.0))
-                                .rounded(px(7.0))
-                                .text_size(px(15.0))
-                                .custom(
-                                    ButtonCustomVariant::new(cx)
-                                        .color(p.panel_alt)
-                                        .foreground(p.warning)
-                                        .hover(p.raised_hover)
-                                        .active(p.raised),
-                                )
-                                .on_click(move |_, _, cx| {
-                                    zero_view.update(cx, |this, cx| {
-                                        this.state.zero_axis(axis);
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
+                        .border_1()
+                        .border_color(p.border)
+                        .on_click(move |_, _, cx| {
+                            zero_view.update(cx, |this, cx| {
+                                this.state.zero_axis(axis);
+                                cx.notify();
+                            });
+                        }),
                 )
         });
 
         card(&p)
-            .flex_1()
+            .h(px(ROW_H))
+            .flex_shrink_0()
+            .gap_1()
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .h(px(20.0))
                     .child(section_label("DRO", p))
                     .child(wcs_menu),
             )
-            .child(div().flex().flex_wrap().gap_2().flex_1().children(tiles))
+            .child(h_flex().gap_2().flex_1().min_h(px(0.0)).children(tiles))
     }
 
-    fn params_card(&self, p: Palette) -> impl IntoElement {
-        let rows = [
-            ("Origin X", "-123.450".to_string()),
-            ("Origin Y", "-87.200".to_string()),
-            ("Origin Z", "-2.000".to_string()),
-            (
-                "Feed",
-                format!("{} {}/min", self.state.feed_rate, self.state.unit()),
-            ),
-        ];
-        card(&p)
-            .w(px(240.0))
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(section_label("WORK", p))
-                    .child(chip(self.state.wcs(), p)),
-            )
-            .child(v_flex().gap_1().children(rows.iter().map(|(name, value)| {
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .text_size(px(10.0))
-                    .child(div().text_color(p.text_faint).child(*name))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(9.0))
-                            .font_family(self.mono.clone())
-                            .text_color(p.text_dim)
-                            .child(value.clone()),
-                    )
-            })))
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(chip("G21", p))
-                    .child(chip("G90", p))
-                    .child(chip("G17", p)),
-            )
-    }
+    /// Feed: label and 24 px percentage, then a full-width slider flanked by
+    /// 48 px -10/+10 buttons.
+    fn feed_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let down_view = view.clone();
+        let up_view = view.clone();
+        let down_slider = self.feed_slider.clone();
+        let up_slider = self.feed_slider.clone();
 
-    fn feed_card(&self, p: Palette) -> impl IntoElement {
         card(&p)
-            .w(px(220.0))
+            .h(px(ROW_H))
+            .flex_shrink_0()
             .child(
                 h_flex()
                     .items_end()
@@ -1183,21 +1251,72 @@ impl Shell {
                     .child(
                         div()
                             .font_family(self.mono.clone())
-                            .text_size(px(22.0))
+                            .text_size(px(24.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.accent)
                             .child(format!("{}%", self.state.feed_override)),
                     ),
             )
-            .child(Slider::new(&self.feed_slider).h(px(36.0)))
             .child(
-                div()
-                    .text_size(px(8.0))
-                    .text_color(p.text_faint)
-                    .child("DRAG THE TRACK"),
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(48.0))
+                    .child(
+                        Button::new("feed-down")
+                            .label("-10")
+                            .h(px(48.0))
+                            .w(px(48.0))
+                            .rounded_lg()
+                            .text_size(px(12.0))
+                            .custom(mode_variant(cx, p, false))
+                            .border_1()
+                            .border_color(p.border)
+                            .on_click(move |_, window, cx| {
+                                down_view.update(cx, |this, cx| {
+                                    this.state.feed_override =
+                                        this.state.feed_override.saturating_sub(10).max(10);
+                                    let value = f32::from(this.state.feed_override);
+                                    down_slider.update(cx, |slider, cx| {
+                                        slider.set_value(value, window, cx);
+                                    });
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(Slider::new(&self.feed_slider).h(px(24.0))),
+                    )
+                    .child(
+                        Button::new("feed-up")
+                            .label("+10")
+                            .h(px(48.0))
+                            .w(px(48.0))
+                            .rounded_lg()
+                            .text_size(px(12.0))
+                            .custom(mode_variant(cx, p, false))
+                            .border_1()
+                            .border_color(p.border)
+                            .on_click(move |_, window, cx| {
+                                up_view.update(cx, |this, cx| {
+                                    this.state.feed_override =
+                                        this.state.feed_override.saturating_add(10).min(200);
+                                    let value = f32::from(this.state.feed_override);
+                                    up_slider.update(cx, |slider, cx| {
+                                        slider.set_value(value, window, cx);
+                                    });
+                                    cx.notify();
+                                });
+                            }),
+                    ),
             )
     }
 
+    /// Jog: axis selector, step selector, 48 px minus/plus and a continuous
+    /// toggle in the header.
     fn jog_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let axes = self.state.axes().iter().enumerate().map(|(index, axis)| {
@@ -1206,10 +1325,10 @@ impl Shell {
             let axis_view = view.clone();
             Button::new(format!("jog-axis-{index}"))
                 .label(axis.label())
-                .h(px(38.0))
-                .w(px(44.0))
+                .h(px(48.0))
+                .w(px(48.0))
                 .rounded(px(6.0))
-                .text_size(px(12.0))
+                .text_size(px(13.0))
                 .custom(mode_variant(cx, p, active))
                 .border_1()
                 .border_color(if active { p.accent } else { p.border })
@@ -1233,9 +1352,9 @@ impl Shell {
                     Button::new(format!("jog-step-{index}"))
                         .label(*label)
                         .flex_1()
-                        .h(px(44.0))
+                        .h(px(48.0))
                         .rounded(px(6.0))
-                        .text_size(px(11.0))
+                        .text_size(px(12.0))
                         .custom(mode_variant(cx, p, active))
                         .border_1()
                         .border_color(if active { p.accent } else { p.border })
@@ -1251,19 +1370,44 @@ impl Shell {
         let plus_view = view.clone();
 
         card(&p)
-            .flex_1()
+            .h(px(ROW_H))
+            .flex_shrink_0()
+            .gap_1()
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(section_label("JOG", p))
-                    .child(div().flex().flex_wrap().gap_1().children(axes))
+                    .h(px(22.0))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label("JOG", p))
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(12.0))
+                                    .text_color(p.text)
+                                    .child(format!(
+                                        "{} {:.2} mm",
+                                        self.state.jog_axis.label(),
+                                        self.state.jog_step
+                                    )),
+                            )
+                            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                                if self.state.continuous {
+                                    "CONTINUOUS"
+                                } else {
+                                    "STEP"
+                                },
+                            )),
+                    )
                     .child(
                         Switch::new("continuous")
                             .checked(self.state.continuous)
                             .label("CONT")
-                            .text_size(px(9.0))
+                            .text_size(px(10.0))
                             .on_change(move |checked, _, cx| {
                                 continuous_view.update(cx, |this, cx| {
                                     this.state.continuous = *checked;
@@ -1276,14 +1420,16 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .h(px(64.0))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(h_flex().gap_1().children(axes))
                     .child(
                         Button::new("jog-minus")
                             .label("-")
                             .h(px(64.0))
-                            .w(px(76.0))
+                            .w(px(64.0))
                             .rounded_lg()
-                            .text_size(px(30.0))
+                            .text_size(px(26.0))
                             .custom(
                                 ButtonCustomVariant::new(cx)
                                     .color(p.raised)
@@ -1301,38 +1447,19 @@ impl Shell {
                             }),
                     )
                     .child(
-                        div()
+                        h_flex()
+                            .gap_1()
                             .flex_1()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .font_family(self.mono.clone())
-                                    .text_size(px(18.0))
-                                    .text_color(p.text)
-                                    .child(format!(
-                                        "{} {:.2} mm",
-                                        self.state.jog_axis.label(),
-                                        self.state.jog_step
-                                    )),
-                            )
-                            .child(div().text_size(px(8.0)).text_color(p.text_faint).child(
-                                if self.state.continuous {
-                                    "CONTINUOUS"
-                                } else {
-                                    "STEP"
-                                },
-                            )),
+                            .min_w(px(0.0))
+                            .children(step_labels),
                     )
                     .child(
                         Button::new("jog-plus")
                             .label("+")
                             .h(px(64.0))
-                            .w(px(76.0))
+                            .w(px(64.0))
                             .rounded_lg()
-                            .text_size(px(30.0))
+                            .text_size(px(26.0))
                             .custom(
                                 ButtonCustomVariant::new(cx)
                                     .color(p.raised)
@@ -1350,9 +1477,10 @@ impl Shell {
                             }),
                     ),
             )
-            .child(div().flex().gap_1().children(step_labels))
     }
 
+    /// Spindle: on/off, RPM field, CW/CCW and the override slider. Exactly the
+    /// height of the Feed/Jog row.
     fn spindle_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let power_view = view.clone();
@@ -1361,27 +1489,41 @@ impl Shell {
         let rpm_view = view;
 
         card(&p)
-            .w(px(360.0))
+            .h(px(ROW_H))
+            .flex_shrink_0()
+            .gap_1()
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .h(px(20.0))
                     .child(section_label("SPINDLE", p))
                     .child(
-                        Switch::new("spindle-power")
-                            .checked(self.state.spindle_on)
-                            .label(if self.state.spindle_on { "ON" } else { "OFF" })
-                            .text_size(px(10.0))
-                            .on_change(move |checked, _, cx| {
-                                power_view.update(cx, |this, cx| {
-                                    this.state.spindle_on = *checked;
-                                    this.state.push_console(
-                                        ConsoleLevel::Command,
-                                        format!("M{} (mock)", if *checked { 3 } else { 5 }),
-                                    );
-                                    cx.notify();
-                                });
-                            }),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_faint)
+                                    .child(format!("{}%", self.state.spindle_override)),
+                            )
+                            .child(
+                                Switch::new("spindle-power")
+                                    .checked(self.state.spindle_on)
+                                    .label(if self.state.spindle_on { "ON" } else { "OFF" })
+                                    .text_size(px(10.0))
+                                    .on_change(move |checked, _, cx| {
+                                        power_view.update(cx, |this, cx| {
+                                            this.state.spindle_on = *checked;
+                                            this.state.push_console(
+                                                ConsoleLevel::Command,
+                                                format!("M{} (mock)", if *checked { 3 } else { 5 }),
+                                            );
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
                     ),
             )
             .child(
@@ -1392,6 +1534,7 @@ impl Shell {
                         div()
                             .id("rpm-field")
                             .flex_1()
+                            .min_w(px(0.0))
                             .flex()
                             .items_center()
                             .justify_end()
@@ -1424,6 +1567,12 @@ impl Shell {
                             .rounded(px(7.0))
                             .text_size(px(11.0))
                             .custom(mode_variant(cx, p, self.state.spindle_cw))
+                            .border_1()
+                            .border_color(if self.state.spindle_cw {
+                                p.accent
+                            } else {
+                                p.border
+                            })
                             .on_click(move |_, _, cx| {
                                 cw_view.update(cx, |this, cx| {
                                     this.state.spindle_cw = true;
@@ -1440,6 +1589,12 @@ impl Shell {
                             .rounded(px(7.0))
                             .text_size(px(11.0))
                             .custom(mode_variant(cx, p, !self.state.spindle_cw))
+                            .border_1()
+                            .border_color(if self.state.spindle_cw {
+                                p.border
+                            } else {
+                                p.accent
+                            })
                             .on_click(move |_, _, cx| {
                                 ccw_view.update(cx, |this, cx| {
                                     this.state.spindle_cw = false;
@@ -1450,46 +1605,67 @@ impl Shell {
                     ),
             )
             .child(
-                v_flex()
-                    .gap_1()
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(18.0))
                     .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .text_size(px(9.0))
+                        div()
+                            .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("OVERRIDE")
-                            .child(format!("{}%", self.state.spindle_override)),
+                            .child("OVERRIDE"),
                     )
-                    .child(Slider::new(&self.spindle_slider).h(px(24.0))),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(Slider::new(&self.spindle_slider).h(px(18.0))),
+                    ),
             )
+    }
+
+    /// Three columns with shared row guides. The right column is dropped below
+    /// 1120 px; a full portrait reflow is deferred to M7.
+    fn workspace(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        width: Pixels,
+        compact: bool,
+    ) -> impl IntoElement {
+        let (left_w, right_w) = if width >= px(1600.0) {
+            (400.0, 260.0)
+        } else {
+            (340.0, 220.0)
+        };
+
+        let mut row = h_flex()
+            .gap(px(GAP))
+            .flex_1()
+            .min_h(px(0.0))
+            .child(self.left_column(p, cx, left_w))
+            .child(self.center_column(p, cx));
+
+        if !compact {
+            row = row.child(self.aux_column(p, cx, right_w));
+        }
+        row
     }
 }
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::new(self.state.dark);
-        let compact = window.viewport_size().width < px(1120.0);
-
-        let mut main_row = h_flex()
-            .gap_2()
-            .flex_1()
-            .min_h(px(0.0))
-            .px_2()
-            .child(self.left_rail(p, cx))
-            .child(self.center(p, cx));
-        if !compact {
-            main_row = main_row.child(self.right_rail(p, cx));
-        }
+        let width = window.viewport_size().width;
+        let compact = width < px(1120.0);
 
         let content = div()
             .flex_1()
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .gap_2()
-            .child(main_row)
-            .child(self.bottom_dock(p, cx));
+            .p(px(GAP))
+            .child(self.workspace(p, cx, width, compact));
 
         let mut root = div()
             .relative()
@@ -1543,7 +1719,7 @@ fn tab_button(cx: &App, p: Palette, label: LeftTab, active: bool, view: Entity<S
     Button::new(format!("left-tab-{}", label.label()))
         .label(label.label())
         .flex_1()
-        .h(px(44.0))
+        .h(px(48.0))
         .rounded_lg()
         .text_size(px(13.0))
         .custom(mode_variant(cx, p, active))
@@ -1567,7 +1743,7 @@ fn card(p: &Palette) -> Div {
 
 fn section_label(text: &'static str, p: Palette) -> Div {
     div()
-        .text_size(px(9.5))
+        .text_size(px(11.0))
         .font_weight(FontWeight::BOLD)
         .text_color(p.text_dim)
         .child(text)
@@ -1577,13 +1753,14 @@ fn chip(text: &str, p: Palette) -> Div {
     div()
         .px_2()
         .h(px(22.0))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .rounded(px(5.0))
         .bg(p.panel_alt)
         .border_1()
         .border_color(p.border)
-        .text_size(px(9.0))
+        .text_size(px(10.0))
         .font_weight(FontWeight::BOLD)
         .text_color(p.text_dim)
         .child(text.to_string())
@@ -1594,14 +1771,14 @@ fn legend(color: Hsla, text: &'static str, p: Palette) -> Div {
         .items_center()
         .gap_1()
         .child(div().w(px(6.0)).h(px(6.0)).rounded(px(999.0)).bg(color))
-        .child(div().text_size(px(9.0)).text_color(p.text_dim).child(text))
+        .child(div().text_size(px(10.0)).text_color(p.text_dim).child(text))
 }
 
 fn info_row(name: &str, milestone: &str, p: Palette) -> Div {
     h_flex()
         .items_center()
         .justify_between()
-        .h(px(38.0))
+        .h(px(40.0))
         .px_2()
         .rounded(px(6.0))
         .bg(p.panel_alt)
