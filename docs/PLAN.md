@@ -1,15 +1,17 @@
 # ghs-rs — implementation plan
 
-**Status:** M4 — real toolpath viewer; M3 job UI complete
+**Status:** M5 — settings/offsets/tools; M6 probing foundation in parallel
 **Updated:** 2026-11-01
 **Reference hardware:** FlexiHAL / STM32F446, grblHAL `1.1f.20240604`
 
 Protocol, serial, viewer geometry, the capability-configured simulator, the
 G-code parser, the demo loopback bridge, the headless engine, the M3 job runner,
-and the job UI are implemented. The approved touch shell runs live against the
-in-process simulator with serial connect, hold-to-jog, a real program list,
-job controls, progress, and the tool-change sheet. The M4 real viewer is in
-progress; start-from-line, check mode, probing, settings, and hardware
+the job UI, the M4 real viewer, and the M5 settings editor are implemented. The
+approved touch shell runs live against the in-process simulator with serial
+connect, hold-to-jog, a real program list, job controls, progress, the
+tool-change sheet, the parsed toolpath, and generated, read-back-verified
+settings. The M5 offsets/tools pass and the M6 probe-plan foundation are running;
+profiles/backup UI, probing UI, start-from-line, check mode, and hardware
 validation remain.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:

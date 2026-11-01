@@ -25,7 +25,11 @@ documented, and is localized.
 | Engine | Implemented (M3) | M2 session + job runner; 20 job tests, simulator-over-loopback |
 | App shell | Live demo + job UI | approved layout; live DRO/MDI/console; serial picker |
 | Program UI | Implemented (M3) | real parsed list, progress/current line, job controls, tool-change sheet |
-| Viewer UI | In progress | synthetic canvas; M4 real toolpath pass running |
+| Viewer UI | Implemented (M4) | real toolpath, camera, marker, pan/zoom; 31 app tests |
+| Settings UI | Implemented (M5) | generated from `$ES`/`$EG`; verified writes |
+| Offsets/tools | In progress | M5 app pass running |
+| Probing | Foundation in progress | `ghs-probe` plans/math; UI/engine correlation next |
+| Config/backup | Implemented (M5) | `ghs-config`, 51 tests; UI wiring partial |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
 
 Rows below are the feature-level checklist. A protocol/simulator row can be
