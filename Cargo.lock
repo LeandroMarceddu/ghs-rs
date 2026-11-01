@@ -1942,6 +1942,7 @@ dependencies = [
  "ghs-demo",
  "ghs-engine",
  "ghs-gcode",
+ "ghs-probe",
  "ghs-serial",
  "ghs-viewer",
  "gpui-kit",
