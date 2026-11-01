@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use ghs_serial::{LoopbackTransport, Transport, TransportEvent, loopback_pair};
-use ghs_sim::{SimProfile, Simulator};
+pub use ghs_sim::SimProfile;
+use ghs_sim::Simulator;
 use thiserror::Error;
 
 /// How often simulated time advances while the bridge is idle.

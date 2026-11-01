@@ -11,6 +11,11 @@ authors.workspace = true
 ghs-core.workspace = true
 ghs-proto.workspace = true
 ghs-serial.workspace = true
-ghs-sim.workspace = true
+crossbeam-channel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+ghs-demo.workspace = true
+ghs-sim.workspace = true
+

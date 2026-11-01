@@ -1949,13 +1949,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghs-engine"
+name = "ghs-demo"
 version = "0.1.0"
 dependencies = [
- "ghs-core",
+ "crossbeam-channel",
  "ghs-proto",
  "ghs-serial",
  "ghs-sim",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "ghs-engine"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "ghs-core",
+ "ghs-demo",
+ "ghs-proto",
+ "ghs-serial",
+ "ghs-sim",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "ghs-gcode"
+version = "0.1.0"
+dependencies = [
+ "ghs-core",
+ "ghs-viewer",
+ "proptest",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -1986,8 +2011,7 @@ version = "0.1.0"
 dependencies = [
  "ghs-core",
  "ghs-proto",
- "serde",
- "thiserror 2.0.21",
+ "proptest",
  "tracing",
 ]
 
