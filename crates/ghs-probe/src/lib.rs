@@ -52,8 +52,13 @@
 //! the rest of the grid. [`HeightMap`] stores one
 //! `Option<f64>` per cell, interpolates bilinearly only when every required
 //! sample is valid, and offers [`HeightMap::apply_to_z`] as the compensation
-//! primitive. Exporting a corrected `.nc` file is deliberately deferred; the
-//! app should stream compensation or export in a later milestone.
+//! primitive. [`HeightMap::compensate_toolpath`] applies the map to a viewer
+//! toolpath, subdividing long moves for sampling and reporting compensated
+//! and uncompensated length. It takes a caller-supplied work offset because
+//! lookups are machine XY; rotation and scaling are deliberately not modelled.
+//! [`HeightMap::summary`] and [`HeightMap::csv`] are pure in-memory exports.
+//! Writing a corrected `.nc` file is deferred; the app should stream
+//! compensation or export in a later milestone.
 //!
 //! # Probe radius
 //!
@@ -112,8 +117,9 @@ pub use cycle::{CornerProbe, EdgeSpec, ProbeCycle, RotationProbe};
 pub use error::{ProbeError, ValidationError};
 pub use gcode::{PlannedProbe, ProbeMoveCode, ProbePlan, ProbePreconditions, ProbeVector};
 pub use heightmap::{
-    HEIGHT_MAP_POINT_OVERHEAD_SECONDS, HeightMap, HeightMapEstimate, HeightMapGrid,
-    MAX_HEIGHT_MAP_AXIS_POINTS, MAX_HEIGHT_MAP_POINTS,
+    CompensatedToolpath, HEIGHT_MAP_POINT_OVERHEAD_SECONDS, HeightMap, HeightMapEstimate,
+    HeightMapGrid, HeightMapSummary, MAX_COMPENSATED_SEGMENTS, MAX_HEIGHT_MAP_AXIS_POINTS,
+    MAX_HEIGHT_MAP_POINTS,
 };
 pub use math::{
     CircleFit, RectangleFit, RotationAxis, RotationFit, circle_feature_radius, corner_work_zero,
