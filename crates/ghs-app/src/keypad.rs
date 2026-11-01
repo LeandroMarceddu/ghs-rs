@@ -130,7 +130,7 @@ pub fn overlay(
                     .border_color(palette.border)
                     .on_click(move |_, _, cx| {
                         view.update(cx, |shell, cx| {
-                            shell.state.keypad_action(action);
+                            shell.keypad_action(action, cx);
                             cx.notify();
                         });
                     }),
@@ -180,7 +180,7 @@ pub fn overlay(
                     })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |shell, cx| {
-                            shell.state.keypad_action(action);
+                            shell.keypad_action(action, cx);
                             cx.notify();
                         });
                     }),
@@ -214,7 +214,7 @@ pub fn overlay(
                 .occlude()
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     scrim_view.update(cx, |shell, cx| {
-                        shell.state.keypad_action(KeypadAction::Cancel);
+                        shell.keypad_action(KeypadAction::Cancel, cx);
                         cx.notify();
                     });
                 }),

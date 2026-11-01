@@ -1,10 +1,52 @@
-//! Mock machine state for the M0 shell.
+//! View-model state for the touch shell.
 //!
-//! No serial, protocol, or engine code is involved. `Profile` is a plain data
-//! value: panels and axis rows are derived from `Capabilities`, never from a
-//! board name or a compile-time feature. The reference machine is one profile,
-//! not a code path; a generic or extended controller can supply a different
-//! value without touching this module's consumers.
+//! The shell starts against the in-process demo controller and maps engine
+//! telemetry into this plain data model. `--mock` keeps the original mock
+//! mutations for layout review. `Profile` is a plain data value: panels and
+//! axis rows are derived from `Capabilities`, never from a board name or a
+//! compile-time feature. The reference machine is one profile, not a code
+//! path; a generic or extended controller can supply a different value without
+//! touching this module's consumers.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ghs_core::Units as CoreUnits;
+use ghs_engine::{
+    Axis as CoreAxis, ControllerInfo, MachineSnapshot, Signals as CoreSignals, StatusReport,
+};
+
+/// Connection state shown in the top-bar status pill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// No engine; the shell mutates mock data only (`--mock`).
+    Mock,
+    /// A transport is open but the engine handshake is still running.
+    Connecting,
+    /// The handshake completed and telemetry is live.
+    Ready,
+    /// The link closed; the last snapshot stays visible but stale.
+    Disconnected,
+    /// Starting the engine or connecting failed.
+    Failed(String),
+}
+
+impl ConnectionState {
+    /// Short label for the status pill.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ConnectionState::Mock => "MOCK",
+            ConnectionState::Connecting => "CONNECTING",
+            ConnectionState::Ready => "READY",
+            ConnectionState::Disconnected => "DISCONNECTED",
+            ConnectionState::Failed(_) => "ERROR",
+        }
+    }
+
+    /// True when the UI may issue controller commands.
+    pub fn is_ready_like(&self) -> bool {
+        matches!(self, ConnectionState::Mock | ConnectionState::Ready)
+    }
+}
 
 /// Top-level workspace selected in the mode bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,8 +137,6 @@ impl Axis {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Units {
     Millimetre,
-    /// Reserved for G20 display at M2; the M0 mock is metric only.
-    #[allow(dead_code)]
     Inch,
 }
 
@@ -112,6 +152,22 @@ impl Units {
         match self {
             Units::Millimetre => "Millimetres (G21)",
             Units::Inch => "Inches (G20)",
+        }
+    }
+
+    /// Convert a millimetre value into this display unit.
+    pub fn display(self, value_mm: f64) -> f64 {
+        match self {
+            Units::Millimetre => value_mm,
+            Units::Inch => value_mm / ghs_core::Units::MM_PER_INCH,
+        }
+    }
+
+    /// Map the engine's unit enum into the display enum.
+    pub fn from_core(units: CoreUnits) -> Self {
+        match units {
+            CoreUnits::Mm => Units::Millimetre,
+            CoreUnits::Inch => Units::Inch,
         }
     }
 }
@@ -158,6 +214,77 @@ impl Capabilities {
         }
     }
 
+    /// Neutral capability set used while the handshake is still running.
+    pub fn live_pending() -> Self {
+        Self {
+            axes: (0..3).map(Axis::from_index).collect(),
+            units: Units::Millimetre,
+            has_probe: false,
+            has_tool_table: false,
+            tool_table_entries: 0,
+            has_sd: false,
+            has_atc: false,
+            has_mpg: false,
+            multi_spindle: false,
+            // grblHAL has no capability flag for the three classic coolant
+            // outputs; keep them visible and let the `A:` field report state.
+            coolant_mist: true,
+            coolant_flood: true,
+            coolant_fan: true,
+            limit_pins: false,
+            has_estop: false,
+            has_door: false,
+        }
+    }
+
+    /// Build capabilities from an engine `$I+` record.
+    ///
+    /// Every decision is made from reported signals and options. The board
+    /// name is never inspected.
+    pub fn from_info(info: &ControllerInfo, units: Units) -> Self {
+        let axes: Vec<Axis> = if info.axes.is_empty() {
+            (0..3).map(Axis::from_index).collect()
+        } else {
+            info.axis_list()
+                .into_iter()
+                .map(|axis| Axis::from_index(axis.index()))
+                .collect()
+        };
+        let limit_pins = info.has_signal(CoreSignals::X_LIMIT)
+            || info.has_signal(CoreSignals::Y_LIMIT)
+            || info.has_signal(CoreSignals::Z_LIMIT);
+        let has_probe = info.has_signal(CoreSignals::PROBE)
+            || info.has_signal(CoreSignals::PROBE_PRIMARY)
+            || info.has_signal(CoreSignals::TOOL_SETTER)
+            || info.has_signal(CoreSignals::PROBE_SECONDARY)
+            || info.has_probe_connected_signal();
+        let multi_spindle = info
+            .new_options
+            .iter()
+            .find_map(|option| option.strip_prefix("SPINDLES="))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .is_some_and(|count| count > 1);
+        let tool_table_entries = info.tool_table_entries.unwrap_or(0);
+        Self {
+            axes,
+            units,
+            has_probe,
+            has_tool_table: tool_table_entries > 0,
+            tool_table_entries,
+            has_sd: info.has_sd(),
+            has_atc: info.has_atc(),
+            has_mpg: info.has_mpg(),
+            multi_spindle,
+            coolant_mist: true,
+            coolant_flood: true,
+            coolant_fan: true,
+            limit_pins,
+            has_estop: info.has_signal(CoreSignals::ESTOP),
+            has_door: info.has_signal(CoreSignals::DOOR),
+        }
+    }
+
+    /// Coolant channels exposed by this capability set, with their UI slot.
     pub fn coolant_channels(&self) -> Vec<(&'static str, usize)> {
         let mut out = Vec::new();
         if self.coolant_mist {
@@ -172,7 +299,7 @@ impl Capabilities {
         out
     }
 
-    /// Post-v1.0 panels exposed by this profile. The M0 shell only reports
+    /// Post-v1.0 panels exposed by this profile. The touch shell only reports
     /// them; each becomes a real view behind its own capability at M7+.
     pub fn accessory_panels(&self) -> [(&'static str, bool); 3] {
         [
@@ -186,15 +313,39 @@ impl Capabilities {
 /// One controller identity plus its capabilities.
 #[derive(Clone, Debug)]
 pub struct Profile {
-    pub name: &'static str,
+    pub name: String,
     pub capabilities: Capabilities,
 }
 
 impl Profile {
     pub fn mock_reference() -> Self {
         Self {
-            name: "Mock 3-axis mill",
+            name: "Mock 3-axis mill".to_string(),
             capabilities: Capabilities::mock_reference(),
+        }
+    }
+
+    pub fn live_pending() -> Self {
+        Self {
+            name: "Controller (connecting)".to_string(),
+            capabilities: Capabilities::live_pending(),
+        }
+    }
+
+    pub fn live(info: &ControllerInfo, units: Units) -> Self {
+        let board = info
+            .board
+            .clone()
+            .or_else(|| info.firmware.clone())
+            .unwrap_or_else(|| "grblHAL controller".to_string());
+        let version = if info.version.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", info.version)
+        };
+        Self {
+            name: format!("{board}{version}"),
+            capabilities: Capabilities::from_info(info, units),
         }
     }
 }
@@ -249,11 +400,12 @@ pub enum ConsoleLevel {
     Command,
     Ok,
     Warn,
+    Error,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConsoleLine {
-    pub time: &'static str,
+    pub time: String,
     pub level: ConsoleLevel,
     pub text: String,
 }
@@ -261,11 +413,23 @@ pub struct ConsoleLine {
 impl ConsoleLine {
     fn new(level: ConsoleLevel, text: impl Into<String>) -> Self {
         Self {
-            time: "----",
+            time: now_hhmm(),
             level,
             text: text.into(),
         }
     }
+}
+
+/// Wall-clock `HH:MM` for a console line.
+///
+/// The shell has no clock service yet. UTC from the system clock is enough for
+/// ordering console output and avoids a timezone dependency in the binary.
+fn now_hhmm() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() % 86_400)
+        .unwrap_or(0);
+    format!("{:02}:{:02}", seconds / 3_600, (seconds % 3_600) / 60)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,7 +484,9 @@ pub struct Signal {
     pub state: SignalState,
 }
 
-const WCS: [&str; 6] = ["G54", "G55", "G56", "G57", "G58", "G59"];
+const WCS: [&str; 9] = [
+    "G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3",
+];
 const PROGRAM: [(&str, ProgramKind); 30] = [
     ("(Shop sign - 6 mm pocket)", ProgramKind::Comment),
     ("G21 G90 G54", ProgramKind::Setup),
@@ -360,18 +526,30 @@ pub struct AppState {
     pub mode: Mode,
     pub left_tab: LeftTab,
     pub dark: bool,
+    pub connection: ConnectionState,
+    pub live: bool,
     pub machine_state: &'static str,
     pub job_name: &'static str,
     pub dro: Vec<f64>,
+    pub mpos: Vec<f64>,
+    pub wco: Vec<f64>,
+    pub dtg: Vec<f64>,
     pub wcs_index: usize,
     pub jog_axis: Axis,
     pub jog_step: f64,
     pub continuous: bool,
     pub feed_override: u16,
     pub spindle_override: u16,
+    pub rapid_override: u16,
+    pub feed_override_active: bool,
+    pub spindle_override_active: bool,
     pub spindle_on: bool,
     pub spindle_cw: bool,
     pub rpm: u32,
+    pub spindle_actual_rpm: f64,
+    pub tool: Option<u32>,
+    pub tlr: Option<bool>,
+    pub sd: Option<String>,
     pub coolant: [bool; 3],
     pub console: Vec<ConsoleLine>,
     pub program: Vec<ProgramLine>,
@@ -381,6 +559,7 @@ pub struct AppState {
     pub mdi: String,
     pub macros: Vec<Macro>,
     pub signals: Vec<Signal>,
+    pub signal_caps: String,
     pub feed_rate: u32,
 }
 
@@ -388,24 +567,37 @@ impl AppState {
     pub fn new() -> Self {
         let profile = Profile::mock_reference();
         let dro = initial_dro(&profile.capabilities.axes);
-        let signals = build_signals(&profile.capabilities, "Idle");
+        let signals = build_signals(&profile.capabilities, "Idle", CoreSignals::NONE, false);
+        let axes = profile.capabilities.axes.len();
         Self {
             profile,
             mode: Mode::Job,
             left_tab: LeftTab::Console,
             dark: true,
+            connection: ConnectionState::Mock,
+            live: false,
             machine_state: "Idle",
             job_name: "shop-sign-pocket.nc",
-            dro,
+            dro: dro.clone(),
+            mpos: dro.clone(),
+            wco: vec![0.0; axes],
+            dtg: vec![0.0; axes],
             wcs_index: 0,
             jog_axis: Axis::X,
             jog_step: 1.0,
             continuous: false,
             feed_override: 100,
             spindle_override: 100,
+            rapid_override: 100,
+            feed_override_active: false,
+            spindle_override_active: false,
             spindle_on: true,
             spindle_cw: true,
             rpm: 12_000,
+            spindle_actual_rpm: 0.0,
+            tool: Some(3),
+            tlr: None,
+            sd: None,
             coolant: [false, true, false],
             console: seed_console(),
             program: PROGRAM
@@ -432,7 +624,163 @@ impl AppState {
                 mac("M8/M9", MacroAction::Coolant),
             ],
             signals,
+            signal_caps: "HSDEP".to_string(),
             feed_rate: 1200,
+        }
+    }
+
+    /// Switch to the live engine view model.
+    ///
+    /// The first snapshot replaces every value below; clearing the seeded mock
+    /// console makes the controller handshake and real acknowledgements the
+    /// only console history.
+    pub fn begin_live(&mut self) {
+        self.live = true;
+        self.connection = ConnectionState::Connecting;
+        self.profile = Profile::live_pending();
+        self.machine_state = "Unknown";
+        self.job_name = "No job loaded (M3)";
+        self.active_line = 0;
+        self.progress = 0.0;
+        self.console.clear();
+        self.mpos = vec![0.0; self.profile.capabilities.axes.len()];
+        self.dro = vec![0.0; self.profile.capabilities.axes.len()];
+        self.wco = vec![0.0; self.profile.capabilities.axes.len()];
+        self.dtg = vec![0.0; self.profile.capabilities.axes.len()];
+        self.wcs_index = 0;
+        self.feed_override = 100;
+        self.spindle_override = 100;
+        self.rapid_override = 100;
+        self.feed_override_active = false;
+        self.spindle_override_active = false;
+        self.spindle_on = false;
+        self.spindle_cw = true;
+        self.rpm = 0;
+        self.spindle_actual_rpm = 0.0;
+        self.tool = None;
+        self.tlr = None;
+        self.sd = None;
+        self.coolant = [false; 3];
+        self.feed_rate = 0;
+        self.signals.clear();
+        self.signal_caps.clear();
+        self.push_console(
+            ConsoleLevel::Info,
+            "Starting in-process FlexiHal demo controller",
+        );
+    }
+
+    /// Rebuild capabilities and axis rows from the engine's `$I+` record.
+    pub fn apply_controller_info(&mut self, info: &ControllerInfo) {
+        let units = self.profile.capabilities.units;
+        self.profile = Profile::live(info, units);
+        let axis_count = self.profile.capabilities.axes.len();
+        self.mpos.resize(axis_count, 0.0);
+        self.dro.resize(axis_count, 0.0);
+        self.wco.resize(axis_count, 0.0);
+        self.dtg.resize(axis_count, 0.0);
+        if !self.profile.capabilities.axes.contains(&self.jog_axis) {
+            self.jog_axis = self
+                .profile
+                .capabilities
+                .axes
+                .first()
+                .copied()
+                .unwrap_or(Axis::X);
+        }
+        self.signal_caps = info.signals.to_string();
+        self.signals = build_signals(
+            &self.profile.capabilities,
+            self.machine_state,
+            CoreSignals::NONE,
+            true,
+        );
+    }
+
+    /// Apply one engine snapshot plus the raw status fields that are not in
+    /// [`MachineSnapshot`].
+    ///
+    /// Positions arrive in millimetres and are converted at this display edge.
+    pub fn apply_snapshot(&mut self, snapshot: &MachineSnapshot, status: Option<&StatusReport>) {
+        let units = self.profile.capabilities.units;
+        let axis_count = self.profile.capabilities.axes.len();
+        self.mpos.resize(axis_count, 0.0);
+        self.dro.resize(axis_count, 0.0);
+        self.wco.resize(axis_count, 0.0);
+        self.dtg.resize(axis_count, 0.0);
+
+        for (index, app_axis) in self.profile.capabilities.axes.iter().enumerate() {
+            let Some(core_axis) = CoreAxis::from_index(app_axis.index()) else {
+                continue;
+            };
+            let work = if snapshot.wpos.axes().contains(core_axis) {
+                snapshot.wpos.get(core_axis)
+            } else {
+                snapshot.mpos.get(core_axis) - snapshot.wco.get(core_axis)
+            };
+            let machine = snapshot.mpos.get(core_axis);
+            let offset = snapshot.wco.get(core_axis);
+            if let Some(slot) = self.dro.get_mut(index) {
+                *slot = units.display(work);
+            }
+            if let Some(slot) = self.mpos.get_mut(index) {
+                *slot = units.display(machine);
+            }
+            if let Some(slot) = self.wco.get_mut(index) {
+                *slot = units.display(offset);
+            }
+        }
+
+        self.machine_state = snapshot.state.as_str();
+        self.wcs_index = snapshot.wcs.index();
+        if !self.feed_override_active {
+            self.feed_override = snapshot.overrides.feed;
+        }
+        if !self.spindle_override_active {
+            self.spindle_override = snapshot.overrides.spindle;
+        }
+        self.rapid_override = snapshot.overrides.rapid;
+        self.feed_rate = snapshot.feed_spindle.feed.max(0.0).round() as u32;
+        self.spindle_on = snapshot.feed_spindle.spindle_on;
+        self.spindle_cw = snapshot.feed_spindle.clockwise;
+        if snapshot.feed_spindle.spindle_rpm > 0.0 || snapshot.feed_spindle.spindle_on {
+            self.rpm = snapshot.feed_spindle.spindle_rpm.max(0.0).round() as u32;
+        }
+        self.signals = build_signals(
+            &self.profile.capabilities,
+            self.machine_state,
+            snapshot.signals,
+            true,
+        );
+
+        if let Some(status) = status {
+            if let Some(accessory) = &status.accessory {
+                self.coolant[0] = accessory.mist;
+                self.coolant[1] = accessory.flood;
+            }
+            if let Some(tool) = status.tool {
+                self.tool = Some(tool);
+            }
+            if let Some(tlr) = status.tlo_reference_set {
+                self.tlr = Some(tlr);
+            }
+            if let Some(actual) = status.spindle_actual_rpm {
+                self.spindle_actual_rpm = actual;
+            }
+            if let Some(dtg) = status.dtg {
+                for (index, app_axis) in self.profile.capabilities.axes.iter().enumerate() {
+                    if let Some(core_axis) = CoreAxis::from_index(app_axis.index())
+                        && let Some(slot) = self.dtg.get_mut(index)
+                    {
+                        *slot = units.display(dtg.get(core_axis));
+                    }
+                }
+            }
+            if let Some(sd) = &status.sd {
+                self.sd = Some(format!("{sd:?}"));
+            }
+        } else {
+            self.dtg.fill(0.0);
         }
     }
 
@@ -446,6 +794,21 @@ impl AppState {
 
     pub fn value(&self, axis: Axis) -> f64 {
         self.dro.get(axis.index()).copied().unwrap_or(0.0)
+    }
+
+    /// Work-coordinate offset for one axis, in display units.
+    pub fn offset(&self, axis: Axis) -> f64 {
+        self.wco.get(axis.index()).copied().unwrap_or(0.0)
+    }
+
+    /// One-based `P` word for the active WCS (`G54` -> `P1`).
+    pub fn wcs_program_number(&self) -> usize {
+        self.wcs_index + 1
+    }
+
+    /// Apply a unit-mode change from the parser state.
+    pub fn set_units(&mut self, units: CoreUnits) {
+        self.profile.capabilities.units = Units::from_core(units);
     }
 
     fn set_value(&mut self, axis: Axis, value: f64) {
@@ -470,7 +833,11 @@ impl AppState {
         self.set_value(axis, 0.0);
         self.push_console(
             ConsoleLevel::Command,
-            format!("G10 L20 P1 {}0.000 (mock)", axis.label()),
+            format!(
+                "G10 L20 P{} {}0.000 (mock)",
+                self.wcs_program_number(),
+                axis.label()
+            ),
         );
     }
 
@@ -661,15 +1028,22 @@ impl AppState {
         match keypad.target {
             KeypadTarget::Mdi => {
                 self.mdi = keypad.buffer.trim().to_string();
-                self.push_console(ConsoleLevel::Info, "MDI text updated with keypad");
+                if !self.live {
+                    self.push_console(ConsoleLevel::Info, "MDI text updated with keypad");
+                }
             }
             KeypadTarget::Dro(axis) => match keypad.buffer.trim().parse::<f64>() {
                 Ok(value) => {
-                    self.set_value(axis, value);
-                    self.push_console(
-                        ConsoleLevel::Command,
-                        format!("{} = {:.3} mm (mock keypad)", axis.label(), value),
-                    );
+                    if self.live {
+                        // The shell sends G10 L20 and waits for the next
+                        // snapshot, so a rejected command never moves the DRO.
+                    } else {
+                        self.set_value(axis, value);
+                        self.push_console(
+                            ConsoleLevel::Command,
+                            format!("{} = {:.3} mm (mock keypad)", axis.label(), value),
+                        );
+                    }
                 }
                 Err(_) => self.push_console(
                     ConsoleLevel::Warn,
@@ -679,10 +1053,12 @@ impl AppState {
             KeypadTarget::Rpm => match keypad.buffer.trim().parse::<f64>() {
                 Ok(value) => {
                     self.rpm = value.clamp(0.0, 24_000.0) as u32;
-                    self.push_console(
-                        ConsoleLevel::Command,
-                        format!("S{} (mock keypad)", self.rpm),
-                    );
+                    if !self.live {
+                        self.push_console(
+                            ConsoleLevel::Command,
+                            format!("S{} (mock keypad)", self.rpm),
+                        );
+                    }
                 }
                 Err(_) => self.push_console(ConsoleLevel::Warn, "RPM must be numeric"),
             },
@@ -697,26 +1073,49 @@ fn initial_dro(axes: &[Axis]) -> Vec<f64> {
         .collect()
 }
 
-fn build_signals(capabilities: &Capabilities, machine_state: &str) -> Vec<Signal> {
+fn build_signals(
+    capabilities: &Capabilities,
+    machine_state: &str,
+    signals: CoreSignals,
+    live: bool,
+) -> Vec<Signal> {
     let mut out = Vec::new();
     if capabilities.limit_pins {
         for axis in capabilities.axes.iter().take(3) {
+            let asserted = CoreAxis::from_index(axis.index())
+                .is_some_and(|core_axis| signals.contains_axis_limit(core_axis));
             out.push(Signal {
                 label: format!("{} LIMIT", axis.label()),
-                state: SignalState::Ok,
+                state: if asserted {
+                    SignalState::Alert
+                } else {
+                    SignalState::Ok
+                },
             });
         }
     }
     if capabilities.has_probe {
+        let triggered = signals.contains(CoreSignals::PROBE)
+            || signals.contains(CoreSignals::PROBE_PRIMARY)
+            || signals.contains(CoreSignals::TOOL_SETTER)
+            || signals.contains(CoreSignals::PROBE_SECONDARY);
         out.push(Signal {
             label: "PROBE".into(),
-            state: SignalState::Warn,
+            state: if triggered {
+                SignalState::Warn
+            } else if live {
+                SignalState::Off
+            } else {
+                // The M0 mock keeps the probe amber so the design review shows
+                // every signal colour.
+                SignalState::Warn
+            },
         });
     }
     if capabilities.has_estop {
         out.push(Signal {
             label: "E-STOP".into(),
-            state: if machine_state == "Alarm" {
+            state: if signals.contains(CoreSignals::ESTOP) || machine_state == "Alarm" {
                 SignalState::Alert
             } else {
                 SignalState::Ok
@@ -726,7 +1125,11 @@ fn build_signals(capabilities: &Capabilities, machine_state: &str) -> Vec<Signal
     if capabilities.has_door {
         out.push(Signal {
             label: "DOOR".into(),
-            state: SignalState::Off,
+            state: if signals.contains(CoreSignals::DOOR) {
+                SignalState::Alert
+            } else {
+                SignalState::Off
+            },
         });
     }
     out
@@ -765,8 +1168,105 @@ fn seed_console() -> Vec<ConsoleLine> {
     SEED.iter()
         .map(|(level, text)| {
             let mut line = ConsoleLine::new(*level, *text);
-            line.time = "10:42";
+            line.time = "10:42".to_string();
             line
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use ghs_core::{
+        FeedSpindle, MachineState, Overrides, Position, Signals, Wcs, parse_controller_info,
+    };
+    use ghs_engine::StatusReport;
+
+    use super::*;
+
+    const FLEXIHAL: &[&str] = &[
+        "[VER:1.1f.20240604:]",
+        "[OPT:VNMSL+2,64,1024,3,0]",
+        "[AXS:3:XYZ]",
+        "[NEWOPT:ENUMS,RT+,HOME,ES,EXPR,TC,SED]",
+        "[FIRMWARE:grblHAL]",
+        "[SIGNALS:HSDEP]",
+        "[BOARD:FlexiHAL_20240604_210624]",
+    ];
+
+    #[test]
+    fn live_telemetry_maps_to_the_touch_view_model() {
+        let info = parse_controller_info(FLEXIHAL);
+        let mut state = AppState::new();
+        state.begin_live();
+        state.apply_controller_info(&info);
+
+        assert_eq!(state.axes().len(), 3);
+        assert!(state.profile.capabilities.has_probe);
+        assert!(state.profile.capabilities.has_estop);
+        assert!(state.profile.capabilities.has_door);
+        assert!(!state.profile.capabilities.limit_pins);
+        assert!(!state.profile.capabilities.has_tool_table);
+        assert!(state.profile.name.contains("FlexiHAL"));
+
+        let snapshot = MachineSnapshot {
+            state: MachineState::Idle,
+            mpos: Position::xyz(110.0, 220.0, 330.0),
+            wpos: Position::xyz(10.0, 20.0, 30.0),
+            wco: Position::xyz(100.0, 200.0, 300.0),
+            wcs: Wcs::G56,
+            overrides: Overrides::new(125, 50, 90),
+            feed_spindle: FeedSpindle::new(800.0, 12_000.0, true, false),
+            signals: Signals::PROBE | Signals::ESTOP | Signals::DOOR,
+            ..MachineSnapshot::default()
+        };
+        let mut status = StatusReport {
+            tool: Some(4),
+            tlo_reference_set: Some(true),
+            dtg: Some(Position::xyz(-1.0, -2.0, -3.0)),
+            ..StatusReport::default()
+        };
+        state.apply_snapshot(&snapshot, Some(&status));
+        assert_eq!(state.dro, vec![10.0, 20.0, 30.0]);
+        assert_eq!(state.mpos, vec![110.0, 220.0, 330.0]);
+        assert_eq!(state.wco, vec![100.0, 200.0, 300.0]);
+        assert_eq!(state.wcs_index, Wcs::G56.index());
+        assert_eq!(state.feed_override, 125);
+        assert_eq!(state.rapid_override, 50);
+        assert_eq!(state.spindle_override, 90);
+        assert_eq!(state.feed_rate, 800);
+        assert_eq!(state.rpm, 12_000);
+        assert!(state.spindle_on);
+        assert!(!state.spindle_cw);
+        assert_eq!(state.tool, Some(4));
+        assert_eq!(state.tlr, Some(true));
+        assert_eq!(state.dtg, vec![-1.0, -2.0, -3.0]);
+        assert_eq!(
+            state
+                .signals
+                .iter()
+                .find(|signal| signal.label == "PROBE")
+                .map(|signal| signal.state),
+            Some(SignalState::Warn)
+        );
+        assert_eq!(
+            state
+                .signals
+                .iter()
+                .find(|signal| signal.label == "E-STOP")
+                .map(|signal| signal.state),
+            Some(SignalState::Alert)
+        );
+        assert_eq!(
+            state
+                .signals
+                .iter()
+                .find(|signal| signal.label == "DOOR")
+                .map(|signal| signal.state),
+            Some(SignalState::Alert)
+        );
+
+        status.tool = Some(5);
+        state.apply_snapshot(&snapshot, Some(&status));
+        assert_eq!(state.tool, Some(5));
+    }
 }

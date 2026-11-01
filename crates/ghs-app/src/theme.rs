@@ -1,4 +1,4 @@
-//! Shop-floor visual language for the M0 touch shell.
+//! Shop-floor visual language for the touch shell.
 //!
 //! The tokens here are intentionally crate-local for now. At M2 they move into
 //! `ghs-ui` together with the component wrappers, so that a GPUI Kit upgrade

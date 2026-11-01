@@ -1,14 +1,15 @@
-//! ghs-rs M0 touch-shell prototype.
+//! ghs-rs touch shell.
 //!
-//! Run with `cargo run -p ghs-app`. There is no serial port and no engine here:
-//! every control mutates mock state so the layout, touch targets, canvas, and
-//! in-app keypad can be reviewed on Linux before M1 lands.
+//! Run with `cargo run -p ghs-app`. The default startup is the M2 vertical
+//! slice: an in-process FlexiHal simulator, one engine thread, and live DRO,
+//! state, overrides, spindle, coolant, signals, console, MDI and jog. The UI
+//! only sends typed engine commands; it never writes controller bytes.
 //!
-//! Demo flags: `--light` starts in the light theme, `--keypad` opens the X
-//! keypad at startup. Neither flag changes normal operation. `--size WxH`
-//! (or `--size=WxH`) opens at an explicit logical size for layout review, e.g.
-//! `--size 1920x1080` or `--size 1080x1920`; `--fullscreen` pins the shell to
-//! the current output.
+//! Demo flags: `--mock` keeps the original mock-state shell for design review,
+//! `--light` starts in the light theme, and `--keypad` opens the X keypad at
+//! startup. `--size WxH` (or `--size=WxH`) opens at an explicit logical size for
+//! layout review, e.g. `--size 1920x1080` or `--size 1080x1920`;
+//! `--fullscreen` pins the shell to the current output.
 //!
 //! Window policy:
 //! - 1280x800 default (UX-01), 1920x1080 works by widening the centre column.
@@ -17,6 +18,7 @@
 //!   plan documented at the top of `shell.rs`.
 
 mod keypad;
+mod live;
 mod shell;
 mod state;
 mod theme;
@@ -53,7 +55,7 @@ fn main() {
             }),
             window_min_size: Some(size(px(1024.0), px(600.0))),
             titlebar: Some(TitlebarOptions {
-                title: Some("ghs-rs - grblHAL touch shell (M0)".into()),
+                title: Some("ghs-rs - grblHAL touch shell (M2)".into()),
                 ..Default::default()
             }),
             app_id: Some("ghs-rs".into()),

@@ -1,4 +1,4 @@
-//! Touch shell layout for the M0 spike.
+//! Touch shell layout for the M2 live shell.
 //!
 //! Asymmetric three-column grid (see `docs/design/touch-layout.md`):
 //!
@@ -29,22 +29,27 @@
 //! - Every panel keeps its 48 px targets in portrait; the dock scrolls rather
 //!   than shrinking controls.
 
+use ghs_engine::{
+    Axes, Axis as CoreAxis, Command, JogCommand, MachineState, Position, RealtimeCommand,
+};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    IntoElement, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 
 use crate::keypad;
+use crate::live::LiveLink;
 use crate::state::{
-    AppState, Axis, ConsoleLevel, KeypadTarget, LeftTab, Mode, ProgramKind, SignalState,
+    AppState, Axis, ConnectionState, ConsoleLevel, KeypadAction, KeypadTarget, LeftTab, Mode,
+    ProgramKind, SignalState,
 };
 use crate::theme::Palette;
 use crate::viewer;
@@ -61,6 +66,11 @@ pub struct Shell {
     feed_slider: Entity<SliderState>,
     spindle_slider: Entity<SliderState>,
     mono: SharedString,
+    link: Option<LiveLink>,
+    feed_slider_active: bool,
+    spindle_slider_active: bool,
+    console_scroll: ScrollHandle,
+    _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -83,11 +93,33 @@ impl Shell {
 
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe(&feed_slider, |this, _, event, cx| {
-            this.state.feed_override = slider_value(event).round().clamp(10.0, 200.0) as u16;
+            match event {
+                SliderEvent::Change(value) => {
+                    this.feed_slider_active = true;
+                    this.state.feed_override = value.end().round().clamp(10.0, 200.0) as u16;
+                }
+                SliderEvent::Release(value) => {
+                    this.feed_slider_active = false;
+                    let target = value.end().round().clamp(10.0, 200.0) as u16;
+                    this.state.feed_override = target;
+                    this.request_feed_override(target);
+                }
+            }
             cx.notify();
         }));
         subscriptions.push(cx.subscribe(&spindle_slider, |this, _, event, cx| {
-            this.state.spindle_override = slider_value(event).round().clamp(50.0, 200.0) as u16;
+            match event {
+                SliderEvent::Change(value) => {
+                    this.spindle_slider_active = true;
+                    this.state.spindle_override = value.end().round().clamp(50.0, 200.0) as u16;
+                }
+                SliderEvent::Release(value) => {
+                    this.spindle_slider_active = false;
+                    let target = value.end().round().clamp(50.0, 200.0) as u16;
+                    this.state.spindle_override = target;
+                    this.request_spindle_override(target);
+                }
+            }
             cx.notify();
         }));
 
@@ -96,16 +128,434 @@ impl Shell {
         // Demo-only switches used for screenshots and manual reviews. They do
         // not affect normal startup and never touch the controller.
         state.dark = !std::env::args().any(|arg| arg == "--light");
+        let mock = std::env::args().any(|arg| arg == "--mock");
+        if mock {
+            state.connection = ConnectionState::Mock;
+            state.push_console(
+                ConsoleLevel::Info,
+                "Design-review mock mode; no controller is attached",
+            );
+        }
         if std::env::args().any(|arg| arg == "--keypad") {
             state.open_keypad(KeypadTarget::Dro(Axis::X));
         }
-        Self {
+
+        let mut shell = Self {
             state,
             feed_slider,
             spindle_slider,
             mono,
+            link: None,
+            feed_slider_active: false,
+            spindle_slider_active: false,
+            console_scroll: ScrollHandle::new(),
+            _poll_task: None,
             _subscriptions: subscriptions,
+        };
+        if !mock {
+            shell.connect_demo(cx);
         }
+        shell._poll_task = Some(shell.spawn_poll(cx));
+        shell
+    }
+
+    fn spawn_poll(&self, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                if weak.update(cx, |shell, cx| shell.poll(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.link.as_mut() else {
+            return;
+        };
+        let before = self.state.console.len();
+        if link.poll(&mut self.state) {
+            if self.state.console.len() != before {
+                self.console_scroll.scroll_to_bottom();
+            }
+            cx.notify();
+        }
+    }
+
+    // ------------------------------------------------------- connection/link
+
+    fn connect_demo(&mut self, cx: &mut Context<Self>) {
+        self.state.begin_live();
+        let result = if let Some(link) = self.link.as_mut() {
+            link.connect_demo()
+        } else {
+            match LiveLink::start_demo() {
+                Ok(link) => {
+                    self.link = Some(link);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = result {
+            self.state.connection = ConnectionState::Failed(error.clone());
+            self.state
+                .push_console(ConsoleLevel::Error, format!("Connect failed: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(link) = &self.link {
+            link.disconnect();
+        }
+        self.state.connection = ConnectionState::Disconnected;
+        self.state.push_console(
+            ConsoleLevel::Warn,
+            "Disconnect requested; the last telemetry is stale",
+        );
+        cx.notify();
+    }
+
+    fn send_command(&mut self, command: Command) -> bool {
+        let Some(link) = &self.link else {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "No engine connection; command was not sent",
+            );
+            return false;
+        };
+        match link.send(command) {
+            Ok(()) => true,
+            Err(error) => {
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("Engine: {error}"));
+                false
+            }
+        }
+    }
+
+    fn send_mdi_line(&mut self, line: String) -> bool {
+        self.send_command(Command::Mdi(line))
+    }
+
+    // ------------------------------------------------------------ UI gating
+
+    fn machine(&self) -> MachineState {
+        MachineState::parse(self.state.machine_state)
+    }
+
+    fn ready(&self) -> bool {
+        self.state.connection.is_ready_like()
+    }
+
+    fn locked(&self) -> bool {
+        matches!(self.state.machine_state, "Alarm" | "Door")
+    }
+
+    fn mdi_allowed(&self) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        if !self.state.live {
+            return !self.locked();
+        }
+        self.machine() == MachineState::Idle
+    }
+
+    fn jog_allowed(&self) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        if !self.state.live {
+            return !self.locked();
+        }
+        matches!(
+            self.machine(),
+            MachineState::Idle | MachineState::Hold | MachineState::Jog | MachineState::Tool
+        )
+    }
+
+    fn aux_allowed(&self) -> bool {
+        self.ready() && (!self.state.live || !self.machine().is_locked())
+    }
+
+    fn macro_allowed(&self, action: crate::state::MacroAction) -> bool {
+        use crate::state::MacroAction;
+        match action {
+            MacroAction::Unlock | MacroAction::Home | MacroAction::Park => self.ready(),
+            MacroAction::ProbeZ => self.ready(),
+            MacroAction::ZeroXy | MacroAction::ZeroZ | MacroAction::SafeZ => self.mdi_allowed(),
+            MacroAction::Coolant => self.aux_allowed(),
+        }
+    }
+
+    // -------------------------------------------------------------- actions
+
+    fn send_mdi(&mut self, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.send_mdi();
+            cx.notify();
+            return;
+        }
+        let text = self.state.mdi.trim().to_string();
+        if text.is_empty() {
+            self.state.push_console(ConsoleLevel::Warn, "MDI is empty");
+            cx.notify();
+            return;
+        }
+        self.send_mdi_line(text);
+        cx.notify();
+    }
+
+    fn jog(&mut self, sign: f64, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.jog(sign);
+            cx.notify();
+            return;
+        }
+        let axis = self.state.jog_axis;
+        let Some(core_axis) = CoreAxis::from_index(axis.index()) else {
+            self.state
+                .push_console(ConsoleLevel::Warn, "Selected axis is not reported");
+            cx.notify();
+            return;
+        };
+        let distance = sign * self.state.jog_step;
+        let mut position = Position::new(Axes::from(core_axis));
+        position.set(core_axis, distance);
+        let feed = if self.state.feed_rate > 0 {
+            f64::from(self.state.feed_rate)
+        } else {
+            // Idle reports FS:0,0; a jog still needs a positive feed.
+            1_000.0
+        };
+        match JogCommand::incremental(position, feed) {
+            Ok(jog) => {
+                self.send_command(Command::Jog(jog));
+            }
+            Err(error) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Jog: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn zero_axis(&mut self, axis: Axis, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.zero_axis(axis);
+            cx.notify();
+            return;
+        }
+        let line = format!(
+            "G10 L20 P{} {}0",
+            self.state.wcs_program_number(),
+            axis.label()
+        );
+        self.send_mdi_line(line);
+        cx.notify();
+    }
+
+    fn select_wcs(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= AppState::wcs_count() {
+            return;
+        }
+        if self.state.live {
+            if !self.mdi_allowed() {
+                self.state
+                    .push_console(ConsoleLevel::Warn, "WCS change requires Idle");
+                cx.notify();
+                return;
+            }
+            self.state.wcs_index = index;
+            self.send_mdi_line(AppState::wcs_at(index).to_string());
+        } else {
+            self.state.wcs_index = index;
+        }
+        cx.notify();
+    }
+
+    fn toggle_coolant(&mut self, channel: usize, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.toggle_coolant(channel);
+            cx.notify();
+            return;
+        }
+        let command = match channel {
+            0 => RealtimeCommand::MistToggle,
+            1 => RealtimeCommand::FloodToggle,
+            2 => RealtimeCommand::Fan0Toggle,
+            _ => return,
+        };
+        if self.send_command(Command::Realtime(command))
+            && let Some(value) = self.state.coolant.get_mut(channel)
+        {
+            *value = !*value;
+        }
+        cx.notify();
+    }
+
+    fn spindle_power(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.spindle_on = on;
+            self.state.push_console(
+                ConsoleLevel::Command,
+                format!("M{} (mock)", if on { 3 } else { 5 }),
+            );
+            cx.notify();
+            return;
+        }
+        let line = if on {
+            format!(
+                "M{} S{}",
+                if self.state.spindle_cw { 3 } else { 4 },
+                self.state.rpm
+            )
+        } else {
+            "M5".to_string()
+        };
+        if self.send_mdi_line(line) {
+            self.state.spindle_on = on;
+        }
+        cx.notify();
+    }
+
+    fn spindle_direction(&mut self, clockwise: bool, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.spindle_cw = clockwise;
+            self.state.spindle_on = true;
+            cx.notify();
+            return;
+        }
+        let line = format!("M{} S{}", if clockwise { 3 } else { 4 }, self.state.rpm);
+        if self.send_mdi_line(line) {
+            self.state.spindle_cw = clockwise;
+            self.state.spindle_on = true;
+        }
+        cx.notify();
+    }
+
+    fn request_feed_override(&mut self, target: u16) {
+        if !self.state.live {
+            return;
+        }
+        self.send_command(Command::SetFeedOverride(target.clamp(10, 200)));
+    }
+
+    fn request_spindle_override(&mut self, target: u16) {
+        if !self.state.live {
+            return;
+        }
+        self.send_command(Command::SetSpindleOverride(target.clamp(10, 200)));
+    }
+
+    fn reset(&mut self, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.machine_state = "Idle";
+            self.state
+                .push_console(ConsoleLevel::Warn, "SOFT RESET requested (mock)");
+            cx.notify();
+            return;
+        }
+        self.send_command(Command::Reset);
+        cx.notify();
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.state.machine_state = "Hold";
+            self.state
+                .push_console(ConsoleLevel::Warn, "Feed hold (mock)");
+            cx.notify();
+            return;
+        }
+        self.send_command(Command::Realtime(RealtimeCommand::Stop));
+        cx.notify();
+    }
+
+    fn run_macro(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(mac) = self.state.macros.get(index).copied() else {
+            return;
+        };
+        if !self.state.live {
+            self.state.run_macro(index);
+            cx.notify();
+            return;
+        }
+        use crate::state::MacroAction;
+        match mac.action {
+            MacroAction::ZeroXy => {
+                let line = format!("G10 L20 P{} X0 Y0", self.state.wcs_program_number());
+                self.send_mdi_line(line);
+            }
+            MacroAction::ZeroZ => {
+                let line = format!("G10 L20 P{} Z0", self.state.wcs_program_number());
+                self.send_mdi_line(line);
+            }
+            MacroAction::SafeZ => {
+                self.send_mdi_line("G0 Z25".to_string());
+            }
+            MacroAction::Home => {
+                self.send_command(Command::Home);
+            }
+            MacroAction::Unlock => {
+                self.send_command(Command::Unlock);
+            }
+            MacroAction::Park => {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    "Park needs a machine-specific position; not sent (M7)",
+                );
+            }
+            MacroAction::ProbeZ => {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    "Probe cycles are not wired until M6; not sent",
+                );
+            }
+            MacroAction::Coolant => {
+                if self.send_command(Command::Realtime(RealtimeCommand::FloodToggle))
+                    && let Some(value) = self.state.coolant.get_mut(1)
+                {
+                    *value = !*value;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn keypad_action(&mut self, action: KeypadAction, cx: &mut Context<Self>) {
+        let submitted = matches!(action, KeypadAction::Submit)
+            .then(|| self.state.keypad.clone())
+            .flatten();
+        self.state.keypad_action(action);
+        if self.state.live
+            && let Some(keypad) = submitted
+        {
+            match keypad.target {
+                KeypadTarget::Mdi => {}
+                KeypadTarget::Rpm => {
+                    if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
+                        let rpm = value.clamp(0.0, 24_000.0).round() as u32;
+                        self.send_mdi_line(format!("S{rpm}"));
+                    }
+                }
+                KeypadTarget::Dro(axis) => {
+                    if let Ok(value) = keypad.buffer.trim().parse::<f64>() {
+                        let line = format!(
+                            "G10 L20 P{} {}{value:.3}",
+                            self.state.wcs_program_number(),
+                            axis.label()
+                        );
+                        self.send_mdi_line(line);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn top_bar(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -132,8 +582,31 @@ impl Shell {
         });
 
         let theme_view = view.clone();
+        let link_view = view.clone();
         let reset_view = view.clone();
         let stop_view = view.clone();
+
+        let (dot_color, link_label) = match &self.state.connection {
+            ConnectionState::Mock => (p.text_faint, self.state.connection.label()),
+            ConnectionState::Connecting => (p.warning, self.state.connection.label()),
+            ConnectionState::Ready => (p.success, self.state.connection.label()),
+            ConnectionState::Disconnected => (p.danger, self.state.connection.label()),
+            ConnectionState::Failed(_) => (p.danger, self.state.connection.label()),
+        };
+        let status_text = format!(
+            "{} {}A | {}",
+            link_label,
+            self.state.profile.capabilities.axes.len(),
+            self.state.machine_state
+        );
+        let link_text = if matches!(
+            self.state.connection,
+            ConnectionState::Connecting | ConnectionState::Ready
+        ) {
+            "DISCONNECT"
+        } else {
+            "CONNECT"
+        };
 
         div()
             .h(px(56.0))
@@ -175,23 +648,13 @@ impl Shell {
                     .bg(p.panel_alt)
                     .border_1()
                     .border_color(p.border)
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(
-                        if self.state.machine_state == "Alarm" {
-                            p.danger
-                        } else {
-                            p.success
-                        },
-                    ))
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(dot_color))
                     .child(
                         div()
                             .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text_dim)
-                            .child(format!(
-                                "MOCK {}A | {}",
-                                self.state.profile.capabilities.axes.len(),
-                                self.state.machine_state
-                            )),
+                            .child(status_text),
                     ),
             )
             .child(
@@ -209,6 +672,27 @@ impl Shell {
                     }),
             )
             .child(
+                Button::new("link")
+                    .label(link_text)
+                    .secondary()
+                    .h(px(48.0))
+                    .w(px(96.0))
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .on_click(move |_, _, cx| {
+                        link_view.update(cx, |this, cx| {
+                            if matches!(
+                                this.state.connection,
+                                ConnectionState::Connecting | ConnectionState::Ready
+                            ) {
+                                this.disconnect(cx);
+                            } else {
+                                this.connect_demo(cx);
+                            }
+                        });
+                    }),
+            )
+            .child(
                 Button::new("reset")
                     .label("RESET")
                     .danger()
@@ -217,14 +701,7 @@ impl Shell {
                     .rounded_lg()
                     .text_size(px(13.0))
                     .on_click(move |_, _, cx| {
-                        reset_view.update(cx, |this, cx| {
-                            this.state.machine_state = "Idle";
-                            this.state.push_console(
-                                ConsoleLevel::Warn,
-                                "SOFT RESET requested (visual only)",
-                            );
-                            cx.notify();
-                        });
+                        reset_view.update(cx, |this, cx| this.reset(cx));
                     }),
             )
             .child(
@@ -236,12 +713,7 @@ impl Shell {
                     .rounded_lg()
                     .text_size(px(13.0))
                     .on_click(move |_, _, cx| {
-                        stop_view.update(cx, |this, cx| {
-                            this.state.machine_state = "Hold";
-                            this.state
-                                .push_console(ConsoleLevel::Warn, "Feed hold (visual only)");
-                            cx.notify();
-                        });
+                        stop_view.update(cx, |this, cx| this.stop(cx));
                     }),
             )
     }
@@ -351,6 +823,7 @@ impl Shell {
             .p_2()
             .h_full()
             .id("console-scroll")
+            .track_scroll(&self.console_scroll)
             .overflow_y_scroll()
             .font_family(self.mono.clone())
             .children(self.state.console.iter().map(|line| {
@@ -363,7 +836,7 @@ impl Shell {
                             .w(px(34.0))
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child(line.time),
+                            .child(line.time.clone()),
                     )
                     .child(
                         div()
@@ -523,7 +996,7 @@ impl Shell {
                     .right(px(8.0))
                     .flex()
                     .gap_1()
-                    .child(chip("G54", p))
+                    .child(chip(self.state.wcs(), p))
                     .child(chip(self.state.unit(), p))
                     .child(chip("1:1", p)),
             )
@@ -558,7 +1031,17 @@ impl Shell {
                     .border_color(p.border)
                     .text_size(px(10.0))
                     .text_color(p.text_dim)
-                    .child("TOOL 3 | 6 mm FLAT | S12000"),
+                    .child(if self.state.live {
+                        format!(
+                            "TOOL {} | S{}",
+                            self.state
+                                .tool
+                                .map_or_else(|| "--".to_string(), |tool| tool.to_string()),
+                            self.state.rpm
+                        )
+                    } else {
+                        "TOOL 3 | 6 mm FLAT | S12000".to_string()
+                    }),
             )
     }
 
@@ -860,10 +1343,10 @@ impl Shell {
                     .rounded(px(6.0))
                     .text_size(px(11.0))
                     .custom(variant)
+                    .disabled(!self.aux_allowed())
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
-                            this.state.toggle_coolant(channel);
-                            cx.notify();
+                            this.toggle_coolant(channel, cx);
                         });
                     })
             });
@@ -889,10 +1372,10 @@ impl Shell {
                             .hover(p.raised_hover)
                             .active(p.accent_muted),
                     )
+                    .disabled(!self.macro_allowed(mac.action))
                     .on_click(move |_, _, cx| {
                         macro_view.update(cx, |this, cx| {
-                            this.state.run_macro(index);
-                            cx.notify();
+                            this.run_macro(index, cx);
                         });
                     })
                     .into_any_element()
@@ -929,15 +1412,37 @@ impl Shell {
             }))
         });
 
-        let work_rows = [
-            ("Origin X", "-123.450".to_string()),
-            ("Origin Y", "-87.200".to_string()),
-            ("Origin Z", "-2.000".to_string()),
-            (
-                "Feed",
-                format!("{} {}/min", self.state.feed_rate, self.state.unit()),
-            ),
-        ];
+        let work_rows = if self.state.live {
+            [
+                ("Origin X", format!("{:>8.3}", self.state.offset(Axis::X))),
+                ("Origin Y", format!("{:>8.3}", self.state.offset(Axis::Y))),
+                ("Origin Z", format!("{:>8.3}", self.state.offset(Axis::Z))),
+                (
+                    "Feed",
+                    format!("{} {}/min", self.state.feed_rate, self.state.unit()),
+                ),
+            ]
+        } else {
+            [
+                ("Origin X", "-123.450".to_string()),
+                ("Origin Y", "-87.200".to_string()),
+                ("Origin Z", "-2.000".to_string()),
+                (
+                    "Feed",
+                    format!("{} {}/min", self.state.feed_rate, self.state.unit()),
+                ),
+            ]
+        };
+
+        let signal_note = if self.state.live {
+            if self.state.signal_caps.is_empty() {
+                "Pn: waiting for $I+".to_string()
+            } else {
+                format!("Pn: {}", self.state.signal_caps)
+            }
+        } else {
+            "HSDEP | no probe-connected pin".to_string()
+        };
 
         card(&p)
             .flex_1()
@@ -968,7 +1473,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("HSDEP | no probe-connected pin"),
+                            .child(signal_note),
                     ),
             )
             // No divider: the extra height of the tall cell simply spaces the
@@ -1014,7 +1519,16 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(chip("G21", p))
+                            .child(chip(
+                                if self.state.profile.capabilities.units
+                                    == crate::state::Units::Inch
+                                {
+                                    "G20"
+                                } else {
+                                    "G21"
+                                },
+                                p,
+                            ))
                             .child(chip("G90", p))
                             .child(chip("G17", p)),
                     ),
@@ -1074,11 +1588,9 @@ impl Shell {
                             .w(px(80.0))
                             .rounded_lg()
                             .text_size(px(12.0))
+                            .disabled(!self.mdi_allowed())
                             .on_click(move |_, _, cx| {
-                                send_view.update(cx, |this, cx| {
-                                    this.state.send_mdi();
-                                    cx.notify();
-                                });
+                                send_view.update(cx, |this, cx| this.send_mdi(cx));
                             }),
                     ),
             )
@@ -1086,12 +1598,13 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(p.text_faint)
-                            .child("Mock send appends to console"),
-                    )
+                    .child(div().text_size(px(11.0)).text_color(p.text_faint).child(
+                        if self.state.live {
+                            "Live: engine logs command + ok"
+                        } else {
+                            "Mock send appends to console"
+                        },
+                    ))
                     .child(
                         div()
                             .text_size(px(10.0))
@@ -1125,8 +1638,7 @@ impl Shell {
                     menu = menu.item(PopupMenuItem::new(AppState::wcs_at(index)).on_click(
                         move |_, _, cx| {
                             wcs_view.update(cx, |this, cx| {
-                                this.state.wcs_index = index;
-                                cx.notify();
+                                this.select_wcs(index, cx);
                             });
                         },
                     ));
@@ -1207,10 +1719,10 @@ impl Shell {
                         )
                         .border_1()
                         .border_color(p.border)
+                        .disabled(!self.mdi_allowed())
                         .on_click(move |_, _, cx| {
                             zero_view.update(cx, |this, cx| {
-                                this.state.zero_axis(axis);
-                                cx.notify();
+                                this.zero_axis(axis, cx);
                             });
                         }),
                 )
@@ -1272,6 +1784,7 @@ impl Shell {
                             .custom(mode_variant(cx, p, false))
                             .border_1()
                             .border_color(p.border)
+                            .disabled(!self.ready())
                             .on_click(move |_, window, cx| {
                                 down_view.update(cx, |this, cx| {
                                     this.state.feed_override =
@@ -1280,6 +1793,7 @@ impl Shell {
                                     down_slider.update(cx, |slider, cx| {
                                         slider.set_value(value, window, cx);
                                     });
+                                    this.request_feed_override(value.round() as u16);
                                     cx.notify();
                                 });
                             }),
@@ -1300,6 +1814,7 @@ impl Shell {
                             .custom(mode_variant(cx, p, false))
                             .border_1()
                             .border_color(p.border)
+                            .disabled(!self.ready())
                             .on_click(move |_, window, cx| {
                                 up_view.update(cx, |this, cx| {
                                     this.state.feed_override =
@@ -1308,6 +1823,7 @@ impl Shell {
                                     up_slider.update(cx, |slider, cx| {
                                         slider.set_value(value, window, cx);
                                     });
+                                    this.request_feed_override(value.round() as u16);
                                     cx.notify();
                                 });
                             }),
@@ -1439,10 +1955,10 @@ impl Shell {
                             )
                             .border_1()
                             .border_color(p.border)
+                            .disabled(!self.jog_allowed())
                             .on_click(move |_, _, cx| {
                                 minus_view.update(cx, |this, cx| {
-                                    this.state.jog(-1.0);
-                                    cx.notify();
+                                    this.jog(-1.0, cx);
                                 });
                             }),
                     )
@@ -1469,10 +1985,10 @@ impl Shell {
                             )
                             .border_1()
                             .border_color(p.border)
+                            .disabled(!self.jog_allowed())
                             .on_click(move |_, _, cx| {
                                 plus_view.update(cx, |this, cx| {
-                                    this.state.jog(1.0);
-                                    cx.notify();
+                                    this.jog(1.0, cx);
                                 });
                             }),
                     ),
@@ -1511,16 +2027,12 @@ impl Shell {
                             .child(
                                 Switch::new("spindle-power")
                                     .checked(self.state.spindle_on)
+                                    .disabled(!self.mdi_allowed())
                                     .label(if self.state.spindle_on { "ON" } else { "OFF" })
                                     .text_size(px(10.0))
                                     .on_change(move |checked, _, cx| {
                                         power_view.update(cx, |this, cx| {
-                                            this.state.spindle_on = *checked;
-                                            this.state.push_console(
-                                                ConsoleLevel::Command,
-                                                format!("M{} (mock)", if *checked { 3 } else { 5 }),
-                                            );
-                                            cx.notify();
+                                            this.spindle_power(*checked, cx);
                                         });
                                     }),
                             ),
@@ -1554,7 +2066,14 @@ impl Shell {
                             .child(format!("{}", self.state.rpm))
                             .on_click(move |_, _, cx| {
                                 rpm_view.update(cx, |this, cx| {
-                                    this.state.open_keypad(KeypadTarget::Rpm);
+                                    if this.mdi_allowed() {
+                                        this.state.open_keypad(KeypadTarget::Rpm);
+                                    } else {
+                                        this.state.push_console(
+                                            ConsoleLevel::Warn,
+                                            "Spindle RPM change requires Idle",
+                                        );
+                                    }
                                     cx.notify();
                                 });
                             }),
@@ -1573,11 +2092,10 @@ impl Shell {
                             } else {
                                 p.border
                             })
+                            .disabled(!self.mdi_allowed())
                             .on_click(move |_, _, cx| {
                                 cw_view.update(cx, |this, cx| {
-                                    this.state.spindle_cw = true;
-                                    this.state.spindle_on = true;
-                                    cx.notify();
+                                    this.spindle_direction(true, cx);
                                 });
                             }),
                     )
@@ -1595,11 +2113,10 @@ impl Shell {
                             } else {
                                 p.accent
                             })
+                            .disabled(!self.mdi_allowed())
                             .on_click(move |_, _, cx| {
                                 ccw_view.update(cx, |this, cx| {
-                                    this.state.spindle_cw = false;
-                                    this.state.spindle_on = true;
-                                    cx.notify();
+                                    this.spindle_direction(false, cx);
                                 });
                             }),
                     ),
@@ -1690,12 +2207,6 @@ impl Render for Shell {
             ));
         }
         root
-    }
-}
-
-fn slider_value(event: &SliderEvent) -> f32 {
-    match event {
-        SliderEvent::Change(value) | SliderEvent::Release(value) => value.end(),
     }
 }
 
@@ -1805,5 +2316,6 @@ fn console_color(level: ConsoleLevel, p: Palette) -> Hsla {
         ConsoleLevel::Command => p.info,
         ConsoleLevel::Ok => p.success,
         ConsoleLevel::Warn => p.warning,
+        ConsoleLevel::Error => p.danger,
     }
 }

@@ -8,11 +8,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-# M0 is a mock-state UI spike: no serial, protocol, or engine code is linked
-# yet. These return at M2 when the shell drives `EngineHandle`.
-# ghs-core.workspace = true
-# ghs-proto.workspace = true
-# ghs-engine.workspace = true
+# M2: the shell drives one engine session. Protocol types are reached through
+# `ghs-engine` re-exports, never by writing bytes from the app.
+ghs-core.workspace = true
+ghs-engine.workspace = true
+ghs-demo.workspace = true
 
 # Pinned by the workspace. Keep GPUI behind this facade so a future `ghs-ui`
 # crate can own the version churn (see docs/adr/0004-gpui-ui-layer.md).
