@@ -77,4 +77,52 @@ pub enum Command {
     RequestStatus,
     /// Clear the controller's sticky error state with an empty line.
     ClearError,
+    /// Parse and validate a program for streaming.
+    ///
+    /// Parsing runs on the engine thread. The program is retained until it is
+    /// replaced, so a stop or disconnect never discards the source.
+    LoadProgram {
+        /// Program name or path shown in the UI.
+        name: String,
+        /// Complete program source text.
+        source: String,
+    },
+    /// Stream the loaded program one acknowledged line at a time.
+    ///
+    /// `from_line` is deferred: only `None` or `Some(1)` is accepted until the
+    /// modal preamble can be produced safely. A larger line returns
+    /// [`crate::EngineError::Unsupported`].
+    StartProgram {
+        /// Optional 1-based source line to start from.
+        from_line: Option<u32>,
+    },
+    /// Feed hold the running job and freeze program output.
+    PauseProgram,
+    /// Cycle start a paused job or continue after a tool change.
+    ResumeProgram,
+    /// Stop the job and retain the loaded program.
+    StopProgram {
+        /// Send a soft reset after stopping. A reset discards the controller's
+        /// buffered motion and pending tool change.
+        reset: bool,
+    },
+    /// Acknowledge a pending manual tool change with `0xA3`.
+    AcknowledgeToolChange,
+    /// Enable or disable the virtual optional-stop flag.
+    SetOptionalStop(bool),
+    /// Enable or disable the virtual single-block flag.
+    SetSingleBlock(bool),
+    /// Enable or disable block delete.
+    SetBlockDelete(bool),
+    /// Enable or disable a breakpoint at a 1-based source line.
+    SetBreakpoint {
+        /// Source line number.
+        line: u32,
+        /// Whether the job pauses before this line.
+        enabled: bool,
+    },
+    /// Enter controller check mode and stream the loaded program.
+    ///
+    /// Deferred until check mode is wired end to end.
+    StartCheckRun,
 }

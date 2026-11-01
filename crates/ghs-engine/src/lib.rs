@@ -25,7 +25,10 @@
 //!
 //! The M2 slice covers connect, handshake, live telemetry, realtime commands,
 //! jog, MDI, overrides, home/unlock/reset/sleep, settings read/write with
-//! read-back verification, logs and the safety gateway. Job streaming is M3.
+//! read-back verification, logs and the safety gateway. M3 adds the job
+//! runner: validated program loading, one-line-at-a-time streaming through
+//! the same streamer, pause/resume/stop, stop conditions, breakpoints and the
+//! manual tool-change handshake.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -35,6 +38,7 @@ mod config;
 mod error;
 mod event;
 mod handle;
+mod job;
 mod overrides;
 mod runtime;
 mod telemetry;
@@ -42,15 +46,16 @@ mod telemetry;
 pub use command::{Command, ConnectTarget};
 pub use config::EngineConfig;
 pub use error::EngineError;
-pub use event::{EngineEvent, LogLevel};
+pub use event::{EngineEvent, JobAbortReason, JobPauseReason, LogLevel};
 pub use handle::{Engine, EngineHandle};
 
 // Re-export the domain and protocol types used in the public API so a caller
 // can construct commands without depending on every crate directly.
 pub use ghs_core::{
-    AlarmCode, Axes, Axis, ControllerInfo, FeedSpindle, MachineSnapshot, MachineState, Overrides,
-    Position, ProbeResult, Setting, SettingValue, Signals, Wcs,
+    AlarmCode, Axes, Axis, ControllerInfo, FeedSpindle, JobInfo, JobState, MachineSnapshot,
+    MachineState, Overrides, Position, ProbeResult, Setting, SettingValue, Signals, Wcs,
 };
+pub use ghs_gcode::{Program, ProgramLine};
 pub use ghs_proto::{
     CodeTable, EncodeError, ExtendedCommand, JogCommand, JogMode, Offsets, ParserState,
     RealtimeCommand, SettingDescription, SettingGroup, StatusReport, StreamerError, SystemCommand,

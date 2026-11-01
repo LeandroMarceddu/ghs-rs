@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use ghs_demo::{SimProfile, start};
 use ghs_engine::{
-    Axes, Axis, Command, ConnectTarget, Engine, EngineConfig, JogCommand, JogMode, Position,
+    Axes, Axis, Command, ConnectTarget, Engine, EngineConfig, EngineEvent, EngineHandle, JobState,
+    JogCommand, JogMode, Position,
 };
 
 fn fast_config() -> EngineConfig {
@@ -99,4 +100,123 @@ fn connects_to_the_simulator_and_runs_mdi() {
 
 fn drain_events(engine: &ghs_engine::EngineHandle) {
     while engine.events().try_recv().is_ok() {}
+}
+
+fn wait_for_event(
+    engine: &EngineHandle,
+    timeout: Duration,
+    predicate: impl Fn(&EngineEvent) -> bool,
+) -> EngineEvent {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for an engine event"
+        );
+        match engine.events().recv_timeout(remaining) {
+            Ok(event) => {
+                if predicate(&event) {
+                    return event;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                panic!("timed out waiting for an engine event");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                panic!("engine event channel disconnected");
+            }
+        }
+    }
+}
+
+fn connect_simulator(config: EngineConfig) -> (EngineHandle, ghs_demo::SimSession) {
+    let (endpoint, session) = start(SimProfile::FlexiHal).expect("start simulator");
+    let engine = Engine::spawn(config).expect("spawn engine");
+    engine
+        .connect(ConnectTarget::Transport(Box::new(endpoint)))
+        .expect("connect");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !engine.is_ready() && Instant::now() < deadline {
+        drain_events(&engine);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(engine.is_ready(), "engine did not become ready");
+    (engine, session)
+}
+
+#[test]
+fn runs_a_program_to_completion_on_the_simulator() {
+    let (engine, _session) = connect_simulator(fast_config());
+    engine
+        .send(Command::LoadProgram {
+            name: "demo.nc".into(),
+            source: "G21 G90\nG0 X1 Y1\nG1 Z-1 F100\nM2\n".into(),
+        })
+        .expect("load program");
+    let loaded = wait_for_event(&engine, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::JobLoaded { .. })
+    });
+    assert!(matches!(
+        loaded,
+        EngineEvent::JobLoaded { total_lines: 4, .. }
+    ));
+    engine
+        .send(Command::StartProgram { from_line: None })
+        .expect("start program");
+    wait_for_event(&engine, Duration::from_secs(10), |event| {
+        matches!(event, EngineEvent::JobCompleted { .. })
+    });
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.job.state, JobState::Completed);
+    assert_eq!(snapshot.job.completed_lines, 4);
+    assert_eq!(snapshot.job.progress, 1.0);
+    engine.shutdown();
+}
+
+#[test]
+fn completes_a_tool_change_on_the_simulator() {
+    let (engine, _session) = connect_simulator(fast_config());
+    engine
+        .send(Command::LoadProgram {
+            name: "tool.nc".into(),
+            source: "T2 M6\nG0 X2\nM2\n".into(),
+        })
+        .expect("load program");
+    engine
+        .send(Command::StartProgram { from_line: None })
+        .expect("start program");
+    let tool = wait_for_event(&engine, Duration::from_secs(5), |event| {
+        matches!(event, EngineEvent::ToolChangeRequired { .. })
+    });
+    assert_eq!(tool, EngineEvent::ToolChangeRequired { tool: 2, line: 1 });
+    assert!(wait_until(
+        || engine.snapshot().state == ghs_engine::MachineState::Tool,
+        Duration::from_secs(2)
+    ));
+    engine
+        .send(Command::AcknowledgeToolChange)
+        .expect("acknowledge tool change");
+    engine
+        .send(Command::ResumeProgram)
+        .expect("cycle start after the tool change");
+    wait_for_event(&engine, Duration::from_secs(10), |event| {
+        matches!(event, EngineEvent::JobCompleted { .. })
+    });
+    assert_eq!(engine.snapshot().job.state, JobState::Completed);
+    engine.shutdown();
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }

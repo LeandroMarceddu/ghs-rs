@@ -323,6 +323,91 @@ fn split_items(bytes: &[u8]) -> Vec<Item> {
     }
 }
 
+/// Idle status report used by the scripted controller.
+pub const IDLE_STATUS: &str = "<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|WCO:0.000,0.000,0.000|Bf:15,1024|FS:0,0|Pn:|WCS:G54|Ov:100,100,100|A:|MPG:0|H:1|T:0|TLR:0>";
+
+/// Queue the standard `$I+`/`$$`/`$#`/`$G` discovery script.
+pub fn standard_script(control: &Control) {
+    standard_script_with_options(
+        control,
+        "[OPT:VNMSL+2,64,1024,3,0]",
+        "[NEWOPT:ENUMS,RT+,HOME,ES,EXPR,TC,SED]",
+        IDLE_STATUS,
+    );
+}
+
+/// Queue discovery with a custom `OPT` line.
+pub fn standard_script_with_opt(control: &Control, opt: &str) {
+    standard_script_with_options(
+        control,
+        opt,
+        "[NEWOPT:ENUMS,RT+,HOME,ES,EXPR,TC,SED]",
+        IDLE_STATUS,
+    );
+}
+
+/// Queue discovery with custom option and status lines.
+pub fn standard_script_with_options(control: &Control, opt: &str, newopt: &str, status: &str) {
+    control.set_status(status);
+    control.expect_line(
+        "$I+",
+        &[
+            "[VER:1.1f.20240604:]",
+            opt,
+            "[AXS:3:XYZ]",
+            newopt,
+            "[FIRMWARE:grblHAL]",
+            "[SIGNALS:HSDEP]",
+            "[NVS STORAGE:*EEPROM]",
+            "[FREE MEMORY:80K]",
+            "[DRIVER:STM32F446]",
+            "[DRIVER VERSION:240428]",
+            "[BOARD:FlexiHAL_20240604_210624]",
+            "[AUX IO:4,4,0,0]",
+            "[PLUGIN:MODBUS v0.16]",
+            "[SPINDLE:Huanyang v1]",
+            "ok",
+        ],
+    );
+    control.expect_line(
+        "$$",
+        &["$0=10", "$22=1", "$100=250.000", "$110=8000.000", "ok"],
+    );
+    control.expect_line(
+        "$#",
+        &[
+            "[G54:10.000,20.000,30.000]",
+            "[G55:0.000,0.000,0.000]",
+            "[G28:0.000,0.000,0.000]",
+            "[G30:0.000,0.000,0.000]",
+            "[G92:0.000,0.000,0.000]",
+            "[TLO:0.000,0.000,0.000]",
+            "[TLR:0.000]",
+            "ok",
+        ],
+    );
+    control.expect_line("$G", &["[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]", "ok"]);
+    if newopt.contains("ENUMS") {
+        control.expect_line(
+            "$EA",
+            &["[ALARMCODE:1|Hard limit|Hard limit triggered.]", "ok"],
+        );
+        control.expect_line(
+            "$EE",
+            &["[ERRORCODE:20|Unsupported command|Invalid g-code.]", "ok"],
+        );
+        control.expect_line(
+            "$ES",
+            &[
+                "[SETTING:0|0|Step pulse time|microseconds|5|####0|3|1000|0|N/A]",
+                "[SETTING:100|1|X steps per mm|step/mm|6|#####0.000|1|100000|0|N/A]",
+                "ok",
+            ],
+        );
+        control.expect_line("$EG", &["[SETTINGGROUP:1|N/A|Axes]", "ok"]);
+    }
+}
+
 /// Wait until a predicate is true or the timeout expires.
 pub fn wait_until(mut predicate: impl FnMut() -> bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;

@@ -7,7 +7,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use ghs_core::{AlarmCode, ControllerInfo, MachineSnapshot, MachineState, Setting, SettingValue};
+use ghs_core::{
+    AlarmCode, ControllerInfo, JobState, MachineSnapshot, MachineState, Setting, SettingValue,
+};
 use ghs_proto::{
     CodeTable, ExtendedCommand, JogCommand, Offsets, ParserState, RealtimeCommand, Response,
     ResponseParser, SettingDescription, SettingGroup, StatusReport, Streamer, StreamerError,
@@ -18,8 +20,9 @@ use ghs_serial::{SerialTransport, Transport, TransportError, TransportEvent};
 use crate::command::{Command, ConnectTarget};
 use crate::config::EngineConfig;
 use crate::error::EngineError;
-use crate::event::{EngineEvent, LogLevel};
+use crate::event::{EngineEvent, JobAbortReason, JobPauseReason, LogLevel};
 use crate::handle::{EngineInput, SharedState};
+use crate::job::JobRunner;
 use crate::overrides::{feed_override_commands, rapid_override_command, spindle_override_commands};
 use crate::telemetry::apply_status;
 
@@ -129,6 +132,7 @@ enum LinePurpose {
     SettingWrite,
     SettingRead,
     ClearError,
+    JobLine { index: usize, line: u32 },
 }
 
 /// Stage of a settings write.
@@ -167,6 +171,7 @@ pub(crate) struct EngineRuntime {
     advance_after_clear: bool,
     error_latched: bool,
     settings_dump_pending: bool,
+    job: JobRunner,
 
     snapshot: Arc<MachineSnapshot>,
     last_status: Option<Arc<StatusReport>>,
@@ -223,6 +228,7 @@ impl EngineRuntime {
             advance_after_clear: false,
             error_latched: false,
             settings_dump_pending: false,
+            job: JobRunner::new(),
             snapshot: Arc::new(MachineSnapshot::default()),
             last_status: None,
             last_status_at: None,
@@ -405,6 +411,7 @@ impl EngineRuntime {
             step.label()
         ));
         self.streamer.clear();
+        self.streamer.resume();
         self.current_purpose = None;
         self.advance_discovery(step, now);
     }
@@ -413,15 +420,33 @@ impl EngineRuntime {
         if self.sleeping {
             return;
         }
+        if let Some((line, tool)) = self.job.tool_change_stalled(now) {
+            let message = format!("controller did not enter the Tool state for T{tool}");
+            self.job.abort(now, false);
+            self.streamer.pause();
+            self.sync_job_snapshot();
+            self.emit_job_progress(now);
+            self.emit(EngineEvent::JobError {
+                line,
+                code: 0,
+                message,
+            });
+            self.emit(EngineEvent::JobAborted {
+                line,
+                reason: JobAbortReason::ProgramError,
+            });
+            return;
+        }
         if let Some(last_status) = self.last_status_at {
             let elapsed = now.saturating_duration_since(last_status);
             if elapsed >= self.config.watchdog_disconnect {
                 self.close_link("status watchdog timeout");
                 return;
             }
+            let job_running = self.job.is_running();
             if !self.watchdog_paused
                 && elapsed >= self.config.watchdog_pause
-                && self.snapshot.state.is_motion()
+                && (self.snapshot.state.is_motion() || job_running)
             {
                 self.watchdog_paused = true;
                 let command = if self.snapshot.state == MachineState::Jog {
@@ -435,6 +460,9 @@ impl EngineRuntime {
                 if let Err(error) = self.send_realtime_command(command, true) {
                     self.close_link(&format!("watchdog hold failed: {error}"));
                     return;
+                }
+                if job_running {
+                    self.pause_job(JobPauseReason::Watchdog);
                 }
             }
         }
@@ -451,6 +479,7 @@ impl EngineRuntime {
                 self.close_link(&format!("status request failed: {error}"));
             }
         }
+        self.pump_job();
     }
 
     fn poll_interval(&self) -> Duration {
@@ -557,6 +586,7 @@ impl EngineRuntime {
         let now = Instant::now();
         self.parser.reset();
         self.streamer.clear();
+        self.streamer.resume();
         let _ = self
             .streamer
             .set_rx_buffer_size(self.config.default_rx_buffer);
@@ -574,7 +604,9 @@ impl EngineRuntime {
         self.sleep_on_ack = false;
         self.wake_probe_pending = false;
 
-        self.snapshot = Arc::new(MachineSnapshot::default());
+        let mut snapshot = MachineSnapshot::default();
+        self.job.apply_info(&mut snapshot.job);
+        self.snapshot = Arc::new(snapshot);
         self.last_status = None;
         self.last_status_at = None;
         self.last_alarm_emitted = None;
@@ -604,6 +636,7 @@ impl EngineRuntime {
         self.transport_events = None;
         self.parser.reset();
         self.streamer.clear();
+        self.streamer.resume();
         self.discovery = None;
         self.current_purpose = None;
         self.mdi_queue.clear();
@@ -623,11 +656,19 @@ impl EngineRuntime {
         self.shared.ready.store(false, Ordering::Release);
 
         if was_connected {
+            let aborted = self
+                .job
+                .abort(Instant::now(), true)
+                .map(|line| (line, JobAbortReason::Disconnected));
             let mut next = (*self.snapshot).clone();
             next.state = MachineState::Unknown;
             next.alarm = None;
+            self.job.apply_info(&mut next.job);
             self.snapshot = Arc::new(next);
             self.publish_snapshot();
+            if let Some((line, reason)) = aborted {
+                self.emit(EngineEvent::JobAborted { line, reason });
+            }
             self.emit(EngineEvent::Disconnected);
             self.log_warn(format!("Disconnected: {reason}"));
         }
@@ -663,6 +704,19 @@ impl EngineRuntime {
                 self.send_status_request(false, true)
             }
             Command::ClearError => self.execute_clear_error(),
+            Command::LoadProgram { name, source } => self.execute_load_program(name, &source),
+            Command::StartProgram { from_line } => self.execute_start_program(from_line),
+            Command::PauseProgram => self.execute_pause_program(),
+            Command::ResumeProgram => self.execute_resume_program(),
+            Command::StopProgram { reset } => self.execute_stop_program(reset),
+            Command::AcknowledgeToolChange => self.execute_acknowledge_tool_change(),
+            Command::SetOptionalStop(enabled) => self.execute_set_optional_stop(enabled),
+            Command::SetSingleBlock(enabled) => self.execute_set_single_block(enabled),
+            Command::SetBlockDelete(enabled) => self.execute_set_block_delete(enabled),
+            Command::SetBreakpoint { line, enabled } => self.job.set_breakpoint(line, enabled),
+            Command::StartCheckRun => Err(EngineError::Unsupported(
+                "controller check mode ($C) is not wired end to end".into(),
+            )),
         }
     }
 
@@ -675,10 +729,12 @@ impl EngineRuntime {
         match command {
             RealtimeCommand::SoftReset => self.soft_reset(),
             RealtimeCommand::Stop => {
+                self.abort_job(JobAbortReason::OperatorStop, false, true);
                 self.abort_pending_lines("stop");
                 self.send_realtime_command(command, true)
             }
             RealtimeCommand::SoftEStop => {
+                self.abort_job(JobAbortReason::EmergencyStop, false, true);
                 self.abort_pending_lines("soft E-stop");
                 self.send_realtime_command(command, true)?;
                 self.apply_local_alarm(AlarmCode::ESTOP.code());
@@ -709,9 +765,49 @@ impl EngineRuntime {
             RealtimeCommand::CycleStart => {
                 self.ensure_ready()?;
                 self.ensure_motion_unlocked()?;
+                if self.job.is_tool_change() && self.job.tool_change_acknowledged() {
+                    self.ensure_resume_allowed()?;
+                    self.job.finish_tool_change(Instant::now())?;
+                    self.watchdog_paused = false;
+                    self.streamer.resume();
+                    self.send_realtime_command(command, true)?;
+                    self.sync_job_snapshot();
+                    self.emit(EngineEvent::JobResumed);
+                    self.pump_job();
+                    return Ok(());
+                }
+                if self.job.is_paused() && !self.job.is_tool_change() {
+                    self.ensure_resume_allowed()?;
+                    self.job.resume(Instant::now())?;
+                    self.watchdog_paused = false;
+                    self.streamer.resume();
+                    self.send_realtime_command(command, true)?;
+                    self.sync_job_snapshot();
+                    self.emit(EngineEvent::JobResumed);
+                    self.pump_job();
+                    return Ok(());
+                }
                 self.watchdog_paused = false;
                 self.streamer.resume();
                 self.send_realtime_command(command, true)
+            }
+            RealtimeCommand::ToolChangeAck => {
+                self.ensure_ready()?;
+                self.send_realtime_command(command, true)?;
+                if self.job.is_tool_change() {
+                    self.job.acknowledge_tool_change();
+                    self.log_info("Tool change acknowledged; waiting for cycle start");
+                }
+                Ok(())
+            }
+            RealtimeCommand::FeedHold => {
+                self.ensure_ready()?;
+                let running = self.job.is_running();
+                self.send_realtime_command(command, true)?;
+                if running {
+                    self.pause_job(JobPauseReason::Operator);
+                }
+                Ok(())
             }
             _ => {
                 self.ensure_ready()?;
@@ -723,6 +819,7 @@ impl EngineRuntime {
     fn execute_system(&mut self, command: SystemCommand) -> Result<(), EngineError> {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
+        self.ensure_job_stream_available()?;
 
         match &command {
             SystemCommand::WriteSetting { .. } => {
@@ -780,7 +877,14 @@ impl EngineRuntime {
     fn execute_jog(&mut self, jog: JogCommand) -> Result<(), EngineError> {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
+        self.ensure_job_stream_available()?;
         self.ensure_jog_allowed()?;
+        if self.job.is_running() {
+            return Err(EngineError::JobState {
+                action: "jog",
+                state: self.job.job_state(),
+            });
+        }
         let line = jog.encode()?;
         self.enqueue_line(&line, LinePurpose::Jog)
     }
@@ -788,7 +892,14 @@ impl EngineRuntime {
     fn execute_mdi(&mut self, text: &str) -> Result<(), EngineError> {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
+        self.ensure_job_stream_available()?;
         self.ensure_mdi_allowed()?;
+        if self.job.is_active() {
+            return Err(EngineError::JobState {
+                action: "run MDI",
+                state: self.job.job_state(),
+            });
+        }
         if !self.streamer.is_idle() {
             return Err(EngineError::Busy);
         }
@@ -937,6 +1048,7 @@ impl EngineRuntime {
     fn execute_set_setting(&mut self, number: u16, value: SettingValue) -> Result<(), EngineError> {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
+        self.ensure_job_stream_available()?;
         self.ensure_idle()?;
         if self.pending_write.is_some() || !self.streamer.is_idle() {
             return Err(EngineError::Busy);
@@ -1001,6 +1113,7 @@ impl EngineRuntime {
     fn execute_clear_error(&mut self) -> Result<(), EngineError> {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
+        self.ensure_job_stream_available()?;
         if !self.streamer.is_idle() {
             return Err(EngineError::Busy);
         }
@@ -1008,7 +1121,456 @@ impl EngineRuntime {
         self.send_clear_line()
     }
 
+    // ------------------------------------------------------------- job control
+
+    fn execute_load_program(&mut self, name: String, source: &str) -> Result<(), EngineError> {
+        let program = self.job.load(name.clone(), source)?;
+        let total_lines = self.job.total_lines();
+        self.sync_job_snapshot();
+        self.emit(EngineEvent::JobLoaded {
+            name,
+            total_lines,
+            program,
+        });
+        Ok(())
+    }
+
+    fn execute_start_program(&mut self, from_line: Option<u32>) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        self.ensure_motion_unlocked()?;
+        if !self.job.has_program() {
+            return Err(EngineError::NoProgram);
+        }
+        if !self.streamer.is_idle() || self.current_purpose.is_some() {
+            return Err(EngineError::Busy);
+        }
+        let state = self.snapshot.state;
+        if !state.can_start_job() {
+            return Err(EngineError::NotIdle { state });
+        }
+        if let Some(line) = from_line {
+            if line == 0 {
+                return Err(EngineError::InvalidCommand(
+                    "start line must be 1 or greater".into(),
+                ));
+            }
+            if line > 1 {
+                if line > self.job.total_lines() {
+                    return Err(EngineError::InvalidCommand(format!(
+                        "start line {line} is outside the program"
+                    )));
+                }
+                return Err(EngineError::Unsupported(
+                    "start-from-line needs a modal preamble; only the first line is supported"
+                        .into(),
+                ));
+            }
+        }
+
+        let now = Instant::now();
+        let from = self.job.start(now)?;
+        self.streamer.resume();
+        self.sync_job_snapshot();
+        self.emit(EngineEvent::JobStarted {
+            from_line: from,
+            total_lines: self.job.total_lines(),
+        });
+        self.emit_job_progress(now);
+        self.pump_job();
+        Ok(())
+    }
+
+    fn execute_pause_program(&mut self) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        if !self.job.is_running() {
+            return Err(EngineError::JobState {
+                action: "pause",
+                state: self.job.job_state(),
+            });
+        }
+        self.execute_realtime(RealtimeCommand::FeedHold)
+    }
+
+    fn execute_resume_program(&mut self) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        if self.job.is_tool_change() {
+            self.ensure_resume_allowed()?;
+            if !self.job.tool_change_acknowledged() {
+                return Err(EngineError::JobState {
+                    action: "continue after a tool change",
+                    state: self.job.job_state(),
+                });
+            }
+            let now = Instant::now();
+            self.job.finish_tool_change(now)?;
+            self.watchdog_paused = false;
+            self.streamer.resume();
+            self.send_realtime_command(RealtimeCommand::CycleStart, true)?;
+            self.sync_job_snapshot();
+            self.emit(EngineEvent::JobResumed);
+            self.pump_job();
+            return Ok(());
+        }
+        if self.job.is_paused() {
+            return self.execute_realtime(RealtimeCommand::CycleStart);
+        }
+        Err(EngineError::JobState {
+            action: "resume",
+            state: self.job.job_state(),
+        })
+    }
+
+    fn execute_stop_program(&mut self, reset: bool) -> Result<(), EngineError> {
+        if !self.job.can_stop() {
+            return Err(EngineError::JobState {
+                action: "stop",
+                state: self.job.job_state(),
+            });
+        }
+        let now = Instant::now();
+        let state = self.snapshot.state;
+        let active = self.job.is_active();
+        if active && self.transport.is_some() && !reset {
+            if state == MachineState::Tool {
+                self.send_realtime_command(RealtimeCommand::Stop, true)?;
+                self.streamer.clear();
+                self.streamer.resume();
+                self.current_purpose = None;
+            } else {
+                self.send_realtime_command(RealtimeCommand::FeedHold, true)?;
+            }
+        }
+        let line = self
+            .job
+            .stop(now)
+            .unwrap_or_else(|| self.job.current_line().max(1));
+        if active {
+            if self.streamer.in_flight_lines() == 0 {
+                self.streamer.clear();
+                self.streamer.resume();
+            } else {
+                self.streamer.pause();
+            }
+        }
+        self.sync_job_snapshot();
+        self.emit_job_progress(now);
+        self.emit(EngineEvent::JobAborted {
+            line,
+            reason: JobAbortReason::OperatorStop,
+        });
+        if reset && self.transport.is_some() {
+            self.execute_realtime(RealtimeCommand::SoftReset)?;
+        }
+        Ok(())
+    }
+
+    fn execute_acknowledge_tool_change(&mut self) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        if !self.job.is_tool_change() {
+            return Err(EngineError::JobState {
+                action: "acknowledge a tool change",
+                state: self.job.job_state(),
+            });
+        }
+        if !self.job.tool_change_acknowledged() {
+            self.send_realtime_command(RealtimeCommand::ToolChangeAck, true)?;
+            self.job.acknowledge_tool_change();
+            self.log_info("Tool change acknowledged; waiting for cycle start");
+        }
+        Ok(())
+    }
+
+    fn execute_set_optional_stop(&mut self, enabled: bool) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        if self.job.optional_stop() != enabled {
+            self.send_realtime_command(RealtimeCommand::OptionalStopToggle, true)?;
+            self.job.set_optional_stop(enabled);
+            self.log_info(format!(
+                "Optional stop {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+        Ok(())
+    }
+
+    fn execute_set_single_block(&mut self, enabled: bool) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        if self.job.single_block() != enabled {
+            self.send_realtime_command(RealtimeCommand::SingleBlockToggle, true)?;
+            self.job.set_single_block(enabled);
+            self.log_info(format!(
+                "Single block {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+        Ok(())
+    }
+
+    fn execute_set_block_delete(&mut self, enabled: bool) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        self.ensure_job_stream_available()?;
+        if self.job.is_running() {
+            return Err(EngineError::JobState {
+                action: "change block delete",
+                state: self.job.job_state(),
+            });
+        }
+        if !self.streamer.is_idle() || self.current_purpose.is_some() {
+            return Err(EngineError::Busy);
+        }
+        if self.job.block_delete() != enabled {
+            let line = SystemCommand::ToggleBlockDelete.encode()?;
+            self.enqueue_line(&line, LinePurpose::System)?;
+            self.job.set_block_delete(enabled);
+            self.log_info(format!(
+                "Block delete {}",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+        Ok(())
+    }
+
+    fn pause_job(&mut self, reason: JobPauseReason) {
+        let now = Instant::now();
+        if let Some((line, reason)) = self.job.pause(now, reason) {
+            self.streamer.pause();
+            self.sync_job_snapshot();
+            self.emit_job_progress(now);
+            self.emit(EngineEvent::JobPaused { line, reason });
+        }
+    }
+
+    fn begin_tool_change(&mut self, tool: u32, line: u32) {
+        let now = Instant::now();
+        if let Some(pending) = self.job.begin_tool_change(now, tool, line) {
+            // Keep the streamer running so jog and `$` lines can be sent while
+            // the controller waits in Tool. The job phase, not the streamer,
+            // prevents the next program line from being queued.
+            self.streamer.resume();
+            self.sync_job_snapshot();
+            self.emit_job_progress(now);
+            self.emit(EngineEvent::ToolChangeRequired {
+                tool: pending.tool,
+                line: pending.line,
+            });
+        }
+    }
+
+    fn abort_job(&mut self, reason: JobAbortReason, interrupt: bool, clear_stream: bool) {
+        let now = Instant::now();
+        if let Some(line) = self.job.abort(now, interrupt) {
+            if clear_stream {
+                self.streamer.clear();
+                self.streamer.resume();
+                self.current_purpose = None;
+            } else {
+                self.streamer.pause();
+            }
+            self.sync_job_snapshot();
+            self.emit_job_progress(now);
+            self.emit(EngineEvent::JobAborted { line, reason });
+        }
+    }
+
+    fn complete_job(&mut self) {
+        let now = Instant::now();
+        let Some(elapsed) = self.job.complete(now) else {
+            return;
+        };
+        self.streamer.resume();
+        self.sync_job_snapshot();
+        self.emit_job_progress(now);
+        self.emit(EngineEvent::JobCompleted { elapsed });
+    }
+
+    fn fail_job_controller(&mut self, line: u32, code: u16) {
+        let message = self.error_codes.error_label(code);
+        let now = Instant::now();
+        self.job.fail_in_flight(now, line);
+        self.streamer.clear();
+        self.streamer.resume();
+        self.current_purpose = None;
+        self.sync_job_snapshot();
+        self.emit_job_progress(now);
+        self.emit(EngineEvent::JobError {
+            line,
+            code,
+            message,
+        });
+    }
+
+    fn fail_job_stream(&mut self, line: u32, error: EngineError) {
+        let now = Instant::now();
+        self.job.fail_in_flight(now, line);
+        self.streamer.clear();
+        self.streamer.resume();
+        self.current_purpose = None;
+        self.sync_job_snapshot();
+        self.emit_job_progress(now);
+        self.emit(EngineEvent::JobError {
+            line,
+            code: 0,
+            message: error.to_string(),
+        });
+        self.emit(EngineEvent::JobAborted {
+            line,
+            reason: JobAbortReason::ProgramError,
+        });
+    }
+
+    fn on_job_ack(&mut self) {
+        let now = Instant::now();
+        let Some(ack) = self.job.acknowledge(now) else {
+            self.sync_job_snapshot();
+            return;
+        };
+        self.sync_job_snapshot();
+        if ack.progress_due {
+            self.emit_job_progress(now);
+        }
+        if ack.meta.is_tool_change() && !self.job.is_tool_change() {
+            self.begin_tool_change(ack.meta.tool, ack.line);
+            return;
+        }
+        if !self.job.is_running() {
+            if self.streamer.is_idle()
+                && matches!(
+                    self.job.job_state(),
+                    JobState::Aborted | JobState::Completed | JobState::Interrupted
+                )
+            {
+                self.streamer.resume();
+            }
+            return;
+        }
+        if ack.meta.is_program_end() {
+            self.complete_job();
+            return;
+        }
+        if ack.meta.is_program_stop() {
+            self.pause_job(JobPauseReason::ProgramStop);
+            return;
+        }
+        if ack.meta.is_optional_stop() && self.job.optional_stop() {
+            self.pause_job(JobPauseReason::OptionalStop);
+            return;
+        }
+        if self.job.single_block() {
+            self.pause_job(JobPauseReason::SingleBlock);
+            return;
+        }
+        self.pump_job();
+    }
+
+    fn pump_job(&mut self) {
+        if !self.job.is_running()
+            || self.mpg_active
+            || self.current_purpose.is_some()
+            || !self.streamer.is_idle()
+        {
+            return;
+        }
+        if !matches!(self.snapshot.state, MachineState::Idle | MachineState::Run) {
+            return;
+        }
+        loop {
+            let index = self.job.cursor();
+            if index >= self.job.total_lines() as usize {
+                self.complete_job();
+                return;
+            }
+            let Some((line_number, has_words, block_delete, source)) =
+                self.job.line(index).map(|line| {
+                    (
+                        u32::try_from(line.line).unwrap_or(u32::MAX),
+                        line.has_words(),
+                        line.block_delete,
+                        line.source.clone(),
+                    )
+                })
+            else {
+                self.complete_job();
+                return;
+            };
+            if !has_words {
+                self.job.advance_skipped();
+                continue;
+            }
+            if self.job.block_delete() && block_delete {
+                self.job.advance_skipped();
+                continue;
+            }
+            if self.job.breakpoint_hit(line_number) {
+                self.pause_job(JobPauseReason::Breakpoint);
+                return;
+            }
+            match self.enqueue_line(
+                &source,
+                LinePurpose::JobLine {
+                    index,
+                    line: line_number,
+                },
+            ) {
+                Ok(()) => {
+                    self.job.mark_sent(index, line_number);
+                    self.sync_job_snapshot();
+                    return;
+                }
+                Err(error) => {
+                    self.fail_job_stream(line_number, error);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn sync_job_snapshot(&mut self) {
+        let mut next = (*self.snapshot).clone();
+        self.job.apply_info(&mut next.job);
+        self.snapshot = Arc::new(next);
+        self.publish_snapshot();
+    }
+
+    fn emit_job_progress(&mut self, now: Instant) {
+        if !self.job.has_program() {
+            return;
+        }
+        self.emit(EngineEvent::JobProgress {
+            current_line: self.job.current_line().max(1),
+            completed: self.job.completed_lines(),
+            total: self.job.total_lines(),
+            elapsed: self.job.elapsed(now),
+        });
+    }
+
+    fn ensure_job_stream_available(&self) -> Result<(), EngineError> {
+        if self.job.is_paused() && !self.job.is_tool_change() {
+            return Err(EngineError::JobState {
+                action: "send a line",
+                state: self.job.job_state(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_resume_allowed(&self) -> Result<(), EngineError> {
+        let state = self.snapshot.state;
+        match state {
+            MachineState::Idle | MachineState::Hold | MachineState::Tool => Ok(()),
+            _ if state.is_locked() => Err(EngineError::MotionBlocked { state }),
+            _ => Err(EngineError::NotIdle { state }),
+        }
+    }
+
     fn soft_reset(&mut self) -> Result<(), EngineError> {
+        self.abort_job(JobAbortReason::SoftReset, false, true);
         self.abort_pending_lines("soft reset");
         self.parser.reset();
         self.wake_probe_pending = false;
@@ -1039,10 +1601,12 @@ impl EngineRuntime {
     }
 
     fn enter_sleep(&mut self) {
+        self.abort_job(JobAbortReason::ControllerSleep, false, true);
         self.sleeping = true;
         self.sleep_on_ack = false;
         self.wake_probe_pending = false;
         self.streamer.clear();
+        self.streamer.resume();
         self.current_purpose = None;
         self.parser.reset();
         self.mdi_queue.clear();
@@ -1071,6 +1635,7 @@ impl EngineRuntime {
 
     fn abort_pending_lines(&mut self, reason: &str) {
         let dropped = self.streamer.clear();
+        self.streamer.resume();
         self.current_purpose = None;
         self.mdi_queue.clear();
         self.pending_write = None;
@@ -1332,7 +1897,8 @@ impl EngineRuntime {
         }
         let report = Arc::new(report);
         let previous_state = self.snapshot.state;
-        let next = apply_status(&self.snapshot, &report);
+        let mut next = apply_status(&self.snapshot, &report);
+        self.job.apply_info(&mut next.job);
         let state_changed = next.state != previous_state;
 
         self.snapshot = Arc::new(next);
@@ -1378,6 +1944,35 @@ impl EngineRuntime {
             }
         }
 
+        let machine_state = self.snapshot.state;
+        if machine_state == MachineState::Alarm {
+            self.abort_job(JobAbortReason::Alarm, true, true);
+        } else if machine_state == MachineState::Door {
+            self.abort_job(JobAbortReason::Door, false, true);
+        } else if machine_state == MachineState::Tool {
+            if self.job.is_tool_change() {
+                self.job.note_tool_state();
+            } else if let Some((tool, line)) = self.job.in_flight_tool_change() {
+                self.begin_tool_change(tool, line);
+                self.job.note_tool_state();
+            } else if self.job.is_running() {
+                let tool = report.tool.unwrap_or_else(|| self.job.active_tool());
+                let line = self.job.current_line().max(1);
+                self.begin_tool_change(tool, line);
+                self.job.note_tool_state();
+            }
+        } else if machine_state == MachineState::Hold
+            && self.job.is_running()
+            && !self.job.in_flight_pauses_job()
+        {
+            let reason = if self.job.single_block() {
+                JobPauseReason::SingleBlock
+            } else {
+                JobPauseReason::FeedHold
+            };
+            self.pause_job(reason);
+        }
+
         if self.snapshot.state == MachineState::Sleep
             && !self.sleeping
             && self.phase == Phase::Ready
@@ -1403,17 +1998,20 @@ impl EngineRuntime {
                     ));
                 }
                 self.log_warn("MPG/pendant took control; motion commands are blocked");
+                if self.job.is_running() {
+                    self.pause_job(JobPauseReason::FeedHold);
+                }
             } else {
                 self.log_info("MPG/pendant released control");
             }
         }
 
         self.update_phase_after_status(now);
-        if self.phase == Phase::Ready
-            && !self.sleeping
-            && self.next_poll_at > deadline(now, self.poll_interval())
-        {
-            self.next_poll_at = deadline(now, self.poll_interval());
+        if self.phase == Phase::Ready && !self.sleeping {
+            if self.next_poll_at > deadline(now, self.poll_interval()) {
+                self.next_poll_at = deadline(now, self.poll_interval());
+            }
+            self.pump_job();
         }
     }
 
@@ -1428,6 +2026,7 @@ impl EngineRuntime {
                 }
                 Phase::Discovering => {
                     self.streamer.clear();
+                    self.streamer.resume();
                     self.current_purpose = None;
                     self.discovery = None;
                     self.phase = Phase::MpgPassive {
@@ -1472,6 +2071,7 @@ impl EngineRuntime {
                 }
             }
             Some(LinePurpose::MdiLine) => self.send_next_mdi_line(),
+            Some(LinePurpose::JobLine { .. }) => self.on_job_ack(),
             Some(LinePurpose::ClearError) => {
                 self.error_latched = false;
                 if self.advance_after_clear {
@@ -1504,6 +2104,7 @@ impl EngineRuntime {
             if self.current_purpose.is_some() {
                 self.current_purpose = None;
                 self.streamer.clear();
+                self.streamer.resume();
             }
             None
         };
@@ -1538,7 +2139,15 @@ impl EngineRuntime {
                 self.settings_dump_pending = false;
                 self.sleep_on_ack = false;
             }
-            Some(LinePurpose::Jog) | None => {}
+            Some(LinePurpose::JobLine { line, .. }) => {
+                self.fail_job_controller(line, code);
+            }
+            Some(LinePurpose::Jog) | None => {
+                if self.job.is_running() {
+                    let line = self.job.current_line().max(1);
+                    self.fail_job_controller(line, code);
+                }
+            }
         }
 
         if let Err(error) = self.send_clear_line() {
@@ -1552,8 +2161,10 @@ impl EngineRuntime {
         let mut next = (*self.snapshot).clone();
         next.state = MachineState::Alarm;
         next.alarm = Some(alarm);
+        self.job.apply_info(&mut next.job);
         self.snapshot = Arc::new(next);
         self.publish_snapshot();
+        self.abort_job(JobAbortReason::Alarm, true, true);
         if self.last_alarm_emitted != Some(code) {
             self.last_alarm_emitted = Some(code);
             self.emit(EngineEvent::Alarm(code));
@@ -1647,6 +2258,7 @@ impl EngineRuntime {
             return;
         }
         self.streamer.clear();
+        self.streamer.resume();
         self.current_purpose = None;
         self.parser.reset();
         self.reset_discovery_state();
@@ -1726,6 +2338,7 @@ impl EngineRuntime {
                 next.label()
             ));
             self.streamer.clear();
+            self.streamer.resume();
             self.current_purpose = None;
             self.advance_discovery(next, now);
         }

@@ -1,6 +1,6 @@
 //! Typed engine errors.
 
-use ghs_core::MachineState;
+use ghs_core::{JobState, MachineState};
 use ghs_proto::{EncodeError, StreamerError};
 use ghs_serial::TransportError;
 
@@ -63,6 +63,27 @@ pub enum EngineError {
     /// The command is malformed or not allowed through this gateway.
     #[error("invalid command: {0}")]
     InvalidCommand(String),
+
+    /// No program is loaded in the job runner.
+    #[error("no program is loaded")]
+    NoProgram,
+
+    /// The job is in a state that does not allow the requested action.
+    #[error("cannot {action} while the job is in the {state:?} state")]
+    JobState {
+        /// Requested action, for example `"start"`.
+        action: &'static str,
+        /// Current job state.
+        state: JobState,
+    },
+
+    /// The program failed validation before it could be streamed.
+    #[error("invalid program: {0}")]
+    InvalidProgram(String),
+
+    /// The request is understood but not implemented yet.
+    #[error("not supported yet: {0}")]
+    Unsupported(String),
 
     /// The engine configuration was rejected.
     #[error("invalid engine configuration: {0}")]
