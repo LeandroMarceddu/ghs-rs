@@ -14,6 +14,8 @@ ghs-core.workspace = true
 ghs-engine.workspace = true
 ghs-demo.workspace = true
 ghs-serial.workspace = true
+ghs-gcode.workspace = true
+ghs-viewer.workspace = true
 
 # Pinned by the workspace. Keep GPUI behind this facade so a future `ghs-ui`
 # crate can own the version churn (see docs/adr/0004-gpui-ui-layer.md).
