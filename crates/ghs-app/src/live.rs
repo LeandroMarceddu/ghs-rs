@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ghs_demo::{SimProfile, SimSession};
 use ghs_engine::{
     Command, ConnectTarget, ControllerInfo, Engine, EngineConfig, EngineError, EngineEvent,
-    EngineHandle, JobAbortReason, LogLevel, MachineSnapshot, SerialConfig, Setting,
+    EngineHandle, JobAbortReason, JobPauseReason, LogLevel, MachineSnapshot, SerialConfig, Setting,
     SettingDescription, SettingGroup, StatusReport,
 };
 
@@ -412,6 +412,7 @@ impl LiveLink {
                 if state.offsets.status().is_pending() {
                     state.offsets.failed("disconnected");
                 }
+                state.probe.on_disconnected();
                 state.push_console(
                     ConsoleLevel::Warn,
                     "Disconnected; the last telemetry is stale",
@@ -432,6 +433,7 @@ impl LiveLink {
             }
             EngineEvent::Alarm(code) => {
                 state.machine_state = "Alarm";
+                state.probe.on_alarm(code);
                 if state.offsets.status().is_pending() {
                     state.offsets.failed(format!("ALARM:{code}"));
                 }
@@ -507,13 +509,24 @@ impl LiveLink {
                 }
                 true
             }
-            EngineEvent::CodeTables { .. } | EngineEvent::Probe(_) => false,
+            EngineEvent::CodeTables { .. } => false,
+            EngineEvent::Probe(result) => {
+                if state.probe.bind_result(result) {
+                    state.push_console(ConsoleLevel::Info, format!("Probe bound: {result}"));
+                }
+                true
+            }
             EngineEvent::JobLoaded {
                 name, total_lines, ..
             } => {
+                state.probe.on_job_loaded(&name);
                 // Loading is an explicit "show me the job" action for the demo
                 // and future file picker; reveal the parsed list immediately.
-                state.left_tab = LeftTab::Program;
+                // A probe program keeps the console in front: the generated
+                // lines and raw `PRB` results are the audit trail.
+                if !state.probe.is_running() && !state.probe.owns_program(&name) {
+                    state.left_tab = LeftTab::Program;
+                }
                 state.push_console(
                     ConsoleLevel::Info,
                     format!("Program loaded: {name} ({total_lines} lines)"),
@@ -524,6 +537,7 @@ impl LiveLink {
                 from_line,
                 total_lines,
             } => {
+                state.probe.on_job_started();
                 state.push_console(
                     ConsoleLevel::Info,
                     format!("Job started at line {from_line} ({total_lines} lines)"),
@@ -532,6 +546,9 @@ impl LiveLink {
             }
             EngineEvent::JobProgress { .. } => job_changed,
             EngineEvent::JobPaused { line, reason } => {
+                state
+                    .probe
+                    .on_job_paused(line, reason == JobPauseReason::Breakpoint);
                 state.push_console(
                     ConsoleLevel::Warn,
                     format!("Job paused at line {line}: {}", pause_reason_label(reason)),
@@ -543,6 +560,7 @@ impl LiveLink {
                 true
             }
             EngineEvent::JobCompleted { elapsed } => {
+                state.probe.on_job_completed();
                 state.push_console(
                     ConsoleLevel::Ok,
                     format!("Job completed in {}", format_elapsed(elapsed)),
@@ -550,6 +568,7 @@ impl LiveLink {
                 true
             }
             EngineEvent::JobAborted { line, reason } => {
+                state.probe.on_job_aborted(abort_reason_label(reason));
                 let level = if matches!(
                     reason,
                     JobAbortReason::Alarm | JobAbortReason::EmergencyStop
@@ -569,6 +588,7 @@ impl LiveLink {
                 code,
                 message,
             } => {
+                state.probe.on_job_error(line, &message);
                 let text = if code == 0 {
                     format!("Job error at line {line}: {message}")
                 } else {

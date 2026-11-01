@@ -21,6 +21,7 @@ use ghs_engine::{
 
 use crate::config::ConfigModel;
 use crate::offsets::OffsetModel;
+use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::tools::{ToolField, ToolTableModel};
 
@@ -195,6 +196,8 @@ pub struct Capabilities {
     pub axes: Vec<Axis>,
     pub units: Units,
     pub has_probe: bool,
+    /// The controller advertises a probe-connected (`PC`) signal.
+    pub has_probe_connected: bool,
     pub has_tool_table: bool,
     pub tool_table_entries: usize,
     pub has_sd: bool,
@@ -216,6 +219,7 @@ impl Capabilities {
             axes: (0..3).map(Axis::from_index).collect(),
             units: Units::Millimetre,
             has_probe: true,
+            has_probe_connected: false,
             has_tool_table: true,
             tool_table_entries: 0,
             has_sd: false,
@@ -237,6 +241,7 @@ impl Capabilities {
             axes: (0..3).map(Axis::from_index).collect(),
             units: Units::Millimetre,
             has_probe: false,
+            has_probe_connected: false,
             has_tool_table: false,
             tool_table_entries: 0,
             has_sd: false,
@@ -286,6 +291,7 @@ impl Capabilities {
             axes,
             units,
             has_probe,
+            has_probe_connected: info.has_probe_connected_signal(),
             has_tool_table: tool_table_entries > 0,
             tool_table_entries,
             has_sd: info.has_sd(),
@@ -385,6 +391,8 @@ pub enum KeypadTarget {
     },
     /// One numeric field in the tool sheet.
     Tool(ToolField),
+    /// One numeric probe preflight field.
+    ProbeField(ProbeField),
 }
 
 impl KeypadTarget {
@@ -403,6 +411,7 @@ impl KeypadTarget {
                 format!("{} {} OFFSET", AppState::wcs_at(wcs), axis.label())
             }
             KeypadTarget::Tool(field) => field.title().to_string(),
+            KeypadTarget::ProbeField(field) => field.label().to_string(),
         }
     }
 }
@@ -996,6 +1005,10 @@ pub struct AppState {
     pub settings: SettingsModel,
     /// Live `$#` offsets, formatted for the offsets workspace.
     pub offsets: OffsetModel,
+    /// Probe preflight, run binding and apply model.
+    pub probe: ProbeModel,
+    /// Asserted `Pn` input bits from the last snapshot, for probe gating.
+    pub signals_raw: CoreSignals,
     /// Application-owned tool table and its profile state.
     pub tools: ToolTableModel,
     /// Local app preferences, controller profile, and backup helpers.
@@ -1069,6 +1082,8 @@ impl AppState {
             feed_rate: 1200,
             settings: SettingsModel::default(),
             offsets: OffsetModel::default(),
+            probe: ProbeModel::default(),
+            signals_raw: CoreSignals::NONE,
             tools: ToolTableModel::new(),
             config,
         };
@@ -1113,6 +1128,7 @@ impl AppState {
         self.coolant = [false; 3];
         self.feed_rate = 0;
         self.signals.clear();
+        self.signals_raw = CoreSignals::NONE;
         self.signal_caps.clear();
         // Metadata belongs to the controller, never to the previous session.
         self.settings = SettingsModel::default();
@@ -1121,6 +1137,7 @@ impl AppState {
         self.offsets = OffsetModel::default();
         self.sync_offset_context();
         self.tools = ToolTableModel::new();
+        self.probe = ProbeModel::default();
         self.config.begin_connection();
         self.push_console(ConsoleLevel::Info, message);
     }
@@ -1225,6 +1242,7 @@ impl AppState {
         }
 
         self.machine_state = snapshot.state.as_str();
+        self.signals_raw = snapshot.signals;
         let previous_wcs = self.wcs_index;
         self.wcs_index = snapshot.wcs.index();
         if previous_wcs != self.wcs_index {
@@ -1340,6 +1358,9 @@ impl AppState {
 
     /// Job status label, including the mock program's "loaded" state.
     pub fn display_job_status(&self) -> &'static str {
+        if self.probe.owns_program(&self.job.name) {
+            return "PROBE PLAN";
+        }
         if !self.live && !self.job.has_program() && !self.program.is_empty() {
             return match self.job.state {
                 JobState::Idle => "LOADED",
@@ -1600,6 +1621,15 @@ impl AppState {
                 )
             }
             KeypadTarget::Tool(field) => (String::new(), true, Some(field.title().to_string())),
+            KeypadTarget::ProbeField(field) => {
+                let value = self.probe.field_text(field).to_string();
+                let hint = if field.unit().is_empty() {
+                    field.label().to_string()
+                } else {
+                    format!("{} ({})", field.label(), field.unit())
+                };
+                (value, true, Some(hint))
+            }
         };
         self.keypad = Some(KeypadState {
             target,
@@ -1742,6 +1772,11 @@ impl AppState {
             }
             KeypadTarget::Tool(_) => {
                 // The tool sheet owns this draft; the shell applies it.
+            }
+            KeypadTarget::ProbeField(field) => {
+                if let Err(message) = self.probe.set_field_text(field, keypad.buffer.clone()) {
+                    self.push_console(ConsoleLevel::Warn, message);
+                }
             }
         }
     }

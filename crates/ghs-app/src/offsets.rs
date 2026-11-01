@@ -176,6 +176,32 @@ impl OffsetModel {
         self.wcs_rows().into_iter().nth(index)
     }
 
+    /// Stored `$#` value for a work coordinate system, in millimetres.
+    #[must_use]
+    pub fn wcs_position(&self, wcs: Wcs) -> Option<Position> {
+        self.offsets.wcs(wcs)
+    }
+
+    /// Reported `G92` offset, in millimetres.
+    #[must_use]
+    pub fn g92_position(&self) -> Option<Position> {
+        self.offsets.g92
+    }
+
+    /// Active tool-length offset on Z, in millimetres.
+    ///
+    /// A one-value `[TLO:...]` line is interpreted as Z, matching grblHAL's
+    /// single-axis tool-length convention. A multi-value line uses the Z
+    /// entry. An empty or absent line is zero.
+    #[must_use]
+    pub fn tlo_z_mm(&self) -> f64 {
+        match self.offsets.tlo.as_deref() {
+            Some([single]) => *single,
+            Some(values) => values.get(2).copied().unwrap_or(0.0),
+            None => 0.0,
+        }
+    }
+
     /// Read-only rows for the remaining `$#` parameters.
     #[must_use]
     pub fn named_rows(&self) -> Vec<NamedRow> {

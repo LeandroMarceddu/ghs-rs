@@ -16,10 +16,15 @@
 //! `--settings-group=NAME` selects a reported group in that workspace;
 //! `--demo-settings-write` changes one safe integer through the normal
 //! pending/Apply/read-back path for the applied screenshot. `--offsets`,
-//! `--tools`, and `--utility` open those M5 workspaces directly. `--demo-tools`
-//! seeds the app-side tool table after the controller profile loads.
-//! `--demo-offsets-write` sends one real `G10 L20` through MDI and refreshes
-//! `$#` for the applied-offsets screenshot. `--size WxH` (or `--size=WxH`)
+//! `--tools`, `--utility`, and `--probe` open those workspaces directly.
+//! `--demo-tools` seeds the app-side tool table after the controller profile
+//! loads. `--demo-offsets-write` sends one real `G10 L20` through MDI and
+//! refreshes `$#` for the applied-offsets screenshot. `--probe-card=z|edge-x|
+//! edge-y|corner|circle|rotation|tool|height` opens one probe cycle once live
+//! telemetry and `$#` are available; `--demo-probe-check` stands in for the
+//! operator's "probe connected" confirmation on a board without `PC`;
+//! `--demo-probe-run` and `--demo-probe-apply` press the same explicit RUN and
+//! Apply/Confirm actions for simulator evidence. `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
 //!
@@ -34,6 +39,7 @@ mod connection;
 mod keypad;
 mod live;
 mod offsets;
+mod probe;
 mod settings;
 mod shell;
 mod state;

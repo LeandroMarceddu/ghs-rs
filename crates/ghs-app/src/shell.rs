@@ -35,7 +35,8 @@ use std::time::Duration;
 use ghs_config::ToolRecord;
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
-    MachineState, Position, Program, RealtimeCommand, SerialConfig, SystemCommand, Wcs,
+    MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
+    SystemCommand, Wcs,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -57,6 +58,10 @@ use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
 use crate::offsets::OffsetStatus;
+use crate::probe::{
+    PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight, ProbeRun,
+    RowState, outcome_summary,
+};
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
@@ -203,6 +208,12 @@ pub struct Shell {
     demo_tools_done: bool,
     demo_offsets_write: bool,
     demo_offsets_write_done: bool,
+    probe_card_demo: Option<String>,
+    probe_card_demo_done: bool,
+    demo_probe_run: bool,
+    demo_probe_run_done: bool,
+    demo_probe_apply: bool,
+    demo_probe_apply_done: bool,
     _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -313,6 +324,16 @@ impl Shell {
         }
         let demo_tools = std::env::args().any(|arg| arg == "--demo-tools");
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
+        let probe_card_demo = std::env::args().find_map(|arg| {
+            arg.strip_prefix("--probe-card=")
+                .map(std::string::ToString::to_string)
+        });
+        if probe_card_demo.is_some() || std::env::args().any(|arg| arg == "--probe") {
+            state.mode = Mode::Probe;
+        }
+        let demo_probe_apply = std::env::args().any(|arg| arg == "--demo-probe-apply");
+        let demo_probe_run =
+            demo_probe_apply || std::env::args().any(|arg| arg == "--demo-probe-run");
 
         let mut shell = Self {
             state,
@@ -346,11 +367,24 @@ impl Shell {
             demo_tools_done: false,
             demo_offsets_write,
             demo_offsets_write_done: false,
+            probe_card_demo,
+            probe_card_demo_done: false,
+            demo_probe_run,
+            demo_probe_run_done: false,
+            demo_probe_apply,
+            demo_probe_apply_done: false,
             _poll_task: None,
             _subscriptions: subscriptions,
         };
         if !mock {
             shell.connect_demo(cx);
+        }
+        if shell.demo_probe_run || std::env::args().any(|arg| arg == "--demo-probe-check") {
+            // The reference board has no PC signal; the screenshot switch
+            // stands in for the operator's explicit "probe connected" check.
+            // Applied after `connect_demo` because `begin_live` resets the
+            // probe model for a new session.
+            shell.state.probe.probe_connected_confirmed = true;
         }
         if let Some(value) = connection_panel_arg() {
             if value == "serial" {
@@ -380,6 +414,28 @@ impl Shell {
         let mut changed = false;
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
+        }
+        // Resume only after a planned probe checkpoint whose PRB was bound.
+        // This pacing exists for the in-process simulator only; a serial
+        // controller streams the plan and never auto-resumes. Never resume
+        // after an alarm, error, disconnect, operator pause or watchdog.
+        let demo_pacing = matches!(
+            self.link.as_ref().and_then(|link| link.mode()),
+            Some(LinkMode::Demo)
+        );
+        if demo_pacing
+            && self.state.probe.needs_resume()
+            && self.ready()
+            && !self.locked()
+            && matches!(
+                self.machine(),
+                MachineState::Idle | MachineState::Hold | MachineState::Tool
+            )
+            && self.state.job.is_paused()
+            && self.send_command(Command::ResumeProgram)
+        {
+            self.state.probe.mark_resumed();
+            changed = true;
         }
         // A G10 write is followed by a read-only `$#`. The engine may still be
         // streaming the MDI line, so retry quietly until it accepts the
@@ -500,6 +556,55 @@ impl Shell {
                 "Demo: G10 L20 write through the normal MDI path",
             );
             self.send_offset_value(Wcs::G54, Axis::X, 12.5, cx);
+            changed = true;
+        }
+        // Screenshot switch: open one probe card once live telemetry and `$#`
+        // are available, so the preflight shows real poses and offsets.
+        if let Some(name) = self.probe_card_demo.clone()
+            && !self.probe_card_demo_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.offsets.reported()
+        {
+            self.probe_card_demo_done = true;
+            self.state.mode = Mode::Probe;
+            if let Some(card) = parse_probe_card(&name) {
+                let ctx = self.probe_context();
+                self.state.probe.select_card(card, &ctx);
+            } else {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("--probe-card: unknown cycle '{name}'"),
+                );
+            }
+            changed = true;
+        }
+        // Screenshot switch: press the same RUN action after the preflight
+        // passes. It is simulator-only evidence; normal startup never runs.
+        if self.demo_probe_run
+            && !self.demo_probe_run_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.probe.card().is_some()
+            && !self.state.probe.is_running()
+        {
+            let ctx = self.probe_context();
+            if self.state.probe.preflight(&ctx).setup.is_some() {
+                self.demo_probe_run_done = true;
+                self.start_probe_run(cx);
+                changed = true;
+            }
+        }
+        // Screenshot switch: press the same explicit Apply+Confirm actions after
+        // the run completes. It is simulator-only evidence.
+        if self.demo_probe_apply
+            && !self.demo_probe_apply_done
+            && self
+                .state
+                .probe
+                .run()
+                .is_some_and(|run| run.phase == ProbePhase::Complete && run.applied_line.is_none())
+        {
+            self.demo_probe_apply_done = true;
+            self.confirm_probe_apply(cx);
             changed = true;
         }
         // Follow the current line in the Program tab. Only a changed line
@@ -1246,6 +1351,11 @@ impl Shell {
     }
 
     fn job_start_allowed(&self) -> bool {
+        if self.state.probe.owns_program(&self.state.job.name) {
+            // A generated probe program must never be re-run from the job
+            // toolbar: its preflight and explicit cycle confirmation are gone.
+            return false;
+        }
         if !self.ready() || self.locked() || !self.job_loaded() {
             return false;
         }
@@ -1561,6 +1671,219 @@ impl Shell {
         cx.notify();
     }
 
+    // -------------------------------------------------------------- probing
+
+    /// Build the read-only probe preflight context from the current view model.
+    ///
+    /// DRO values are converted back to millimetres here; probe geometry is
+    /// canonical millimetres regardless of the display unit. `$#` supplies the
+    /// stored WCS value, `G92` and `TLO`, so the generated program uses the
+    /// same frame the controller will use.
+    fn probe_context(&self) -> ProbeContext {
+        let s = &self.state;
+        let units = s.profile.capabilities.units;
+        let to_mm = |value: f64| units.to_mm(value);
+        let axis_mm = |index: usize| to_mm(s.mpos.get(index).copied().unwrap_or(0.0));
+        let work_mm = |index: usize| to_mm(s.dro.get(index).copied().unwrap_or(0.0));
+        let wcs = Wcs::from_index(s.wcs_index).unwrap_or(Wcs::G54);
+        ProbeContext {
+            live: s.live,
+            ready: self.ready(),
+            machine_state: self.machine(),
+            job_active: s.job.is_active(),
+            machine_pos_mm: Position::xyz(axis_mm(0), axis_mm(1), axis_mm(2)),
+            work_pos_mm: Position::xyz(work_mm(0), work_mm(1), work_mm(2)),
+            wcs,
+            wcs_value_mm: s.offsets.wcs_position(wcs).unwrap_or_default(),
+            g92_mm: s.offsets.g92_position().unwrap_or_default(),
+            tlo_z_mm: s.offsets.tlo_z_mm(),
+            spindle_on: s.spindle_on,
+            coolant_on: s.coolant.iter().any(|channel| *channel),
+            has_probe: s.profile.capabilities.has_probe,
+            has_probe_connected_signal: s.profile.capabilities.has_probe_connected,
+            probe_disconnected: s.signals_raw.contains(CoreSignals::PROBE_DISCONNECTED),
+            probe_triggered: s.signals_raw.contains(CoreSignals::PROBE)
+                || s.signals_raw.contains(CoreSignals::PROBE_PRIMARY)
+                || s.signals_raw.contains(CoreSignals::TOOL_SETTER)
+                || s.signals_raw.contains(CoreSignals::PROBE_SECONDARY),
+            offsets_reported: s.offsets.reported(),
+            units,
+        }
+    }
+
+    fn select_probe_card(&mut self, card: ProbeCard, cx: &mut Context<Self>) {
+        let ctx = self.probe_context();
+        if self.state.probe.select_card(card, &ctx) {
+            cx.notify();
+        } else if self.state.probe.is_running() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "A probe run is active; finish or stop it before changing cycles",
+            );
+            cx.notify();
+        }
+    }
+
+    fn close_probe_card(&mut self, cx: &mut Context<Self>) {
+        if self.state.probe.close_card() {
+            cx.notify();
+        } else {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "A probe run is active; finish or stop it before leaving the cycle",
+            );
+            cx.notify();
+        }
+    }
+
+    /// Load and start a generated probe program after a passing preflight.
+    ///
+    /// Nothing is sent unless the operator pressed RUN. The engine safety
+    /// gateway remains the final authority; a rejected command is shown in the
+    /// console and the run is marked failed, never retried automatically.
+    fn start_probe_run(&mut self, cx: &mut Context<Self>) {
+        let ctx = self.probe_context();
+        let preflight = self.state.probe.preflight(&ctx);
+        let Some(setup) = preflight.setup else {
+            let reason = if preflight.blockers.is_empty() {
+                "preflight did not produce a plan".to_string()
+            } else {
+                preflight.blockers.join("; ")
+            };
+            self.state
+                .push_console(ConsoleLevel::Warn, format!("Probe refused: {reason}"));
+            cx.notify();
+            return;
+        };
+        let name = setup.plan.name.clone();
+        let source = setup.plan.program.clone();
+        let summary = format!(
+            "Probe {}: {} lines, {} probes, {:.3} mm total search, safe Z {:.3} mm",
+            name,
+            source.lines().count(),
+            setup.plan.expected_probes,
+            setup.plan.total_search_travel_mm(),
+            setup.plan.safe_z_mm
+        );
+        self.state.probe.begin(setup);
+        self.state.left_tab = LeftTab::Console;
+        self.state.push_console(ConsoleLevel::Info, summary);
+        if !self.send_command(Command::LoadProgram { name, source }) {
+            self.state
+                .probe
+                .fail("the engine rejected the probe program load".to_string());
+            cx.notify();
+            return;
+        }
+        // Demo-only pacing: the in-process simulator acknowledges a `G38.2`
+        // before its single-motion model finishes, so the next retract line
+        // would replace the probe. One breakpoint after each probe lets the
+        // simulator finish and emit PRB; the poll resumes only after the
+        // matching result. A serial controller streams the plan normally and
+        // never pauses or auto-resumes here.
+        let demo_pacing = matches!(
+            self.link.as_ref().and_then(|link| link.mode()),
+            Some(LinkMode::Demo)
+        );
+        let checkpoints = if demo_pacing {
+            self.state
+                .probe
+                .run()
+                .map(|run| run.checkpoints.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for line in checkpoints {
+            if !self.send_command(Command::SetBreakpoint {
+                line,
+                enabled: true,
+            }) {
+                self.state
+                    .probe
+                    .fail(format!("the engine rejected probe checkpoint {line}"));
+                cx.notify();
+                return;
+            }
+        }
+        if !self.send_command(Command::StartProgram { from_line: None }) {
+            self.state
+                .probe
+                .fail("the engine rejected the probe program start".to_string());
+        }
+        cx.notify();
+    }
+
+    /// Stop a running probe job. Never resumes.
+    fn abort_probe_run(&mut self, cx: &mut Context<Self>) {
+        if !self.state.probe.is_running() {
+            return;
+        }
+        self.state
+            .probe
+            .fail("operator stopped the probe".to_string());
+        self.send_command(Command::StopProgram { reset: false });
+        cx.notify();
+    }
+
+    fn request_probe_apply(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = self.state.probe.run_mut() {
+            run.apply_confirm = true;
+            run.kept = false;
+        }
+        cx.notify();
+    }
+
+    fn cancel_probe_apply(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = self.state.probe.run_mut() {
+            run.apply_confirm = false;
+        }
+        cx.notify();
+    }
+
+    /// Send the confirmed `G10 L2` line and start the `$#` read-back.
+    fn confirm_probe_apply(&mut self, cx: &mut Context<Self>) {
+        if !self.mdi_allowed() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Probe Apply requires a ready controller in Idle",
+            );
+            cx.notify();
+            return;
+        }
+        let lines = match self.state.probe.apply_lines() {
+            Ok(lines) => lines,
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Apply refused: {message}"));
+                cx.notify();
+                return;
+            }
+        };
+        let mut sent_all = true;
+        for line in lines {
+            if self.send_mdi_line(line.clone()) {
+                self.state.offsets.command_sent(line.clone());
+                self.offset_refresh_sent = false;
+                self.state.probe.mark_applied(line);
+            } else {
+                sent_all = false;
+            }
+        }
+        if !sent_all {
+            self.state.push_console(
+                ConsoleLevel::Error,
+                "Probe Apply was not accepted by the engine; offsets were not changed",
+            );
+        }
+        cx.notify();
+    }
+
+    fn keep_probe_result(&mut self, cx: &mut Context<Self>) {
+        self.state.probe.keep_result();
+        cx.notify();
+    }
+
     fn toggle_coolant(&mut self, channel: usize, cx: &mut Context<Self>) {
         if !self.state.live {
             self.state.toggle_coolant(channel);
@@ -1860,7 +2183,9 @@ impl Shell {
                     }
                     // A settings value stays local until Apply; `AppState`
                     // already wrote it into the row draft.
-                    KeypadTarget::Setting(_) | KeypadTarget::Tool(_) => {}
+                    KeypadTarget::Setting(_)
+                    | KeypadTarget::Tool(_)
+                    | KeypadTarget::ProbeField(_) => {}
                 }
             }
         }
@@ -2206,6 +2531,7 @@ impl Shell {
     fn viewer_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match self.state.mode {
             Mode::Job => self.state.job_title().to_string(),
+            Mode::Probe => "Preflight, run and apply ghs-probe cycles".to_string(),
             Mode::Settings => format!("{} settings from $ES/$EG", self.state.settings.total()),
             _ if self.state.live => "M5 live workspace".to_string(),
             _ => "M5 preview".to_string(),
@@ -2295,6 +2621,8 @@ impl Shell {
             // The generated form owns the whole viewer body: rail, search, and
             // a scrollable list. The top bar and the bottom controls stay put.
             self.settings_view(p, cx).into_any_element()
+        } else if self.state.mode == Mode::Probe {
+            self.probe_view(p, cx).into_any_element()
         } else {
             self.mode_view(p, cx).into_any_element()
         };
@@ -2539,33 +2867,1477 @@ impl Shell {
             )
     }
 
-    fn mode_view(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let caps = &self.state.profile.capabilities;
-        let body = match self.state.mode {
-            Mode::Job => unreachable!(),
-            Mode::Probe => {
-                let items: &[(&str, &str)] = if caps.has_probe {
-                    &[
-                        ("Z touch plate", "M6"),
-                        ("XY corner finder", "M6"),
-                        ("Circle centre", "M6"),
-                        ("Height map", "M6"),
-                    ]
-                } else {
-                    &[
-                        ("No probe input reported", "CAP"),
-                        ("Probe cycles hidden", "CAP"),
-                    ]
-                };
-                v_flex()
-                    .gap_2()
-                    .child(self.list_rows(p, items))
-                    .into_any_element()
+    // ---------------------------------------------------------- probe views
+
+    fn probe_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let ctx = self.probe_context();
+        match self.state.probe.card() {
+            Some(card) => self.probe_detail(p, cx, card, &ctx).into_any_element(),
+            None => self.probe_cards(p, cx, &ctx).into_any_element(),
+        }
+    }
+
+    fn probe_cards(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        ctx: &ProbeContext,
+    ) -> impl IntoElement {
+        let view = cx.entity();
+        let mut grid = v_flex().gap_2();
+        for chunk in ProbeCard::ALL.chunks(3) {
+            let mut row = h_flex().gap_2().items_stretch();
+            for card in chunk {
+                row = row.child(self.probe_card_tile(*card, p, view.clone(), ctx));
             }
+            for _ in chunk.len()..3 {
+                row = row.child(div().flex_1());
+            }
+            grid = grid.child(row);
+        }
+
+        let mut banner = v_flex().gap_2();
+        if !ctx.live {
+            banner = banner.child(probe_notice(
+                "MOCK PREVIEW",
+                "Probe cards are configurable, but RUN needs a live engine. Mock mode never sends motion.",
+                p.warning,
+                p,
+            ));
+        } else if !ctx.ready {
+            banner = banner.child(probe_notice(
+                "LINK NOT READY",
+                "Connect and finish the handshake before a probe can run.",
+                p.warning,
+                p,
+            ));
+        } else if !ctx.has_probe {
+            banner = banner.child(probe_notice(
+                "NO PROBE INPUT",
+                "The controller did not report a probe input. Cycles stay visible for setup, but no run is offered.",
+                p.danger,
+                p,
+            ));
+        }
+
+        v_flex()
+            .id("probe-cards-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .gap_2()
+            .p_2()
+            .child(
+                h_flex()
+                    .h(px(28.0))
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .gap_0()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text_dim)
+                                    .child("PROBE CYCLES"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(p.text_faint)
+                                    .child("Pick a card, inspect the preflight, then press RUN"),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(chip(self.state.wcs(), p))
+                    .child(chip(self.state.unit(), p))
+                    .child(chip(if ctx.ready { "LIVE" } else { "OFFLINE" }, p)),
+            )
+            .child(banner)
+            .child(grid)
+    }
+
+    fn probe_card_tile(
+        &self,
+        card: ProbeCard,
+        p: Palette,
+        view: Entity<Shell>,
+        ctx: &ProbeContext,
+    ) -> impl IntoElement {
+        let deferred = card.deferred_note().is_some();
+        let partial = matches!(card, ProbeCard::Rotation | ProbeCard::ToolLength);
+        let status = if card == ProbeCard::HeightMap {
+            "DEFERRED"
+        } else if partial {
+            "APPLY DEFERRED"
+        } else if ctx.ready && ctx.has_probe {
+            "READY"
+        } else {
+            "SETUP"
+        };
+        let status_color = if card == ProbeCard::HeightMap {
+            p.warning
+        } else if partial {
+            p.info
+        } else if ctx.ready && ctx.has_probe {
+            p.success
+        } else {
+            p.text_faint
+        };
+        let select_view = view.clone();
+        let click_card = card;
+        let configure_view = view;
+        div()
+            .id(format!(
+                "probe-card-{}",
+                card.title().to_lowercase().replace(' ', "-")
+            ))
+            .flex_1()
+            .min_w(px(0.0))
+            .cursor_pointer()
+            .rounded_lg()
+            .border_1()
+            .border_color(if deferred {
+                p.warning.opacity(0.45)
+            } else {
+                p.border
+            })
+            .bg(p.panel_alt)
+            .h(px(112.0))
+            .px_2()
+            .py_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .justify_between()
+            .hover(|style| style.bg(p.raised_hover))
+            .on_click(move |_, _, cx| {
+                select_view.update(cx, |this, cx| {
+                    this.select_probe_card(click_card, cx);
+                });
+            })
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(card.title()),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .h(px(18.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(4.0))
+                                    .bg(status_color.opacity(0.16))
+                                    .text_size(px(9.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(status_color)
+                                    .child(status),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .line_height(px(13.0))
+                            .max_h(px(26.0))
+                            .overflow_hidden()
+                            .text_color(p.text_dim)
+                            .child(card.direction()),
+                    ),
+            )
+            .child(
+                Button::new(format!(
+                    "probe-configure-{}",
+                    card.title().to_lowercase().replace(' ', "-")
+                ))
+                .label(if card == ProbeCard::HeightMap {
+                    "VIEW"
+                } else {
+                    "CONFIGURE"
+                })
+                .secondary()
+                .h(px(48.0))
+                .w_full()
+                .rounded_lg()
+                .text_size(px(11.0))
+                .on_click(move |_, _, cx| {
+                    configure_view.update(cx, |this, cx| {
+                        this.select_probe_card(card, cx);
+                    });
+                }),
+            )
+    }
+
+    fn probe_detail(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        card: ProbeCard,
+        ctx: &ProbeContext,
+    ) -> impl IntoElement {
+        let preflight = self.state.probe.preflight(ctx);
+        let running = self.state.probe.is_running();
+        let back_view = cx.entity();
+        let height_only = card == ProbeCard::HeightMap;
+        let status = if let Some(run) = self.state.probe.run() {
+            run.phase.label()
+        } else if height_only {
+            "DEFERRED"
+        } else if preflight.setup.is_some() {
+            "PREFLIGHT OK"
+        } else {
+            "SETUP"
+        };
+        let status_color = if let Some(run) = self.state.probe.run() {
+            match run.phase {
+                ProbePhase::Running => p.accent,
+                ProbePhase::Complete => p.success,
+                ProbePhase::Failed => p.danger,
+            }
+        } else if height_only {
+            p.warning
+        } else if preflight.setup.is_some() {
+            p.success
+        } else {
+            p.text_faint
+        };
+
+        let body: AnyElement = if let Some(run) = self.state.probe.run() {
+            div()
+                .id("probe-result-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .child(self.probe_run_panel(p, cx, run)),
+                )
+                .into_any_element()
+        } else if card == ProbeCard::HeightMap {
+            div()
+                .id("probe-deferred-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .child(v_flex().gap_2().p_2().child(probe_deferred_panel(card, p)))
+                .into_any_element()
+        } else {
+            let form_pane = div()
+                .id("probe-form-scroll")
+                .w(px(300.0))
+                .flex_shrink_0()
+                .h_full()
+                .overflow_y_scrollbar()
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .line_height(px(13.0))
+                                .text_color(p.text_dim)
+                                .child(card.detail()),
+                        )
+                        .child(self.probe_form(p, cx, card)),
+                );
+            let preflight_pane = div()
+                .id("probe-preflight-scroll")
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .overflow_y_scrollbar()
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .child(self.probe_preflight_panel(&preflight, p, cx)),
+                );
+            h_flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap_2()
+                .child(form_pane)
+                .child(preflight_pane)
+                .into_any_element()
+        };
+
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .h(px(52.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(
+                        Button::new("probe-back")
+                            .label("CYCLES")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(84.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(running)
+                            .on_click(move |_, _, cx| {
+                                back_view.update(cx, |this, cx| this.close_probe_card(cx));
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap_0()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(15.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text)
+                                            .child(card.title()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .h(px(18.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(4.0))
+                                            .bg(status_color.opacity(0.16))
+                                            .text_size(px(9.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(status_color)
+                                            .child(status),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(p.text_dim)
+                                    .truncate()
+                                    .child(card.direction()),
+                            ),
+                    )
+                    .child(chip(self.state.wcs(), p))
+                    .child(chip(self.state.unit(), p)),
+            )
+            .child(body)
+            .child(self.probe_footer(p, cx, card, &preflight, running))
+    }
+
+    fn probe_form(&self, p: Palette, cx: &mut Context<Self>, card: ProbeCard) -> Div {
+        let fields = card.fields();
+        let mut cells = Vec::new();
+        for field in fields {
+            cells.push(self.probe_field_cell(*field, p, cx));
+        }
+        v_flex()
+            .w_full()
+            .gap_2()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("CYCLE PARAMETERS", p))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child("millimetres; tap a value to edit"),
+                    ),
+            )
+            .child(h_flex().w(px(288.0)).flex_wrap().gap_1().children(cells))
+            .child(self.probe_controls(p, cx, card))
+    }
+
+    fn probe_field_cell(&self, field: ProbeField, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let unit = field.unit();
+        let label = if unit.is_empty() {
+            field.label().to_string()
+        } else {
+            format!("{} ({})", field.label(), unit)
+        };
+        let value = self.state.probe.field_text(field).to_string();
+        v_flex()
+            .w(px(140.0))
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(label),
+            )
+            .child(
+                Button::new(format!("probe-field-{}", field.key()))
+                    .label(value)
+                    .h(px(48.0))
+                    .w_full()
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(p.panel)
+                            .foreground(p.text)
+                            .hover(p.raised_hover)
+                            .active(p.accent_muted),
+                    )
+                    .border_1()
+                    .border_color(p.border)
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.state.open_keypad(KeypadTarget::ProbeField(field));
+                            cx.notify();
+                        });
+                    }),
+            )
+    }
+
+    fn probe_controls(&self, p: Palette, cx: &mut Context<Self>, card: ProbeCard) -> Div {
+        let mut rows = v_flex().gap_1();
+        let connected_view = cx.entity();
+        rows = rows.child(
+            h_flex()
+                .h(px(48.0))
+                .items_center()
+                .gap_3()
+                .child(
+                    Switch::new("probe-connected")
+                        .checked(self.state.probe.probe_connected_confirmed)
+                        .label("Probe connected")
+                        .text_size(px(11.0))
+                        .on_change(move |checked, _, cx| {
+                            connected_view.update(cx, |this, cx| {
+                                this.state.probe.probe_connected_confirmed = *checked;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                    if self.state.profile.capabilities.has_probe_connected {
+                        "PC signal is authoritative when the controller reports it"
+                    } else {
+                        "Reference board has no `PC`: this checkbox is the probe verification"
+                    },
+                )),
+        );
+
+        match card {
+            ProbeCard::EdgeX => {
+                rows = rows.child(self.probe_approach_row(p, cx, "X", true));
+                rows = rows.child(self.probe_mode_row(p, cx, "X edge", true));
+            }
+            ProbeCard::EdgeY => {
+                rows = rows.child(self.probe_approach_row(p, cx, "Y", false));
+                rows = rows.child(self.probe_mode_row(p, cx, "Y edge", false));
+            }
+            ProbeCard::Corner => {
+                rows = rows
+                    .child(self.probe_approach_row(p, cx, "X", true))
+                    .child(self.probe_approach_row(p, cx, "Y", false))
+                    .child(self.probe_mode_row(p, cx, "X edge", true))
+                    .child(self.probe_mode_row(p, cx, "Y edge", false));
+            }
+            ProbeCard::CenterCircle => {
+                rows = rows.child(self.probe_circle_mode_row(p, cx));
+                rows = rows.child(self.probe_circle_touch_row(p, cx));
+            }
+            ProbeCard::Rotation => {
+                rows = rows.child(self.probe_rotation_row(p, cx));
+            }
+            _ => {}
+        }
+        rows
+    }
+
+    fn probe_approach_row(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        axis: &'static str,
+        is_x: bool,
+    ) -> Div {
+        let view = cx.entity();
+        let current = if is_x {
+            self.state.probe.edge_x_approach
+        } else {
+            self.state.probe.edge_y_approach
+        };
+        let positive = current == ghs_probe::Sign::Positive;
+        let pos_view = view.clone();
+        let neg_view = view;
+        let positive_id = format!("probe-approach-{axis}-pos");
+        let negative_id = format!("probe-approach-{axis}-neg");
+        h_flex()
+            .h(px(48.0))
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(format!("{axis} APPROACH")),
+            )
+            .child(probe_choice(
+                cx,
+                p,
+                positive_id,
+                &format!("+{axis}"),
+                positive,
+                move |_, cx| {
+                    pos_view.update(cx, |this, cx| {
+                        if is_x {
+                            this.state.probe.edge_x_approach = ghs_probe::Sign::Positive;
+                        } else {
+                            this.state.probe.edge_y_approach = ghs_probe::Sign::Positive;
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(probe_choice(
+                cx,
+                p,
+                negative_id,
+                &format!("-{axis}"),
+                !positive,
+                move |_, cx| {
+                    neg_view.update(cx, |this, cx| {
+                        if is_x {
+                            this.state.probe.edge_x_approach = ghs_probe::Sign::Negative;
+                        } else {
+                            this.state.probe.edge_y_approach = ghs_probe::Sign::Negative;
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(p.text_faint)
+                    .child(format!("searches {axis} toward the material")),
+            )
+    }
+
+    fn probe_mode_row(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        label: &'static str,
+        is_x: bool,
+    ) -> Div {
+        let view = cx.entity();
+        let current = if is_x {
+            self.state.probe.edge_x_mode
+        } else {
+            self.state.probe.edge_y_mode
+        };
+        let outside = current == ghs_probe::EdgeMode::Outside;
+        let out_view = view.clone();
+        let in_view = view;
+        h_flex()
+            .h(px(48.0))
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(format!("{label} SIDE")),
+            )
+            .child(probe_choice(
+                cx,
+                p,
+                format!("probe-mode-{label}-out"),
+                "OUTSIDE",
+                outside,
+                move |_, cx| {
+                    out_view.update(cx, |this, cx| {
+                        if is_x {
+                            this.state.probe.edge_x_mode = ghs_probe::EdgeMode::Outside;
+                        } else {
+                            this.state.probe.edge_y_mode = ghs_probe::EdgeMode::Outside;
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(probe_choice(
+                cx,
+                p,
+                format!("probe-mode-{label}-in"),
+                "POCKET",
+                !outside,
+                move |_, cx| {
+                    in_view.update(cx, |this, cx| {
+                        if is_x {
+                            this.state.probe.edge_x_mode = ghs_probe::EdgeMode::Inside;
+                        } else {
+                            this.state.probe.edge_y_mode = ghs_probe::EdgeMode::Inside;
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+    }
+
+    fn probe_circle_mode_row(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let bore = self.state.probe.circle_mode == ghs_probe::EdgeMode::Inside;
+        let bore_view = view.clone();
+        let boss_view = view;
+        h_flex()
+            .h(px(48.0))
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("FEATURE"),
+            )
+            .child(probe_choice(
+                cx,
+                p,
+                "probe-circle-bore",
+                "BORE (INSIDE)",
+                bore,
+                move |_, cx| {
+                    bore_view.update(cx, |this, cx| {
+                        this.state.probe.circle_mode = ghs_probe::EdgeMode::Inside;
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(probe_choice(
+                cx,
+                p,
+                "probe-circle-boss",
+                "BOSS (OUTSIDE)",
+                !bore,
+                move |_, cx| {
+                    boss_view.update(cx, |this, cx| {
+                        this.state.probe.circle_mode = ghs_probe::EdgeMode::Outside;
+                        cx.notify();
+                    });
+                },
+            ))
+    }
+
+    fn probe_circle_touch_row(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let mut row = h_flex().h(px(48.0)).items_center().gap_2().child(
+            div()
+                .w(px(150.0))
+                .text_size(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("TOUCHES"),
+        );
+        for count in [3_u8, 4, 6, 8] {
+            let view = cx.entity();
+            row = row.child(probe_choice(
+                cx,
+                p,
+                format!("probe-touches-{count}"),
+                &count.to_string(),
+                self.state.probe.circle_touches == count,
+                move |_, cx| {
+                    view.update(cx, |this, cx| {
+                        this.state.probe.circle_touches = count;
+                        let _ = this
+                            .state
+                            .probe
+                            .set_field_text(ProbeField::Touches, count.to_string());
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        row
+    }
+
+    fn probe_rotation_row(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let positive = self.state.probe.rotation_approach == ghs_probe::Sign::Positive;
+        let pos_view = view.clone();
+        let neg_view = view;
+        h_flex()
+            .h(px(48.0))
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("Y APPROACH"),
+            )
+            .child(probe_choice(
+                cx,
+                p,
+                "probe-rotation-pos",
+                "+Y",
+                positive,
+                move |_, cx| {
+                    pos_view.update(cx, |this, cx| {
+                        this.state.probe.rotation_approach = ghs_probe::Sign::Positive;
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(probe_choice(
+                cx,
+                p,
+                "probe-rotation-neg",
+                "-Y",
+                !positive,
+                move |_, cx| {
+                    neg_view.update(cx, |this, cx| {
+                        this.state.probe.rotation_approach = ghs_probe::Sign::Negative;
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(p.text_faint)
+                    .child("two points on a nominally X-aligned edge"),
+            )
+    }
+
+    fn probe_preflight_panel(
+        &self,
+        preflight: &ProbePreflight,
+        p: Palette,
+        _cx: &mut Context<Self>,
+    ) -> Div {
+        let ok = preflight.blockers.is_empty() && preflight.setup.is_some();
+        let mut panel = v_flex()
+            .gap_2()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(if ok {
+                p.success.opacity(0.35)
+            } else {
+                p.danger.opacity(0.45)
+            })
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("PREFLIGHT", p))
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(if ok {
+                                p.success.opacity(0.16)
+                            } else {
+                                p.danger.opacity(0.16)
+                            })
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if ok { p.success } else { p.danger })
+                            .child(if ok { "READY" } else { "REFUSED" }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child("every gate must pass before RUN"),
+                    ),
+            );
+
+        if !preflight.blockers.is_empty() {
+            let mut list = v_flex()
+                .gap_1()
+                .p_2()
+                .rounded(px(6.0))
+                .bg(p.danger.opacity(0.10));
+            for blocker in &preflight.blockers {
+                list = list.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(p.danger)
+                        .child(format!("REFUSED: {blocker}")),
+                );
+            }
+            panel = panel.child(list);
+        }
+
+        let mut cells = Vec::new();
+        for row in &preflight.rows {
+            cells.push(probe_preflight_row(row, p));
+        }
+        panel = panel.child(h_flex().flex_wrap().gap_1().children(cells));
+
+        if let Some(setup) = &preflight.setup {
+            panel = panel
+                .child(self.probe_travel_summary(&setup.plan, p))
+                .child(probe_program_block(&setup.plan.program, p));
+        }
+        panel
+    }
+
+    fn probe_travel_summary(&self, plan: &ghs_probe::ProbePlan, p: Palette) -> Div {
+        let mut lines = v_flex().gap_1();
+        for probe in &plan.probes {
+            lines = lines.child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(9.5))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "{}  {} -> {}  |  {:.3} mm @ {:.0} mm/min",
+                        probe.label, probe.from, probe.to, probe.travel_mm, probe.feed_mm_min
+                    )),
+            );
+        }
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded(px(6.0))
+            .bg(p.panel)
+            .border_1()
+            .border_color(p.border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("SEARCH BOUND", p))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child(format!(
+                                "{:.3} mm total, max {:.3} mm per probe",
+                                plan.total_search_travel_mm(),
+                                plan.probes
+                                    .iter()
+                                    .map(|probe| probe.travel_mm)
+                                    .fold(0.0_f64, f64::max)
+                            )),
+                    ),
+            )
+            .child(lines)
+    }
+
+    fn probe_run_panel(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
+        let phase_color = match run.phase {
+            ProbePhase::Running => p.accent,
+            ProbePhase::Complete => p.success,
+            ProbePhase::Failed => p.danger,
+        };
+        let mut panel = v_flex()
+            .gap_2()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(phase_color.opacity(0.5))
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("PROBE RUN", p))
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(phase_color.opacity(0.16))
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(phase_color)
+                            .child(run.phase.label()),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(format!(
+                                "{} / {} results | {}",
+                                run.bound(),
+                                run.expected(),
+                                run.setup.plan.name
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .when(run.phase == ProbePhase::Running, |this| {
+                        let attack_view = cx.entity();
+                        this.child(
+                            Button::new("probe-abort")
+                                .label("ABORT")
+                                .warning()
+                                .h(px(48.0))
+                                .w(px(92.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .on_click(move |_, _, cx| {
+                                    attack_view.update(cx, |this, cx| {
+                                        this.abort_probe_run(cx);
+                                    });
+                                }),
+                        )
+                    }),
+            );
+
+        if run.phase == ProbePhase::Running {
+            let frac = if run.expected() == 0 {
+                0.0
+            } else {
+                (run.bound() as f32 / run.expected() as f32).clamp(0.0, 1.0)
+            };
+            panel = panel
+                .child(
+                    div()
+                        .h(px(6.0))
+                        .w(px(320.0))
+                        .rounded(px(999.0))
+                        .bg(p.panel)
+                        .child(
+                            div()
+                                .h_full()
+                                .w(px(320.0 * frac))
+                                .rounded(px(999.0))
+                                .bg(p.accent),
+                        ),
+                )
+                .child(div().text_size(px(11.0)).text_color(p.text_dim).child(
+                    "The engine is streaming the generated probe program. \
+                             Raw PRB results bind in plan order.",
+                ));
+            if self.state.probe.waiting_for_probe() {
+                panel = panel.child(
+                    div()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.warning.opacity(0.10))
+                        .text_size(px(10.0))
+                        .text_color(p.warning)
+                        .child(
+                            "Paused at a probe checkpoint; waiting for the raw PRB result. \
+                             The job resumes only after it arrives.",
+                        ),
+                );
+            }
+        }
+
+        if let Some(summary) = run.outcome.as_ref().map(outcome_summary) {
+            panel = panel
+                .child(
+                    div()
+                        .text_size(px(22.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.success)
+                        .child(summary.headline),
+                )
+                .child(
+                    h_flex().flex_wrap().gap_2().children(
+                        summary
+                            .details
+                            .iter()
+                            .map(|(label, value)| probe_detail_cell(label, value, p)),
+                    ),
+                );
+        }
+
+        if let Some(error) = &run.error {
+            panel = panel.child(
+                div()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.danger.opacity(0.10))
+                    .text_size(px(11.0))
+                    .text_color(p.danger)
+                    .child(format!("STOPPED: {error}")),
+            );
+        }
+
+        if !run.raw.is_empty() {
+            let mut raw = v_flex().gap_0();
+            for line in &run.raw {
+                raw = raw.child(
+                    div()
+                        .font_family(self.mono.clone())
+                        .text_size(px(9.5))
+                        .text_color(p.text_dim)
+                        .child(line.clone()),
+                );
+            }
+            panel = panel.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(p.border)
+                    .child(section_label("RAW PRB (machine mm)", p))
+                    .child(
+                        div()
+                            .id("probe-raw-scroll")
+                            .max_h(px(86.0))
+                            .overflow_y_scroll()
+                            .child(raw),
+                    ),
+            );
+        }
+
+        if run.phase == ProbePhase::Complete {
+            panel = panel.child(self.probe_apply_section(p, cx, run));
+        } else if run.phase == ProbePhase::Failed {
+            let retry_view = cx.entity();
+            panel = panel.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("probe-retry")
+                            .label("RETRY PREFLIGHT")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                retry_view.update(cx, |this, cx| this.start_probe_run(cx));
+                            }),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.warning).child(
+                        "No automatic retry or resume. Recover the machine, then run again.",
+                    )),
+            );
+        }
+
+        panel
+    }
+
+    fn probe_apply_section(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
+        let supported = self.state.probe.apply_supported();
+        let mut section = v_flex().gap_2().pt_2().border_t_1().border_color(p.border);
+
+        if let Some(line) = &run.applied_line {
+            let (apply_status, apply_color) = match self.state.offsets.status() {
+                OffsetStatus::Refreshing => ("$# refresh pending".to_string(), p.text_faint),
+                OffsetStatus::Refreshed => ("$# refreshed".to_string(), p.success),
+                OffsetStatus::Failed(message) => (
+                    format!("APPLY FAILED: {message}; the old offset is kept"),
+                    p.danger,
+                ),
+                OffsetStatus::Idle => ("$# not refreshed".to_string(), p.warning),
+            };
+            let failed = matches!(self.state.offsets.status(), OffsetStatus::Failed(_));
+            let (chip, chip_color) = if failed {
+                ("FAILED", p.danger)
+            } else {
+                ("APPLIED", p.success)
+            };
+            section = section.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(20.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(chip_color.opacity(0.16))
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(chip_color)
+                            .child(chip),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(p.text)
+                            .child(line.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(apply_color)
+                            .child(apply_status),
+                    ),
+            );
+        }
+
+        if let Ok(values) = self.state.probe.apply_values() {
+            let mut rows = v_flex().gap_1();
+            for (axis, new_value) in &values {
+                let old_value = run.setup.wcs_value_mm.get(*axis);
+                rows = rows.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .font_family(self.mono.clone())
+                        .text_size(px(10.0))
+                        .child(
+                            div()
+                                .w(px(30.0))
+                                .text_color(p.text_faint)
+                                .child(axis.as_str()),
+                        )
+                        .child(
+                            div()
+                                .w(px(112.0))
+                                .text_color(p.text_dim)
+                                .child(format!("old {}", crate::probe::format_mm(old_value))),
+                        )
+                        .child(
+                            div()
+                                .w(px(112.0))
+                                .text_color(p.success)
+                                .child(format!("new {}", crate::probe::format_mm(*new_value))),
+                        ),
+                );
+            }
+            section = section.child(rows);
+        } else if let Some(note) = run
+            .outcome
+            .as_ref()
+            .and_then(|outcome| match &outcome.value {
+                ghs_probe::ProbeValue::Rotation { .. } => {
+                    Some("Rotation is reported only; applying work rotation is deferred.")
+                }
+                ghs_probe::ProbeValue::ToolLength { .. } => {
+                    Some("TLO apply is deferred until the tool-change workflow owns it.")
+                }
+                _ => None,
+            })
+        {
+            section = section.child(div().text_size(px(10.0)).text_color(p.warning).child(note));
+        }
+
+        if run.kept {
+            section = section.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(p.text_dim)
+                    .child("KEPT: offsets are unchanged. Apply stays available."),
+            );
+        }
+
+        if run.apply_confirm {
+            let lines = self
+                .state
+                .probe
+                .apply_lines()
+                .map(|lines| lines.join(" "))
+                .unwrap_or_else(|error| error);
+            let confirm_view = cx.entity();
+            let cancel_view = cx.entity();
+            section = section.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.warning.opacity(0.10))
+                    .border_1()
+                    .border_color(p.warning.opacity(0.5))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.warning)
+                            .child("CONFIRM OFFSET WRITE"),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(p.text)
+                            .child(lines),
+                    )
+                    .child(div().text_size(px(9.5)).text_color(p.text_dim).child(
+                        "G10 L2 changes the stored WCS offset; it does not move an axis. \
+                                 G92 is preserved. `$#` is read back after the write.",
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("probe-apply-confirm")
+                                    .label("CONFIRM WRITE")
+                                    .warning()
+                                    .h(px(48.0))
+                                    .w(px(150.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .disabled(!self.mdi_allowed())
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |this, cx| {
+                                            this.confirm_probe_apply(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("probe-apply-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .w(px(100.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.cancel_probe_apply(cx);
+                                        });
+                                    }),
+                            )
+                            .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                                if self.mdi_allowed() {
+                                    "controller is Idle"
+                                } else {
+                                    "Apply is locked until the controller is Idle"
+                                },
+                            )),
+                    ),
+            );
+        } else if supported && run.applied_line.is_none() {
+            let keep_view = cx.entity();
+            let apply_view = cx.entity();
+            section = section.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("probe-apply")
+                            .label("APPLY OFFSET")
+                            .primary()
+                            .h(px(52.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!self.mdi_allowed())
+                            .on_click(move |_, _, cx| {
+                                apply_view.update(cx, |this, cx| {
+                                    this.request_probe_apply(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("probe-keep")
+                            .label("KEEP")
+                            .secondary()
+                            .h(px(52.0))
+                            .w(px(90.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                keep_view.update(cx, |this, cx| {
+                                    this.keep_probe_result(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child("Nothing is applied automatically"),
+                    ),
+            );
+        }
+        section
+    }
+
+    fn probe_footer(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        card: ProbeCard,
+        preflight: &ProbePreflight,
+        running: bool,
+    ) -> Div {
+        let can_run = preflight.setup.is_some() && !running && card != ProbeCard::HeightMap;
+        let (title, title_color, detail) = if running {
+            (
+                "PROBE PROGRAM RUNNING".to_string(),
+                p.accent,
+                "The engine owns motion; ABORT stops the job and never resumes",
+            )
+        } else if let Some(run) = self.state.probe.run() {
+            match run.phase {
+                ProbePhase::Complete if !self.state.probe.apply_supported() => (
+                    "PROBE COMPLETE: result reported, apply deferred".to_string(),
+                    p.success,
+                    "No offset write is offered for this cycle; the value stays for audit",
+                ),
+                ProbePhase::Complete => (
+                    "PROBE COMPLETE: review APPLY or KEEP".to_string(),
+                    p.success,
+                    "Nothing is applied automatically; RUN AGAIN needs a fresh preflight",
+                ),
+                ProbePhase::Failed => (
+                    "PROBE FAILED: recover, then retry the preflight".to_string(),
+                    p.danger,
+                    "No automatic retry or resume; the raw results stay for audit",
+                ),
+                ProbePhase::Running => (
+                    "PROBE PROGRAM RUNNING".to_string(),
+                    p.accent,
+                    "The engine owns motion; ABORT stops the job and never resumes",
+                ),
+            }
+        } else if card == ProbeCard::HeightMap {
+            (
+                "HEIGHT MAP IS DEFERRED".to_string(),
+                p.warning,
+                "No motion is generated by this card and no result is faked",
+            )
+        } else if let Some(setup) = &preflight.setup {
+            let count = setup.plan.expected_probes;
+            (
+                format!(
+                    "READY: {} probe{}, {:.3} mm search, safe Z {:.3} mm",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                    setup.plan.total_search_travel_mm(),
+                    setup.plan.safe_z_mm
+                ),
+                p.success,
+                "RUN is the only action that starts motion; there is no auto-start",
+            )
+        } else if !preflight.blockers.is_empty() {
+            (
+                format!("REFUSED: {}", preflight.blockers.join("; ")),
+                p.warning,
+                "RUN is the only action that starts motion; there is no auto-start",
+            )
+        } else {
+            (
+                "NOT READY".to_string(),
+                p.text_faint,
+                "RUN is the only action that starts motion; there is no auto-start",
+            )
+        };
+        let run_exists = self.state.probe.run().is_some();
+        let mut footer = h_flex()
+            .h(px(68.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_t_1()
+            .border_color(p.border)
+            .bg(p.panel);
+        footer = footer.child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(title_color)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(p.text_faint)
+                        .child(detail),
+                ),
+        );
+        if running {
+            let abort_view = cx.entity();
+            footer = footer.child(
+                Button::new("probe-footer-abort")
+                    .label("ABORT")
+                    .warning()
+                    .h(px(56.0))
+                    .w(px(112.0))
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .on_click(move |_, _, cx| {
+                        abort_view.update(cx, |this, cx| this.abort_probe_run(cx));
+                    }),
+            );
+        } else {
+            let run_view = cx.entity();
+            let back_footer_view = cx.entity();
+            footer = footer.child(
+                Button::new("probe-run")
+                    .label(if run_exists { "RUN AGAIN" } else { "RUN" })
+                    .primary()
+                    .h(px(56.0))
+                    .w(px(120.0))
+                    .rounded_lg()
+                    .text_size(px(14.0))
+                    .disabled(!can_run)
+                    .on_click(move |_, _, cx| {
+                        run_view.update(cx, |this, cx| this.start_probe_run(cx));
+                    }),
+            );
+            footer = footer.child(
+                Button::new("probe-footer-back")
+                    .label("CYCLES")
+                    .secondary()
+                    .h(px(56.0))
+                    .w(px(96.0))
+                    .rounded_lg()
+                    .text_size(px(10.0))
+                    .on_click(move |_, _, cx| {
+                        back_footer_view.update(cx, |this, cx| this.close_probe_card(cx));
+                    }),
+            );
+        }
+        footer
+    }
+
+    fn mode_view(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match self.state.mode {
+            Mode::Job | Mode::Probe | Mode::Settings => unreachable!(),
             Mode::Offset => self.offsets_view(p, cx).into_any_element(),
             Mode::Utility => self.utility_view(p, cx).into_any_element(),
             Mode::Tools => self.tools_view(p, cx).into_any_element(),
-            Mode::Settings => unreachable!(),
         };
         v_flex()
             .gap_2()
@@ -2585,14 +4357,6 @@ impl Shell {
                     .child(chip(if self.state.live { "LIVE" } else { "MOCK" }, p)),
             )
             .child(div().flex_1().min_h(px(0.0)).child(body))
-    }
-
-    fn list_rows(&self, p: Palette, items: &[(&str, &str)]) -> Div {
-        v_flex().gap_2().children(
-            items
-                .iter()
-                .map(|(name, milestone)| info_row(name, milestone, p)),
-        )
     }
 
     fn offsets_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -5733,6 +7497,229 @@ fn mode_variant(cx: &App, p: Palette, active: bool) -> ButtonCustomVariant {
     }
 }
 
+fn parse_probe_card(name: &str) -> Option<ProbeCard> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "z" | "z-touch" | "z-touch-plate" => Some(ProbeCard::ZTouchPlate),
+        "edge-x" | "x" => Some(ProbeCard::EdgeX),
+        "edge-y" | "y" => Some(ProbeCard::EdgeY),
+        "corner" => Some(ProbeCard::Corner),
+        "circle" | "center-circle" | "centre-circle" => Some(ProbeCard::CenterCircle),
+        "rotation" => Some(ProbeCard::Rotation),
+        "tool" | "tool-length" => Some(ProbeCard::ToolLength),
+        "height" | "height-map" => Some(ProbeCard::HeightMap),
+        _ => None,
+    }
+}
+
+fn probe_notice(title: &str, body: &str, color: Hsla, p: Palette) -> Div {
+    h_flex()
+        .gap_2()
+        .p_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(color.opacity(0.45))
+        .bg(color.opacity(0.10))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(10.5))
+                .text_color(p.text_dim)
+                .child(body.to_string()),
+        )
+}
+
+fn probe_deferred_panel(card: ProbeCard, p: Palette) -> Div {
+    let note = card
+        .deferred_note()
+        .unwrap_or("This cycle is deferred in this build.");
+    let mut panel = v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(p.warning.opacity(0.5))
+        .bg(p.warning.opacity(0.08))
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .px_2()
+                        .h(px(20.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.0))
+                        .bg(p.warning.opacity(0.18))
+                        .text_size(px(9.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child("DEFERRED"),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.text)
+                        .child(card.title()),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                .text_color(p.text_dim)
+                .child(note),
+        );
+    if card == ProbeCard::HeightMap {
+        panel = panel
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("IMPLEMENTED IN ghs-probe"),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .text_size(px(10.5))
+                    .text_color(p.text_dim)
+                    .child("Bounded row-major `HeightMapGrid` program with a `G38.2` per point")
+                    .child("Safe-Z rapid plane, per-point retract, invalid-cell tracking")
+                    .child("Bilinear interpolation that refuses to cross an invalid sample"),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("NOT IMPLEMENTED HERE"),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .text_size(px(10.5))
+                    .text_color(p.text_dim)
+                    .child("Grid editor, point/time estimate and progress sheet")
+                    .child("2D height overlay and program compensation/export"),
+            );
+    }
+    panel.child(
+        div()
+            .text_size(px(10.0))
+            .text_color(p.warning)
+            .child("No motion is generated by this card and no result is faked."),
+    )
+}
+
+fn probe_preflight_row(row: &PreflightRow, p: Palette) -> Div {
+    let color = match row.state {
+        RowState::Ok => p.success,
+        RowState::Info => p.text_dim,
+        RowState::Warn => p.warning,
+        RowState::Bad => p.danger,
+    };
+    h_flex()
+        .w_full()
+        .min_w(px(0.0))
+        .h(px(22.0))
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(96.0))
+                .flex_shrink_0()
+                .text_size(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child(row.label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .font_family("monospace")
+                .text_size(px(9.5))
+                .text_color(color)
+                .child(row.value.clone()),
+        )
+}
+
+fn probe_program_block(program: &str, p: Palette) -> Div {
+    v_flex()
+        .gap_1()
+        .child(section_label("GENERATED PROGRAM", p))
+        .child(
+            div()
+                .id("probe-program-scroll")
+                .max_h(px(126.0))
+                .overflow_y_scroll()
+                .p_2()
+                .rounded(px(6.0))
+                .bg(p.panel)
+                .border_1()
+                .border_color(p.border)
+                .font_family("monospace")
+                .text_size(px(9.5))
+                .text_color(p.text_dim)
+                .children(program.lines().map(|line| div().child(line.to_string()))),
+        )
+}
+
+fn probe_detail_cell(label: &str, value: &str, p: Palette) -> Div {
+    v_flex()
+        .gap_0()
+        .px_2()
+        .py_1()
+        .rounded(px(6.0))
+        .bg(p.panel)
+        .border_1()
+        .border_color(p.border)
+        .child(
+            div()
+                .text_size(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .font_family("monospace")
+                .text_size(px(11.0))
+                .text_color(p.text)
+                .child(value.to_string()),
+        )
+}
+
+fn probe_choice(
+    cx: &App,
+    p: Palette,
+    id: impl Into<String>,
+    label: &str,
+    active: bool,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new(id.into())
+        .label(label)
+        .h(px(48.0))
+        .px_3()
+        .rounded_lg()
+        .text_size(px(10.0))
+        .custom(mode_variant(cx, p, active))
+        .on_click(move |_, window, cx| on_click(window, cx))
+}
+
 fn tab_button(cx: &App, p: Palette, label: LeftTab, active: bool, view: Entity<Shell>) -> Button {
     Button::new(format!("left-tab-{}", label.label()))
         .label(label.label())
@@ -5833,23 +7820,6 @@ fn legend(color: Hsla, text: &'static str, p: Palette) -> Div {
         .gap_1()
         .child(div().w(px(6.0)).h(px(6.0)).rounded(px(999.0)).bg(color))
         .child(div().text_size(px(10.0)).text_color(p.text_dim).child(text))
-}
-
-fn info_row(name: &str, milestone: &str, p: Palette) -> Div {
-    h_flex()
-        .items_center()
-        .justify_between()
-        .h(px(40.0))
-        .px_2()
-        .rounded(px(6.0))
-        .bg(p.panel_alt)
-        .child(
-            div()
-                .text_size(px(12.0))
-                .text_color(p.text)
-                .child(name.to_string()),
-        )
-        .child(chip(milestone, p))
 }
 
 fn console_color(level: ConsoleLevel, p: Palette) -> Hsla {

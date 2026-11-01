@@ -104,6 +104,10 @@ pub fn overlay(
                         .hint
                         .clone()
                         .unwrap_or_else(|| "TOOL FIELD".to_string()),
+                    KeypadTarget::ProbeField(_) => keypad
+                        .hint
+                        .clone()
+                        .unwrap_or_else(|| "PROBE FIELD (mm)".to_string()),
                 }),
         );
 
