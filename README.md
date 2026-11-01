@@ -11,11 +11,10 @@ macOS, and Linux.
 
 > **Status: pre-alpha, M6.** Protocol, simulator, serial, job streaming, the
 > real 2D viewer, generated settings, live offsets, the tool table, profiles,
-> backups, and the probe workspace are implemented. Height-map probing and
-> measurement work; explicit Apply/Revert compensation is the current pass.
-> The reference FlexiHAL is not yet available for hardware validation, so all
-> evidence so far is simulator and unit-test based. See
-> [docs/PLAN.md](docs/PLAN.md).
+> backups, the probe workspace, and the height-map measurement and explicit
+> Apply/Revert workflow are implemented. The reference FlexiHAL is not yet
+> available for hardware validation, so all evidence so far is simulator and
+> unit-test based. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
 
@@ -56,14 +55,14 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   (link, Idle, spindle/coolant off, probe signal or explicit confirmation, and
   loaded offsets), ordered `PRB` binding, and a confirmed `G10 L2` apply.
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
-  partial-map invalidation, 2D overlay, and CSV export. The sender-side G-code
-  rewrite exists; the Apply/Revert UI is the current pass.
+  partial-map invalidation, 2D overlay, and CSV export. Explicit Apply rewrites
+  the loaded program with bilinear compensation, keeps the original for Revert,
+  and labels the compensated job.
 - **Touch shell** — approved C1/C2/C3 layout, 48 px primary controls,
   dark/light themes, and a resizable desktop layout from 1024×600 up.
 
 ## In progress
 
-- Height-map **Apply/Revert** and compensated-program labelling.
 - Macros, startup lines, keymap editing, goto/restore, and the typed controller
   tool table.
 - Start-from-line/check mode, 3D view, i18n, packaging, and the post-v1.0
