@@ -81,9 +81,24 @@ safe Z, spindle off) and a retract. Do not hand the app raw prelude text.
 - Probe row by row with retracts; bound the number of points and estimated
   time; show it before starting.
 - Store `z[x][y]` with validity flags. Interpolate bilinearly.
-- Apply compensation either by transforming the streamed program (preferred
-  for the controller) or by exporting a corrected `.nc`; label the method.
-- Show the map in the 2D viewer as a colored surface/contour overlay (M7).
+- Apply compensation with an explicit **Apply height map** action that rewrites
+  the loaded program in the sender, matching ioSender's `ApplyHeightMap`:
+  split `G0`/`G1` and `G2`/`G3` moves at the smaller grid step, add the
+  bilinearly interpolated height to Z, re-emit the program, and keep the
+  original for Revert. This is a static, operator-triggered transform, not a
+  real-time stream correction.
+- Refuse Apply when the map is incomplete or the program leaves the mapped
+  area unless the operator explicitly accepts uncompensated moves; never
+  extrapolate a missing cell.
+- Preserve non-motion words, comments, `G90`/`G91`, `G20`/`G21`, and
+  `G17`/`G18`/`G19`; refuse radius arcs outside XY and checksummed input
+  rather than emitting a corrupt program.
+- Do not compensate a non-moving `G0`/`G1` or an `F`-only block. ioSender had
+  this bug (issue #451); it must be a regression test here.
+- Probe XY offset and map Z offset are part of the parity contract; the map
+  must be stored with the setup and not reused after a WCS or tool change.
+- Show the map in the 2D viewer as a colored cell overlay now; 3D surface and
+  contours are M7.
 - Re-probe invalid points; do not interpolate across a failed corner blindly.
 - A height map is per workpiece/setup; do not silently reuse it after a WCS or
   tool change.

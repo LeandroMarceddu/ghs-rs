@@ -157,8 +157,8 @@ implemented before its UI or hardware validation row is complete.
 | PROBE-07 | XY touch plate offsets | M6 | todo | Single probe input |
 | PROBE-08 | Probe verify and connected flow | M6 | todo | No `PC` signal on this build |
 | PROBE-09 | Pre and post probe macros | M6 | todo | Bounded |
-| PROBE-10 | Height map probing | M6 | todo | Grid, feeds, safe Z |
-| PROBE-11 | Height map compensation and export | M6 | todo | Stream correction |
+| PROBE-10 | Height map probing | M6 | in progress | Grid, feeds, safe Z |
+| PROBE-11 | Height map compensation and export | M6 | in progress | Explicit Apply rewrite, original preserved |
 | PROBE-12 | Probe-safe interlocks | M6 | todo | Mandatory |
 | PROBE-13 | Probe feed, step, and retry settings | M6 | todo | Persisted |
 | PROBE-14 | Probe results display and log | M6 | todo | PRB history |
