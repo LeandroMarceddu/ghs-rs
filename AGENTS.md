@@ -21,6 +21,9 @@ Kit. Read these first, in order:
   extensions; never hardcode the reference board's capabilities.
 - **SD, ATC, MPG, multi-spindle, and extra-axis UI** are post-v1.0. Their
   protocol fields and capabilities must still be parsed in M1.
+- **Simulator profiles are data, not code paths.** One simulator engine is
+  parameterized by a `ControllerProfile`; `flexihal` is a subset of
+  `generic-full`. Never branch on a profile name in product code.
 - Do not copy ioSender source. Behavioral compatibility and protocol facts only.
 - Do not add telemetry or network calls to the app.
 

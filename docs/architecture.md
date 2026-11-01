@@ -187,6 +187,11 @@ Job runner responsibilities:
 - Settings are a `BTreeMap<u16, Setting>` with a typed value and metadata from
   `$ES`/`$EG`/`$SED`; a bundled fallback covers controllers without runtime
   enumeration. The settings UI is generated from the metadata, never hardcoded.
+- A `ControllerProfile` is pure data: firmware version/build, option set,
+  signals, axes, RX/planner buffers, tool-table entries, plugins, and known
+  quirks. `Capabilities` is derived from it and from runtime responses. The UI
+  reads capabilities only; it never asks which profile is active. `flexihal`
+  and `generic-full` are two instances of the same profile type.
 
 ## Safety gateway
 
@@ -250,9 +255,12 @@ Hard rules:
 - `ghs-proto` unit and golden tests; property tests for buffer accounting and
   malformed input.
 - `ghs-sim` scenario tests for handshake, MPG takeover, alarms, tool change,
-  probing, overrides, disconnect, and reconnect. Two profiles: `flexihal` and
-  `generic-full` (more axes, SD, ATC, MPG, multi-spindle) to prove capability
-  gating.
+  probing, overrides, disconnect, and reconnect.
+- The simulator is one engine parameterized by a `ControllerProfile`.
+  `flexihal` is a strict subset of `generic-full`; both run the same scenario
+  suite with capability-dependent expectations. The subset is essential for
+  testing absence and fallback paths (no `SD`, no `PC`, no extra axes, older
+  build, 64-byte buffer). Product code never branches on a profile name.
 - Recorded real sessions replayed through the same parser.
 - `ghs-gcode` golden toolpaths, differential tests against hand-computed
   geometry, and fuzzing.

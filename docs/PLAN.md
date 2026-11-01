@@ -41,10 +41,14 @@ Recorded from the machine's `$I+` response (see
 | AUX IO | 4 digital in, 4 digital out | Signals/AUX panel |
 | Buffer | 64-byte RX, 1024 planner blocks | Character-counting streamer with headroom |
 
-The simulator must reproduce this profile as `flexihal`, plus at least one
-`generic-full` profile (more axes, SD, ATC, MPG, multi-spindle) to exercise
-capability gating. Every UI panel must be driven by the controller's reported
-capabilities, never by a hardcoded board assumption.
+The simulator is **one engine parameterized by a controller profile**, not a
+separate implementation per board. `flexihal` is a strict subset of
+`generic-full`; the same engine and UI code must work for both. We keep both
+profiles as test fixtures because the *absence* paths matter: no `SD`, no `PC`,
+no extra axes, an older build, and a 64-byte buffer are exactly where fallback
+bugs hide. `generic-full` is the superset used for broad scenario coverage;
+`flexihal` is the regression fixture for the real machine. There is no
+board-specific product mode: every panel is driven by reported capabilities.
 
 > **Hardware access note.** The controller lives offline in a garden shed, so
 > M1 is simulator-first. Hardware-in-the-loop validation is a gate at M2/M3
@@ -179,7 +183,7 @@ configurable and color-blind safe.
 | Stage | Estimate | Ships | Exit gate |
 |---|---|---|---|
 | **M0 Bootstrap & spikes** | 1–2 wk | Workspace, CI (Linux/macOS/Windows), licenses, docs, hardware profile; GPUI shell, touch, 2D canvas, 3D projection, serial loopback spikes | Demo app at 60 fps with 200k segments, working keypad and layout; serial loopback proven |
-| **M1 Protocol + simulator** | 2–3 wk | `ghs-core`, `ghs-proto`, `ghs-sim` with `flexihal` and `generic-full` profiles, fixture replay | Connect to both profiles; identity/capabilities; `$EA`/`$EE`/`$ES`/`$EG`; live status at 10 Hz; streamer property tests |
+| **M1 Protocol + simulator** | 2–3 wk | `ghs-core`, `ghs-proto`, one `ghs-sim` engine with `flexihal` (subset) and `generic-full` (superset) profiles, fixture replay | Connect to both profiles with identical code; identity/capabilities; `$EA`/`$EE`/`$ES`/`$EG`; live status at 10 Hz; streamer property tests |
 | **M2 Manual control — v0.1** | 2–3 wk | Engine, serial transport, DRO/WCS, jog, overrides, spindle/coolant, MDI, home/unlock/reset, signals, touch shell | Operate simulator and the real board from the UI; guards and stop always visible |
 | **M3 Job engine — v0.2** | 3 wk | Load/validate/stream, pause/resume/stop, tool change, single block/optional stop, start-from-line, timer/progress, console | 100k-line job with repeated pause/abort/reconnect; zero buffer overruns; hardware run |
 | **M4 Program + 2D — v0.5** | 3 wk | G-code parser, geometry, 2D viewer, virtualized program list | 1M lines under 2 s; 60 fps pan/zoom; live marker; arcs/incremental/planes correct |

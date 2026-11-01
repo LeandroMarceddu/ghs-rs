@@ -327,6 +327,15 @@ banner; treat `MPG:1` accordingly. `0x8B` toggles MPG mode when supported.
 | Plasma, drag knife | — | No | Explicitly out of scope |
 | Network transports | — | No | Serial only |
 
+### Profile model
+
+Capabilities are data, not code paths. The simulator is one engine configured
+by a `ControllerProfile`; `flexihal` is a strict subset of `generic-full`, so
+the same engine and UI must handle both. Keep both as test fixtures because
+absence and fallback paths (no `SD`, no `PC`, fewer axes, older build, smaller
+RX buffer) are where bugs hide. Product code branches on capabilities, never on
+a profile name.
+
 ## 12. Reference-board deviations
 
 The FlexiHAL build (`1.1f.20240604`) advertises `ENUMS`, `RT+`, `HOME`, `ES`,
