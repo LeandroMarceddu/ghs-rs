@@ -97,6 +97,7 @@ pub struct Shell {
     spindle_slider_active: bool,
     console_scroll: ScrollHandle,
     program_scroll: UniformListScrollHandle,
+    viewer: viewer::ViewerHandle,
     last_job_line: u32,
     demo_program: DemoProgram,
     demo_start: bool,
@@ -197,6 +198,7 @@ impl Shell {
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
             program_scroll: UniformListScrollHandle::new(),
+            viewer: viewer::ViewerHandle::new(),
             last_job_line: 0,
             demo_program,
             demo_start,
@@ -1395,7 +1397,7 @@ impl Shell {
             v_flex()
                 .size_full()
                 .child(self.job_toolbar(p, cx))
-                .child(div().flex_1().min_h(px(0.0)).child(self.job_view(p)))
+                .child(div().flex_1().min_h(px(0.0)).child(self.job_view(p, cx)))
                 .into_any_element()
         } else {
             self.mode_view(p, cx).into_any_element()
@@ -1545,12 +1547,34 @@ impl Shell {
             )
     }
 
-    fn job_view(&self, p: Palette) -> impl IntoElement {
+    fn job_view(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let program = self.state.job.program().cloned();
+        // Real geometry comes from `JobLoaded`; the synthetic sketch remains
+        // only for `--mock` and for a live session with nothing loaded.
+        let path_label = match (&program, self.state.live) {
+            (Some(_), _) => "TOOLPATH",
+            (None, true) => "NO PROGRAM",
+            (None, false) => "SYNTHETIC",
+        };
+        let segments = program
+            .as_ref()
+            .map(|program| format!("{} SEG", program.toolpath.segment_count()));
+        let marker = viewer::marker_mm(self.state.profile.capabilities.units, &self.state.dro);
+        let zoom = format!("{}%", self.viewer.zoom_percent());
+
+        let fit_view = cx.entity();
+        let fit = chip_button("viewer-fit", "FIT", p, move |_, cx| {
+            fit_view.update(cx, |this, cx| {
+                this.viewer.fit();
+                cx.notify();
+            });
+        });
+
         div()
             .relative()
             .size_full()
             .bg(p.bg)
-            .child(viewer::toolpath(p))
+            .child(viewer::view(&self.viewer, p, program, marker, cx.entity()))
             .child(
                 div()
                     .absolute()
@@ -1559,7 +1583,8 @@ impl Shell {
                     .flex()
                     .gap_1()
                     .child(chip("2D TOP", p))
-                    .child(chip("SYNTHETIC", p)),
+                    .child(chip(path_label, p))
+                    .when_some(segments, |this, segments| this.child(chip(&segments, p))),
             )
             .child(
                 div()
@@ -1570,7 +1595,8 @@ impl Shell {
                     .gap_1()
                     .child(chip(self.state.wcs(), p))
                     .child(chip(self.state.unit(), p))
-                    .child(chip("1:1", p)),
+                    .child(chip(&zoom, p))
+                    .child(fit),
             )
             .child(
                 div()
@@ -3336,6 +3362,12 @@ impl Shell {
     }
 }
 
+impl viewer::HasViewer for Shell {
+    fn viewer_handle(&self) -> &viewer::ViewerHandle {
+        &self.viewer
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::new(self.state.dark);
@@ -3592,6 +3624,32 @@ fn chip(text: &str, p: Palette) -> Div {
         .text_size(px(10.0))
         .font_weight(FontWeight::BOLD)
         .text_color(p.text_dim)
+        .child(text.to_string())
+}
+
+/// A chip-sized action button, used for the viewer FIT control.
+fn chip_button(
+    id: &'static str,
+    text: &str,
+    p: Palette,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .h(px(22.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .rounded(px(5.0))
+        .bg(p.panel_alt)
+        .border_1()
+        .border_color(p.border)
+        .text_size(px(10.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(p.text_dim)
+        .hover(|style| style.bg(p.raised_hover).text_color(p.text))
+        .on_click(move |_, window, cx| on_click(window, cx))
         .child(text.to_string())
 }
 

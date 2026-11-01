@@ -166,6 +166,14 @@ impl Units {
         }
     }
 
+    /// Convert a value in this display unit back to millimetres.
+    pub fn to_mm(self, value: f64) -> f64 {
+        match self {
+            Units::Millimetre => value,
+            Units::Inch => value * ghs_core::Units::MM_PER_INCH,
+        }
+    }
+
     /// Map the engine's unit enum into the display enum.
     pub fn from_core(units: CoreUnits) -> Self {
         match units {
@@ -1660,6 +1668,16 @@ mod tests {
         "[SIGNALS:HSDEP]",
         "[BOARD:FlexiHAL_20240604_210624]",
     ];
+
+    #[test]
+    fn units_round_trip_between_millimetres_and_inch() {
+        assert_eq!(Units::Millimetre.to_mm(12.5), 12.5);
+        assert!((Units::Inch.to_mm(1.0) - 25.4).abs() < 1.0e-9);
+        for value in [0.0, 1.0, -3.75, 120.125] {
+            let shown = Units::Inch.display(value);
+            assert!((Units::Inch.to_mm(shown) - value).abs() < 1.0e-9);
+        }
+    }
 
     #[test]
     fn live_telemetry_maps_to_the_touch_view_model() {
