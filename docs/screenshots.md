@@ -1,0 +1,114 @@
+# Screenshots and UI verification
+
+Use this when a task needs a visual proof. A screenshot is part of acceptance:
+report the path **and** verify its pixel size with `identify`.
+
+## Rules
+
+- Never leave `cargo run` or the app in the foreground. Build first, launch in
+  the background, capture, kill, and verify `pgrep -a ghs-app` is empty.
+- The development desktop runs a KWin script that remembers and restores window
+  sizes. It overrides the app's `--size`; do not try to fix that in the app.
+- Use an isolated environment for deterministic captures: empty
+  `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME` and a private
+  `XDG_RUNTIME_DIR` (mode 700) so the KWin script does not run inside the test
+  compositor.
+- The app flags are `--size WxH`, `--fullscreen`, `--mock`, `--light`,
+  `--keypad`, and (when present) `--connection-panel=serial`.
+- Always verify the PNG with `identify`; a capture command can exit 0 and write
+  nothing.
+- Kill the app and the compositor in a `trap`/cleanup step. Check
+  `pgrep -a ghs-app` and `pgrep -a kwin_wayland` afterward.
+- Do not kill an app process from another target directory unless it is an
+  orphan blocking a run; check its parent and, if in doubt, ask the
+  orchestrator.
+
+## Verified method: nested KWin + private D-Bus
+
+This is the method used for the approved captures. The private
+`dbus-run-session` is required: without it, `spectacle` can exit 0 and write
+nothing, while the nested compositor has no screen-capture service.
+
+```sh
+cd /home/leandro/Desktop/Dev/Testing/ghs-rs
+cargo build -p ghs-app
+
+SIZE=1280x800
+W=${SIZE%x*}; H=${SIZE#*x}
+OUT=/tmp/opencode/ghs-live-$SIZE.png
+ROOT=/tmp/opencode/ghs-shot-env
+rm -rf "$ROOT"
+mkdir -p "$ROOT/config" "$ROOT/data" "$ROOT/cache" "$ROOT/runtime"
+chmod 700 "$ROOT/runtime"
+export XDG_RUNTIME_DIR="$ROOT/runtime"
+export XDG_CONFIG_HOME="$ROOT/config"
+export XDG_DATA_HOME="$ROOT/data"
+export XDG_CACHE_HOME="$ROOT/cache"
+export W H OUT
+
+dbus-run-session -- bash -c '
+  export WAYLAND_DISPLAY=wayland-0
+  export XDG_CURRENT_DESKTOP=KDE
+  kwin_wayland --virtual --width "$W" --height "$H" --scale 1 \
+    --socket wayland-0 >"$XDG_RUNTIME_DIR/kwin.log" 2>&1 &
+  KWIN=$!
+  sleep 2
+  ./target/debug/ghs-app --fullscreen >"$XDG_RUNTIME_DIR/app.log" 2>&1 &
+  APP=$!
+  sleep 4
+  spectacle --fullscreen --background --nonotify --output "$OUT" \
+    >"$XDG_RUNTIME_DIR/spectacle.log" 2>&1 || true
+  kill "$APP" 2>/dev/null || true
+  kill "$KWIN" 2>/dev/null || true
+'
+
+identify "$OUT" || echo "capture failed; check $ROOT/spectacle.log"
+pgrep -a ghs-app || true
+```
+
+A verified run produced `/tmp/opencode/ghs-shot-test3.png` at 1280×800.
+`/tmp/opencode/ghs-shots/start-nested.sh` is the app agent's equivalent
+long-lived helper if you need repeated captures.
+
+Notes:
+
+- The nested compositor normally creates `wayland-0`; do not set a custom
+  `--socket` unless you also set `WAYLAND_DISPLAY` to that exact name.
+- The app must be `--fullscreen` to fill the virtual output at the requested
+  size.
+- `spectacle` can depend on the session bus/portal. If it exits without a file,
+  fall back to the host X11 path below. Do not spend a long time fighting it.
+- Capture 1280×800, 1920×1080, and 1080×1920 by repeating with a different
+  `SIZE`.
+
+## Fallback: host X11/Xwayland interaction
+
+The host runs KWin Wayland with Xwayland. This path is useful for click-driven
+proof (MDI, jog, dialogs) where `xdotool` is needed.
+
+- Build the app.
+- Launch it as an X11 client if GPUI selects X11: set `DISPLAY=:0` and clear
+  `WAYLAND_DISPLAY` (or use the app's own X11 backend if it exposes one).
+- KWin may restore the remembered 1920×1002 size; capture that as the large
+  case and record the actual size.
+- `xdotool` can click by screen coordinates; take a screenshot after the click
+  and verify the console/DRO changed.
+- Capture with `import -window root` (ImageMagick) or `spectacle --fullscreen
+  --background --nonotify --output ...`.
+
+The previous successful interaction proofs are:
+
+- `/tmp/opencode/ghs-x11-mdi.png` — MDI `G0 X10 Y10`, console `> ...` + `ok`,
+  DRO X/Y 10.000.
+- `/tmp/opencode/ghs-x11-jog.png` — jog command and the simulator error before
+  the `$J=G21` fix.
+- `/tmp/opencode/ghs-x11-disconnected.png` and `-reconnected.png`.
+
+## What to report
+
+1. Absolute screenshot paths.
+2. Actual dimensions from `identify`.
+3. What the screenshot proves (live vs mock, command/console line, DRO values).
+4. Any capture limitation (KWin size override, missing portal, hardware
+   unavailable).
+5. Confirmation that no `ghs-app` process remains.
