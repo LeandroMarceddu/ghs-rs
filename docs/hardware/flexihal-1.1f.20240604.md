@@ -45,8 +45,8 @@ HOME, TLO, PRB) and show, for example, `G59.3:-1031.000,-847.000,-2.000` and
 |---|---|---|
 | Firmware | `1.1f.20240604` | The only firmware version that must work at v1.0 |
 | Build options | `VNMSL+2` | Variable spindle, line numbers, mist, spindle, limits; `+2` variant |
-| Serial RX buffer | `64` bytes (second `OPT` field) | Streamer must use 64, not the grbl default of 128 |
-| Planner blocks | `1024` | Deep pipeline; character counting remains the hard limit |
+| Serial RX buffer | `1024` bytes (second `OPT` field) | Streamer must use the reported 1024, not the legacy default |
+| Planner/block buffer | `64` (first `OPT` field) | Block pipeline; character counting remains the hard limit |
 | Axes | `3` (`XYZ`) | 3-axis UI; domain stays 9-axis capable |
 | Tool table | `0` controller entries | Tool table is app-side; push offsets with `G10`/`$` as needed |
 | `NEWOPT` | `ENUMS`, `RT+`, `HOME`, `ES`, `EXPR`, `TC`, `SED` | Enumerations, top-bit realtime, homing, E-stop, expressions, manual M6, settings descriptions |

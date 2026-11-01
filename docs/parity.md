@@ -78,7 +78,7 @@ documented, and is localized.
 |---|---|---|---|---|
 | JOB-01 | Open, drag-and-drop, recent files | M3 | todo | `.nc`, `.gcode`, `.tap`, `.ngc` |
 | JOB-02 | Validate program before streaming | M3 | todo | Syntax, tools, feeds |
-| JOB-03 | Character-counting streaming with `Bf` top-up | M3 | todo | 64-byte buffer |
+| JOB-03 | Character-counting streaming with `Bf` top-up | M3 | todo | Use the reported RX buffer (1024 on FlexiHAL) |
 | JOB-04 | Pause, resume, stop | M3 | todo | Hold, resume, reset semantics |
 | JOB-05 | Manual tool change prompt and resume | M3 | todo | `TC`, persistent tool plugin |
 | JOB-06 | Optional stop, single block, block delete | M3 | todo | Realtime toggles |

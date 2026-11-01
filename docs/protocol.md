@@ -292,15 +292,20 @@ banner; treat `MPG:1` accordingly. `0x8B` toggles MPG mode when supported.
 
 ## 10. Streaming and buffer accounting
 
-- The controller reports the serial RX buffer size in `$I` `OPT` (second value
-  after the option string). The reference board reports 64 bytes; do not assume
-  128.
+- The controller reports the serial RX buffer size in `$I` `OPT` as the second
+  numeric value after the option string; the first is the planner/block buffer
+  size. The reference board reports 1024 bytes RX and a 64-block planner buffer;
+  do not assume 128.
 - Character counting is the hard invariant: bytes sent since the last ack
   (including the terminator) must not exceed the RX buffer.
 - `Bf` reports planner blocks free and RX bytes free. Use it to top up, but
   never let it override the invariant.
 - Real-time bytes are out-of-band and do not count against the buffer.
 - One `ok`/`error` acknowledges one streamed line.
+- The sender uses extended realtime codes. Printable `?`, `!`, `~`, and `%`
+  inside program text or comments can still be intercepted by the controller;
+  the G-code layer must strip them or setup must disable legacy printable
+  realtime handling (`$39=0`) before streaming untrusted programs.
 - On `error`, stop and clear (empty line or `$` command) before continuing.
 - Pause with `!`/`0x82`; resume with `~`/`0x81`; cancel jogs with `0x85`.
 - A full report (`0x87`) is useful after connect, after alarm clear, and
@@ -332,14 +337,14 @@ banner; treat `MPG:1` accordingly. `0x8B` toggles MPG mode when supported.
 Capabilities are data, not code paths. The simulator is one engine configured
 by a `ControllerProfile`; `flexihal` is a strict subset of `generic-full`, so
 the same engine and UI must handle both. Keep both as test fixtures because
-absence and fallback paths (no `SD`, no `PC`, fewer axes, older build, smaller
-RX buffer) are where bugs hide. Product code branches on capabilities, never on
+absence and fallback paths (no `SD`, no `PC`, fewer axes, older build, a
+different reported RX buffer) are where bugs hide. Product code branches on capabilities, never on
 a profile name.
 
 ## 12. Reference-board deviations
 
 The FlexiHAL build (`1.1f.20240604`) advertises `ENUMS`, `RT+`, `HOME`, `ES`,
-`EXPR`, `TC`, `SED`, three axes, 64-byte RX, and one probe. It does not
+`EXPR`, `TC`, `SED`, three axes, 1024-byte RX, and one probe. It does not
 advertise `SD`, `ATC`, `MPG`, `PC`, or `PROBES=n`. Therefore:
 
 - Use `$ES`/`$EG` for settings; the board supports enumerations.

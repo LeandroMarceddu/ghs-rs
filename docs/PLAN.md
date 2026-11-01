@@ -39,14 +39,14 @@ Recorded from the machine's `$I+` response (see
 | ATC / MPG / network | not reported | Protocol parses ATC/MPG; UI is post-v1.0; network is out of scope |
 | Spindle | Huanyang VFD (`SPINDLE:Huanyang v1`) | RPM, CW/CCW, spindle override |
 | AUX IO | 4 digital in, 4 digital out | Signals/AUX panel |
-| Buffer | 64-byte RX, 1024 planner blocks | Character-counting streamer with headroom |
+| Buffer | 1024-byte RX, 64 planner blocks | Character-counting streamer uses the reported RX size |
 
 The simulator is **one engine parameterized by a controller profile**, not a
 separate implementation per board. `flexihal` is a strict subset of
 `generic-full`; the same engine and UI code must work for both. We keep both
 profiles as test fixtures because the *absence* paths matter: no `SD`, no `PC`,
-no extra axes, an older build, and a 64-byte buffer are exactly where fallback
-bugs hide. `generic-full` is the superset used for broad scenario coverage;
+no extra axes, an older build, and a different reported RX buffer are exactly
+where fallback bugs hide. `generic-full` is the superset used for broad scenario coverage;
 `flexihal` is the regression fixture for the real machine. There is no
 board-specific product mode: every panel is driven by reported capabilities.
 

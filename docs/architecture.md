@@ -131,8 +131,9 @@ seconds during a job to refresh fields that are only sent on change.
 
 Streamer:
 
-- The controller reports a 64-byte serial RX buffer in this build's `OPT` field;
-  the streamer uses the reported size, falling back to 128 bytes.
+- The controller reports a 1024-byte serial RX buffer in the second numeric
+  `OPT` field (the first is the 64-block planner buffer); the streamer uses the
+  reported size, falling back to 128 bytes.
 - Character counting: a line may be sent only if
   `line_len <= buffer_size - sent_unacked - queued_bytes`.
 - `Bf:` (planner/serial free space) is used to top up the pipeline after the
@@ -260,7 +261,8 @@ Hard rules:
   `flexihal` is a strict subset of `generic-full`; both run the same scenario
   suite with capability-dependent expectations. The subset is essential for
   testing absence and fallback paths (no `SD`, no `PC`, no extra axes, older
-  build, 64-byte buffer). Product code never branches on a profile name.
+  build, different reported buffer). Product code never branches on a profile
+  name.
 - Recorded real sessions replayed through the same parser.
 - `ghs-gcode` golden toolpaths, differential tests against hand-computed
   geometry, and fuzzing.
