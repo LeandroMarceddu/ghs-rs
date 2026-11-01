@@ -1,0 +1,13 @@
+[package]
+name = "ghs-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ghs-core.workspace = true
+ghs-proto.workspace = true
+ghs-engine.workspace = true
