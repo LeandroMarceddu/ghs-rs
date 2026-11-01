@@ -8,6 +8,7 @@ members = [
   "crates/ghs-engine",
   "crates/ghs-viewer",
   "crates/ghs-gcode",
+  "crates/ghs-demo",
   "crates/ghs-app",
 ]
 default-members = ["crates/ghs-app"]
@@ -28,6 +29,7 @@ ghs-sim = { path = "crates/ghs-sim" }
 ghs-engine = { path = "crates/ghs-engine" }
 ghs-viewer = { path = "crates/ghs-viewer" }
 ghs-gcode = { path = "crates/ghs-gcode" }
+ghs-demo = { path = "crates/ghs-demo" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

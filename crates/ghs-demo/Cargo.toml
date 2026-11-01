@@ -1,0 +1,18 @@
+[package]
+name = "ghs-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ghs-serial.workspace = true
+ghs-sim.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ghs-proto.workspace = true
