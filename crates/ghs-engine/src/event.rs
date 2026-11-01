@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ghs_core::{ControllerInfo, ProbeResult, Setting, SettingValue};
 use ghs_gcode::Program;
-use ghs_proto::CodeTable;
+use ghs_proto::{CodeTable, SettingDescription, SettingGroup};
 
 /// Why a running job stopped feeding lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,6 +104,14 @@ pub enum EngineEvent {
     /// Every setting value read during discovery, enriched with metadata from
     /// `$ES`/`$EG` when the controller advertises `ENUMS`.
     Settings(Arc<Vec<Setting>>),
+
+    /// Typed setting metadata and groups from `$ES`/`$EG`, for generated forms.
+    SettingMetadata {
+        /// Typed setting descriptions.
+        descriptions: Arc<Vec<SettingDescription>>,
+        /// Hierarchical setting groups.
+        groups: Arc<Vec<SettingGroup>>,
+    },
 
     /// Runtime alarm and error descriptions from `$EA`/`$EE`.
     CodeTables {

@@ -2417,9 +2417,23 @@ impl EngineRuntime {
     }
 
     fn publish_settings(&mut self, emit: bool) {
+        let descriptions = Arc::new(
+            self.setting_descriptions
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let groups = Arc::new(self.setting_groups.values().cloned().collect::<Vec<_>>());
+        self.shared
+            .set_setting_metadata(Arc::clone(&descriptions), Arc::clone(&groups));
+
         let list = Arc::new(self.build_settings());
         self.shared.set_settings(Arc::clone(&list));
         if emit {
+            self.emit(EngineEvent::SettingMetadata {
+                descriptions,
+                groups,
+            });
             self.emit(EngineEvent::Settings(list));
         }
     }

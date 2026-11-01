@@ -8,7 +8,8 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use ghs_core::{ControllerInfo, MachineSnapshot, Setting};
 use ghs_proto::{
-    CodeTable as ProtoCodeTable, Offsets, ParserState, StatusReport, Streamer, StreamerConfig,
+    CodeTable as ProtoCodeTable, Offsets, ParserState, SettingDescription, SettingGroup,
+    StatusReport, Streamer, StreamerConfig,
 };
 
 use crate::command::{Command, ConnectTarget};
@@ -24,6 +25,8 @@ pub(crate) struct Telemetry {
     pub(crate) last_status: Option<Arc<StatusReport>>,
     pub(crate) info: Option<Arc<ControllerInfo>>,
     pub(crate) settings: Arc<Vec<Setting>>,
+    pub(crate) setting_descriptions: Arc<Vec<SettingDescription>>,
+    pub(crate) setting_groups: Arc<Vec<SettingGroup>>,
     pub(crate) offsets: Arc<Offsets>,
     pub(crate) parser_state: Option<Arc<ParserState>>,
     pub(crate) alarm_codes: Arc<ProtoCodeTable>,
@@ -61,6 +64,24 @@ impl SharedState {
 
     pub(crate) fn settings(&self) -> Arc<Vec<Setting>> {
         Arc::clone(&self.telemetry().settings)
+    }
+
+    pub(crate) fn setting_descriptions(&self) -> Arc<Vec<SettingDescription>> {
+        Arc::clone(&self.telemetry().setting_descriptions)
+    }
+
+    pub(crate) fn setting_groups(&self) -> Arc<Vec<SettingGroup>> {
+        Arc::clone(&self.telemetry().setting_groups)
+    }
+
+    pub(crate) fn set_setting_metadata(
+        &self,
+        descriptions: Arc<Vec<SettingDescription>>,
+        groups: Arc<Vec<SettingGroup>>,
+    ) {
+        let mut telemetry = self.telemetry();
+        telemetry.setting_descriptions = descriptions;
+        telemetry.setting_groups = groups;
     }
 
     pub(crate) fn offsets(&self) -> Arc<Offsets> {
@@ -273,6 +294,18 @@ impl EngineHandle {
     #[must_use]
     pub fn settings(&self) -> Arc<Vec<Setting>> {
         self.shared.settings()
+    }
+
+    /// Setting type/range metadata from `$ES`, when the controller reports it.
+    #[must_use]
+    pub fn setting_descriptions(&self) -> Arc<Vec<SettingDescription>> {
+        self.shared.setting_descriptions()
+    }
+
+    /// Setting groups from `$EG`, when the controller reports them.
+    #[must_use]
+    pub fn setting_groups(&self) -> Arc<Vec<SettingGroup>> {
+        self.shared.setting_groups()
     }
 
     /// Latest `$#` offsets.
