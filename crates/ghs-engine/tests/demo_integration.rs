@@ -8,7 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ghs_demo::{SimProfile, start};
-use ghs_engine::{Axis, Command, ConnectTarget, Engine, EngineConfig};
+use ghs_engine::{
+    Axes, Axis, Command, ConnectTarget, Engine, EngineConfig, JogCommand, JogMode, Position,
+};
 
 fn fast_config() -> EngineConfig {
     EngineConfig {
@@ -65,6 +67,29 @@ fn connects_to_the_simulator_and_runs_mdi() {
     assert!(
         moved,
         "simulator position did not update: {:?}",
+        engine.snapshot().wpos
+    );
+
+    let axes = [Axis::X].into_iter().collect::<Axes>();
+    let mut distance = Position::new(axes);
+    distance.set(Axis::X, 1.0);
+    let jog = JogCommand::new(axes, distance, 1000.0, JogMode::Incremental).expect("jog");
+    engine.send(Command::Jog(jog)).expect("accept jog");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut jogged = false;
+    while Instant::now() < deadline {
+        drain_events(&engine);
+        let snapshot = engine.snapshot();
+        if (snapshot.wpos[Axis::X] - 2.0).abs() < 1.0e-6 {
+            jogged = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        jogged,
+        "jog did not move the simulator: {:?}",
         engine.snapshot().wpos
     );
 

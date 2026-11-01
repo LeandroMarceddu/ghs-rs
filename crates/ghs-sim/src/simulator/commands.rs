@@ -548,6 +548,7 @@ impl Simulator {
             return;
         };
         let mut incremental = true;
+        let mut scale = self.units.mm_per_unit();
         let mut axis_words: Vec<(Axis, f64)> = Vec::new();
         let mut feed_value = None;
         for word in &words {
@@ -557,6 +558,12 @@ impl Simulator {
                         incremental = true;
                     } else if gcode::is_code(word.value, 90.0) {
                         incremental = false;
+                    } else if gcode::is_code(word.value, 20.0) {
+                        // Jog units are local to the $J line; they do not
+                        // change the controller's modal unit state.
+                        scale = 25.4;
+                    } else if gcode::is_code(word.value, 21.0) {
+                        scale = 1.0;
                     } else {
                         self.emit_error_only(20, out);
                         return;
@@ -595,7 +602,6 @@ impl Simulator {
             }
         }
 
-        let scale = self.units.mm_per_unit();
         let target = if incremental {
             let mut position = self.mpos;
             for (axis, raw) in &axis_words {

@@ -222,6 +222,23 @@ fn homing_unlock_and_soft_reset_paths() {
 }
 
 #[test]
+fn jog_accepts_explicit_units_without_changing_modal_units() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+
+    assert_eq!(single_line(&sim.feed(b"$J=G21 G91 X1 F1000\n")), "ok");
+    settle(&mut sim);
+    assert_eq!(sim.position()[Axis::X], 1.0);
+
+    // 0.5 inch is 12.7 mm; the G20 is local to the jog line.
+    assert_eq!(single_line(&sim.feed(b"$J=G20 G91 X0.5 F10\n")), "ok");
+    settle(&mut sim);
+    assert!((sim.position()[Axis::X] - 13.7).abs() < 1.0e-6);
+
+    let parser = text(&sim.feed(b"$G\n"));
+    assert!(parser.contains("G21"), "modal units changed: {parser}");
+}
+
+#[test]
 fn jog_moves_over_ticks_and_cancels() {
     let mut sim = Simulator::new(SimProfile::FlexiHal);
     assert_eq!(single_line(&sim.feed(b"$J=G91 X10 F1000\n")), "ok");
