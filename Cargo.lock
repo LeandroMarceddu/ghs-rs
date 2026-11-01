@@ -1937,6 +1937,7 @@ dependencies = [
 name = "ghs-app"
 version = "0.1.0"
 dependencies = [
+ "ghs-config",
  "ghs-core",
  "ghs-demo",
  "ghs-engine",
