@@ -3,6 +3,10 @@
 Target: **P2 milling parity** with ioSender for the reference FlexiHAL machine,
 using the ioSender Touch interaction model.
 
+The protocol layer targets grblHAL generally and parses the full command,
+status, and enumeration surface. The v1.0 UI is the reference machine; rows
+marked `post-v1.0` are parsed and modeled in M1 but their UI is deferred.
+
 Status values: `todo`, `wip`, `done`, `n/a`.
 
 A row is `done` only when it works against the simulator, has automated tests,
@@ -17,20 +21,32 @@ documented, and is localized.
 | COM-02 | Connect/disconnect with baud rate, 8N1 | M1 | todo | Default 115200 |
 | COM-03 | Optional DTR reset for 8-bit boards | M2 | todo | Default off for STM32F446 |
 | COM-04 | Banner handshake and soft reset | M1 | todo | Timeout and retry policy |
-| COM-05 | `$I` and `$I+` capability parsing | M1 | todo | Axes, options, signals, plugins, buffers |
-| COM-06 | `$$` settings read and `$SED` descriptions | M1 | todo | Dynamic settings schema |
+| COM-05 | `$I` and `$I+` capability parsing | M1 | todo | Axes, all NEWOPT values, signals, plugins, buffers, spindles |
+| COM-06 | `$ES`/`$EG` settings enumeration and `$SED` descriptions | M1 | todo | Generated schema; `$$` fallback |
 | COM-07 | `$#` offsets and `$G` parser state | M1 | todo | Parse all reported fields |
 | COM-08 | Adaptive status polling and full report `0x87` | M1 | todo | 10 Hz active, 2 Hz idle |
 | COM-09 | All grblHAL status fields | M1 | todo | MPos, WPos, Bf, Ln, FS, Pn, WCO, WCS, Ov, A, H, D, Sc, TLR, In, SD, MPG, FW |
 | COM-10 | All realtime commands | M1 | todo | Reset, hold, resume, jog cancel, door, overrides, spindle stop, coolant, optional stop, single block |
 | COM-11 | `RT+` top-bit realtime negotiation | M1 | todo | Reference build advertises RT+ |
-| COM-12 | Messages, errors, alarms with descriptions | M1 | todo | grblHAL tables plus `[MSG:...]` |
+| COM-12 | Messages, errors, alarms with descriptions | M1 | todo | `$EA`/`$EE` plus `[MSG:...]`; bundled fallback |
 | COM-13 | Probe result (`PRB`) parsing | M1 | todo | Used by the probing suite |
 | COM-14 | Disable controller auto-reporting on connect | M1 | todo | Setting `$481` when present |
 | COM-15 | Hotplug, reconnect, and status watchdog | M2 | todo | Never auto-resume a job |
 | COM-16 | Session recording and replay | M1 | todo | Real captures become fixtures |
 | COM-17 | Check mode (`$C`) | M3 | todo | Dry run |
 | COM-18 | In-process loopback simulator for demo and tests | M1 | todo | Not a user-facing network transport |
+| COM-19 | Runtime alarm/error code sets (`$EA`, `$EE`) | M1 | todo | Fallback tables only when unavailable |
+| COM-20 | Runtime settings and groups (`$ES`, `$EG`) | M1 | todo | Data types, formats, min/max, reboot flags |
+| COM-21 | Parser state report (`$G`, `0x83`) | M1 | todo | All grblHAL codes |
+| COM-22 | Pins, limit state, last events (`$PINS`, `$PINSTATE`, `$LIM`, `$LEV`) | M1 | todo | Signals/AUX panel |
+| COM-23 | Spindle and port enumeration (`$SPINDLES`, `$SPINDLESH`, `$PORTS`) | M1 | todo | Multi-spindle capable |
+| COM-24 | Manual tool change protocol (`Tool` state, `0xA3`) | M1 | todo | Jog and offsets while pending |
+| COM-25 | MPG takeover (`|MPG:1/0`) | M1 | todo | Pause UI, keep telemetry |
+| COM-26 | SD mount and streaming status (`|SD:`) | M1 | todo | Parse only; UI post-v1.0 |
+| COM-27 | Startup sequence without banner or DTR reset | M1 | todo | 400–500 ms listen, `0x87`, MPG wait |
+| COM-28 | Error persistence handling | M1 | todo | Clear with blank line or `$` before resume |
+| COM-29 | Multi-spindle status fields (`|SP<n>`) | M1 | todo | Parse; UI post-v1.0 |
+| COM-30 | Extra-axis status and capabilities | M1 | todo | 9-axis domain; UI expands if reported |
 
 ## Machine control
 
@@ -94,7 +110,7 @@ documented, and is localized.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| SETUP-01 | Settings editor generated from `$SED` and `$HELP` | M5 | todo | Fallback for gaps |
+| SETUP-01 | Settings editor generated from `$ES`/`$EG`/`$SED` | M5 | todo | Fallback for older builds |
 | SETUP-02 | Grouped, searchable, typed, validated settings | M5 | todo | Axis arrays |
 | SETUP-03 | Setting write, read-back verification, backup and restore | M5 | todo | EEPROM caution |
 | SETUP-04 | Stepper and axis calibration | M5 | todo | Guided measurement |
@@ -180,8 +196,17 @@ documented, and is localized.
 | Drag knife | Not needed |
 | Network transports (Telnet, WebSocket, TCP) | Serial only |
 | FTP and WebDAV | No network transport |
-| SD card and YModem | Controller has no SD card |
-| ATC | Controller reports `TC`, not ATC |
-| MPG and pendant input takeover | Controller has a keypad, no MPG |
-| Rotary and 4th–5th axis UI | 3-axis machine |
 | Camera, Vectric direct output, HPGL/Excellon converters | Not required |
+
+## Post-v1.0, capability-gated
+
+Parsed and modeled in M1; UI deferred until the milling feature bar is solid.
+
+| Capability | Trigger |
+|---|---|
+| SD card browsing and YModem upload | `SD`, `YM` |
+| ATC tool-change flows | `ATC=1` |
+| MPG/pendant UI | `MPG` |
+| Multi-spindle panels | `$SPINDLESH` with more than one |
+| Extra-axis DRO/jog rows | `$I+` axes greater than 3 |
+| Gamepad | Optional |

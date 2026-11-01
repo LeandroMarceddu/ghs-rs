@@ -4,18 +4,23 @@ ghs-rs is a cross-platform grblHAL G-code sender in Rust using GPUI and GPUI
 Kit. Read these first, in order:
 
 1. `docs/PLAN.md` — scope, milestones, execution model.
-2. `docs/architecture.md` — crates, threading, protocol, safety.
-3. `docs/hardware/flexihal-1.1f.20240604.md` — the reference controller.
-4. `docs/parity.md` — the feature checklist and current status.
-5. `docs/SAFETY.md` — non-negotiable motion rules.
+2. `docs/protocol.md` — the grblHAL protocol surface and support matrix.
+3. `docs/architecture.md` — crates, threading, protocol, safety.
+4. `docs/hardware/flexihal-1.1f.20240604.md` — the reference controller.
+5. `docs/parity.md` — the feature checklist and current status.
+6. `docs/SAFETY.md` — non-negotiable motion rules.
 
 ## Scope guardrails
 
 - **Serial only.** No Telnet, WebSocket, TCP, HTTP, FTP, or WebDAV transports.
   The in-process loopback is for tests and demo mode only.
 - **grblHAL only.** No legacy Grbl compatibility layer.
-- **3-axis milling.** No lathe, plasma THC, drag knife, rotary, or 5-axis UI.
-- **No SD card, ATC, MPG, or camera work** before v1.0.
+- **3-axis milling UI.** No lathe, plasma THC, drag knife, or camera UI.
+- **Protocol breadth.** Parse the full grblHAL status, realtime, system-command,
+  parser-state, and runtime-enumeration surface. Ignore unknown fields and
+  extensions; never hardcode the reference board's capabilities.
+- **SD, ATC, MPG, multi-spindle, and extra-axis UI** are post-v1.0. Their
+  protocol fields and capabilities must still be parsed in M1.
 - Do not copy ioSender source. Behavioral compatibility and protocol facts only.
 - Do not add telemetry or network calls to the app.
 
@@ -43,6 +48,8 @@ Kit. Read these first, in order:
   and examples.
 - Public items get doc comments. Units are explicit in names or docs.
 - Keep protocol and domain code independent of GPUI, serial ports, and clocks.
+- Do not hardcode a settings UI. Prefer `$ES`/`$EG`/`$SED` metadata; bundled
+  schemas are fallbacks only.
 - Derive `Debug`, `Clone`, `PartialEq` where useful; use `serde` only at
   persistence and fixture boundaries.
 - ASCII-only source and default UI strings until the i18n milestone.

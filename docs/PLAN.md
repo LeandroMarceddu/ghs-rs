@@ -4,10 +4,13 @@
 **Updated:** 2026-11-01
 **Reference hardware:** FlexiHAL / STM32F446, grblHAL `1.1f.20240604`
 
-This is the canonical plan. It is deliberately narrower than a full ioSender
-clone: the target is a first-class sender for a 3-axis grblHAL mill, with the
-touch ergonomics of ioSender Touch. Features the reference machine cannot use
-are out of scope until after v1.0.
+This is the canonical plan. The **protocol layer targets grblHAL generally**:
+it parses every status field, real-time command, system command, and runtime
+enumeration the controller can report, and ignores unknown extensions
+gracefully. The **v1.0 UI is focused on the reference 3-axis mill**, with every
+panel capability-gated so other grblHAL controllers expose the features they
+actually support. Lathe, plasma, drag knife, and network transports remain
+explicitly out of scope.
 
 ## 1. Product
 
@@ -32,14 +35,16 @@ Recorded from the machine's `$I+` response (see
 | Options | `ENUMS`, `RT+`, `HOME`, `ES`, `EXPR`, `TC`, `SED` | Top-bit realtime, expressions, settings descriptions, manual tool change |
 | Signals | `HSDEP` | Feed hold, cycle start, door, E-stop, probe |
 | Tool table | 0 controller entries | Tool table lives in the app; `TC` = manual M6 |
-| SD card | not reported | No SD/YModem work in v1.0 |
-| ATC / MPG / network | not reported | Out of scope for v1.0 |
+| SD card | not reported | Protocol parses `SD`; UI is post-v1.0 |
+| ATC / MPG / network | not reported | Protocol parses ATC/MPG; UI is post-v1.0; network is out of scope |
 | Spindle | Huanyang VFD (`SPINDLE:Huanyang v1`) | RPM, CW/CCW, spindle override |
 | AUX IO | 4 digital in, 4 digital out | Signals/AUX panel |
 | Buffer | 64-byte RX, 1024 planner blocks | Character-counting streamer with headroom |
 
-The simulator must reproduce this profile by default, and every UI panel must
-be capability-gated so other grblHAL boards degrade gracefully.
+The simulator must reproduce this profile as `flexihal`, plus at least one
+`generic-full` profile (more axes, SD, ATC, MPG, multi-spindle) to exercise
+capability gating. Every UI panel must be driven by the controller's reported
+capabilities, never by a hardcoded board assumption.
 
 > **Hardware access note.** The controller lives offline in a garden shed, so
 > M1 is simulator-first. Hardware-in-the-loop validation is a gate at M2/M3
@@ -52,11 +57,15 @@ be capability-gated so other grblHAL boards degrade gracefully.
 ### In scope
 
 - Serial connection, controller identification, capability discovery.
+- Full grblHAL protocol surface: status fields, realtime commands, system
+  commands, parser state, probe results, tool change, MPG takeover, SD status.
+- Runtime code sets and settings from `$EA`/`$EE`/`$ES`/`$EG`/`$SED`, with
+  bundled fallbacks for older builds.
 - Live status, DRO, work offsets, jogging, MDI, overrides, spindle, coolant.
-- Program load, validation, streaming, pause/resume/stop, manual tool change.
+- Program load, validation, streaming, pause/resume/stop, tool change.
 - Program list, 2D toolpath, 3D toolpath, live tool marker.
-- Settings editor generated from `$SED`/`$HELP`, with a bundled fallback.
-- Offsets, tool table, macros, startup lines, keymap, app settings, profiles.
+- Generated settings editor, offsets, tool table, macros, startup lines,
+  keymap, app settings, profiles.
 - Full milling probing suite and height-map compensation.
 - Material surfacing, gantry squaring, stepper/XY calibration.
 - Touch layout, on-screen keypad, portrait/landscape, themes, units.
@@ -66,20 +75,25 @@ be capability-gated so other grblHAL boards degrade gracefully.
 
 | Feature | Reason |
 |---|---|
-| Legacy Grbl | Reference machine and target are grblHAL |
+| Legacy Grbl | Target is grblHAL |
 | Lathe mode and lathe wizards | Not a lathe |
 | Plasma THC | Not a plasma table |
 | Drag knife | Not needed |
 | Network transports (Telnet/WebSocket/TCP) | Serial only |
 | FTP/WebDAV controller file transfer | No network transport |
-| SD card / YModem | Reference controller has no SD card |
-| ATC | Reference controller reports `TC`, not ATC |
-| MPG/pendant | Reference controller has a keypad plugin, no MPG |
-| Rotary / 4th–5th axis UI | 3-axis machine |
 | Camera, Vectric direct output, HPGL/Excellon converters | Not required |
 
-These can be revisited after v1.0, behind capability flags, without changing
-the architecture.
+### Post-v1.0, capability-gated
+
+The protocol and domain layers already carry these; the UI is added after the
+milling feature bar is solid:
+
+- SD card browsing and YModem upload when the controller reports `SD`/`YM`.
+- ATC flows when the controller reports `ATC=1`; manual `TC` is in v1.0.
+- MPG/pendant UI when `MPG` is reported; the sender already pauses on `|MPG:1`.
+- Multi-spindle panels when `$SPINDLESH` reports more than one.
+- Extra-axis DRO/jog rows when `$I+` reports more than three axes.
+- Gamepad support.
 
 ## 4. Parity gates
 
@@ -93,6 +107,8 @@ pause/resume/stop, manual tool change.
 - ioSender milling features: settings, offsets, tools, macros, 2D/3D viewer,
   full probing suite, height map, surfacing/calibration, program management,
   transforms, signals, backup/restore, localization.
+- Generic grblHAL protocol support, with runtime enumerations and
+  capability-gated panels rather than a board-specific UI.
 - Serial hotplug/reconnect, session logging, crash-safe configuration.
 - Windows, macOS, Linux builds and installers.
 
@@ -130,11 +146,15 @@ Decisions already made:
    and demo mode; it is not a user-facing network transport.
 4. **Capability-driven UI.** `$I+` decides which panels exist.
 5. **9-axis domain, 3-axis UI.** Positions and settings use fixed arrays; the
-   UI initially exposes X/Y/Z.
+   UI initially exposes X/Y/Z and expands if the controller reports more.
 6. **mm is canonical.** G20/G21 changes display and protocol state, not stored
    coordinates. Domain uses `f64`; rendering uses `f32`.
 7. **GPUI Kit 0.8.x, pinned exactly.** A thin `ghs-ui` layer contains the API
    churn.
+8. **Protocol breadth, UI depth.** Parse the full grblHAL surface and ignore
+   unknown extensions; expose only what the controller supports.
+9. **Runtime enumeration over hardcoded tables.** Prefer `$EA`/`$EE`/`$ES`/
+   `$EG`/`$SED`; bundled tables are fallbacks, not the source of truth.
 
 ## 6. UI direction
 
@@ -159,11 +179,11 @@ configurable and color-blind safe.
 | Stage | Estimate | Ships | Exit gate |
 |---|---|---|---|
 | **M0 Bootstrap & spikes** | 1–2 wk | Workspace, CI (Linux/macOS/Windows), licenses, docs, hardware profile; GPUI shell, touch, 2D canvas, 3D projection, serial loopback spikes | Demo app at 60 fps with 200k segments, working keypad and layout; serial loopback proven |
-| **M1 Protocol + simulator** | 2–3 wk | `ghs-core`, `ghs-proto`, `ghs-sim`, fixture replay | Connect to simulator; identity/capabilities/settings; live status at 10 Hz; streamer property tests |
+| **M1 Protocol + simulator** | 2–3 wk | `ghs-core`, `ghs-proto`, `ghs-sim` with `flexihal` and `generic-full` profiles, fixture replay | Connect to both profiles; identity/capabilities; `$EA`/`$EE`/`$ES`/`$EG`; live status at 10 Hz; streamer property tests |
 | **M2 Manual control — v0.1** | 2–3 wk | Engine, serial transport, DRO/WCS, jog, overrides, spindle/coolant, MDI, home/unlock/reset, signals, touch shell | Operate simulator and the real board from the UI; guards and stop always visible |
 | **M3 Job engine — v0.2** | 3 wk | Load/validate/stream, pause/resume/stop, tool change, single block/optional stop, start-from-line, timer/progress, console | 100k-line job with repeated pause/abort/reconnect; zero buffer overruns; hardware run |
 | **M4 Program + 2D — v0.5** | 3 wk | G-code parser, geometry, 2D viewer, virtualized program list | 1M lines under 2 s; 60 fps pan/zoom; live marker; arcs/incremental/planes correct |
-| **M5 Setup & data — v0.6** | 3 wk | Settings editor (`$SED`), offsets, tool table, macros, keymap, profiles, backup | Configure the FlexiHAL machine end-to-end; settings round-trip; restore verified |
+| **M5 Setup & data — v0.6** | 3 wk | Generated settings editor (`$ES`/`$EG`/`$SED`), offsets, tool table, macros, keymap, profiles, backup | Configure the FlexiHAL machine end-to-end; settings round-trip; restore verified |
 | **M6 Probing + height map — v0.8** | 4 wk | Probe framework, Z/edge/center/rotation/tool-length/XY plate, height map, compensation | Golden tests per cycle; hardware sign-off; safe-Z and probe interlocks proven |
 | **M7 3D, utilities, release — v1.0** | 4 wk | 3D viewer, surfacing/squaring/calibration, i18n, installers, first-run wizard, docs | P2 audit signed off; installers on 3 OSes; safety onboarding complete |
 
@@ -171,8 +191,9 @@ Total to v1.0: **~5.5–7 months** for one focused developer with AI assistance 
 the machine available. The critical path is hardware validation of streaming,
 probing, and spindle control, not code volume.
 
-Post-v1.0 candidates, only if needed: gamepad, keypad/pendant integration,
-camera, ATC, SD card, Workbench polish, 4th axis.
+Post-v1.0, capability-gated: SD card/YModem, ATC, MPG/pendant, multi-spindle,
+extra-axis UI, gamepad, Workbench polish. Protocol parsing for these lands in
+M1; only the UI is deferred.
 
 ## 8. Execution model with subagents
 

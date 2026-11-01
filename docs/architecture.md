@@ -10,10 +10,16 @@
    coolant, probing, and job control all pass through `ghs-engine`, which
    enforces machine-state and safety rules.
 4. **Capability-driven UI.** The controller's `$I+` response decides which
-   panels and controls exist.
-5. **Deterministic tests first.** The simulator and recorded sessions are the
+   panels and controls exist. Never hardcode the reference board's capability
+   set into the UI or protocol.
+5. **Protocol breadth, UI depth.** Parse the full grblHAL status, realtime,
+   system-command, and runtime-enumeration surface; ignore unknown extensions.
+   See [protocol.md](protocol.md).
+6. **Runtime enumerations over bundled tables.** Prefer `$EA`, `$EE`, `$ES`,
+   `$EG`, and `$SED`; bundled tables are fallbacks for older builds.
+7. **Deterministic tests first.** The simulator and recorded sessions are the
    primary test oracles; hardware is the final gate.
-6. **No async runtime.** Threads plus channels are enough for a 10–20 Hz control
+8. **No async runtime.** Threads plus channels are enough for a 10–20 Hz control
    loop and avoid competing with GPUI's executor.
 
 ## Crates
@@ -98,17 +104,26 @@ Rules:
 
 ## Protocol and streaming
 
-Handshake:
+Handshake (do not assume a banner or a DTR reset):
 
-1. Open the port with the configured baud rate (default 115200), 8N1.
-2. Optionally toggle DTR to reset 8-bit boards (setting; default off for the
-   STM32F446).
-3. Drain the banner until `\r\n` or `Grbl ...`/`grblHAL ...` is seen, with a
-   2 s timeout.
-4. Send a soft reset (`0x18`) if configured, then wait for the banner.
-5. Query `$I+`, `$$`, `$#`, `$G`, and `$SED`/`$HELP` as needed.
-6. Disable controller auto-reporting if enabled (grblHAL setting `$481`).
-7. Start status polling.
+1. Open the port at the configured baud rate (default 115200), 8N1; apply
+   DTR/RTS/flow control.
+2. Listen for 400–500 ms. If a status report with `|MPG:1` arrives, a
+   pendant/secondary sender is in control: stay passive and wait for
+   `|MPG:0`.
+3. Request a full status report (`0x87`; `0x80` when `RT+`, otherwise `?`) and
+   wait up to ~250 ms. This confirms an extended grblHAL controller without
+   relying on the banner.
+4. If the report is `Alarm:<n>`, treat critical alarms (1, 2, 10, 17, 20) as
+   locked: no motion or configuration until the condition clears and the user
+   unlocks/homes/resets.
+5. Query `$I+` for axes, options, signals, buffers, driver, board, plugins, and
+   tool-table entries.
+6. With `ENUMS`, fetch `$EA` (alarms), `$EE` (errors), `$ES` (settings), and
+   `$EG` (groups). With `SED`, fetch `$SED=<n>` descriptions. Fall back to
+   `$$`/bundled tables only when needed.
+7. Disable controller auto-reporting if enabled (`$481` or `0x8C`).
+8. Start status polling.
 
 Status polling is adaptive: 10 Hz while running/jogging, 2 Hz when idle. A full
 report (`0x87`) is requested after connect, after alarm/unlock, and every few
@@ -125,10 +140,16 @@ Streamer:
 - One `ok`/`error` acknowledges one line. Messages and status reports can be
   interleaved and must not disturb accounting.
 - Real-time bytes are sent out-of-band and never count against the buffer.
-- The build advertises `RT+`, so top-bit-set variants are available; the session
-  negotiates this and uses the safest form the controller supports.
-- Pause sends `!`; resume sends `~`; jog cancel sends `0x85`; reset sends
-  `0x18`. The streamer freezes while paused and tracks in-flight lines.
+- The build advertises `RT+`: use the fixed extended codes `0x80` (status),
+  `0x81` (cycle start), and `0x82` (feed hold), plus the additional `0x83`–
+  `0xA4` commands where applicable. These are not a bitwise OR of printable
+  ASCII.
+- Pause sends `0x82`; resume sends `0x81`; jog cancel sends `0x85`; reset sends
+  `0x18`; stop sends `0x19`; soft E-stop sends `0x9F`. The streamer freezes
+  while paused and tracks in-flight lines.
+- On `error:<n>`, grblHAL keeps the error active until a reset, empty line, or
+  `$` command clears it. The job runner stops, clears, and requires a decision
+  before resuming.
 
 Job runner responsibilities:
 
@@ -139,6 +160,18 @@ Job runner responsibilities:
 - Stop at `M0`, `M1`, optional stop, single-block, breakpoints, and manual `M6`.
 - Capture `PRB` results for probing and `[MSG:...]` for the console.
 - Support start-from-line and run-to-line with explicit confirmations.
+
+### Tool change and MPG
+
+- On `M6`, the controller enters `Tool` state. The engine pauses the streamer,
+  emits a tool-change event, and waits for the UI. After the user acknowledges,
+  the engine sends `0xA3`; jogging, `$` commands, and tool-length offsets are
+  allowed while pending. Cycle start resumes the saved program.
+- When a status report contains `|MPG:1`, a pendant has taken over the input
+  stream. The engine disables motion commands from the app, keeps telemetry
+  live, and waits for `|MPG:0` before restoring control.
+- These are protocol-level features even when the reference board does not use
+  them; the UI is capability-gated.
 
 ## Domain model
 
@@ -151,8 +184,9 @@ Job runner responsibilities:
   timestamp.
 - `Capabilities` is parsed from `$I+` and drives UI visibility: axes, options,
   signals, AUX IO, plugins, buffer sizes, tool-table entries.
-- Settings are `BTreeMap<u16, Setting>` with a typed value and optional
-  description/group from `$SED`/`$HELP`; a bundled fallback covers gaps.
+- Settings are a `BTreeMap<u16, Setting>` with a typed value and metadata from
+  `$ES`/`$EG`/`$SED`; a bundled fallback covers controllers without runtime
+  enumeration. The settings UI is generated from the metadata, never hardcoded.
 
 ## Safety gateway
 
@@ -215,8 +249,10 @@ Hard rules:
 
 - `ghs-proto` unit and golden tests; property tests for buffer accounting and
   malformed input.
-- `ghs-sim` scenario tests for handshake, alarms, tool change, probing,
-  overrides, disconnect, and reconnect.
+- `ghs-sim` scenario tests for handshake, MPG takeover, alarms, tool change,
+  probing, overrides, disconnect, and reconnect. Two profiles: `flexihal` and
+  `generic-full` (more axes, SD, ATC, MPG, multi-spindle) to prove capability
+  gating.
 - Recorded real sessions replayed through the same parser.
 - `ghs-gcode` golden toolpaths, differential tests against hand-computed
   geometry, and fuzzing.
@@ -225,6 +261,8 @@ Hard rules:
 
 ## Explicit non-goals
 
-Legacy Grbl, network transports, lathe, plasma THC, drag knife, SD/YModem, ATC,
-MPG, camera, and rotary/4th-axis UI. The domain model leaves room for more axes
-and capabilities, but no UI or protocol work is done for them before v1.0.
+Legacy Grbl, network transports, lathe, plasma THC, drag knife, and camera.
+SD/YModem, ATC, MPG, multi-spindle, and extra-axis *UI* are post-v1.0, but their
+protocol fields and capabilities are parsed and modeled from M1. The domain
+model leaves room for more axes and capabilities; no board-specific assumption
+is allowed.
