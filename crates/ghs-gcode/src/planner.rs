@@ -948,7 +948,11 @@ impl Planner<'_> {
                     self.plan_machine_line(draft, block, motion, fallback)?;
                 } else if block.has_axis_words() {
                     self.plan_work_line(draft, block, motion, fallback)?;
-                } else if motion.is_probe() {
+                } else if motion.is_probe() && motion_g.is_some() {
+                    // A bare `G38.2` selects a probe move and needs an axis.
+                    // Without a motion word this block only changes modal
+                    // state (for example `G91`), so the modal probe must not
+                    // execute or fail here.
                     return Err(self.error(
                         fallback,
                         ParseErrorKind::MissingParameter,

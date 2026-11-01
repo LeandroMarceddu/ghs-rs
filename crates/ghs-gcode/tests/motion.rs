@@ -282,6 +282,21 @@ fn probing_moves_are_marked_and_not_cutting() {
 }
 
 #[test]
+fn a_modal_word_after_a_probe_move_is_not_a_probe() {
+    // `G91` changes the distance mode; it must not be treated as a probe move
+    // just because `G38.2` is the modal motion.
+    let program = parse_program("G0 Z0\nG38.2 Z-5 F50\nG91\nG0 Z2\nG90\n").expect("valid");
+    let segments = program.toolpath.segments();
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[1].kind, SegmentKind::Rapid);
+    assert!((segments[1].end.z - segments[1].start.z - 2.0).abs() < 1.0e-6);
+
+    // A probe code without an axis is still rejected.
+    let errors = parse_program("G38.2 F50\n").expect_err("probe without axes");
+    assert_eq!(errors[0].kind, ParseErrorKind::MissingParameter);
+}
+
+#[test]
 fn g40_g61_and_g64_are_accepted() {
     let program = parse_program("G40\nG61\nG64\n").expect("valid");
     assert_eq!(
