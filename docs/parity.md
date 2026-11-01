@@ -27,9 +27,9 @@ documented, and is localized.
 | Program UI | Implemented (M3) | real parsed list, progress/current line, job controls, tool-change sheet |
 | Viewer UI | Implemented (M4) | real toolpath, camera, marker, pan/zoom; 31 app tests |
 | Settings UI | Implemented (M5) | generated from `$ES`/`$EG`; verified writes |
-| Offsets/tools | In progress | M5 app pass running |
-| Probing | Foundation in progress | `ghs-probe` plans/math; UI/engine correlation next |
-| Config/backup | Implemented (M5) | `ghs-config`, 51 tests; UI wiring partial |
+| Offsets/tools | Implemented (M5) | live `$#`, G10 L20 edits, app-side persisted tool table |
+| Probing | Plans done, UI in progress | `ghs-probe` 76 tests; Probe mode agent running |
+| Config/backup | Implemented (M5) | app/controller profiles, atomic saves, backup bundles |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
 
 Rows below are the feature-level checklist. A protocol/simulator row can be
