@@ -2390,11 +2390,9 @@ impl EngineRuntime {
         self.next_full_at = deadline(now, self.config.full_status_interval);
 
         let info = Arc::new(self.info.clone());
-        let settings = Arc::new(self.build_settings());
         let alarms = Arc::new(self.alarm_codes.clone());
         let errors = Arc::new(self.error_codes.clone());
         self.shared.set_info(Some(Arc::clone(&info)));
-        self.shared.set_settings(Arc::clone(&settings));
         self.shared
             .set_code_tables(Arc::clone(&alarms), Arc::clone(&errors));
         self.publish_offsets();
@@ -2403,7 +2401,9 @@ impl EngineRuntime {
 
         self.emit(EngineEvent::Connected);
         self.emit(EngineEvent::ControllerInfo(info));
-        self.emit(EngineEvent::Settings(settings));
+        // Publish values together with the `$ES`/`$EG` metadata recorded
+        // during discovery; the settings UI needs both in one ready event.
+        self.publish_settings(true);
         self.emit(EngineEvent::CodeTables { alarms, errors });
         self.log_info("Controller ready; status polling active");
     }

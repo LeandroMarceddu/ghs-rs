@@ -49,6 +49,14 @@ fn connects_to_the_simulator_and_runs_mdi() {
     assert_eq!(info.axes.to_string(), "XYZ");
     assert_eq!(info.rx_buffer_size, Some(1024));
     assert_eq!(info.planner_blocks, Some(64));
+    assert!(
+        !engine.setting_descriptions().is_empty(),
+        "setting metadata must be published at the end of discovery"
+    );
+    assert!(
+        !engine.setting_groups().is_empty(),
+        "setting groups must be published at the end of discovery"
+    );
 
     engine
         .send(Command::Mdi("G0 X1".into()))
