@@ -633,8 +633,8 @@ impl AppState {
     ///
     /// The first snapshot replaces every value below; clearing the seeded mock
     /// console makes the controller handshake and real acknowledgements the
-    /// only console history.
-    pub fn begin_live(&mut self) {
+    /// only console history. `message` names the transport that is opening.
+    pub fn begin_live(&mut self, message: impl Into<String>) {
         self.live = true;
         self.connection = ConnectionState::Connecting;
         self.profile = Profile::live_pending();
@@ -664,10 +664,7 @@ impl AppState {
         self.feed_rate = 0;
         self.signals.clear();
         self.signal_caps.clear();
-        self.push_console(
-            ConsoleLevel::Info,
-            "Starting in-process FlexiHal demo controller",
-        );
+        self.push_console(ConsoleLevel::Info, message);
     }
 
     /// Rebuild capabilities and axis rows from the engine's `$I+` record.
@@ -1197,7 +1194,7 @@ mod tests {
     fn live_telemetry_maps_to_the_touch_view_model() {
         let info = parse_controller_info(FLEXIHAL);
         let mut state = AppState::new();
-        state.begin_live();
+        state.begin_live("test transport");
         state.apply_controller_info(&info);
 
         assert_eq!(state.axes().len(), 3);

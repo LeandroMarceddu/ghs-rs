@@ -1,24 +1,51 @@
-//! Live engine link for demo mode.
+//! Live engine link for demo and serial transports.
 //!
 //! One engine thread owns the transport. This module owns the engine handle,
-//! keeps the simulator session alive, drains events without blocking, and maps
-//! telemetry into [`AppState`]. It never writes controller bytes: every action
-//! is a typed [`Command`] through the engine's safety gateway.
+//! keeps a simulator session alive in demo mode, drains events without
+//! blocking, and maps telemetry into [`AppState`]. It never writes controller
+//! bytes: every action is a typed [`Command`] through the engine's safety
+//! gateway.
+//!
+//! [`LinkMode`] records what the current (or last requested) session is. Demo
+//! sessions hold a [`SimSession`]; serial sessions hold only the configuration
+//! that was handed to the engine.
 
 use std::sync::Arc;
 
 use ghs_demo::{SimProfile, SimSession};
 use ghs_engine::{
     Command, ConnectTarget, ControllerInfo, Engine, EngineConfig, EngineError, EngineEvent,
-    EngineHandle, LogLevel, MachineSnapshot, StatusReport,
+    EngineHandle, LogLevel, MachineSnapshot, SerialConfig, StatusReport,
 };
 
 use crate::state::{AppState, ConnectionState, ConsoleLevel, Units};
 
-/// One live engine plus the in-process simulator feeding it.
+/// Transport used by a live session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkMode {
+    /// In-process FlexiHAL simulator over the loopback transport.
+    Demo,
+    /// A real serial port opened by the engine.
+    Serial(SerialConfig),
+}
+
+impl LinkMode {
+    /// Short name for the connection dialog and console.
+    pub fn describe(&self) -> String {
+        match self {
+            LinkMode::Demo => "Demo - FlexiHAL loopback".to_string(),
+            LinkMode::Serial(config) => {
+                format!("{} at {} baud, 8N1", config.port, config.baud)
+            }
+        }
+    }
+}
+
+/// One live engine plus the optional in-process simulator feeding it.
 pub struct LiveLink {
     engine: EngineHandle,
     sim: Option<SimSession>,
+    mode: Option<LinkMode>,
     last_info: Option<Arc<ControllerInfo>>,
     last_snapshot: Option<Arc<MachineSnapshot>>,
     last_status: Option<Arc<StatusReport>>,
@@ -27,39 +54,76 @@ pub struct LiveLink {
 impl LiveLink {
     /// Spawn an engine and connect it to a fresh FlexiHal demo simulator.
     pub fn start_demo() -> Result<Self, String> {
+        Self::start(LinkMode::Demo)
+    }
+
+    /// Spawn an engine and open a serial port.
+    ///
+    /// The engine validates the configuration and blocks until the port is
+    /// open; the handshake then continues asynchronously through [`Self::poll`].
+    pub fn start_serial(config: SerialConfig) -> Result<Self, String> {
+        Self::start(LinkMode::Serial(config))
+    }
+
+    fn start(mode: LinkMode) -> Result<Self, String> {
         let engine = Engine::spawn(EngineConfig::default()).map_err(|error| error.to_string())?;
         let mut link = Self {
             engine,
             sim: None,
+            mode: None,
             last_info: None,
             last_snapshot: None,
             last_status: None,
         };
-        link.connect_demo()?;
+        link.connect(mode)?;
         Ok(link)
     }
 
-    /// Start a fresh simulator and reconnect the existing engine to it.
+    /// Connect the existing engine to a fresh FlexiHAL simulator.
     ///
     /// The previous loopback endpoint is closed by the engine during
     /// disconnect, so demo reconnect always creates a new simulator session.
     pub fn connect_demo(&mut self) -> Result<(), String> {
-        if let Some(mut sim) = self.sim.take() {
-            sim.stop();
+        self.connect(LinkMode::Demo)
+    }
+
+    /// Connect the existing engine to a serial port.
+    ///
+    /// Any demo simulator is stopped first. On failure the engine stays
+    /// disconnected and the error text is returned for the dialog.
+    pub fn connect_serial(&mut self, config: SerialConfig) -> Result<(), String> {
+        self.connect(LinkMode::Serial(config))
+    }
+
+    /// Open the requested transport. The engine must not already be connected;
+    /// the shell presents Disconnect before Connect for that case.
+    fn connect(&mut self, mode: LinkMode) -> Result<(), String> {
+        if self.engine.is_connected() {
+            return Err("disconnect the current link first".to_string());
         }
+        self.stop_sim();
         self.drain_events();
-        let (endpoint, sim) = ghs_demo::start(SimProfile::FlexiHal).map_err(|e| e.to_string())?;
-        self.sim = Some(sim);
         self.reset_cache();
-        if let Err(error) = self
-            .engine
-            .connect(ConnectTarget::Transport(Box::new(endpoint)))
-        {
-            if let Some(mut sim) = self.sim.take() {
-                sim.stop();
+        match &mode {
+            LinkMode::Demo => {
+                let (endpoint, sim) =
+                    ghs_demo::start(SimProfile::FlexiHal).map_err(|e| e.to_string())?;
+                self.sim = Some(sim);
+                if let Err(error) = self
+                    .engine
+                    .connect(ConnectTarget::Transport(Box::new(endpoint)))
+                {
+                    self.stop_sim();
+                    return Err(error.to_string());
+                }
             }
-            return Err(error.to_string());
+            LinkMode::Serial(config) => {
+                if let Err(error) = self.engine.connect(ConnectTarget::Serial(config.clone())) {
+                    return Err(error.to_string());
+                }
+            }
         }
+        self.mode = Some(mode);
         Ok(())
     }
 
@@ -72,9 +136,25 @@ impl LiveLink {
         while self.engine.events().try_recv().is_ok() {}
     }
 
+    fn stop_sim(&mut self) {
+        if let Some(mut sim) = self.sim.take() {
+            sim.stop();
+        }
+    }
+
     /// Close the transport. The engine thread stays alive for a reconnect.
     pub fn disconnect(&self) {
         self.engine.disconnect();
+    }
+
+    /// True while a transport is open, including during the handshake.
+    pub fn is_connected(&self) -> bool {
+        self.engine.is_connected()
+    }
+
+    /// Transport requested for the current session, if one was opened.
+    pub fn mode(&self) -> Option<&LinkMode> {
+        self.mode.as_ref()
     }
 
     /// Send one typed command through the engine gateway.
@@ -286,6 +366,7 @@ mod tests {
     #[test]
     fn demo_link_connects_sends_mdi_and_reconnects() {
         let mut link = LiveLink::start_demo().expect("start demo engine");
+        assert_eq!(link.mode(), Some(&LinkMode::Demo));
         assert!(
             wait_until(|| link.engine.is_ready(), Duration::from_secs(5)),
             "demo handshake did not complete"
@@ -324,5 +405,78 @@ mod tests {
             "reconnect handshake did not complete"
         );
         link.disconnect();
+    }
+
+    #[test]
+    fn a_rejected_serial_config_leaves_demo_reconnect_available() {
+        let mut link = LiveLink::start_demo().expect("start demo engine");
+        assert!(
+            wait_until(|| link.engine.is_ready(), Duration::from_secs(5)),
+            "demo handshake did not complete"
+        );
+        link.disconnect();
+        assert!(
+            wait_until(|| !link.engine.is_connected(), Duration::from_secs(2)),
+            "disconnect did not close the link"
+        );
+
+        // An empty port name fails validation before any hardware is touched.
+        let error = link
+            .connect_serial(SerialConfig::new(""))
+            .expect_err("an empty port must be rejected");
+        assert!(!error.is_empty());
+        assert!(!link.engine.is_connected());
+        assert!(link.sim.is_none(), "a serial attempt drops the simulator");
+
+        link.connect_demo()
+            .expect("demo reconnect after a bad config");
+        assert!(
+            wait_until(|| link.engine.is_ready(), Duration::from_secs(5)),
+            "demo handshake after a rejected config did not complete"
+        );
+        link.disconnect();
+    }
+
+    #[test]
+    fn a_missing_serial_port_reports_an_error_and_stays_disconnected() {
+        let mut link = LiveLink::start_demo().expect("start demo engine");
+        assert!(
+            wait_until(|| link.engine.is_ready(), Duration::from_secs(5)),
+            "demo handshake did not complete"
+        );
+        link.disconnect();
+        assert!(
+            wait_until(|| !link.engine.is_connected(), Duration::from_secs(2)),
+            "disconnect did not close the link"
+        );
+
+        // No hardware is opened: the path does not exist, so the engine must
+        // return an error and leave the session disconnected.
+        let error = link
+            .connect_serial(SerialConfig::new("/dev/ghs-rs-missing-tty"))
+            .expect_err("a missing serial port must fail");
+        assert!(!error.is_empty());
+        assert!(!link.engine.is_connected());
+
+        link.connect_demo()
+            .expect("demo reconnect after a failed port");
+        assert!(
+            wait_until(|| link.engine.is_ready(), Duration::from_secs(5)),
+            "demo handshake after a failed serial port did not complete"
+        );
+        link.disconnect();
+    }
+
+    #[test]
+    fn mode_descriptions_name_the_transport() {
+        assert!(LinkMode::Demo.describe().contains("FlexiHAL"));
+        let config = SerialConfig {
+            baud: 250_000,
+            ..SerialConfig::new("/dev/ttyACM0")
+        };
+        let description = LinkMode::Serial(config).describe();
+        assert!(description.contains("/dev/ttyACM0"));
+        assert!(description.contains("250000"));
+        assert!(description.contains("8N1"));
     }
 }

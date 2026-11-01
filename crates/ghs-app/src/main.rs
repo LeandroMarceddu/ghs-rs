@@ -6,10 +6,11 @@
 //! only sends typed engine commands; it never writes controller bytes.
 //!
 //! Demo flags: `--mock` keeps the original mock-state shell for design review,
-//! `--light` starts in the light theme, and `--keypad` opens the X keypad at
-//! startup. `--size WxH` (or `--size=WxH`) opens at an explicit logical size for
-//! layout review, e.g. `--size 1920x1080` or `--size 1080x1920`;
-//! `--fullscreen` pins the shell to the current output.
+//! `--light` starts in the light theme, `--keypad` opens the X keypad at
+//! startup, and `--connection-panel` (or `--connection-panel=serial`) opens
+//! the transport picker. `--size WxH` (or `--size=WxH`) opens at an explicit
+//! logical size for layout review, e.g. `--size 1920x1080` or
+//! `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
 //!
 //! Window policy:
 //! - 1280x800 default (UX-01), 1920x1080 works by widening the centre column.
@@ -17,6 +18,7 @@
 //! - Resizable, so a developer can drag it to portrait and inspect the reflow
 //!   plan documented at the top of `shell.rs`.
 
+mod connection;
 mod keypad;
 mod live;
 mod shell;

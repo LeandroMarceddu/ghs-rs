@@ -29,8 +29,11 @@
 //! - Every panel keeps its 48 px targets in portrait; the dock scrolls rather
 //!   than shrinking controls.
 
+use std::time::Duration;
+
 use ghs_engine::{
-    Axes, Axis as CoreAxis, Command, JogCommand, MachineState, Position, RealtimeCommand,
+    Axes, Axis as CoreAxis, Command, EngineError, JogCommand, MachineState, Position,
+    RealtimeCommand, SerialConfig,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -41,12 +44,13 @@ use gpui_kit::component::{Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
+    IntoElement, MouseButton, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 
+use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::keypad;
-use crate::live::LiveLink;
+use crate::live::{LinkMode, LiveLink};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, KeypadAction, KeypadTarget, LeftTab, Mode,
     ProgramKind, SignalState,
@@ -60,6 +64,21 @@ const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
 const ROW_H: f32 = 112.0;
 /// Gap between cards and between columns.
 const GAP: f32 = 12.0;
+/// How often a held continuous jog re-issues its step.
+const JOG_REPEAT: Duration = Duration::from_millis(120);
+
+/// One press-and-hold jog gesture.
+#[derive(Clone, Copy, Debug)]
+struct JogHold {
+    sign: f64,
+    continuous: bool,
+    started: std::time::Instant,
+}
+
+/// A release earlier than this is a click, not a hold: keep the one-step jog
+/// instead of cancelling it. This also keeps a touch tap working, because GPUI
+/// delivers a touch tap's mouse down and up together.
+const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
 
 pub struct Shell {
     pub state: AppState,
@@ -67,6 +86,11 @@ pub struct Shell {
     spindle_slider: Entity<SliderState>,
     mono: SharedString,
     link: Option<LiveLink>,
+    panel: ConnectionPanel,
+    panel_scroll: ScrollHandle,
+    jog_hold: Option<JogHold>,
+    jog_generation: u64,
+    jog_task: Option<Task<()>>,
     feed_slider_active: bool,
     spindle_slider_active: bool,
     console_scroll: ScrollHandle,
@@ -146,6 +170,11 @@ impl Shell {
             spindle_slider,
             mono,
             link: None,
+            panel: ConnectionPanel::new(),
+            panel_scroll: ScrollHandle::new(),
+            jog_hold: None,
+            jog_generation: 0,
+            jog_task: None,
             feed_slider_active: false,
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
@@ -154,6 +183,12 @@ impl Shell {
         };
         if !mock {
             shell.connect_demo(cx);
+        }
+        if let Some(value) = connection_panel_arg() {
+            if value == "serial" {
+                shell.panel.select_transport(TransportChoice::Serial);
+            }
+            shell.open_connection(cx);
         }
         shell._poll_task = Some(shell.spawn_poll(cx));
         shell
@@ -173,12 +208,21 @@ impl Shell {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
-        let Some(link) = self.link.as_mut() else {
-            return;
-        };
-        let before = self.state.console.len();
-        if link.poll(&mut self.state) {
-            if self.state.console.len() != before {
+        let console_before = self.state.console.len();
+        let mut changed = false;
+        if let Some(link) = self.link.as_mut() {
+            changed |= link.poll(&mut self.state);
+        }
+        // A transport drop, alarm or mode change must not leave a jog running.
+        if self.jog_hold.is_some() && !self.jog_allowed() {
+            self.end_jog(cx);
+            changed = true;
+        }
+        if self.panel.poll() {
+            changed = true;
+        }
+        if changed {
+            if self.state.console.len() != console_before {
                 self.console_scroll.scroll_to_bottom();
             }
             cx.notify();
@@ -187,8 +231,53 @@ impl Shell {
 
     // ------------------------------------------------------- connection/link
 
+    /// Open the transport picker from the status pill or the CONNECT button.
+    fn open_connection(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.panel.open();
+        cx.notify();
+    }
+
+    fn close_connection(&mut self, cx: &mut Context<Self>) {
+        self.panel.close();
+        cx.notify();
+    }
+
+    /// Connect the transport selected in the dialog.
+    fn connect_selected(&mut self, cx: &mut Context<Self>) {
+        if self.link.as_ref().is_some_and(|link| link.is_connected()) {
+            self.panel.error = Some("disconnect the current link first".to_string());
+            cx.notify();
+            return;
+        }
+        match self.panel.transport {
+            TransportChoice::Demo => self.connect_demo(cx),
+            TransportChoice::Serial => {
+                let Some(config) = self.panel.selected_config() else {
+                    self.panel.error = Some("select a serial port before connecting".to_string());
+                    cx.notify();
+                    return;
+                };
+                self.connect_serial(config, cx);
+            }
+        }
+    }
+
+    /// Name of the current transport, for the connection dialog.
+    fn connection_name(&self) -> String {
+        if !matches!(
+            self.state.connection,
+            ConnectionState::Connecting | ConnectionState::Ready
+        ) {
+            return "Not connected".to_string();
+        }
+        self.link
+            .as_ref()
+            .and_then(LiveLink::mode)
+            .map_or_else(|| "Not connected".to_string(), LinkMode::describe)
+    }
+
     fn connect_demo(&mut self, cx: &mut Context<Self>) {
-        self.state.begin_live();
         let result = if let Some(link) = self.link.as_mut() {
             link.connect_demo()
         } else {
@@ -200,15 +289,53 @@ impl Shell {
                 Err(error) => Err(error),
             }
         };
-        if let Err(error) = result {
-            self.state.connection = ConnectionState::Failed(error.clone());
-            self.state
-                .push_console(ConsoleLevel::Error, format!("Connect failed: {error}"));
+        match result {
+            Ok(()) => {
+                self.state
+                    .begin_live("Starting in-process FlexiHAL demo controller");
+                self.panel.error = None;
+            }
+            Err(error) => self.report_connect_failure(error),
         }
         cx.notify();
     }
 
+    fn connect_serial(&mut self, config: SerialConfig, cx: &mut Context<Self>) {
+        let result = if let Some(link) = self.link.as_mut() {
+            link.connect_serial(config.clone())
+        } else {
+            match LiveLink::start_serial(config.clone()) {
+                Ok(link) => {
+                    self.link = Some(link);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.state.begin_live(format!(
+                    "Opening {} at {} baud, 8N1 (line control off)",
+                    config.port, config.baud
+                ));
+                self.panel.error = None;
+            }
+            Err(error) => self.report_connect_failure(error),
+        }
+        cx.notify();
+    }
+
+    /// Keep the last snapshot on screen; mark the connection failed and show
+    /// the engine text in both the dialog and the console.
+    fn report_connect_failure(&mut self, error: String) {
+        self.state.connection = ConnectionState::Failed(error.clone());
+        self.state
+            .push_console(ConsoleLevel::Error, format!("Connect failed: {error}"));
+        self.panel.error = Some(error);
+    }
+
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.end_jog(cx);
         if let Some(link) = &self.link {
             link.disconnect();
         }
@@ -217,18 +344,26 @@ impl Shell {
             ConsoleLevel::Warn,
             "Disconnect requested; the last telemetry is stale",
         );
+        self.panel.error = None;
         cx.notify();
     }
 
+    fn send_command_quiet(&mut self, command: Command) -> Result<(), EngineError> {
+        match self.link.as_ref() {
+            Some(link) => link.send(command),
+            None => Err(EngineError::NotConnected),
+        }
+    }
+
     fn send_command(&mut self, command: Command) -> bool {
-        let Some(link) = &self.link else {
+        if self.link.is_none() {
             self.state.push_console(
                 ConsoleLevel::Warn,
                 "No engine connection; command was not sent",
             );
             return false;
-        };
-        match link.send(command) {
+        }
+        match self.send_command_quiet(command) {
             Ok(()) => true,
             Err(error) => {
                 self.state
@@ -250,6 +385,11 @@ impl Shell {
 
     fn ready(&self) -> bool {
         self.state.connection.is_ready_like()
+    }
+
+    /// Live data on screen that no longer comes from a ready controller.
+    fn stale(&self) -> bool {
+        self.state.live && !self.ready()
     }
 
     fn locked(&self) -> bool {
@@ -311,18 +451,61 @@ impl Shell {
         cx.notify();
     }
 
-    fn jog(&mut self, sign: f64, cx: &mut Context<Self>) {
+    /// Press half of a jog gesture.
+    ///
+    /// A step jog sends one command. A continuous jog sends one command on
+    /// press and re-issues it at [`JOG_REPEAT`] while the pointer stays down;
+    /// a release after [`JOG_CANCEL_AFTER`] sends `JogCancel` (0x85) so the
+    /// controller stops at once.
+    fn jog_press(&mut self, sign: f64, cx: &mut Context<Self>) {
+        if !self.jog_allowed() {
+            return;
+        }
         if !self.state.live {
             self.state.jog(sign);
             cx.notify();
             return;
         }
+        self.jog_generation = self.jog_generation.wrapping_add(1);
+        let generation = self.jog_generation;
+        let continuous = self.state.continuous;
+        self.jog_hold = Some(JogHold {
+            sign,
+            continuous,
+            started: std::time::Instant::now(),
+        });
+        self.send_jog(sign, false);
+        if continuous {
+            self.spawn_jog_repeat(generation, cx);
+        }
+        cx.notify();
+    }
+
+    /// Release half of a jog gesture: stop the repeat loop and cancel motion
+    /// after a genuine hold. A quick click keeps its one step.
+    fn end_jog(&mut self, cx: &mut Context<Self>) {
+        let Some(hold) = self.jog_hold.take() else {
+            return;
+        };
+        // The repeat task observes the generation and exits on its next tick;
+        // dropping a task from inside its own callback would be unsafe.
+        self.jog_generation = self.jog_generation.wrapping_add(1);
+        if hold.continuous && hold.started.elapsed() >= JOG_CANCEL_AFTER && self.state.live {
+            let _ = self.send_command_quiet(Command::Realtime(RealtimeCommand::JogCancel));
+        }
+        cx.notify();
+    }
+
+    /// Build and send one relative jog.
+    ///
+    /// `quiet_busy` keeps the repeat loop from filling the console while the
+    /// controller is still executing the previous step.
+    fn send_jog(&mut self, sign: f64, quiet_busy: bool) -> bool {
         let axis = self.state.jog_axis;
         let Some(core_axis) = CoreAxis::from_index(axis.index()) else {
             self.state
                 .push_console(ConsoleLevel::Warn, "Selected axis is not reported");
-            cx.notify();
-            return;
+            return false;
         };
         let distance = sign * self.state.jog_step;
         let mut position = Position::new(Axes::from(core_axis));
@@ -333,15 +516,50 @@ impl Shell {
             // Idle reports FS:0,0; a jog still needs a positive feed.
             1_000.0
         };
-        match JogCommand::incremental(position, feed) {
-            Ok(jog) => {
-                self.send_command(Command::Jog(jog));
+        let jog = match JogCommand::incremental(position, feed) {
+            Ok(jog) => jog,
+            Err(error) => {
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("Jog: {error}"));
+                return false;
             }
-            Err(error) => self
-                .state
-                .push_console(ConsoleLevel::Error, format!("Jog: {error}")),
+        };
+        match self.send_command_quiet(Command::Jog(jog)) {
+            Ok(()) => true,
+            Err(EngineError::Busy) if quiet_busy => false,
+            Err(error) => {
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("Jog: {error}"));
+                false
+            }
         }
-        cx.notify();
+    }
+
+    fn spawn_jog_repeat(&mut self, generation: u64, cx: &mut Context<Self>) {
+        self.jog_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(JOG_REPEAT).await;
+                let keep_going = weak
+                    .update(cx, |shell, cx| {
+                        if shell.jog_generation != generation {
+                            return false;
+                        }
+                        let Some(hold) = shell.jog_hold else {
+                            return false;
+                        };
+                        if !shell.jog_allowed() {
+                            shell.end_jog(cx);
+                            return false;
+                        }
+                        shell.send_jog(hold.sign, true);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 
     fn zero_axis(&mut self, axis: Axis, cx: &mut Context<Self>) {
@@ -583,6 +801,7 @@ impl Shell {
 
         let theme_view = view.clone();
         let link_view = view.clone();
+        let pill_view = view.clone();
         let reset_view = view.clone();
         let stop_view = view.clone();
 
@@ -593,8 +812,11 @@ impl Shell {
             ConnectionState::Disconnected => (p.danger, self.state.connection.label()),
             ConnectionState::Failed(_) => (p.danger, self.state.connection.label()),
         };
+        // "READY 3A" was ambiguous; say what the number counts, and keep the
+        // machine state one glance away. The pill is the connection entry
+        // point, so tapping it opens the transport picker.
         let status_text = format!(
-            "{} {}A | {}",
+            "{} | {} axes | {}",
             link_label,
             self.state.profile.capabilities.axes.len(),
             self.state.machine_state
@@ -640,6 +862,8 @@ impl Shell {
             .child(div().flex_1())
             .child(
                 h_flex()
+                    .id("link-pill")
+                    .cursor_pointer()
                     .items_center()
                     .gap_2()
                     .h(px(36.0))
@@ -648,6 +872,10 @@ impl Shell {
                     .bg(p.panel_alt)
                     .border_1()
                     .border_color(p.border)
+                    .hover(|style| style.bg(p.raised_hover))
+                    .on_click(move |_, _, cx| {
+                        pill_view.update(cx, |this, cx| this.open_connection(cx));
+                    })
                     .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(dot_color))
                     .child(
                         div()
@@ -687,7 +915,7 @@ impl Shell {
                             ) {
                                 this.disconnect(cx);
                             } else {
-                                this.connect_demo(cx);
+                                this.open_connection(cx);
                             }
                         });
                     }),
@@ -1651,6 +1879,7 @@ impl Shell {
             let value_view = view.clone();
             let zero_view = view.clone();
             let value = format!("{:>8.3}", self.state.value(axis));
+            let stale = self.stale();
             div()
                 .flex_1()
                 .min_w(px(0.0))
@@ -1692,7 +1921,7 @@ impl Shell {
                                     .cursor_pointer()
                                     .font_family(self.mono.clone())
                                     .text_size(px(26.0))
-                                    .text_color(p.text)
+                                    .text_color(if stale { p.text_faint } else { p.text })
                                     .child(value)
                                     .on_click(move |_, _, cx| {
                                         value_view.update(cx, |this, cx| {
@@ -1738,7 +1967,13 @@ impl Shell {
                     .justify_between()
                     .h(px(20.0))
                     .child(section_label("DRO", p))
-                    .child(wcs_menu),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(self.stale(), |this| this.child(stale_badge(p)))
+                            .child(wcs_menu),
+                    ),
             )
             .child(h_flex().gap_2().flex_1().min_h(px(0.0)).children(tiles))
     }
@@ -1884,6 +2119,54 @@ impl Shell {
 
         let minus_view = view.clone();
         let plus_view = view.clone();
+        let minus_up = view.clone();
+        let plus_up = view.clone();
+        let allowed = self.jog_allowed();
+
+        // A Button component only exposes `on_click`, which cannot express
+        // press-and-hold. These are plain 64 px targets with mouse-down and
+        // mouse-up handlers; `on_mouse_up_out` covers a release outside the
+        // target so a continuous jog can never keep running.
+        let jog_button = |id: &'static str, label: &'static str, sign: f64| {
+            let press_view = if sign < 0.0 {
+                minus_view.clone()
+            } else {
+                plus_view.clone()
+            };
+            let release_view = if sign < 0.0 {
+                minus_up.clone()
+            } else {
+                plus_up.clone()
+            };
+            let release_out_view = release_view.clone();
+            div()
+                .id(id)
+                .h(px(64.0))
+                .w(px(64.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .border_1()
+                .border_color(p.border)
+                .bg(if allowed { p.raised } else { p.panel_alt })
+                .text_size(px(26.0))
+                .text_color(if allowed { p.text } else { p.text_faint })
+                .when(allowed, |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.bg(p.raised_hover))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            press_view.update(cx, |this, cx| this.jog_press(sign, cx));
+                        })
+                        .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                            release_view.update(cx, |this, cx| this.end_jog(cx));
+                        })
+                        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                            release_out_view.update(cx, |this, cx| this.end_jog(cx));
+                        })
+                })
+                .child(label)
+        };
 
         card(&p)
             .h(px(ROW_H))
@@ -1939,29 +2222,7 @@ impl Shell {
                     .flex_1()
                     .min_h(px(0.0))
                     .child(h_flex().gap_1().children(axes))
-                    .child(
-                        Button::new("jog-minus")
-                            .label("-")
-                            .h(px(64.0))
-                            .w(px(64.0))
-                            .rounded_lg()
-                            .text_size(px(26.0))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(p.raised)
-                                    .foreground(p.text)
-                                    .hover(p.raised_hover)
-                                    .active(p.accent_muted),
-                            )
-                            .border_1()
-                            .border_color(p.border)
-                            .disabled(!self.jog_allowed())
-                            .on_click(move |_, _, cx| {
-                                minus_view.update(cx, |this, cx| {
-                                    this.jog(-1.0, cx);
-                                });
-                            }),
-                    )
+                    .child(jog_button("jog-minus", "-", -1.0))
                     .child(
                         h_flex()
                             .gap_1()
@@ -1969,29 +2230,7 @@ impl Shell {
                             .min_w(px(0.0))
                             .children(step_labels),
                     )
-                    .child(
-                        Button::new("jog-plus")
-                            .label("+")
-                            .h(px(64.0))
-                            .w(px(64.0))
-                            .rounded_lg()
-                            .text_size(px(26.0))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(p.raised)
-                                    .foreground(p.text)
-                                    .hover(p.raised_hover)
-                                    .active(p.accent_muted),
-                            )
-                            .border_1()
-                            .border_color(p.border)
-                            .disabled(!self.jog_allowed())
-                            .on_click(move |_, _, cx| {
-                                plus_view.update(cx, |this, cx| {
-                                    this.jog(1.0, cx);
-                                });
-                            }),
-                    ),
+                    .child(jog_button("jog-plus", "+", 1.0)),
             )
     }
 
@@ -2141,6 +2380,417 @@ impl Shell {
             )
     }
 
+    // ------------------------------------------------------ connection panel
+
+    /// Transport picker overlay. It starts below the 56 px top bar so RESET
+    /// and STOP stay visible and reachable while a serial link is opening.
+    fn connection_overlay(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let connected = self.link.as_ref().is_some_and(LiveLink::is_connected)
+            || matches!(
+                self.state.connection,
+                ConnectionState::Connecting | ConnectionState::Ready
+            );
+        let error = self
+            .panel
+            .error
+            .clone()
+            .or_else(|| match &self.state.connection {
+                ConnectionState::Failed(reason) => Some(reason.clone()),
+                _ => None,
+            });
+
+        let body = match self.panel.transport {
+            TransportChoice::Demo => v_flex()
+                .gap_1()
+                .p_2()
+                .rounded(px(6.0))
+                .bg(p.panel_alt)
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(p.text_dim)
+                        .child("In-process FlexiHAL simulator over the loopback transport. No serial port is opened."),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.text_faint)
+                        .child("Same engine, handshake, streamer and safety gateway as a real controller."),
+                )
+                .into_any_element(),
+            TransportChoice::Serial => self.serial_picker(p, &view, cx).into_any_element(),
+        };
+
+        let transports = [TransportChoice::Demo, TransportChoice::Serial]
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let choice = *choice;
+                let active = self.panel.transport == choice;
+                let transport_view = view.clone();
+                Button::new(format!("transport-{index}"))
+                    .label(choice.label())
+                    .flex_1()
+                    .h(px(48.0))
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .custom(mode_variant(cx, p, active))
+                    .border_1()
+                    .border_color(if active { p.accent } else { p.border })
+                    .on_click(move |_, _, cx| {
+                        transport_view.update(cx, |this, cx| {
+                            this.panel.select_transport(choice);
+                            cx.notify();
+                        });
+                    })
+            });
+
+        let close_view = view.clone();
+        let scrim_view = view.clone();
+        let connect_view = view.clone();
+        let disconnect_view = view.clone();
+
+        let mut sheet = v_flex()
+            .w(px(520.0))
+            .max_w_full()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border_strong)
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child("CONNECTION"),
+                            )
+                            .child(chip(self.state.connection.label(), p)),
+                    )
+                    .child(
+                        Button::new("panel-close-x")
+                            .label("X")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(48.0))
+                            .rounded_lg()
+                            .text_size(px(13.0))
+                            .on_click(move |_, _, cx| {
+                                close_view.update(cx, |this, cx| this.close_connection(cx));
+                            }),
+                    ),
+            )
+            .child(section_label("TRANSPORT", p))
+            .child(h_flex().gap_2().children(transports))
+            .when(connected, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.text_faint)
+                        .child("Disconnect before switching transport."),
+                )
+            })
+            .child(body)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .h(px(20.0))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("CURRENT LINK"),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(p.text_dim)
+                            .child(self.connection_name()),
+                    ),
+            );
+
+        if let Some(error) = error {
+            sheet = sheet.child(
+                div()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.danger.opacity(0.14))
+                    .text_size(px(11.0))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+
+        let footer = h_flex()
+            .gap_2()
+            .child(
+                Button::new("panel-connect")
+                    .label("CONNECT")
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(140.0))
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .disabled(connected)
+                    .on_click(move |_, _, cx| {
+                        connect_view.update(cx, |this, cx| this.connect_selected(cx));
+                    }),
+            )
+            .child(
+                Button::new("panel-disconnect")
+                    .label("DISCONNECT")
+                    .warning()
+                    .h(px(48.0))
+                    .w(px(140.0))
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .disabled(!connected)
+                    .on_click(move |_, _, cx| {
+                        disconnect_view.update(cx, |this, cx| this.disconnect(cx));
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("panel-close")
+                    .label("CLOSE")
+                    .secondary()
+                    .h(px(48.0))
+                    .w(px(96.0))
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .on_click(move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_connection(cx));
+                    }),
+            );
+
+        sheet = sheet.child(footer);
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("connection-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let scrim_view = view.clone();
+                        scrim_view.update(cx, |this, cx| this.close_connection(cx));
+                    }),
+            )
+            .child(sheet)
+    }
+
+    /// Serial half of the connection dialog: port list, baud and line defaults.
+    fn serial_picker(&self, p: Palette, view: &Entity<Shell>, cx: &mut Context<Self>) -> Div {
+        let refresh_view = view.clone();
+        let mut rows = v_flex().w_full().gap_1();
+
+        if self.panel.ports.is_empty() {
+            rows = rows.child(
+                div()
+                    .w_full()
+                    .h(px(56.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .text_size(px(11.0))
+                    .text_color(p.text_faint)
+                    .child(
+                        self.panel
+                            .ports_error
+                            .clone()
+                            .unwrap_or_else(|| "No serial ports found".to_string()),
+                    ),
+            );
+        } else {
+            for (index, port) in self.panel.ports.iter().enumerate() {
+                let selected = self.panel.selected_port.as_deref() == Some(port.name.as_str());
+                let port_view = view.clone();
+                let name = port.name.clone();
+                let detail = port
+                    .description
+                    .clone()
+                    .or_else(|| port.manufacturer.clone())
+                    .unwrap_or_else(|| "serial port".to_string());
+                rows = rows.child(
+                    h_flex()
+                        .id(format!("port-{index}"))
+                        .w_full()
+                        .cursor_pointer()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .h(px(48.0))
+                        .px_2()
+                        .rounded(px(6.0))
+                        .bg(if selected {
+                            p.accent_muted
+                        } else {
+                            p.panel_alt
+                        })
+                        .border_1()
+                        .border_color(if selected { p.accent } else { p.border })
+                        .hover(|style| style.bg(p.raised_hover))
+                        .on_click(move |_, _, cx| {
+                            port_view.update(cx, |this, cx| {
+                                this.panel.select_port(name.clone());
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            v_flex()
+                                .min_w(px(0.0))
+                                .child(
+                                    div()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(13.0))
+                                        .text_color(if selected { p.accent } else { p.text })
+                                        .child(port.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_faint)
+                                        .child(detail),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .rounded(px(999.0))
+                                .bg(if selected { p.accent } else { p.border }),
+                        ),
+                );
+            }
+        }
+
+        // Three rows visible; more ports scroll. A fixed-height wrapper keeps
+        // the dialog compact on a 1280x800 panel with many USB adapters.
+        let list_height = if self.panel.ports.is_empty() {
+            56.0
+        } else {
+            let rows_visible = self.panel.ports.len().min(3) as f32;
+            rows_visible * 52.0 - 4.0
+        };
+        let port_list = div()
+            .id("port-list")
+            .w_full()
+            .h(px(list_height))
+            .flex_shrink_0()
+            .track_scroll(&self.panel_scroll)
+            .overflow_y_scroll()
+            .child(rows);
+
+        let baud = self.panel.baud;
+        let baud_view = view.clone();
+        let baud_menu = Button::new("baud-menu")
+            .label(format!("{baud} baud"))
+            .h(px(48.0))
+            .w(px(148.0))
+            .rounded(px(7.0))
+            .text_size(px(12.0))
+            .custom(mode_variant(cx, p, false))
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let mut menu = menu.min_w(px(170.0));
+                for rate in BAUD_RATES {
+                    let baud_view = baud_view.clone();
+                    menu = menu.item(PopupMenuItem::new(format!("{rate} baud")).on_click(
+                        move |_, _, cx| {
+                            baud_view.update(cx, |this, cx| {
+                                this.panel.set_baud(rate);
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+                menu
+            });
+
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label("SERIAL PORT", p))
+                    .child(
+                        Button::new("ports-refresh")
+                            .label("REFRESH")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(104.0))
+                            .rounded_lg()
+                            .text_size(px(12.0))
+                            .on_click(move |_, _, cx| {
+                                refresh_view.update(cx, |this, cx| {
+                                    this.panel.refresh();
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(port_list)
+            .when(
+                self.panel.selected_port.is_none() && !self.panel.ports.is_empty(),
+                |this| {
+                    this.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("Tap a port to select it; nothing opens until CONNECT."),
+                    )
+                },
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(baud_menu)
+                    .child(chip("8N1", p))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(self.panel.line_control_summary()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child("Line settings are fixed at 8 data bits, no parity, one stop bit. DTR reset pulses are not implemented in M2."),
+            )
+    }
+
     /// Three columns with shared row guides. The right column is dropped below
     /// 1120 px; a full portrait reflow is deferred to M7.
     fn workspace(
@@ -2206,8 +2856,27 @@ impl Render for Shell {
                 cx,
             ));
         }
+        if self.panel.open {
+            root = root.child(self.connection_overlay(p, cx));
+        }
         root
     }
+}
+
+/// Read the demo `--connection-panel[=serial]` switch.
+///
+/// A bare flag opens the dialog on the demo transport; `=serial` also selects
+/// the serial tab so a review capture can show the port list.
+fn connection_panel_arg() -> Option<String> {
+    for arg in std::env::args() {
+        if arg == "--connection-panel" {
+            return Some(String::new());
+        }
+        if let Some(value) = arg.strip_prefix("--connection-panel=") {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn mode_variant(cx: &App, p: Palette, active: bool) -> ButtonCustomVariant {
@@ -2275,6 +2944,23 @@ fn chip(text: &str, p: Palette) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(p.text_dim)
         .child(text.to_string())
+}
+
+/// Compact "the numbers below are not live" marker for the DRO header.
+fn stale_badge(p: Palette) -> Div {
+    div()
+        .px_1()
+        .h(px(16.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded(px(4.0))
+        .bg(p.danger.opacity(0.16))
+        .text_size(px(9.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(p.danger)
+        .child("STALE")
 }
 
 fn legend(color: Hsla, text: &'static str, p: Palette) -> Div {
