@@ -480,7 +480,7 @@ impl Parser {
                 next[u] = uv[0];
                 next[v] = uv[1];
                 next[normal] = normal_start + (normal_end - normal_start) * t;
-                if t1 >= 1.0 - 1.0e-12 {
+                if t >= 1.0 - 1.0e-12 {
                     next = end;
                 }
                 if distance(previous, next) <= 1.0e-12 {

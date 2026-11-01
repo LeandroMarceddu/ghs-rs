@@ -219,3 +219,32 @@ fn helical_full_circle_closes_and_has_exact_bounds() {
     assert!(close(first.start.x, last.end.x) && close(first.start.y, last.end.y));
     assert!(close(last.end.z, -2.0));
 }
+
+#[test]
+fn semicircle_second_half_is_tessellated() {
+    let program = parse_program("G0 X0 Y0\nG1 X40 F800\nG2 X40 Y40 I0 J20\n").expect("valid");
+    let arcs: Vec<_> = program
+        .toolpath
+        .segments()
+        .iter()
+        .filter(|segment| segment.kind == SegmentKind::Arc)
+        .collect();
+
+    assert!(
+        arcs.len() > 20,
+        "the second half collapsed to a chord: {} arc segments",
+        arcs.len()
+    );
+    assert!(
+        arcs.iter()
+            .all(|segment| segment.start.distance(segment.end) < 4.0),
+        "an arc chord is longer than the tessellation allows"
+    );
+    assert!(
+        arcs.iter()
+            .any(|segment| close(segment.end.x, 25.858) && close(segment.end.y, 34.142)),
+        "second-half midpoint is missing"
+    );
+    let last = arcs.last().expect("arc segments");
+    assert!(close(last.end.x, 40.0) && close(last.end.y, 40.0));
+}
