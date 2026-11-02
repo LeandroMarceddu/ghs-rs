@@ -1,0 +1,243 @@
+name: Release
+
+# Tag pushes and manual runs build the three desktop archives and attach them to
+# a DRAFT GitHub Release. Nothing is signed, notarized, or published
+# automatically; see docs/RELEASE.md for the checklist and the hardware gate.
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build, for example v0.1.0"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  prepare:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Validate release tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+(\.[0-9]+){1,2}(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$tag' is not a supported release tag"
+            echo "::error::Expected vMAJOR.MINOR[.PATCH][-pre]."
+            echo "::error::Push a v* tag or dispatch this workflow with an existing tag input."
+            exit 1
+          fi
+          echo "Releasing $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Package (${{ matrix.os }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GPUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libudev-dev \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libvulkan1
+
+      - name: Build release binary
+        run: cargo build --release -p ghs-app
+
+      - name: Package archive (Linux, macOS)
+        id: package_unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) arch="x86_64" ;;
+            arm64|aarch64) arch="aarch64" ;;
+            *)
+              echo "::error::Unsupported architecture: $arch"
+              exit 1
+              ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux) platform="linux-${arch}" ;;
+            macOS) platform="macos-${arch}" ;;
+            *)
+              echo "::error::Unsupported runner OS: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          name="ghs-rs-${TAG}-${platform}"
+          stage="dist/${name}"
+          mkdir -p "$stage"
+          cp target/release/ghs-app "$stage/ghs-app"
+          cp README.md LICENSE-APACHE LICENSE-MIT NOTICE "$stage/"
+          cp packaging/README.md "$stage/PACKAGING.md"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp packaging/linux/ghs-rs.desktop "$stage/ghs-rs.desktop"
+          fi
+          tar -czf "dist/${name}.tar.gz" -C dist "$name"
+          {
+            echo "name=${name}"
+            echo "archive=dist/${name}.tar.gz"
+          } >> "$GITHUB_OUTPUT"
+          ls -l "dist/${name}.tar.gz"
+          tar -tzf "dist/${name}.tar.gz" | sort
+
+      - name: Package archive (Windows)
+        id: package_windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+            "AMD64" { "x86_64" }
+            "ARM64" { "aarch64" }
+            default { throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE" }
+          }
+          $name = "ghs-rs-$env:TAG-windows-$arch"
+          $stage = Join-Path "dist" $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "target/release/ghs-app.exe" -Destination $stage
+          Copy-Item -Path README.md, LICENSE-APACHE, LICENSE-MIT, NOTICE -Destination $stage
+          Copy-Item -Path "packaging/README.md" -Destination (Join-Path $stage "PACKAGING.md")
+          $archive = "dist/$name.zip"
+          # Use Windows' bundled bsdtar so zip entries always use forward slashes.
+          $tar = Join-Path $env:SystemRoot "System32\tar.exe"
+          & $tar -c --format zip -f $archive -C "dist" $name
+          if ($LASTEXITCODE -ne 0) { throw "tar.exe failed to create $archive" }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+          Get-Item $archive | ForEach-Object { "archive: $($_.FullName) ($($_.Length) bytes)" }
+          & $tar -tf $archive
+          if ($LASTEXITCODE -ne 0) { throw "tar.exe failed to list $archive" }
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package_unix.outputs.name || steps.package_windows.outputs.name }}
+          path: ${{ steps.package_unix.outputs.archive || steps.package_windows.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Draft GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify artifact set
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          expected=(
+            "dist/ghs-rs-${TAG}-linux-x86_64.tar.gz"
+            "dist/ghs-rs-${TAG}-windows-x86_64.zip"
+          )
+          for file in "${expected[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing release artifact: $file"
+              exit 1
+            fi
+          done
+          shopt -s nullglob
+          macos=(dist/ghs-rs-"${TAG}"-macos-*.tar.gz)
+          if [ "${#macos[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one macOS archive, found ${#macos[@]}"
+            exit 1
+          fi
+          echo "macOS archive: ${macos[0]}"
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ghs-rs-*.tar.gz ghs-rs-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ghs-rs ${{ needs.prepare.outputs.tag }}
+          draft: true
+          prerelease: ${{ contains(needs.prepare.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          body: |
+            Build of the grblHAL sender. The archives are unsigned and were
+            produced without code signing or notarization.
+
+            A build is not hardware-validated until the FlexiHAL operator
+            checklist in docs/SAFETY.md passes for these exact archives. Record
+            that result in these notes before publishing.
+
+            - Linux x86_64: `.tar.gz` with `ghs-app`, notices, and a desktop entry.
+            - Windows x86_64: `.zip` with `ghs-app.exe` and notices. No installer.
+            - macOS: `.tar.gz` with an unsigned `ghs-app`; no `.app` bundle yet.
+
+            Verify downloads against `SHA256SUMS.txt`. Read `docs/RELEASE.md` and
+            `docs/SAFETY.md` in the repository before connecting a machine.
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt

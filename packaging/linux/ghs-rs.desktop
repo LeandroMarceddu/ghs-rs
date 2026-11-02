@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=grblHAL Sender
+GenericName=CNC G-code Sender
+Comment=Send G-code to a grblHAL controller over a serial port
+Exec=ghs-app
+Icon=applications-engineering
+Terminal=false
+Categories=Utility;Engineering;
+Keywords=CNC;grblHAL;G-code;GCode;Mill;
+StartupNotify=true
