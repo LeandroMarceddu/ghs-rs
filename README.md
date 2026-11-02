@@ -9,13 +9,13 @@ The goal is a touch-first CNC sender with the ergonomics of
 feature set of [ioSender](https://github.com/terjeio/ioSender) — on Windows,
 macOS, and Linux.
 
-> **Status: pre-alpha, M6 complete except hardware.** Protocol, simulator,
-> serial, job streaming, the real 2D viewer, generated settings, live offsets,
-> the tool table, profiles, backups, the probe workspace, and the height-map
-> measurement, explicit Apply/Revert, and per-profile map save/load workflow are
-> implemented. The reference FlexiHAL is not yet available for hardware
-> validation, so all evidence so far is simulator and unit-test based. See
-> [docs/PLAN.md](docs/PLAN.md).
+> **Status: pre-alpha, M5/M6 closeout.** Protocol, simulator, serial, job
+> streaming, the real 2D viewer, generated settings, live offsets, the tool
+> table, profiles, backups, the probe workspace, the height-map
+> measurement/Apply/Revert/save-load workflow, confirmed offset goto, and
+> startup-line editing are implemented. The reference FlexiHAL is not yet
+> available for hardware validation, so all evidence so far is simulator and
+> unit-test based. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
 
@@ -44,10 +44,13 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   envelope, motion-style paths, and a live tool marker.
 - **Settings** — generated from `$ES`/`$EG` metadata, grouped and searchable,
   with boolean, bitfield, axis-mask, radio, numeric, text and password controls,
-  range validation, and read-back-verified writes.
+  range validation, read-back-verified writes, and `$N0`/`$N1` startup-line
+  editing with read-back verification.
 - **Offsets and tools** — live `$#` values for G54–G59.3, G28/G30, G92, HOME,
-  TLO, TLR, G51 and PRB; `G10 L20` zero/edit with `$#` refresh; a persisted
-  app-side tool table used by the M6 tool-change sheet.
+  TLO, TLR, G51 and PRB; large `G10 L20` zero controls with `$#` refresh;
+  confirmed `G28`/`G30` goto and `G92.1` clear; a persisted app-side tool table
+  used by the M6 tool-change sheet; and a separate read-only controller tool
+  table.
 - **Profiles and backups** — identity-keyed controller profiles, app config,
   atomic saves, rolling backups, export/validate/import, and identity-mismatch
   confirmation.
@@ -68,8 +71,7 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 
 ## In progress
 
-- Macros, startup lines, keymap editing, goto/restore, and the typed controller
-  tool table.
+- User-defined macros, keymap editing, and offsets backup/restore.
 - Start-from-line/check mode, 3D view, i18n, packaging, and the post-v1.0
   SD/ATC/MPG surfaces.
 - Hardware validation on the reference FlexiHAL.

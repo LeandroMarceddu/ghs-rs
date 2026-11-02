@@ -55,7 +55,8 @@ Generate the form; do not hardcode setting numbers. Map types:
   set-offset actions, acknowledge (`0xA3`), then resume. The sheet already
   exists; M5 adds tool length probing and offset editing.
 - If the controller reports `[T:...]` entries, display them read-only plus the
-  app table; do not silently overwrite controller data.
+  app table; do not silently overwrite controller data. The engine exposes a
+  typed controller table and the app shows it in a separate read-only panel.
 - Tool length can be set with `$TLR`/probe (M6) or a controlled MDI move.
 
 ## Macros, startup lines, keymap
@@ -63,7 +64,8 @@ Generate the form; do not hardcode setting numbers. Map types:
 - Macros are named MDI/system sequences; persist in the profile; confirm risky
   motion macros.
 - Startup lines `$N0`/`$N1` are read/written through the engine; never edit
-  while a job is active.
+  while a job is active. A write is explicit, idle-only, and read back to
+  verify the stored text; it is never optimistically reflected in the UI.
 - Keymap and app settings are local; JSON/TOML with atomic writes and rolling
   backups.
 

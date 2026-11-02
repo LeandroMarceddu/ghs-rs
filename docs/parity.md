@@ -87,10 +87,10 @@ implemented before its UI or hardware validation row is complete.
 | CTL-11 | Home, unlock, reset, sleep | M2 | todo | State-aware |
 | CTL-12 | Signals, pins, and AUX IO display | M2 | todo | HSDEP plus 4/4 AUX |
 | CTL-13 | Macros with parameters and special words | M5 | todo | Toolbar and editor |
-| CTL-14 | Startup lines | M5 | todo | Read, edit, verify |
+| CTL-14 | Startup lines | M5 | done | Read, edit, read-back verify |
 | CTL-15 | Keymap editor | M5 | todo | Keyboard and gamepad later |
-| CTL-16 | Work offsets editor, G54–G59.3, G10 | M5 | todo | Edit, zero, save |
-| CTL-17 | App-side tool table and manual M6 workflow | M5 | todo | 0 controller entries |
+| CTL-16 | Work offsets editor, G54–G59.3, G10 | M5 | done | Edit, zero, goto, G92 clear |
+| CTL-17 | App-side tool table and manual M6 workflow | M5 | done | Controller table read-only |
 | CTL-18 | Metric and imperial units | M2 | todo | mm canonical |
 | CTL-19 | Themes and DPI scaling | M5 | todo | Dark, light, high contrast |
 
@@ -132,17 +132,17 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| SETUP-01 | Settings editor generated from `$ES`/`$EG`/`$SED` | M5 | todo | Fallback for older builds |
-| SETUP-02 | Grouped, searchable, typed, validated settings | M5 | todo | Axis arrays |
-| SETUP-03 | Setting write, read-back verification, backup and restore | M5 | todo | EEPROM caution |
+| SETUP-01 | Settings editor generated from `$ES`/`$EG`/`$SED` | M5 | done | Fallback for older builds |
+| SETUP-02 | Grouped, searchable, typed, validated settings | M5 | done | Axis arrays |
+| SETUP-03 | Setting write, read-back verification, backup and restore | M5 | done | EEPROM caution |
 | SETUP-04 | Stepper and axis calibration | M5 | todo | Guided measurement |
-| SETUP-05 | App settings and controller profiles | M5 | todo | Keyed by `$I` identity |
-| SETUP-06 | Import and export settings, offsets, tools | M5 | todo | JSON/CSV |
+| SETUP-05 | App settings and controller profiles | M5 | done | Keyed by `$I` identity |
+| SETUP-06 | Import and export settings, offsets, tools | M5 | partial | Backup bundle; offsets `.nc` open |
 | SETUP-07 | Controller reset (`$RST`) with backup prompt | M5 | todo | Destructive, confirmed |
 | SETUP-08 | Keymap persistence | M5 | todo | Includes jog keys |
-| SETUP-09 | Startup line persistence | M5 | todo | `$N` |
-| SETUP-10 | Tool table persistence | M5 | todo | App-side |
-| SETUP-11 | Offsets backup and restore | M5 | todo | `offsets.nc` equivalent |
+| SETUP-09 | Startup line persistence | M5 | done | `$N` read/edit/verify |
+| SETUP-10 | Tool table persistence | M5 | done | App-side |
+| SETUP-11 | Offsets backup and restore | M5 | partial | `offsets.nc` equivalent open |
 
 ## Probing
 
