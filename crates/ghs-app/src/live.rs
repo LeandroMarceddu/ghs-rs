@@ -869,6 +869,27 @@ mod tests {
     }
 
     #[test]
+    fn demo_link_sets_rapid_override_and_reports_it_in_the_snapshot() {
+        let link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        assert!(
+            wait_until(|| link.engine.is_ready(), Duration::from_secs(5)),
+            "demo handshake did not complete"
+        );
+        assert_eq!(link.engine.snapshot().overrides.rapid, 100);
+
+        link.send(Command::SetRapidOverride(50))
+            .expect("set the rapid override");
+        assert!(
+            wait_until(
+                || link.engine.snapshot().overrides.rapid == 50,
+                Duration::from_secs(2)
+            ),
+            "the simulator snapshot did not report the new rapid override"
+        );
+        link.disconnect();
+    }
+
+    #[test]
     fn mode_descriptions_name_the_transport() {
         assert!(LinkMode::Demo.describe().contains("FlexiHAL"));
         let config = SerialConfig {

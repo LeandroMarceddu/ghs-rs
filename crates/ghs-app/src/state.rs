@@ -939,6 +939,18 @@ impl JobView {
         (self.completed.min(self.total) as f32 / self.total as f32).clamp(0.0, 1.0)
     }
 
+    /// Estimated remaining active time for a running or paused job.
+    ///
+    /// Uses the job's tracked active elapsed time and confirmed progress; it
+    /// never guesses from line counts alone. Idle, finished, and not-yet-
+    /// started jobs return `None`.
+    pub fn eta(&self) -> Option<Duration> {
+        if !self.is_active() {
+            return None;
+        }
+        estimate_remaining(self.elapsed, self.fraction())
+    }
+
     /// Whether the runner is feeding or ready to feed lines.
     pub fn is_active(&self) -> bool {
         matches!(self.state, JobState::Running | JobState::Paused)
@@ -1283,6 +1295,79 @@ pub fn format_elapsed(elapsed: Duration) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Longest remaining time the Job ETA strip will display.
+///
+/// A job that has just started has a tiny progress sample, so an unclamped
+/// estimate can be days or years. A day is already far beyond any job this UI
+/// is meant to run; showing a cap is more honest than an absurd number.
+pub const MAX_JOB_ETA: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Estimate the remaining active job time from elapsed time and progress.
+///
+/// `progress` is the fraction of the program already confirmed, in `(0, 1)`.
+/// Zero, one, negative, or non-finite progress has no meaningful remaining
+/// time, and neither has a job with no elapsed time yet, so all of those return
+/// `None`. The result is rounded up to whole seconds and clamped to
+/// [`MAX_JOB_ETA`], which keeps `NaN`, negative values, and absurd estimates
+/// out of the header.
+pub fn estimate_remaining(elapsed: Duration, progress: f32) -> Option<Duration> {
+    if !progress.is_finite() || progress <= 0.0 || progress >= 1.0 {
+        return None;
+    }
+    let elapsed_s = elapsed.as_secs_f64();
+    if !elapsed_s.is_finite() || elapsed_s <= 0.0 {
+        return None;
+    }
+    let remaining_s = elapsed_s * ((1.0 - f64::from(progress)) / f64::from(progress));
+    if !remaining_s.is_finite() {
+        return None;
+    }
+    // Round up: an ETA of 00:00 while work remains reads as "already done".
+    let seconds = remaining_s.ceil().max(1.0);
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .map(|remaining| remaining.min(MAX_JOB_ETA))
+}
+
+/// Rapid override levels offered by the compact touch control, in tap order.
+pub const RAPID_OVERRIDE_CYCLE: [u16; 3] = [100, 50, 25];
+
+/// Next rapid override level in the touch cycle.
+///
+/// The controller also documents a 5 percent extra-low level. It is not part
+/// of this compact cycle; any reported value outside the cycle (including 5)
+/// returns to 100 percent, because reset is always valid and is the safest
+/// place to restart from.
+pub fn next_rapid_override(current: u16) -> u16 {
+    RAPID_OVERRIDE_CYCLE
+        .iter()
+        .position(|level| *level == current)
+        .map_or(100, |index| {
+            RAPID_OVERRIDE_CYCLE[(index + 1) % RAPID_OVERRIDE_CYCLE.len()]
+        })
+}
+
+/// Why the rapid-override control cannot send a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RapidOverrideRefusal {
+    /// `--mock` has no engine to send a command to.
+    Mock,
+    /// The transport is connecting, disconnected, or failed.
+    NotReady,
+}
+
+impl RapidOverrideRefusal {
+    /// Operator-facing reason shown in the console.
+    pub fn message(self) -> &'static str {
+        match self {
+            RapidOverrideRefusal::Mock => "MOCK MODE: rapid override needs a live controller",
+            RapidOverrideRefusal::NotReady => {
+                "LINK NOT READY: rapid override is disabled until the handshake completes"
+            }
+        }
     }
 }
 
@@ -1690,6 +1775,33 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    /// Next rapid-override command for the compact touch control.
+    ///
+    /// The target comes from the value the controller last reported. This
+    /// method never changes that value: only the next snapshot may, so a
+    /// rejected or lost command can never leave the chip claiming a level the
+    /// controller does not have.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason in mock mode or while the link is not ready.
+    pub fn rapid_override_step(&self) -> Result<Command, RapidOverrideRefusal> {
+        if !self.live {
+            return Err(RapidOverrideRefusal::Mock);
+        }
+        if !self.connection.is_ready_like() {
+            return Err(RapidOverrideRefusal::NotReady);
+        }
+        Ok(Command::SetRapidOverride(next_rapid_override(
+            self.rapid_override,
+        )))
+    }
+
+    /// Estimated remaining job time for the Job header, when meaningful.
+    pub fn display_eta(&self) -> Option<Duration> {
+        self.job.eta()
     }
 
     /// Register the exact program source and build the one load command.
@@ -2883,6 +2995,152 @@ mod tests {
         Arc::new(
             ghs_gcode::parse_program("G21\nG0 X10\nM6 T2\nM30\n").expect("sample program parses"),
         )
+    }
+
+    #[test]
+    fn rapid_override_cycle_maps_every_documented_level() {
+        assert_eq!(next_rapid_override(100), 50);
+        assert_eq!(next_rapid_override(50), 25);
+        assert_eq!(next_rapid_override(25), 100);
+        // 5 % is a controller level but not part of the compact cycle.
+        assert_eq!(next_rapid_override(5), 100);
+        assert_eq!(next_rapid_override(0), 100);
+        assert_eq!(next_rapid_override(33), 100);
+    }
+
+    #[test]
+    fn rapid_override_step_is_the_exact_command() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+
+        state.rapid_override = 100;
+        assert_eq!(
+            state.rapid_override_step(),
+            Ok(Command::SetRapidOverride(50))
+        );
+        state.rapid_override = 50;
+        assert_eq!(
+            state.rapid_override_step(),
+            Ok(Command::SetRapidOverride(25))
+        );
+        state.rapid_override = 25;
+        assert_eq!(
+            state.rapid_override_step(),
+            Ok(Command::SetRapidOverride(100))
+        );
+
+        // Asking for the next step never changes the displayed value.
+        assert_eq!(state.rapid_override, 25);
+    }
+
+    #[test]
+    fn rapid_override_snapshot_is_the_only_value_source() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.apply_controller_info(&parse_controller_info(FLEXIHAL));
+        assert_eq!(state.rapid_override, 100);
+
+        let snapshot = MachineSnapshot {
+            overrides: Overrides::new(100, 25, 100),
+            ..MachineSnapshot::default()
+        };
+        state.apply_snapshot(&snapshot, None);
+        assert_eq!(state.rapid_override, 25);
+
+        let snapshot = MachineSnapshot {
+            overrides: Overrides::new(100, 50, 100),
+            ..MachineSnapshot::default()
+        };
+        state.apply_snapshot(&snapshot, None);
+        assert_eq!(state.rapid_override, 50);
+    }
+
+    #[test]
+    fn rapid_override_is_refused_when_mock_or_not_ready() {
+        let mut state = AppState::new();
+        assert_eq!(state.rapid_override_step(), Err(RapidOverrideRefusal::Mock));
+
+        state.begin_live("test transport");
+        assert_eq!(state.connection, ConnectionState::Connecting);
+        assert_eq!(
+            state.rapid_override_step(),
+            Err(RapidOverrideRefusal::NotReady)
+        );
+
+        state.connection = ConnectionState::Disconnected;
+        assert_eq!(
+            state.rapid_override_step(),
+            Err(RapidOverrideRefusal::NotReady)
+        );
+
+        state.connection = ConnectionState::Ready;
+        assert_eq!(
+            state.rapid_override_step(),
+            Ok(Command::SetRapidOverride(50))
+        );
+    }
+
+    #[test]
+    fn eta_uses_elapsed_time_and_progress() {
+        let mut job = JobView::default();
+        job.loaded("sample.nc".into(), sample_program(), 100);
+        job.started(1, 100);
+        job.progress(41, 40, 100, Duration::from_secs(90));
+
+        let eta = job.eta().expect("a running job with progress has an ETA");
+        assert_eq!(eta, Duration::from_secs(135));
+        assert_eq!(format_elapsed(eta), "02:15");
+
+        job.paused(41, JobPauseReason::ProgramStop);
+        assert_eq!(job.eta(), Some(Duration::from_secs(135)));
+    }
+
+    #[test]
+    fn eta_is_hidden_when_idle_complete_or_at_zero_progress() {
+        let mut job = JobView::default();
+        assert_eq!(job.eta(), None, "an empty view has no ETA");
+
+        job.loaded("sample.nc".into(), sample_program(), 100);
+        assert_eq!(job.eta(), None, "a loaded but idle job has no ETA");
+
+        job.started(1, 100);
+        assert_eq!(job.eta(), None, "no confirmed line means no ETA");
+
+        job.progress(1, 0, 100, Duration::from_secs(5));
+        assert_eq!(job.eta(), None, "zero progress means no ETA");
+
+        job.progress(1, 50, 100, Duration::from_secs(5));
+        assert!(job.eta().is_some());
+
+        job.completed(Duration::from_secs(10));
+        assert_eq!(job.eta(), None, "a completed job has no ETA");
+
+        job.started(1, 100);
+        job.progress(1, 50, 100, Duration::from_secs(5));
+        job.aborted(51, JobAbortReason::OperatorStop);
+        assert_eq!(job.eta(), None, "an aborted job has no ETA");
+    }
+
+    #[test]
+    fn eta_rejects_invalid_progress_and_clamps_the_maximum() {
+        let elapsed = Duration::from_secs(60);
+        assert_eq!(estimate_remaining(elapsed, 0.0), None);
+        assert_eq!(estimate_remaining(elapsed, -0.25), None);
+        assert_eq!(estimate_remaining(elapsed, f32::NAN), None);
+        assert_eq!(estimate_remaining(elapsed, f32::INFINITY), None);
+        assert_eq!(estimate_remaining(elapsed, 1.0), None);
+        assert_eq!(estimate_remaining(elapsed, 2.0), None);
+        assert_eq!(
+            estimate_remaining(Duration::ZERO, 0.5),
+            None,
+            "no elapsed time means no rate"
+        );
+
+        let huge = estimate_remaining(Duration::from_secs(3_600), 0.000_1)
+            .expect("a tiny progress sample still produces a bounded estimate");
+        assert_eq!(huge, MAX_JOB_ETA);
+        assert!(huge <= MAX_JOB_ETA);
     }
 
     #[test]

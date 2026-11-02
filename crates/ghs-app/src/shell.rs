@@ -3702,6 +3702,24 @@ impl Shell {
         self.send_command(Command::SetSpindleOverride(target.clamp(10, 200)));
     }
 
+    /// Advance rapid override through 100 -> 50 -> 25 -> 100.
+    ///
+    /// The command goes through the engine's guarded path and the chip keeps
+    /// showing the snapshot value, so a rejected or lost command never claims
+    /// a level the controller did not report.
+    fn cycle_rapid_override(&mut self, cx: &mut Context<Self>) {
+        match self.state.rapid_override_step() {
+            Ok(command) => {
+                self.send_command(command);
+            }
+            Err(refusal) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, refusal.message());
+            }
+        }
+        cx.notify();
+    }
+
     fn reset(&mut self, cx: &mut Context<Self>) {
         if !self.state.live {
             self.state.machine_state = "Idle";
@@ -4591,14 +4609,14 @@ impl Shell {
                         .gap_2()
                         .child(
                             div()
-                                .w(px(110.0))
+                                .w(px(96.0))
                                 .h(px(5.0))
                                 .rounded(px(999.0))
                                 .bg(p.panel_alt)
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(px(110.0 * progress))
+                                        .w(px(96.0 * progress))
                                         .rounded(px(999.0))
                                         .bg(p.accent),
                                 ),
@@ -4619,13 +4637,26 @@ impl Shell {
                                     self.state.display_line(),
                                     self.state.display_total()
                                 )),
-                        ),
+                        )
+                        .when_some(self.state.display_eta(), |this, eta| {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.accent)
+                                    .child(format!("ETA {}", format_elapsed(eta))),
+                            )
+                        }),
                 )
                 .child(chip(self.state.wcs(), p))
                 .child(chip("XY", p))
         } else {
             header
         };
+
+        let header = header.child(self.rapid_override_chip(p, cx));
 
         let body = if self.state.mode == Mode::Job {
             v_flex()
@@ -4655,6 +4686,66 @@ impl Shell {
             .overflow_hidden()
             .child(header)
             .child(div().flex_1().min_h(px(0.0)).child(body))
+    }
+
+    /// Compact rapid-override control for the viewer header.
+    ///
+    /// The value is the last controller snapshot, never the target that was
+    /// requested. A tap sends the next level through the engine gateway; a
+    /// refusal is written to the console instead of changing the display.
+    fn rapid_override_chip(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.state.rapid_override;
+        let enabled = self.state.rapid_override_step().is_ok();
+        let reduced = current < 100;
+        let value_color = if reduced { p.warning } else { p.text };
+        let background = if reduced {
+            p.warning.opacity(0.16)
+        } else {
+            p.panel_alt
+        };
+        let border = if reduced {
+            p.warning.opacity(0.6)
+        } else {
+            p.border
+        };
+        let view = cx.entity();
+        let mono = self.mono.clone();
+
+        h_flex()
+            .id("rapid-override")
+            .h(px(48.0))
+            .w(px(88.0))
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .rounded_lg()
+            .bg(background)
+            .border_1()
+            .border_color(border)
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(p.raised_hover).border_color(p.accent))
+            })
+            .when(!enabled, |this| this.opacity(0.55))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| this.cycle_rapid_override(cx));
+            })
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("RAPID"),
+            )
+            .child(
+                div()
+                    .font_family(mono)
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(value_color)
+                    .child(format!("{current}%")),
+            )
     }
 
     /// Slim toolbar inside the viewer: job state, elapsed time and the four
