@@ -32,7 +32,7 @@ Generate the form; do not hardcode setting numbers. Map types:
   "reboot required".
 - Write is explicit: edit locally, then Apply; show pending, verified, or error
   state. Do not mark a setting applied until `SettingWritten.verified`.
-- Batch changes with a backup prompt; never auto-restore.
+- Batch changes and export a backup before settings writes; never auto-restore.
 - `$RST` is destructive; require a typed confirmation and a backup.
 - EEPROM on the reference board means avoid unnecessary writes.
 
