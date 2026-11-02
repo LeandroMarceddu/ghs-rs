@@ -90,6 +90,53 @@ pub enum ValidationError {
         /// Human-readable reason.
         reason: &'static str,
     },
+    /// A height-map label, grid count, step, or measurement frame is invalid.
+    #[error("height map {name:?} {field} is invalid: {reason}")]
+    InvalidHeightMap {
+        /// Map label, or an empty string when the label itself is invalid.
+        name: String,
+        /// Field name, for example `"name"`, `"columns"`, or
+        /// `"frame.wcs_offset"`.
+        field: &'static str,
+        /// Human-readable reason.
+        reason: &'static str,
+    },
+    /// A height-map coordinate, offset, or sample is outside the accepted
+    /// range.
+    #[error(
+        "height map {name:?} {field} must be finite and between {min} and {max} \
+         millimetres (got {value})"
+    )]
+    HeightMapOutOfRange {
+        /// Map label.
+        name: String,
+        /// Field name, for example `"origin_x_mm"` or `"samples"`.
+        field: &'static str,
+        /// Rejected value.
+        value: f64,
+        /// Smallest accepted value.
+        min: f64,
+        /// Largest accepted value.
+        max: f64,
+    },
+    /// A height map's sample vector does not match its declared grid.
+    #[error("height map {name:?} has {actual} samples; expected {expected} (columns * rows)")]
+    HeightMapSampleCount {
+        /// Map label.
+        name: String,
+        /// Sample count implied by `columns * rows`.
+        expected: usize,
+        /// Sample count actually stored.
+        actual: usize,
+    },
+    /// A profile stores more height maps than the format allows.
+    #[error("profile stores {count} height maps; the limit is {max}")]
+    TooManyHeightMaps {
+        /// Number of maps in the profile.
+        count: usize,
+        /// Maximum accepted number of maps.
+        max: usize,
+    },
     /// A window or layout dimension is outside the accepted range.
     #[error("window {field} must be between {min} and {max} (got {value})")]
     WindowOutOfRange {

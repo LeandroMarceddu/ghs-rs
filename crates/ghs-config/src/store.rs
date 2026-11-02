@@ -631,7 +631,8 @@ mod tests {
 
     use super::*;
     use crate::backup::IdentityPolicy;
-    use crate::controller::{ControllerData, ToolRecord};
+    use crate::controller::{ControllerData, HeightMapFrame, HeightMapRecord, ToolRecord};
+    use crate::error::ValidationError;
 
     const FLEXIHAL: &[&str] = &[
         "[VER:1.1f.20240604:]",
@@ -708,7 +709,31 @@ mod tests {
         data.startup_lines.n0 = Some("G21 G90".into());
         data.keymap
             .insert(crate::controller::KeyBinding::new("run.pause", "Space"));
+        data.height_maps = vec![sample_height_map()];
         data
+    }
+
+    fn sample_height_map() -> HeightMapRecord {
+        HeightMapRecord {
+            name: "Fixture top".into(),
+            tool_number: Some(1),
+            created_at_unix_s: Some(1_700_000_000),
+            origin_x_mm: 5.0,
+            origin_y_mm: 6.0,
+            step_x_mm: 10.0,
+            step_y_mm: 10.0,
+            columns: 2,
+            rows: 2,
+            surface_z_mm: -1.5,
+            z_offset_mm: Some(0.1),
+            samples: vec![Some(0.0), Some(0.02), None, Some(0.04)],
+            frame: HeightMapFrame {
+                wcs: Wcs::G54,
+                wcs_offset: Position::xyz(10.0, 20.0, 30.0),
+                g92: Position::xyz(0.5, 0.0, 0.0),
+                tool_length_offset_z_mm: -12.0,
+            },
+        }
     }
 
     fn count_backups(store: &ConfigStore, stem: &str) -> usize {
@@ -830,6 +855,106 @@ mod tests {
             Some(data.clone())
         );
         assert_eq!(store.list_profile_keys().expect("list"), vec![key]);
+    }
+
+    #[test]
+    fn height_maps_are_stored_per_controller_profile() {
+        let (_dir, store) = store("height-map-profile");
+        let first = ProfileKey::from_controller(&info());
+        let second = ProfileKey::from_controller(&other_info());
+
+        let with_map = sample_data();
+        assert_eq!(with_map.height_maps, vec![sample_height_map()]);
+        store
+            .save_controller_data(&first, &with_map)
+            .expect("save first");
+        store
+            .save_controller_data(&second, &ControllerData::new())
+            .expect("save second");
+
+        let loaded_first = store
+            .load_controller_data(&first)
+            .expect("load first")
+            .expect("present");
+        let loaded_second = store
+            .load_controller_data(&second)
+            .expect("load second")
+            .expect("present");
+        assert_eq!(loaded_first, with_map);
+        assert_eq!(loaded_first.height_maps, vec![sample_height_map()]);
+        assert!(loaded_second.height_maps.is_empty());
+    }
+
+    #[test]
+    fn saving_an_invalid_height_map_writes_nothing() {
+        let (_dir, store) = store("invalid-height-map");
+        let key = ProfileKey::from_controller(&info());
+        let mut data = sample_data();
+        data.height_maps[0].samples.pop();
+        assert!(matches!(
+            store.save_controller_data(&key, &data),
+            Err(ConfigError::Validation(
+                ValidationError::HeightMapSampleCount { .. }
+            ))
+        ));
+        assert!(!store.profile_path(&key).exists());
+    }
+
+    #[test]
+    fn backup_round_trip_preserves_height_maps() {
+        let (dir, store) = store("backup-height-map");
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let data = sample_data();
+        let bundle = BackupBundle::new(AppConfig::default(), &info, data.clone())
+            .with_created_at(1_700_000_000);
+        let path = dir.path().join("height-map.json");
+        store.export_backup(&path, &bundle).expect("export");
+
+        let loaded = store.load_backup(&path).expect("load");
+        assert_eq!(loaded.data.height_maps, data.height_maps);
+
+        let outcome = store
+            .import_backup(&path, Some(&info), IdentityPolicy::Reject)
+            .expect("import");
+        assert_eq!(outcome.bundle.data.height_maps, data.height_maps);
+        assert_eq!(
+            store.load_controller_data(&key).expect("load profile"),
+            Some(data)
+        );
+    }
+
+    #[test]
+    fn malformed_height_map_in_a_backup_is_rejected_before_writing() {
+        let (dir, store) = store("backup-invalid-height-map");
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let bundle = BackupBundle::new(AppConfig::default(), &info, sample_data());
+        let path = dir.path().join("height-map.json");
+        store.export_backup(&path, &bundle).expect("export");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        value["data"]["height_maps"][0]["columns"] = serde_json::json!(1);
+        let text = serde_json::to_string(&value).expect("json");
+        fs::write(&path, text).expect("write");
+
+        assert!(matches!(
+            store.load_backup(&path),
+            Err(ConfigError::Validation(ValidationError::InvalidHeightMap {
+                field: "columns",
+                ..
+            }))
+        ));
+        assert!(matches!(
+            store.import_backup(&path, Some(&info), IdentityPolicy::Reject),
+            Err(ConfigError::Validation(ValidationError::InvalidHeightMap {
+                field: "columns",
+                ..
+            }))
+        ));
+        assert!(!store.profile_path(&key).exists());
+        assert_no_temp_files(dir.path());
     }
 
     #[test]

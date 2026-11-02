@@ -13,13 +13,30 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use ghs_core::{Position, SettingValue, Wcs};
+use ghs_core::{Axis, Position, SettingValue, Wcs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ValidationError;
 
 /// Schema version written by this build for a controller profile.
 pub const CONTROLLER_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum number of height maps stored in one controller profile.
+///
+/// A profile is a per-controller document; maps are per workpiece/setup, so a
+/// small bound keeps the profile readable and bounds load and validation time.
+/// Callers must surface [`ValidationError::TooManyHeightMaps`] instead of
+/// dropping maps silently.
+pub const MAX_HEIGHT_MAPS: usize = 16;
+/// Maximum number of columns or rows in one persisted height map.
+pub const MAX_HEIGHT_MAP_AXIS_POINTS: u16 = 128;
+/// Maximum column or row spacing in a persisted height map, in millimetres.
+pub const MAX_HEIGHT_MAP_STEP_MM: f64 = 1_000.0;
+/// Maximum absolute origin, grid extent, surface, offset, or sample coordinate
+/// in a persisted height map, in millimetres.
+pub const MAX_HEIGHT_MAP_COORDINATE_MM: f64 = 100_000.0;
+/// Maximum length of a height-map label in characters.
+const MAX_HEIGHT_MAP_NAME: usize = 128;
 
 /// Maximum length of a tool name in characters.
 const MAX_TOOL_NAME: usize = 128;
@@ -534,6 +551,283 @@ impl OffsetSnapshot {
     }
 }
 
+/// Measurement frame a height map was captured in.
+///
+/// The frame is stored beside the map so it is not reused after a work-offset
+/// or tool change. It is informational: loading a profile never applies an
+/// offset, `G92`, or tool-length value to the controller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeightMapFrame {
+    /// Work coordinate system selected while probing.
+    pub wcs: Wcs,
+    /// Stored offset of `wcs` at capture time, in millimetres.
+    ///
+    /// It must carry X, Y and Z axes; extra axes are preserved.
+    pub wcs_offset: Position,
+    /// Active `G92` offset at capture time, in millimetres.
+    ///
+    /// It must carry X, Y and Z axes; extra axes are preserved.
+    pub g92: Position,
+    /// Active tool length offset (`TLO`) Z component at capture time, in
+    /// millimetres.
+    pub tool_length_offset_z_mm: f64,
+}
+
+/// One persisted height map for a workpiece/setup.
+///
+/// Samples are row-major: `samples[row * columns + column]`. Each `Some` value
+/// is a measured Z coordinate in millimetres and `None` marks a point that was
+/// not probed or whose probe failed. The record keeps its probing frame and
+/// grid so it can be shown and revalidated, but it contains no probing or
+/// motion types, and loading a profile never applies the map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeightMapRecord {
+    /// User label. Non-empty, at most 128 characters, and free of control
+    /// characters. Labels need not be unique within a profile.
+    pub name: String,
+    /// Tool number used for the measurement, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_number: Option<u32>,
+    /// Creation time as Unix seconds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_unix_s: Option<u64>,
+    /// X coordinate of the first grid point, in millimetres.
+    pub origin_x_mm: f64,
+    /// Y coordinate of the first grid point, in millimetres.
+    pub origin_y_mm: f64,
+    /// Column spacing, in millimetres. Positive and at most
+    /// [`MAX_HEIGHT_MAP_STEP_MM`].
+    pub step_x_mm: f64,
+    /// Row spacing, in millimetres. Positive and at most
+    /// [`MAX_HEIGHT_MAP_STEP_MM`].
+    pub step_y_mm: f64,
+    /// Number of columns, in `2..=`[`MAX_HEIGHT_MAP_AXIS_POINTS`].
+    pub columns: u16,
+    /// Number of rows, in `2..=`[`MAX_HEIGHT_MAP_AXIS_POINTS`].
+    pub rows: u16,
+    /// Nominal surface Z used by the probing plan, in millimetres.
+    ///
+    /// This is a recorded grid parameter, not the measured surface.
+    pub surface_z_mm: f64,
+    /// Optional constant Z offset recorded with the map, in millimetres.
+    ///
+    /// `None` means no offset was recorded; zero is distinct from absent.
+    pub z_offset_mm: Option<f64>,
+    /// Row-major samples. The length must equal `columns * rows`.
+    ///
+    /// The default is empty so a missing array is reported by
+    /// [`HeightMapRecord::validate`] as a count error rather than being
+    /// silently filled.
+    #[serde(default)]
+    pub samples: Vec<Option<f64>>,
+    /// Measurement frame at capture time.
+    pub frame: HeightMapFrame,
+}
+
+impl HeightMapRecord {
+    /// Number of grid points, `columns * rows`.
+    #[must_use]
+    pub fn point_count(&self) -> usize {
+        usize::from(self.columns) * usize::from(self.rows)
+    }
+
+    /// Row-major sample index for a column and row.
+    ///
+    /// Returns `None` when the cell is outside the declared grid. The caller
+    /// should still use [`HeightMapRecord::sample`] or index [`Self::samples`]
+    /// to read a value, because a declared cell may be invalid.
+    #[must_use]
+    pub fn index(&self, column: u16, row: u16) -> Option<usize> {
+        if column >= self.columns || row >= self.rows {
+            return None;
+        }
+        Some(usize::from(row) * usize::from(self.columns) + usize::from(column))
+    }
+
+    /// Sample at a column and row.
+    ///
+    /// Returns `None` when the cell is outside the grid, missing, or invalid.
+    /// Use [`HeightMapRecord::index`] to distinguish an out-of-range cell from
+    /// an invalid sample.
+    #[must_use]
+    pub fn sample(&self, column: u16, row: u16) -> Option<f64> {
+        self.samples
+            .get(self.index(column, row)?)
+            .copied()
+            .flatten()
+    }
+
+    /// Validate the label, grid, samples, and measurement frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidHeightMap`] for an empty, over-long,
+    /// or control-character label, an out-of-range column/row count, a
+    /// non-positive or over-large step, a frame without X/Y/Z, or a non-finite
+    /// frame or tool-length value;
+    /// [`ValidationError::HeightMapOutOfRange`] for a finite coordinate or
+    /// sample outside ±[`MAX_HEIGHT_MAP_COORDINATE_MM`], including a grid
+    /// extent that overflows that bound; and
+    /// [`ValidationError::HeightMapSampleCount`] when the sample vector length
+    /// is not exactly `columns * rows`.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.name.trim().is_empty() {
+            return Err(ValidationError::InvalidHeightMap {
+                name: self.name.clone(),
+                field: "name",
+                reason: "must not be empty",
+            });
+        }
+        if self.name.chars().count() > MAX_HEIGHT_MAP_NAME {
+            return Err(ValidationError::InvalidHeightMap {
+                name: self.name.clone(),
+                field: "name",
+                reason: "exceeds the 128-character limit",
+            });
+        }
+        if self.name.chars().any(char::is_control) {
+            return Err(ValidationError::InvalidHeightMap {
+                name: self.name.clone(),
+                field: "name",
+                reason: "must not contain control characters",
+            });
+        }
+        for (field, value) in [("columns", self.columns), ("rows", self.rows)] {
+            if !(2..=MAX_HEIGHT_MAP_AXIS_POINTS).contains(&value) {
+                return Err(ValidationError::InvalidHeightMap {
+                    name: self.name.clone(),
+                    field,
+                    reason: "must be between 2 and 128",
+                });
+            }
+        }
+        check_height_map_step(&self.name, "step_x_mm", self.step_x_mm)?;
+        check_height_map_step(&self.name, "step_y_mm", self.step_y_mm)?;
+        check_height_map_coordinate(&self.name, "origin_x_mm", self.origin_x_mm)?;
+        check_height_map_coordinate(&self.name, "origin_y_mm", self.origin_y_mm)?;
+        check_height_map_coordinate(&self.name, "surface_z_mm", self.surface_z_mm)?;
+        if let Some(value) = self.z_offset_mm {
+            check_height_map_coordinate(&self.name, "z_offset_mm", value)?;
+        }
+        let max_x = self.origin_x_mm + self.step_x_mm * f64::from(self.columns.saturating_sub(1));
+        let max_y = self.origin_y_mm + self.step_y_mm * f64::from(self.rows.saturating_sub(1));
+        check_height_map_coordinate(&self.name, "grid_max_x_mm", max_x)?;
+        check_height_map_coordinate(&self.name, "grid_max_y_mm", max_y)?;
+
+        let expected = self.point_count();
+        if self.samples.len() != expected {
+            return Err(ValidationError::HeightMapSampleCount {
+                name: self.name.clone(),
+                expected,
+                actual: self.samples.len(),
+            });
+        }
+        for value in self.samples.iter().flatten() {
+            check_height_map_coordinate(&self.name, "samples", *value)?;
+        }
+        validate_height_map_frame(self)?;
+        Ok(())
+    }
+}
+
+fn validate_height_map_frame(map: &HeightMapRecord) -> Result<(), ValidationError> {
+    let frame = &map.frame;
+    validate_height_map_frame_position(&map.name, "frame.wcs_offset", frame.wcs_offset)?;
+    validate_height_map_frame_position(&map.name, "frame.g92", frame.g92)?;
+    let tlo = frame.tool_length_offset_z_mm;
+    if !tlo.is_finite() {
+        return Err(ValidationError::InvalidHeightMap {
+            name: map.name.clone(),
+            field: "frame.tool_length_offset_z_mm",
+            reason: "must be finite",
+        });
+    }
+    if tlo.abs() > MAX_HEIGHT_MAP_COORDINATE_MM {
+        return Err(ValidationError::HeightMapOutOfRange {
+            name: map.name.clone(),
+            field: "frame.tool_length_offset_z_mm",
+            value: tlo,
+            min: -MAX_HEIGHT_MAP_COORDINATE_MM,
+            max: MAX_HEIGHT_MAP_COORDINATE_MM,
+        });
+    }
+    Ok(())
+}
+
+fn validate_height_map_frame_position(
+    name: &str,
+    field: &'static str,
+    position: Position,
+) -> Result<(), ValidationError> {
+    let axes = position.axes();
+    if !(axes.contains(Axis::X) && axes.contains(Axis::Y) && axes.contains(Axis::Z)) {
+        return Err(ValidationError::InvalidHeightMap {
+            name: name.to_string(),
+            field,
+            reason: "must carry X, Y and Z axes",
+        });
+    }
+    for (_, value) in position.iter() {
+        if !value.is_finite() {
+            return Err(ValidationError::InvalidHeightMap {
+                name: name.to_string(),
+                field,
+                reason: "coordinates must be finite",
+            });
+        }
+        if value.abs() > MAX_HEIGHT_MAP_COORDINATE_MM {
+            return Err(ValidationError::HeightMapOutOfRange {
+                name: name.to_string(),
+                field,
+                value,
+                min: -MAX_HEIGHT_MAP_COORDINATE_MM,
+                max: MAX_HEIGHT_MAP_COORDINATE_MM,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_height_map_step(
+    name: &str,
+    field: &'static str,
+    value: f64,
+) -> Result<(), ValidationError> {
+    if value.is_finite() && value > 0.0 && value <= MAX_HEIGHT_MAP_STEP_MM {
+        Ok(())
+    } else {
+        Err(ValidationError::InvalidHeightMap {
+            name: name.to_string(),
+            field,
+            reason: "must be finite, positive, and at most 1000 mm",
+        })
+    }
+}
+
+fn check_height_map_coordinate(
+    name: &str,
+    field: &'static str,
+    value: f64,
+) -> Result<(), ValidationError> {
+    if !value.is_finite() {
+        return Err(ValidationError::InvalidHeightMap {
+            name: name.to_string(),
+            field,
+            reason: "must be finite",
+        });
+    }
+    if value.abs() > MAX_HEIGHT_MAP_COORDINATE_MM {
+        return Err(ValidationError::HeightMapOutOfRange {
+            name: name.to_string(),
+            field,
+            value,
+            min: -MAX_HEIGHT_MAP_COORDINATE_MM,
+            max: MAX_HEIGHT_MAP_COORDINATE_MM,
+        });
+    }
+    Ok(())
+}
+
 /// Everything the application persists for one controller.
 ///
 /// This is a snapshot, never a live controller session. Loading a profile does
@@ -563,6 +857,12 @@ pub struct ControllerData {
     /// Local keymap.
     #[serde(default)]
     pub keymap: Keymap,
+    /// Persisted height maps, in user order.
+    ///
+    /// Profiles written before this field existed load with an empty list.
+    /// The limit is [`MAX_HEIGHT_MAPS`].
+    #[serde(default)]
+    pub height_maps: Vec<HeightMapRecord>,
 }
 
 impl Default for ControllerData {
@@ -575,6 +875,7 @@ impl Default for ControllerData {
             macros: Vec::new(),
             startup_lines: StartupLines::default(),
             keymap: Keymap::default(),
+            height_maps: Vec::new(),
         }
     }
 }
@@ -587,7 +888,7 @@ impl ControllerData {
     }
 
     /// Validate the schema, settings, offsets, tools, macros, startup lines,
-    /// and keymap.
+    /// keymap, and height maps.
     ///
     /// # Errors
     ///
@@ -615,6 +916,15 @@ impl ControllerData {
         }
         self.startup_lines.validate()?;
         self.keymap.validate()?;
+        if self.height_maps.len() > MAX_HEIGHT_MAPS {
+            return Err(ValidationError::TooManyHeightMaps {
+                count: self.height_maps.len(),
+                max: MAX_HEIGHT_MAPS,
+            });
+        }
+        for map in &self.height_maps {
+            map.validate()?;
+        }
         Ok(())
     }
 }
@@ -676,6 +986,29 @@ mod tests {
         table
     }
 
+    fn sample_height_map() -> HeightMapRecord {
+        HeightMapRecord {
+            name: "Fixture top".into(),
+            tool_number: Some(3),
+            created_at_unix_s: Some(1_700_000_000),
+            origin_x_mm: 10.0,
+            origin_y_mm: 20.0,
+            step_x_mm: 5.0,
+            step_y_mm: 2.5,
+            columns: 3,
+            rows: 2,
+            surface_z_mm: -1.0,
+            z_offset_mm: Some(0.25),
+            samples: vec![Some(0.0), Some(0.1), None, Some(0.2), Some(0.3), Some(0.4)],
+            frame: HeightMapFrame {
+                wcs: Wcs::G55,
+                wcs_offset: Position::xyz(1.0, 2.0, 3.0),
+                g92: Position::xyz(0.1, 0.2, 0.3),
+                tool_length_offset_z_mm: -12.5,
+            },
+        }
+    }
+
     fn sample_data() -> ControllerData {
         let mut data = ControllerData::new();
         data.settings.insert(20, SettingValue::Bool(true));
@@ -715,6 +1048,7 @@ mod tests {
         keymap.insert(KeyBinding::new("jog.x.plus", "Right"));
         keymap.insert(KeyBinding::new("run.pause", "Space"));
         data.keymap = keymap;
+        data.height_maps = vec![sample_height_map()];
         data
     }
 
@@ -728,6 +1062,8 @@ mod tests {
         decoded.validate().expect("valid after round trip");
         assert!(json.contains("\"G54\""));
         assert!(json.contains("\"G59.3\""));
+        assert!(json.contains("\"height_maps\""));
+        assert_eq!(decoded.height_maps, data.height_maps);
     }
 
     #[test]
@@ -860,5 +1196,301 @@ mod tests {
         assert!(data.tools.is_empty());
         assert!(data.startup_lines.is_empty());
         assert_eq!(data.settings.len(), 0);
+        assert!(data.height_maps.is_empty());
+    }
+
+    #[test]
+    fn height_map_records_round_trip_complete_and_partial() {
+        let mut complete = sample_height_map();
+        complete.samples = (0..6).map(|index| Some(f64::from(index) * 0.1)).collect();
+        complete.z_offset_mm = None;
+        complete.tool_number = None;
+        complete.created_at_unix_s = None;
+
+        let partial = sample_height_map();
+        assert!(partial.samples.contains(&None));
+
+        for map in [complete, partial] {
+            let json = serde_json::to_string(&map).expect("serialize");
+            let decoded: HeightMapRecord = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, map);
+            decoded.validate().expect("valid");
+        }
+    }
+
+    #[test]
+    fn old_profiles_without_height_maps_load_empty() {
+        let data: ControllerData =
+            serde_json::from_str(r#"{"schema_version":1}"#).expect("old profile");
+        assert!(data.height_maps.is_empty());
+        data.validate().expect("valid");
+        assert_eq!(data, ControllerData::default());
+
+        let mut value = serde_json::to_value(sample_data()).expect("json");
+        value.as_object_mut().expect("object").remove("height_maps");
+        let decoded: ControllerData = serde_json::from_value(value).expect("decode");
+        assert!(decoded.height_maps.is_empty());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn height_map_index_and_lookup_are_row_major() {
+        let map = sample_height_map();
+        assert_eq!(map.point_count(), 6);
+        assert_eq!(map.index(0, 0), Some(0));
+        assert_eq!(map.index(2, 0), Some(2));
+        assert_eq!(map.index(0, 1), Some(3));
+        assert_eq!(map.index(2, 1), Some(5));
+        assert_eq!(map.index(3, 0), None);
+        assert_eq!(map.index(0, 2), None);
+        assert_eq!(map.sample(0, 0), Some(0.0));
+        assert_eq!(map.sample(2, 0), None);
+        assert_eq!(map.sample(3, 0), None);
+    }
+
+    #[test]
+    fn height_map_sample_count_and_values_are_validated() {
+        let mut wrong_count = sample_height_map();
+        wrong_count.samples.pop();
+        assert_eq!(
+            wrong_count.validate(),
+            Err(ValidationError::HeightMapSampleCount {
+                name: "Fixture top".into(),
+                expected: 6,
+                actual: 5,
+            })
+        );
+
+        let mut empty = sample_height_map();
+        empty.samples.clear();
+        assert!(matches!(
+            empty.validate(),
+            Err(ValidationError::HeightMapSampleCount {
+                expected: 6,
+                actual: 0,
+                ..
+            })
+        ));
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut map = sample_height_map();
+            map.samples[0] = Some(value);
+            assert!(matches!(
+                map.validate(),
+                Err(ValidationError::InvalidHeightMap {
+                    field: "samples",
+                    ..
+                })
+            ));
+        }
+
+        let mut too_large = sample_height_map();
+        too_large.samples[0] = Some(MAX_HEIGHT_MAP_COORDINATE_MM + 1.0);
+        assert!(matches!(
+            too_large.validate(),
+            Err(ValidationError::HeightMapOutOfRange {
+                field: "samples",
+                ..
+            })
+        ));
+
+        let mut too_small = sample_height_map();
+        too_small.samples[0] = Some(-MAX_HEIGHT_MAP_COORDINATE_MM - 1.0);
+        assert!(matches!(
+            too_small.validate(),
+            Err(ValidationError::HeightMapOutOfRange {
+                field: "samples",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn height_map_grid_bounds_are_validated() {
+        type Mutation = fn(&mut HeightMapRecord);
+        let cases: [(&str, Mutation); 11] = [
+            ("columns", |map| map.columns = 1),
+            ("rows", |map| map.rows = 1),
+            ("columns", |map| {
+                map.columns = MAX_HEIGHT_MAP_AXIS_POINTS + 1
+            }),
+            ("rows", |map| map.rows = MAX_HEIGHT_MAP_AXIS_POINTS + 1),
+            ("step_x_mm", |map| map.step_x_mm = 0.0),
+            ("step_y_mm", |map| map.step_y_mm = -1.0),
+            ("step_x_mm", |map| {
+                map.step_x_mm = MAX_HEIGHT_MAP_STEP_MM + 0.5
+            }),
+            ("step_y_mm", |map| map.step_y_mm = f64::NAN),
+            ("origin_x_mm", |map| map.origin_x_mm = f64::NAN),
+            ("grid_max_x_mm", |map| {
+                map.origin_x_mm = MAX_HEIGHT_MAP_COORDINATE_MM
+            }),
+            ("grid_max_y_mm", |map| {
+                map.origin_y_mm = MAX_HEIGHT_MAP_COORDINATE_MM
+            }),
+        ];
+        for (expected_field, mutate) in cases {
+            let mut map = sample_height_map();
+            mutate(&mut map);
+            match map.validate() {
+                Err(ValidationError::InvalidHeightMap { field, .. })
+                | Err(ValidationError::HeightMapOutOfRange { field, .. }) => {
+                    assert_eq!(field, expected_field);
+                }
+                other => panic!("expected {expected_field} to fail, got {other:?}"),
+            }
+        }
+
+        let mut surface = sample_height_map();
+        surface.surface_z_mm = f64::INFINITY;
+        assert!(matches!(
+            surface.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "surface_z_mm",
+                ..
+            })
+        ));
+
+        let mut offset = sample_height_map();
+        offset.z_offset_mm = Some(MAX_HEIGHT_MAP_COORDINATE_MM + 1.0);
+        assert!(matches!(
+            offset.validate(),
+            Err(ValidationError::HeightMapOutOfRange {
+                field: "z_offset_mm",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn height_map_frame_must_match_the_axis_model() {
+        let mut missing_z = sample_height_map();
+        missing_z
+            .frame
+            .wcs_offset
+            .set_axes(Axes::parse("XY").expect("valid"));
+        assert!(matches!(
+            missing_z.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "frame.wcs_offset",
+                reason: "must carry X, Y and Z axes",
+                ..
+            })
+        ));
+
+        let mut missing_y = sample_height_map();
+        missing_y
+            .frame
+            .g92
+            .set_axes(Axes::parse("XZ").expect("valid"));
+        assert!(matches!(
+            missing_y.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "frame.g92",
+                ..
+            })
+        ));
+
+        let mut non_finite = sample_height_map();
+        non_finite.frame.g92 = Position::xyz(0.0, 0.0, f64::NAN);
+        assert!(matches!(
+            non_finite.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "frame.g92",
+                reason: "coordinates must be finite",
+                ..
+            })
+        ));
+
+        let mut out_of_range = sample_height_map();
+        out_of_range.frame.wcs_offset = Position::xyz(MAX_HEIGHT_MAP_COORDINATE_MM + 1.0, 0.0, 0.0);
+        assert!(matches!(
+            out_of_range.validate(),
+            Err(ValidationError::HeightMapOutOfRange {
+                field: "frame.wcs_offset",
+                ..
+            })
+        ));
+
+        let mut extra_axes = sample_height_map();
+        extra_axes.frame.wcs_offset = Position::xyz(1.0, 2.0, 3.0);
+        extra_axes
+            .frame
+            .wcs_offset
+            .set_axes(Axes::parse("XYZA").expect("valid"));
+        extra_axes.validate().expect("extra axes are preserved");
+
+        let mut non_finite_tlo = sample_height_map();
+        non_finite_tlo.frame.tool_length_offset_z_mm = f64::NAN;
+        assert!(matches!(
+            non_finite_tlo.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "frame.tool_length_offset_z_mm",
+                ..
+            })
+        ));
+
+        let mut too_large_tlo = sample_height_map();
+        too_large_tlo.frame.tool_length_offset_z_mm = MAX_HEIGHT_MAP_COORDINATE_MM + 1.0;
+        assert!(matches!(
+            too_large_tlo.validate(),
+            Err(ValidationError::HeightMapOutOfRange {
+                field: "frame.tool_length_offset_z_mm",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn height_map_labels_are_validated() {
+        for (name, reason) in [
+            ("", "must not be empty"),
+            ("   ", "must not be empty"),
+            ("Bad\nName", "must not contain control characters"),
+        ] {
+            let mut map = sample_height_map();
+            map.name = name.into();
+            assert!(matches!(
+                map.validate(),
+                Err(ValidationError::InvalidHeightMap {
+                    field: "name",
+                    reason: found,
+                    ..
+                }) if found == reason
+            ));
+        }
+
+        let mut too_long = sample_height_map();
+        too_long.name = "x".repeat(MAX_HEIGHT_MAP_NAME + 1);
+        assert!(matches!(
+            too_long.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "name",
+                reason: "exceeds the 128-character limit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn profile_height_map_limit_is_enforced() {
+        let mut data = ControllerData::new();
+        data.height_maps = (0..=MAX_HEIGHT_MAPS)
+            .map(|index| {
+                let mut map = sample_height_map();
+                map.name = format!("Map {index}");
+                map
+            })
+            .collect();
+        assert_eq!(
+            data.validate(),
+            Err(ValidationError::TooManyHeightMaps {
+                count: MAX_HEIGHT_MAPS + 1,
+                max: MAX_HEIGHT_MAPS,
+            })
+        );
+
+        data.height_maps.pop();
+        data.validate().expect("limit is accepted");
     }
 }

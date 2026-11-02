@@ -252,7 +252,7 @@ mod tests {
     use ghs_core::{Position, Wcs, parse_controller_info};
 
     use super::*;
-    use crate::controller::{Macro, ToolRecord};
+    use crate::controller::{HeightMapFrame, HeightMapRecord, Macro, ToolRecord};
 
     const FLEXIHAL: &[&str] = &[
         "[VER:1.1f.20240604:]",
@@ -264,6 +264,29 @@ mod tests {
 
     fn info() -> ControllerInfo {
         parse_controller_info(FLEXIHAL)
+    }
+
+    fn height_map() -> HeightMapRecord {
+        HeightMapRecord {
+            name: "Fixture".into(),
+            tool_number: Some(1),
+            created_at_unix_s: Some(1_700_000_000),
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+            step_x_mm: 10.0,
+            step_y_mm: 10.0,
+            columns: 2,
+            rows: 2,
+            surface_z_mm: -1.0,
+            z_offset_mm: Some(0.05),
+            samples: vec![Some(0.0), Some(0.02), None, Some(0.04)],
+            frame: HeightMapFrame {
+                wcs: Wcs::G54,
+                wcs_offset: Position::xyz(1.0, 2.0, 3.0),
+                g92: Position::xyz(0.1, 0.2, 0.3),
+                tool_length_offset_z_mm: -10.0,
+            },
+        }
     }
 
     fn data() -> ControllerData {
@@ -279,6 +302,7 @@ mod tests {
             pocket: Some(1),
         });
         data.macros = vec![Macro::new("Safe Z", "G0 Z5")];
+        data.height_maps = vec![height_map()];
         data
     }
 
@@ -292,7 +316,74 @@ mod tests {
         let json = original.to_json_string().expect("encode");
         let decoded = BackupBundle::from_json_str(&json).expect("decode");
         assert_eq!(decoded, original);
+        assert_eq!(decoded.data.height_maps, original.data.height_maps);
         decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn bundle_preserves_complete_and_partial_height_maps() {
+        let mut complete = height_map();
+        complete.name = "Complete".into();
+        complete.samples = vec![Some(0.0), Some(0.1), Some(0.2), Some(0.3)];
+        complete.z_offset_mm = None;
+        complete.tool_number = None;
+        complete.created_at_unix_s = None;
+
+        let partial = height_map();
+        assert!(partial.samples.contains(&None));
+
+        let mut original = bundle();
+        original.data.height_maps = vec![complete, partial];
+        let json = original.to_json_string().expect("encode");
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.data.height_maps, original.data.height_maps);
+        assert_eq!(
+            decoded.data.height_maps[0]
+                .samples
+                .iter()
+                .filter(|s| s.is_none())
+                .count(),
+            0
+        );
+        assert_eq!(
+            decoded.data.height_maps[1]
+                .samples
+                .iter()
+                .filter(|s| s.is_none())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_a_malformed_height_map() {
+        let mut invalid_count = bundle();
+        invalid_count.data.height_maps[0].samples.pop();
+        assert_eq!(
+            invalid_count.validate(),
+            Err(ValidationError::HeightMapSampleCount {
+                name: "Fixture".into(),
+                expected: 4,
+                actual: 3,
+            })
+        );
+        assert!(matches!(
+            invalid_count.to_json_string(),
+            Err(ConfigError::Validation(
+                ValidationError::HeightMapSampleCount { .. }
+            ))
+        ));
+
+        let mut invalid_frame = bundle();
+        invalid_frame.data.height_maps[0].frame.wcs_offset = Position::xyz(0.0, 0.0, f64::NAN);
+        assert!(matches!(
+            invalid_frame.validate(),
+            Err(ValidationError::InvalidHeightMap {
+                field: "frame.wcs_offset",
+                ..
+            })
+        ));
     }
 
     #[test]

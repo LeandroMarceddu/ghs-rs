@@ -12,7 +12,8 @@
 //! - [`AppConfig`] holds theme, display units, the last profile key, and
 //!   window/layout fields in `app.json`.
 //! - [`ControllerData`] is one profile: settings snapshot, offsets, the
-//!   application-owned tool table, macros, startup lines, and keymap.
+//!   application-owned tool table, macros, startup lines, keymap, and persisted
+//!   height maps.
 //! - [`BackupBundle`] is a versioned portable snapshot with app config,
 //!   controller identity, controller data, and a creation timestamp.
 //!
@@ -66,8 +67,9 @@ pub use backup::{
     IdentityPolicy, ImportOutcome,
 };
 pub use controller::{
-    CONTROLLER_SCHEMA_VERSION, ControllerData, KeyBinding, Keymap, Macro, OffsetSnapshot,
-    StartupLines, ToolRecord, ToolTable,
+    CONTROLLER_SCHEMA_VERSION, ControllerData, HeightMapFrame, HeightMapRecord, KeyBinding, Keymap,
+    MAX_HEIGHT_MAP_AXIS_POINTS, MAX_HEIGHT_MAP_COORDINATE_MM, MAX_HEIGHT_MAP_STEP_MM,
+    MAX_HEIGHT_MAPS, Macro, OffsetSnapshot, StartupLines, ToolRecord, ToolTable,
 };
 pub use error::{ConfigError, ValidationError};
 pub use profile::ProfileKey;
