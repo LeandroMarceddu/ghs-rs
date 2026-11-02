@@ -65,7 +65,7 @@ use crate::height_map_library::{
 };
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
-use crate::offsets::OffsetStatus;
+use crate::offsets::{OffsetAction, OffsetGate, OffsetStatus};
 use crate::probe::{
     FieldProblem, PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight,
     ProbeRun, ProbeTarget, RowState, format_duration, format_estimate, format_mm,
@@ -219,6 +219,8 @@ pub struct Shell {
     demo_tools_done: bool,
     demo_offsets_write: bool,
     demo_offsets_write_done: bool,
+    demo_offsets_goto: bool,
+    demo_offsets_goto_done: bool,
     probe_card_demo: Option<String>,
     probe_card_demo_done: bool,
     demo_probe_run: bool,
@@ -353,6 +355,7 @@ impl Shell {
         }
         let demo_tools = std::env::args().any(|arg| arg == "--demo-tools");
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
+        let demo_offsets_goto = std::env::args().any(|arg| arg == "--demo-offsets-goto");
         let probe_card_demo = std::env::args().find_map(|arg| {
             arg.strip_prefix("--probe-card=")
                 .map(std::string::ToString::to_string)
@@ -427,6 +430,8 @@ impl Shell {
             demo_tools_done: false,
             demo_offsets_write,
             demo_offsets_write_done: false,
+            demo_offsets_goto,
+            demo_offsets_goto_done: false,
             probe_card_demo,
             probe_card_demo_done: false,
             demo_probe_run,
@@ -643,6 +648,25 @@ impl Shell {
                 "Demo: G10 L20 write through the normal MDI path",
             );
             self.send_offset_value(Wcs::G54, Axis::X, 12.5, cx);
+            changed = true;
+        }
+        // Screenshot switch: open the G28 confirmation sheet through the same
+        // request action as the button. Nothing is sent until Confirm.
+        if self.demo_offsets_goto
+            && !self.demo_offsets_goto_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.offsets.reported()
+            && self.offset_gate().block_reason().is_none()
+        {
+            self.demo_offsets_goto_done = true;
+            self.state.mode = Mode::Offset;
+            self.state.left_tab = LeftTab::Console;
+            self.state.console.clear();
+            self.state.push_console(
+                ConsoleLevel::Info,
+                "Demo: G28 confirmation sheet; nothing has been sent",
+            );
+            self.request_offset_action(OffsetAction::GotoG28, cx);
             changed = true;
         }
         // Screenshot switch: open one probe card once live telemetry and `$#`
@@ -954,6 +978,8 @@ impl Shell {
         if let Some(link) = &self.link {
             link.disconnect();
         }
+        // A confirmation captured on this link must not survive it.
+        self.state.offsets.cancel_action();
         self.state.connection = ConnectionState::Disconnected;
         self.state.push_console(
             ConsoleLevel::Warn,
@@ -1630,6 +1656,16 @@ impl Shell {
         self.machine() == MachineState::Idle
     }
 
+    /// Gate for `G28`/`G30` gotos and `G92.1` clear.
+    fn offset_gate(&self) -> OffsetGate {
+        OffsetGate {
+            live: self.state.live,
+            ready: self.ready(),
+            idle: self.machine() == MachineState::Idle,
+            job_active: self.state.job.is_active(),
+        }
+    }
+
     fn jog_allowed(&self) -> bool {
         if !self.ready() {
             return false;
@@ -1943,6 +1979,73 @@ impl Shell {
                 self.state
                     .push_console(ConsoleLevel::Warn, format!("Offset: {message}"));
             }
+        }
+        cx.notify();
+    }
+
+    /// Open the two-step confirmation sheet for a `G28`/`G30` goto or `G92.1`.
+    ///
+    /// Nothing is sent here. The sheet freezes the DRO and the read-only target
+    /// values so the next tap confirms exactly what the operator saw.
+    fn request_offset_action(&mut self, action: OffsetAction, cx: &mut Context<Self>) {
+        let gate = self.offset_gate();
+        if let Err(message) = self
+            .state
+            .offsets
+            .request_action(action, gate, &self.state.dro)
+        {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("{} refused: {message}", action.label()),
+            );
+        }
+        cx.notify();
+    }
+
+    /// Close the confirmation sheet without sending anything.
+    fn cancel_offset_action(&mut self, cx: &mut Context<Self>) {
+        if self.state.offsets.pending_action().is_some() {
+            self.state.offsets.cancel_action();
+            self.state.push_console(
+                ConsoleLevel::Info,
+                "Offset action cancelled; nothing was sent",
+            );
+        }
+        cx.notify();
+    }
+
+    /// Send the confirmed `G28`, `G30`, or `G92.1` through the guarded MDI path.
+    ///
+    /// The gate is re-checked at confirmation time; the engine remains the
+    /// final authority and its rejection is surfaced in the console and footer.
+    fn confirm_offset_action(&mut self, cx: &mut Context<Self>) {
+        let gate = self.offset_gate();
+        let (action, line) = match self.state.offsets.take_confirmed_command(gate) {
+            Ok(value) => value,
+            Err(message) => {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Offset action refused: {message}"),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        if self.send_mdi_line(line.clone()) {
+            self.state.offsets.command_sent(line.clone());
+            self.offset_refresh_sent = false;
+            let text = if action.moves_machine() {
+                format!("Offset: {line} sent (stored position; motion requested)")
+            } else {
+                format!("Offset: {line} sent (G92 cleared; no motion)")
+            };
+            self.state.push_console(ConsoleLevel::Command, text);
+        } else {
+            self.state.offsets.failed(format!("engine rejected {line}"));
+            self.state.push_console(
+                ConsoleLevel::Error,
+                format!("Offset: the engine rejected {line}; nothing changed"),
+            );
         }
         cx.notify();
     }
@@ -6591,15 +6694,25 @@ impl Shell {
             .child(div().flex_1().min_h(px(0.0)).child(body))
     }
 
+    /// Work-offset workspace.
+    ///
+    /// At 1280x800 the centre column is roughly 636 px wide. Three value fields
+    /// plus three 48 px per-axis zero targets and the selected-WCS detail panel
+    /// cannot share that width without horizontal scrolling, so the primary
+    /// 48 px zero targets live in the active-WCS panel and the dense `$#` table
+    /// stays tap-to-edit. Any WCS can still be zeroed by selecting it first.
+    /// `G28`/`G30` gotos and `G92.1` clear always open the confirmation sheet.
     fn offsets_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let model = &self.state.offsets;
         let rows = model.wcs_rows();
         let named = model.named_rows();
         let can_edit = self.state.live && self.mdi_allowed();
-        let active_wcs = Wcs::from_index(self.state.wcs_index).unwrap_or(Wcs::G54);
+        let active_wcs = model.active_wcs();
+        let active_row = model.wcs_row(active_wcs.index());
+        let action_gate = self.offset_gate();
+        let action_block = action_gate.block_reason();
         let refresh_view = view.clone();
-        let zero_active_view = view.clone();
 
         let (status_color, status_text) = match model.status() {
             OffsetStatus::Idle if !model.reported() => (p.text_faint, "WAITING FOR $#".to_string()),
@@ -6609,23 +6722,192 @@ impl Shell {
             OffsetStatus::Failed(message) => (p.danger, format!("FAILED: {message}")),
         };
 
+        let active_reported = active_row.as_ref().is_some_and(|row| row.reported);
+        let active_values = active_row.as_ref().map_or_else(
+            || "--".to_string(),
+            |row| {
+                format!(
+                    "X {}   Y {}   Z {}",
+                    model.format_optional(row.values[0]),
+                    model.format_optional(row.values[1]),
+                    model.format_optional(row.values[2])
+                )
+            },
+        );
+
+        let mut detail = v_flex()
+            .gap_2()
+            .p_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(chip(&format!("ACTIVE {}", active_wcs.as_str()), p))
+                            .child(chip(&format!("P{}", active_wcs.index() + 1), p))
+                            .child(chip(self.state.unit(), p)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(if active_reported {
+                                p.success
+                            } else {
+                                p.text_faint
+                            })
+                            .child(if active_reported {
+                                "REPORTED"
+                            } else {
+                                "NOT REPORTED"
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(14.0))
+                    .text_color(if active_reported {
+                        p.text
+                    } else {
+                        p.text_faint
+                    })
+                    .child(active_values),
+            );
+
+        let zero_button = |axis: Axis| {
+            let zero_view = view.clone();
+            Button::new(format!("detail-zero-{}", axis.label()))
+                .label(format!("ZERO {}", axis.label()))
+                .warning()
+                .h(px(48.0))
+                .flex_1()
+                .rounded_lg()
+                .text_size(px(11.0))
+                .disabled(!can_edit)
+                .on_click(move |_, _, cx| {
+                    zero_view.update(cx, |this, cx| {
+                        this.zero_offset_axis(active_wcs, axis, cx);
+                    });
+                })
+        };
+        let zero_all_view = view.clone();
+        let zero_all = Button::new("detail-zero-all")
+            .label("ZERO ALL")
+            .danger()
+            .h(px(48.0))
+            .flex_1()
+            .rounded_lg()
+            .text_size(px(11.0))
+            .disabled(!can_edit)
+            .on_click(move |_, _, cx| {
+                zero_all_view.update(cx, |this, cx| {
+                    this.zero_offset_all(active_wcs, cx);
+                });
+            });
+        let zero_top = h_flex()
+            .gap_2()
+            .child(zero_button(Axis::X))
+            .child(zero_button(Axis::Y));
+        let zero_bottom = h_flex().gap_2().child(zero_button(Axis::Z)).child(zero_all);
+        detail = detail.child(zero_top).child(zero_bottom);
+
+        let mut action_row = h_flex().gap_2();
+        for action in OffsetAction::ALL {
+            let action_view = view.clone();
+            let button = Button::new(format!(
+                "offset-action-{}",
+                action.command().replace('.', "-")
+            ))
+            .label(action.label())
+            .h(px(48.0))
+            .flex_1()
+            .rounded_lg()
+            .text_size(px(11.0))
+            .disabled(action_block.is_some() || !model.action_available(action))
+            .on_click(move |_, _, cx| {
+                action_view.update(cx, |this, cx| {
+                    this.request_offset_action(action, cx);
+                });
+            });
+            let button = if action.moves_machine() {
+                button.warning()
+            } else {
+                button.danger()
+            };
+            action_row = action_row.child(button);
+        }
+        let missing_goto: Vec<&str> = OffsetAction::ALL
+            .into_iter()
+            .filter(|action| action.moves_machine() && !model.action_available(*action))
+            .map(OffsetAction::command)
+            .collect();
+
+        let mut actions = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("PREDEFINED POSITIONS / G92"),
+                    )
+                    .child(chip("CONFIRM", p)),
+            )
+            .child(action_row)
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "G28/G30 move to the stored target; CLEAR G92 sends G92.1. \
+                 Cancel sends nothing.",
+            ));
+        if !missing_goto.is_empty() {
+            actions = actions.child(div().text_size(px(10.0)).text_color(p.warning).child(
+                format!(
+                    "{} NOT REPORTED BY $#; goto stays disabled",
+                    missing_goto.join(" / ")
+                ),
+            ));
+        }
+        if let Some(reason) = action_block {
+            actions = actions.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.warning)
+                    .child(format!("LOCKED: {reason}")),
+            );
+        }
+
         let mut list = v_flex().id("offset-wcs-list").gap_1();
         for row in rows {
             let row_view = view.clone();
-            let zero_all_view = view.clone();
             let wcs = row.wcs;
             let active = row.active;
             let mut line = h_flex()
                 .items_center()
                 .gap_1()
-                .h(px(48.0))
+                .h(px(52.0))
                 .px_1()
                 .rounded(px(6.0))
                 .bg(if active { p.accent_muted } else { p.panel_alt });
             line = line.child(
                 Button::new(format!("wcs-{}", wcs.as_str()))
                     .label(wcs.as_str())
-                    .h(px(44.0))
+                    .h(px(48.0))
                     .w(px(64.0))
                     .rounded(px(6.0))
                     .text_size(px(12.0))
@@ -6647,82 +6929,39 @@ impl Shell {
                 let value = row.values.get(axis.index()).copied().flatten();
                 let text = model.format_optional(value);
                 let value_view = view.clone();
-                let zero_view = view.clone();
-                line = line
-                    .child(
-                        Button::new(format!("off-{}-{}", wcs.as_str(), axis.label()))
-                            .label(format!("{text:>9}"))
-                            .h(px(44.0))
-                            .w(px(92.0))
-                            .rounded(px(6.0))
-                            .text_size(px(13.0))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(p.panel)
-                                    .foreground(if value.is_some() {
-                                        p.text
-                                    } else {
-                                        p.text_faint
-                                    })
-                                    .hover(p.raised_hover)
-                                    .active(p.accent_muted),
-                            )
-                            .border_1()
-                            .border_color(p.border)
-                            .disabled(!can_edit)
-                            .on_click(move |_, _, cx| {
-                                value_view.update(cx, |this, cx| {
-                                    this.state.open_keypad(KeypadTarget::WorkOffset {
-                                        wcs: wcs.index(),
-                                        axis,
-                                    });
-                                    cx.notify();
+                line = line.child(
+                    Button::new(format!("off-{}-{}", wcs.as_str(), axis.label()))
+                        .label(format!("{text:>9}"))
+                        .h(px(48.0))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .rounded(px(6.0))
+                        .text_size(px(13.0))
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(p.panel)
+                                .foreground(if value.is_some() {
+                                    p.text
+                                } else {
+                                    p.text_faint
+                                })
+                                .hover(p.raised_hover)
+                                .active(p.accent_muted),
+                        )
+                        .border_1()
+                        .border_color(p.border)
+                        .disabled(!can_edit)
+                        .on_click(move |_, _, cx| {
+                            value_view.update(cx, |this, cx| {
+                                this.state.open_keypad(KeypadTarget::WorkOffset {
+                                    wcs: wcs.index(),
+                                    axis,
                                 });
-                            }),
-                    )
-                    .child(
-                        Button::new(format!("off0-{}-{}", wcs.as_str(), axis.label()))
-                            .label("0")
-                            .h(px(44.0))
-                            .w(px(34.0))
-                            .rounded(px(6.0))
-                            .text_size(px(12.0))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(p.panel_alt)
-                                    .foreground(p.warning)
-                                    .hover(p.raised_hover)
-                                    .active(p.raised),
-                            )
-                            .disabled(!can_edit)
-                            .on_click(move |_, _, cx| {
-                                zero_view.update(cx, |this, cx| {
-                                    this.zero_offset_axis(wcs, axis, cx);
-                                });
-                            }),
-                    );
+                                cx.notify();
+                            });
+                        }),
+                );
             }
-            line = line.child(
-                Button::new(format!("off-all-{}", wcs.as_str()))
-                    .label("ZERO ALL")
-                    .h(px(44.0))
-                    .w(px(80.0))
-                    .rounded(px(6.0))
-                    .text_size(px(10.0))
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(p.panel_alt)
-                            .foreground(p.warning)
-                            .hover(p.raised_hover)
-                            .active(p.raised),
-                    )
-                    .disabled(!can_edit)
-                    .on_click(move |_, _, cx| {
-                        zero_all_view.update(cx, |this, cx| {
-                            this.zero_offset_all(wcs, cx);
-                        });
-                    }),
-            );
             list = list.child(line);
         }
 
@@ -6766,11 +7005,39 @@ impl Shell {
             );
         }
 
-        v_flex()
-            .id("offset-mode-scroll")
-            .gap_2()
-            .size_full()
-            .overflow_y_scrollbar()
+        let status = v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(7.0))
+                            .h(px(7.0))
+                            .rounded(px(999.0))
+                            .bg(status_color),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(status_color)
+                            .child(status_text),
+                    ),
+            )
+            .child(
+                div().text_size(px(10.0)).text_color(p.text_faint).child(
+                    model
+                        .last_line()
+                        .unwrap_or("No offset write yet")
+                        .to_string(),
+                ),
+            );
+
+        let table = v_flex()
+            .flex_1()
+            .min_w(px(300.0))
+            .gap_1()
             .child(
                 h_flex()
                     .items_center()
@@ -6780,88 +7047,36 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(chip(&format!("ACTIVE {}", active_wcs.as_str()), p))
-                            .child(chip(self.state.unit(), p))
-                            .child(chip("G10 L20", p)),
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text_dim)
+                                    .child("WCS OFFSETS"),
+                            )
+                            .child(chip(self.state.unit(), p)),
                     )
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("offset-refresh")
-                                    .label("REFRESH $#")
-                                    .secondary()
-                                    .h(px(44.0))
-                                    .w(px(112.0))
-                                    .rounded_lg()
-                                    .text_size(px(10.0))
-                                    .disabled(!self.state.live || !self.ready())
-                                    .on_click(move |_, _, cx| {
-                                        refresh_view.update(cx, |this, cx| {
-                                            this.request_offset_refresh(cx);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("offset-zero-active")
-                                    .label("ZERO ACTIVE")
-                                    .warning()
-                                    .h(px(44.0))
-                                    .w(px(118.0))
-                                    .rounded_lg()
-                                    .text_size(px(10.0))
-                                    .disabled(!can_edit)
-                                    .on_click(move |_, _, cx| {
-                                        zero_active_view.update(cx, |this, cx| {
-                                            this.zero_offset_all(active_wcs, cx);
-                                        });
-                                    }),
-                            ),
+                        Button::new("offset-refresh")
+                            .label("REFRESH $#")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(112.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!self.state.live || !self.ready())
+                            .on_click(move |_, _, cx| {
+                                refresh_view.update(cx, |this, cx| {
+                                    this.request_offset_refresh(cx);
+                                });
+                            }),
                     ),
             )
-            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "Tap a value to set G10 L20 for that WCS; 0 zeroes one axis. \
-                         Zeroing changes the stored offset only and never moves an axis.",
-            ))
             .child(
                 h_flex()
                     .items_center()
-                    .justify_between()
                     .gap_2()
                     .h(px(20.0))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(7.0))
-                                    .h(px(7.0))
-                                    .rounded(px(999.0))
-                                    .bg(status_color),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(status_color)
-                                    .child(status_text),
-                            ),
-                    )
-                    .child(
-                        div().text_size(px(10.0)).text_color(p.text_faint).child(
-                            model
-                                .last_line()
-                                .unwrap_or("No offset write yet")
-                                .to_string(),
-                        ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(24.0))
                     .px_1()
                     .child(
                         div()
@@ -6872,13 +7087,281 @@ impl Shell {
                     )
                     .child(
                         div()
+                            .flex_1()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
                             .child("X / Y / Z IN DISPLAY UNITS"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("TAP TO EDIT"),
                     ),
             )
-            .child(list)
+            .child(list);
+
+        let left = v_flex()
+            .w(px(300.0))
+            .flex_shrink_0()
+            .gap_2()
+            .child(detail)
+            .child(actions)
+            .child(status);
+
+        v_flex()
+            .id("offset-mode-scroll")
+            .gap_2()
+            .size_full()
+            .overflow_y_scrollbar()
+            .child(
+                h_flex()
+                    .items_start()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(left)
+                    .child(table),
+            )
             .child(named_list)
+            .into_any_element()
+    }
+
+    /// Two-step confirmation for a `G28`/`G30` goto or `G92.1` clear.
+    ///
+    /// The scrim cancels on tap. The confirm button re-checks the live gate and
+    /// the engine remains the final authority; nothing is sent before the
+    /// second explicit press.
+    fn offset_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pending) = self.state.offsets.pending_action() else {
+            return div().into_any_element();
+        };
+        let action = pending.action();
+        let block = self.offset_gate().block_reason();
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let confirm_view = view;
+        let mono = self.mono.clone();
+        let model = &self.state.offsets;
+
+        let mut dro_row = h_flex().gap_2();
+        for (index, axis) in [Axis::X, Axis::Y, Axis::Z].iter().enumerate() {
+            let value = self.state.dro.get(index).copied();
+            dro_row = dro_row.child(
+                v_flex()
+                    .flex_1()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(format!("DRO {}", axis.label())),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(20.0))
+                            .text_color(p.text)
+                            .child(model.format_optional(value)),
+                    ),
+            );
+        }
+
+        let dro_changed = (0..3).any(|index| {
+            let live = self.state.dro.get(index).copied();
+            let requested = pending.dro()[index];
+            match (live, requested) {
+                (Some(live), Some(requested)) => (live - requested).abs() > 0.0005,
+                (None, None) => false,
+                _ => true,
+            }
+        });
+
+        let accent = if action.moves_machine() {
+            p.warning
+        } else {
+            p.danger
+        };
+        let warning = if action.moves_machine() {
+            format!(
+                "{} sends {}. The machine will move to the stored position above. Nothing has \
+                 been sent yet; CANCEL sends nothing. No homing or extra motion is added.",
+                action.label(),
+                pending.command()
+            )
+        } else {
+            format!(
+                "{} sends {}. No axis moves; the displayed work position changes by the cleared \
+                 offset. The old G92 values are shown above and $# is read back after the command.",
+                action.label(),
+                pending.command()
+            )
+        };
+
+        let sheet = v_flex()
+            .w(px(560.0))
+            .max_w_full()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(accent.opacity(0.6))
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(accent)
+                            .child(action.title()),
+                    )
+                    .child(chip("NOT SENT YET", p)),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(24.0))
+                            .text_color(p.text)
+                            .child(pending.command()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("EXACT MDI LINE"),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .w(px(140.0))
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(action.target_label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .font_family(mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(p.text)
+                            .child(pending.target().to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child("CURRENT DRO (DISPLAY UNITS)"),
+            )
+            .child(dro_row)
+            .when(dro_changed, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.warning)
+                        .child("DRO CHANGED SINCE THIS SHEET OPENED; CANCEL AND RECHECK"),
+                )
+            })
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(p.text_dim)
+                    .child(warning),
+            )
+            .when_some(block, |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.warning)
+                        .child(format!("LOCKED: {reason}")),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("offset-confirm-cancel")
+                            .label("CANCEL")
+                            .secondary()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                cancel_view.update(cx, |this, cx| {
+                                    this.cancel_offset_action(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("offset-confirm-accept")
+                            .label(if action.moves_machine() {
+                                format!("CONFIRM {}", pending.command())
+                            } else {
+                                "CLEAR G92".to_string()
+                            })
+                            .danger()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(block.is_some())
+                            .on_click(move |_, _, cx| {
+                                confirm_view.update(cx, |this, cx| {
+                                    this.confirm_offset_action(cx);
+                                });
+                            }),
+                    ),
+            );
+
+        let scrim_view = cx.entity();
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("offset-confirm-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| {
+                            this.cancel_offset_action(cx);
+                        });
+                    }),
+            )
+            .child(sheet)
             .into_any_element()
     }
 
@@ -9572,6 +10055,9 @@ impl Render for Shell {
         }
         if self.panel.open {
             root = root.child(self.connection_overlay(p, cx));
+        }
+        if self.state.offsets.pending_action().is_some() {
+            root = root.child(self.offset_confirm_overlay(p, cx));
         }
         root
     }

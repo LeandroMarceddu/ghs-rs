@@ -7,8 +7,10 @@
 //!
 //! Work-offset edits are always `G10 L20 P<n> <axis><value>` in the selected
 //! coordinate system. `G10` changes the stored offset; it never moves an axis.
-//! `G92` is displayed but not edited here because it is non-persistent and is
-//! cleared by a reset.
+//! `G92` is never edited here, but it can be cleared explicitly with `G92.1`
+//! after a confirmation. `G28` and `G30` gotos also require a confirmation and
+//! send only the bare stored-position command; this module never invents a
+//! target coordinate.
 
 use ghs_config::OffsetSnapshot;
 use ghs_engine::{Axes, Axis as CoreAxis, Offsets, Position, ProbeResult, Wcs};
@@ -67,6 +69,167 @@ impl OffsetStatus {
     }
 }
 
+/// Controller preconditions for an offset action that changes the machine.
+///
+/// `ZERO` writes are idle-only through the engine's MDI gateway. `G28`/`G30`
+/// and `G92.1` move or rebase the work position, so the shell also requires a
+/// live, ready controller in `Idle` with no job active before it offers the
+/// confirmation sheet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OffsetGate {
+    /// A live engine connection is open.
+    pub live: bool,
+    /// The engine handshake finished and telemetry is live.
+    pub ready: bool,
+    /// The controller reports `Idle`.
+    pub idle: bool,
+    /// The job runner is running or paused.
+    pub job_active: bool,
+}
+
+impl OffsetGate {
+    /// An open gate: live, ready, Idle, and no job.
+    #[cfg(test)]
+    pub const READY_IDLE: Self = Self {
+        live: true,
+        ready: true,
+        idle: true,
+        job_active: false,
+    };
+
+    /// First blocking reason, or `None` when the action may be requested.
+    #[must_use]
+    pub fn block_reason(self) -> Option<&'static str> {
+        if !self.live {
+            Some("a live controller is required")
+        } else if !self.ready {
+            Some("the controller is not ready")
+        } else if self.job_active {
+            Some("a job is active")
+        } else if !self.idle {
+            Some("the controller must be Idle")
+        } else {
+            None
+        }
+    }
+
+    /// Validate the gate and return the blocking reason as owned text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason from [`OffsetGate::block_reason`].
+    pub fn check(self) -> Result<(), String> {
+        match self.block_reason() {
+            Some(reason) => Err(reason.to_string()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One controller action that needs a second confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffsetAction {
+    /// Rapid to the controller's stored `G28` position.
+    GotoG28,
+    /// Rapid to the controller's stored `G30` position.
+    GotoG30,
+    /// Clear the non-persistent `G92` offset.
+    ClearG92,
+}
+
+impl OffsetAction {
+    /// Every action, in the order shown by the offsets workspace.
+    pub const ALL: [Self; 3] = [Self::GotoG28, Self::GotoG30, Self::ClearG92];
+
+    /// Exact MDI line sent on confirmation.
+    ///
+    /// `G28`/`G30` use the controller's stored target. `G92.1` clears the
+    /// offset. No axis words or motion adjectives are appended.
+    #[must_use]
+    pub fn command(self) -> &'static str {
+        match self {
+            OffsetAction::GotoG28 => "G28",
+            OffsetAction::GotoG30 => "G30",
+            OffsetAction::ClearG92 => "G92.1",
+        }
+    }
+
+    /// Button label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            OffsetAction::GotoG28 => "GOTO G28",
+            OffsetAction::GotoG30 => "GOTO G30",
+            OffsetAction::ClearG92 => "CLEAR G92",
+        }
+    }
+
+    /// Confirmation sheet title.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            OffsetAction::GotoG28 => "CONFIRM G28 GOTO",
+            OffsetAction::GotoG30 => "CONFIRM G30 GOTO",
+            OffsetAction::ClearG92 => "CONFIRM CLEAR G92",
+        }
+    }
+
+    /// Name of the read-only target shown on the confirmation sheet.
+    #[must_use]
+    pub fn target_label(self) -> &'static str {
+        match self {
+            OffsetAction::GotoG28 => "G28 STORED POSITION",
+            OffsetAction::GotoG30 => "G30 STORED POSITION",
+            OffsetAction::ClearG92 => "OLD G92 OFFSET",
+        }
+    }
+
+    /// Whether the command moves the machine.
+    #[must_use]
+    pub fn moves_machine(self) -> bool {
+        !matches!(self, OffsetAction::ClearG92)
+    }
+}
+
+/// Frozen context for one confirmation sheet.
+///
+/// The action and target text are captured when the operator opens the sheet,
+/// in display units. The DRO is also snapshotted at request time so the sheet
+/// can flag any change against the live DRO before the second tap. The sheet
+/// never re-reads the target values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OffsetConfirm {
+    action: OffsetAction,
+    dro: [Option<f64>; 3],
+    target: String,
+}
+
+impl OffsetConfirm {
+    /// Action being confirmed.
+    #[must_use]
+    pub fn action(&self) -> OffsetAction {
+        self.action
+    }
+
+    /// Exact command that confirmation will send.
+    #[must_use]
+    pub fn command(&self) -> &'static str {
+        self.action.command()
+    }
+
+    /// DRO X/Y/Z in display units when the sheet opened.
+    #[must_use]
+    pub fn dro(&self) -> &[Option<f64>; 3] {
+        &self.dro
+    }
+
+    /// Read-only target text: stored `G28`/`G30` values or the old `G92` values.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
 /// Mapping and formatting state for the offsets workspace.
 #[derive(Clone, Debug)]
 pub struct OffsetModel {
@@ -77,6 +240,7 @@ pub struct OffsetModel {
     reported: bool,
     status: OffsetStatus,
     last_line: Option<String>,
+    pending: Option<OffsetConfirm>,
 }
 
 impl Default for OffsetModel {
@@ -89,6 +253,7 @@ impl Default for OffsetModel {
             reported: false,
             status: OffsetStatus::Idle,
             last_line: None,
+            pending: None,
         }
     }
 }
@@ -180,6 +345,12 @@ impl OffsetModel {
     #[must_use]
     pub fn wcs_position(&self, wcs: Wcs) -> Option<Position> {
         self.offsets.wcs(wcs)
+    }
+
+    /// Active work coordinate system selected by the shell.
+    #[must_use]
+    pub fn active_wcs(&self) -> Wcs {
+        Wcs::from_index(self.active_wcs).unwrap_or(Wcs::G54)
     }
 
     /// Reported `G92` offset, in millimetres.
@@ -326,6 +497,113 @@ impl OffsetModel {
             line.push_str(&format!("{:.dec$}", 0.0, dec = self.decimals()));
         }
         Ok(line)
+    }
+
+    /// Open the confirmation sheet for a controller action.
+    ///
+    /// The target text is frozen here and the DRO is recorded for change
+    /// detection. No command is sent by this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate reason when the controller is not live, ready, Idle, or
+    /// when a job is active. A `G28`/`G30` goto is also refused when `$#` did
+    /// not report the stored position: the app never guesses or invents a
+    /// target, and an unset position can make some controllers home instead.
+    pub fn request_action(
+        &mut self,
+        action: OffsetAction,
+        gate: OffsetGate,
+        dro: &[f64],
+    ) -> Result<(), String> {
+        gate.check()?;
+        if !self.reported {
+            return Err("$# has not reported the offsets yet".to_string());
+        }
+        let target = match action {
+            OffsetAction::GotoG28 => self.reported_target(action, self.offsets.g28)?,
+            OffsetAction::GotoG30 => self.reported_target(action, self.offsets.g30)?,
+            OffsetAction::ClearG92 => self.old_g92_target(),
+        };
+        let dro = [
+            dro.first().copied(),
+            dro.get(1).copied(),
+            dro.get(2).copied(),
+        ];
+        self.pending = Some(OffsetConfirm {
+            action,
+            dro,
+            target,
+        });
+        Ok(())
+    }
+
+    /// Whether an action has the read-only target it needs.
+    ///
+    /// Every action waits for `$#` so the sheet can show the stored values.
+    /// `G28`/`G30` additionally require that specific stored position.
+    #[must_use]
+    pub fn action_available(&self, action: OffsetAction) -> bool {
+        if !self.reported {
+            return false;
+        }
+        match action {
+            OffsetAction::GotoG28 => self.offsets.g28.is_some(),
+            OffsetAction::GotoG30 => self.offsets.g30.is_some(),
+            OffsetAction::ClearG92 => true,
+        }
+    }
+
+    /// Confirmation sheet context, if one is open.
+    #[must_use]
+    pub fn pending_action(&self) -> Option<&OffsetConfirm> {
+        self.pending.as_ref()
+    }
+
+    /// Close the confirmation sheet without producing a command.
+    pub fn cancel_action(&mut self) {
+        self.pending = None;
+    }
+
+    /// Consume a pending confirmation and return its exact command.
+    ///
+    /// The gate is re-checked after the operator taps; telemetry can change
+    /// between opening the sheet and confirming. A refusal still consumes the
+    /// pending action, so a stale sheet can never fire later.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no confirmation is pending or the gate closed.
+    pub fn take_confirmed_command(
+        &mut self,
+        gate: OffsetGate,
+    ) -> Result<(OffsetAction, String), String> {
+        let Some(pending) = self.pending.take() else {
+            return Err("no confirmation is pending".to_string());
+        };
+        gate.check()?;
+        Ok((pending.action, pending.action.command().to_string()))
+    }
+
+    fn reported_target(
+        &self,
+        action: OffsetAction,
+        position: Option<Position>,
+    ) -> Result<String, String> {
+        match position {
+            Some(position) => Ok(self.position_text(position)),
+            None => Err(format!(
+                "the controller did not report a {} stored position",
+                action.command()
+            )),
+        }
+    }
+
+    fn old_g92_target(&self) -> String {
+        self.offsets.g92.map_or_else(
+            || "NONE (G92 IS ZERO)".to_string(),
+            |position| self.position_text(position),
+        )
     }
 
     /// Capture the current live offsets for a local profile or backup.
@@ -519,6 +797,225 @@ mod tests {
         assert_eq!(
             model.zero_all_command(Wcs::G55).expect("line"),
             "G10 L20 P2 X0.000 Y0.000 Z0.000"
+        );
+    }
+
+    fn assert_g10_l20_only(line: &str) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(words.first().copied(), Some("G10"), "{line}");
+        assert_eq!(words.get(1).copied(), Some("L20"), "{line}");
+        for word in &words[2..] {
+            assert!(
+                matches!(word.chars().next(), Some('P' | 'X' | 'Y' | 'Z')),
+                "unexpected word '{word}' in '{line}'"
+            );
+        }
+        for motion in [
+            "G0", "G1", "G2", "G3", "G28", "G30", "G53", "G92", "M3", "M5",
+        ] {
+            assert!(!words.contains(&motion), "motion word {motion} in '{line}'");
+        }
+    }
+
+    #[test]
+    fn zero_commands_are_g10_l20_only_and_contain_no_motion_words() {
+        let model = model(Units::Millimetre);
+        for wcs in Wcs::ALL {
+            for axis in [Axis::X, Axis::Y, Axis::Z] {
+                let line = model.zero_axis_command(wcs, axis).expect("zero axis");
+                assert_g10_l20_only(&line);
+            }
+            let line = model.zero_all_command(wcs).expect("zero all");
+            assert_g10_l20_only(&line);
+        }
+    }
+
+    #[test]
+    fn selected_wcs_zero_targets_map_to_its_program_number() {
+        let mut model = model(Units::Millimetre);
+        model.set_context(
+            Units::Millimetre,
+            &[Axis::X, Axis::Y, Axis::Z],
+            Wcs::G59_2.index(),
+        );
+        model.apply_engine(&sample_offsets());
+        assert_eq!(model.active_wcs(), Wcs::G59_2);
+        assert_eq!(
+            model.zero_all_command(model.active_wcs()).expect("line"),
+            "G10 L20 P8 X0.000 Y0.000 Z0.000"
+        );
+        assert_eq!(
+            model
+                .zero_axis_command(model.active_wcs(), Axis::Z)
+                .expect("line"),
+            "G10 L20 P8 Z0.000"
+        );
+    }
+
+    #[test]
+    fn goto_commands_require_confirmation_and_are_exact() {
+        let mut model = model(Units::Millimetre);
+        model.apply_engine(&sample_offsets());
+
+        model
+            .request_action(
+                OffsetAction::GotoG28,
+                OffsetGate::READY_IDLE,
+                &[12.5, -3.0, 4.25],
+            )
+            .expect("request G28");
+        let pending = model.pending_action().expect("confirmation sheet");
+        assert_eq!(pending.action(), OffsetAction::GotoG28);
+        assert_eq!(pending.command(), "G28");
+        assert_eq!(pending.target(), "X0.000  Y0.000  Z-2.000");
+        assert_eq!(pending.dro(), &[Some(12.5), Some(-3.0), Some(4.25)]);
+
+        let (action, line) = model
+            .take_confirmed_command(OffsetGate::READY_IDLE)
+            .expect("confirmed G28");
+        assert_eq!(action, OffsetAction::GotoG28);
+        assert_eq!(line, "G28");
+        assert!(model.pending_action().is_none());
+
+        model
+            .request_action(OffsetAction::GotoG30, OffsetGate::READY_IDLE, &[0.0; 3])
+            .expect("request G30");
+        let (action, line) = model
+            .take_confirmed_command(OffsetGate::READY_IDLE)
+            .expect("confirmed G30");
+        assert_eq!(action, OffsetAction::GotoG30);
+        assert_eq!(line, "G30");
+    }
+
+    #[test]
+    fn cancelling_a_goto_sends_nothing() {
+        let mut model = model(Units::Millimetre);
+        model.apply_engine(&sample_offsets());
+        model
+            .request_action(
+                OffsetAction::GotoG30,
+                OffsetGate::READY_IDLE,
+                &[1.0, 2.0, 3.0],
+            )
+            .expect("request G30");
+        assert!(model.pending_action().is_some());
+
+        model.cancel_action();
+
+        assert!(model.pending_action().is_none());
+        assert!(
+            model
+                .take_confirmed_command(OffsetGate::READY_IDLE)
+                .is_err(),
+            "cancel must not leave a command behind"
+        );
+    }
+
+    #[test]
+    fn g92_clear_needs_confirmation_and_sends_only_g921() {
+        let mut model = model(Units::Millimetre);
+        model.apply_engine(&sample_offsets());
+        model
+            .request_action(
+                OffsetAction::ClearG92,
+                OffsetGate::READY_IDLE,
+                &[5.0, 6.0, 7.0],
+            )
+            .expect("request clear");
+        let pending = model.pending_action().expect("confirmation sheet");
+        assert_eq!(pending.command(), "G92.1");
+        assert_eq!(pending.target(), "X0.500  Y0.000  Z0.000");
+
+        let (action, line) = model
+            .take_confirmed_command(OffsetGate::READY_IDLE)
+            .expect("confirmed clear");
+        assert_eq!(action, OffsetAction::ClearG92);
+        assert_eq!(line, "G92.1");
+        assert!(!line.contains(' '), "G92 clear carries no axis words");
+
+        model.command_sent(line);
+        assert_eq!(model.status(), &OffsetStatus::Refreshing);
+    }
+
+    #[test]
+    fn goto_refuses_an_unreported_stored_position() {
+        let mut model = model(Units::Millimetre);
+        let mut offsets = sample_offsets();
+        offsets.g28 = None;
+        model.apply_engine(&offsets);
+        assert!(!model.action_available(OffsetAction::GotoG28));
+        assert!(model.action_available(OffsetAction::GotoG30));
+        let error = model
+            .request_action(OffsetAction::GotoG28, OffsetGate::READY_IDLE, &[0.0; 3])
+            .expect_err("unknown target");
+        assert!(error.contains("did not report"), "{error}");
+        assert!(model.pending_action().is_none());
+
+        let mut unseen = OffsetModel::default();
+        unseen.set_context(Units::Millimetre, &[Axis::X, Axis::Y, Axis::Z], 0);
+        assert!(!unseen.action_available(OffsetAction::ClearG92));
+        let error = unseen
+            .request_action(OffsetAction::ClearG92, OffsetGate::READY_IDLE, &[0.0; 3])
+            .expect_err("no $# snapshot");
+        assert!(error.contains("$#"), "{error}");
+    }
+
+    #[test]
+    fn controller_actions_refuse_when_not_live_ready_idle_or_job_active() {
+        let closed = [
+            (
+                OffsetGate {
+                    live: false,
+                    ..OffsetGate::READY_IDLE
+                },
+                "live",
+            ),
+            (
+                OffsetGate {
+                    ready: false,
+                    ..OffsetGate::READY_IDLE
+                },
+                "not ready",
+            ),
+            (
+                OffsetGate {
+                    idle: false,
+                    ..OffsetGate::READY_IDLE
+                },
+                "Idle",
+            ),
+            (
+                OffsetGate {
+                    job_active: true,
+                    ..OffsetGate::READY_IDLE
+                },
+                "job",
+            ),
+        ];
+        for (gate, needle) in closed {
+            let mut model = model(Units::Millimetre);
+            let error = model
+                .request_action(OffsetAction::GotoG28, gate, &[0.0; 3])
+                .expect_err("closed gate");
+            assert!(error.contains(needle), "{error}");
+            assert!(model.pending_action().is_none());
+        }
+
+        let mut model = model(Units::Millimetre);
+        model.apply_engine(&sample_offsets());
+        model
+            .request_action(OffsetAction::ClearG92, OffsetGate::READY_IDLE, &[0.0; 3])
+            .expect("request clear");
+        let error = model
+            .take_confirmed_command(OffsetGate {
+                ready: false,
+                ..OffsetGate::READY_IDLE
+            })
+            .expect_err("gate closed before confirmation");
+        assert!(error.contains("not ready"), "{error}");
+        assert!(
+            model.pending_action().is_none(),
+            "a refused confirmation is consumed"
         );
     }
 

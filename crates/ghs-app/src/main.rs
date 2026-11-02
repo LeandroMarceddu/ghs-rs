@@ -19,7 +19,9 @@
 //! `--tools`, `--utility`, and `--probe` open those workspaces directly.
 //! `--demo-tools` seeds the app-side tool table after the controller profile
 //! loads. `--demo-offsets-write` sends one real `G10 L20` through MDI and
-//! refreshes `$#` for the applied-offsets screenshot. `--probe-card=z|edge-x|
+//! refreshes `$#` for the applied-offsets screenshot. `--demo-offsets-goto`
+//! opens the G28 confirmation sheet through the normal request action without
+//! confirming it. `--probe-card=z|edge-x|
 //! edge-y|corner|circle|rotation|tool|height` opens one probe cycle once live
 //! telemetry and `$#` are available; `--demo-probe-check` stands in for the
 //! operator's "probe connected" confirmation on a board without `PC`;
