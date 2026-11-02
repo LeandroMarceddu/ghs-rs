@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ghs_config::{MAX_HEIGHT_MAPS, ToolRecord};
+use ghs_config::{MAX_HEIGHT_MAPS, Macro as ConfigMacro, ToolRecord};
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
     MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
@@ -65,6 +65,7 @@ use crate::height_map_library::{
 };
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
+use crate::macros::MacroRunRequest;
 use crate::offsets::{OffsetAction, OffsetGate, OffsetStatus};
 use crate::probe::{
     FieldProblem, PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight,
@@ -114,6 +115,10 @@ enum SettingsEntryPurpose {
     StartupLine(u8),
     /// The name field of the open tool sheet.
     ToolName,
+    /// The name field of the open macro editor.
+    MacroName,
+    /// The command field of the open macro editor.
+    MacroCommand,
     /// The name field for saving the measured height map.
     HeightMapName,
 }
@@ -200,6 +205,44 @@ impl ToolEditor {
     }
 }
 
+/// Text fields of one open macro add/edit sheet.
+///
+/// Name and command are local drafts edited through the shared text sheet.
+/// Nothing is persisted until SAVE MACRO, and nothing reaches the controller
+/// from the editor.
+#[derive(Clone, Debug)]
+struct MacroEditor {
+    /// Stored name being edited; `None` for a new macro.
+    original: Option<String>,
+    name: String,
+    command: String,
+    confirm: bool,
+    error: Option<String>,
+}
+
+impl MacroEditor {
+    fn new() -> Self {
+        Self {
+            original: None,
+            name: String::new(),
+            command: String::new(),
+            // A new macro asks before running until the operator opts out.
+            confirm: true,
+            error: None,
+        }
+    }
+
+    fn from_macro(mac: &ConfigMacro) -> Self {
+        Self {
+            original: Some(mac.name.clone()),
+            name: mac.name.clone(),
+            command: mac.command.clone(),
+            confirm: mac.confirm,
+            error: None,
+        }
+    }
+}
+
 pub struct Shell {
     pub state: AppState,
     feed_slider: Entity<SliderState>,
@@ -222,6 +265,8 @@ pub struct Shell {
     demo_start_sent: bool,
     settings_entry: Option<SettingsEntry>,
     tool_editor: Option<ToolEditor>,
+    macro_editor: Option<MacroEditor>,
+    macro_delete: Option<String>,
     startup_confirm: Option<StartupConfirm>,
     offset_refresh_sent: bool,
     backup_import_armed: bool,
@@ -231,6 +276,10 @@ pub struct Shell {
     settings_demo_group_done: bool,
     demo_tools: bool,
     demo_tools_done: bool,
+    demo_macros: bool,
+    demo_macros_done: bool,
+    demo_macro_edit: bool,
+    demo_macro_confirm: bool,
     demo_startup_write: bool,
     demo_startup_write_done: bool,
     demo_offsets_write: bool,
@@ -372,7 +421,15 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--startup-lines") {
             state.mode = Mode::Utility;
         }
+        if std::env::args().any(|arg| arg == "--macros") {
+            state.mode = Mode::Utility;
+        }
         let demo_tools = std::env::args().any(|arg| arg == "--demo-tools");
+        let demo_macro_edit = std::env::args().any(|arg| arg == "--demo-macro-edit");
+        let demo_macro_confirm = std::env::args().any(|arg| arg == "--demo-macro-confirm");
+        let demo_macros = std::env::args().any(|arg| arg == "--demo-macros")
+            || demo_macro_edit
+            || demo_macro_confirm;
         let demo_startup_write = std::env::args().any(|arg| arg == "--demo-startup-write");
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
         let demo_offsets_goto = std::env::args().any(|arg| arg == "--demo-offsets-goto");
@@ -440,6 +497,8 @@ impl Shell {
             demo_start_sent: false,
             settings_entry: None,
             tool_editor: None,
+            macro_editor: None,
+            macro_delete: None,
             startup_confirm: None,
             offset_refresh_sent: false,
             backup_import_armed: false,
@@ -449,6 +508,10 @@ impl Shell {
             settings_demo_group_done: false,
             demo_tools,
             demo_tools_done: false,
+            demo_macros,
+            demo_macros_done: false,
+            demo_macro_edit,
+            demo_macro_confirm,
             demo_startup_write,
             demo_startup_write_done: false,
             demo_offsets_write,
@@ -522,6 +585,12 @@ impl Shell {
         let mut changed = false;
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
+        }
+        // A macro confirmation belongs to the link that produced it. Once the
+        // link is no longer ready it can never be sent.
+        if self.state.macro_run_pending().is_some() && !self.ready() {
+            self.state.cancel_macro_run();
+            changed = true;
         }
         // A failed height-map point must stop the job once, even if the
         // controller did not raise its own alarm yet. Never resume it.
@@ -655,6 +724,36 @@ impl Shell {
                 });
             }
             self.state.tools.set_status("DEMO TABLE (UNSAVED)");
+            changed = true;
+        }
+        // Screenshot switch: seed two profile macros through the normal save
+        // path, then optionally open the editor or a run confirmation. Nothing
+        // is run unless --demo-macro-confirm asks for the sheet; that sheet is
+        // never confirmed by this switch.
+        if self.demo_macros
+            && !self.demo_macros_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.macro_save_blocker().is_none()
+        {
+            self.demo_macros_done = true;
+            self.state.mode = Mode::Utility;
+            if self.state.user_macro_list().is_empty() {
+                if let Err(message) = self.state.save_macro(None, "Park at Z0", "G53 G0 Z0", true) {
+                    self.state
+                        .push_console(ConsoleLevel::Warn, format!("Demo macros: {message}"));
+                }
+                if let Err(message) = self.state.save_macro(None, "Spindle off", "M5", false) {
+                    self.state
+                        .push_console(ConsoleLevel::Warn, format!("Demo macros: {message}"));
+                }
+            }
+            if self.demo_macro_edit {
+                if let Some(mac) = self.state.user_macro_list().first().cloned() {
+                    self.open_macro_editor(Some(&mac), cx);
+                }
+            } else if self.demo_macro_confirm {
+                self.run_user_macro("Park at Z0", cx);
+            }
             changed = true;
         }
         // Screenshot switch: set one startup-line draft, open the real warning
@@ -981,6 +1080,8 @@ impl Shell {
             Ok(()) => {
                 self.state
                     .begin_live("Starting in-process FlexiHAL demo controller");
+                self.macro_editor = None;
+                self.macro_delete = None;
                 self.panel.error = None;
             }
             Err(error) => self.report_connect_failure(error),
@@ -1006,6 +1107,8 @@ impl Shell {
                     "Opening {} at {} baud, 8N1 (line control off)",
                     config.port, config.baud
                 ));
+                self.macro_editor = None;
+                self.macro_delete = None;
                 self.panel.error = None;
             }
             Err(error) => self.report_connect_failure(error),
@@ -1029,6 +1132,7 @@ impl Shell {
         }
         // A confirmation captured on this link must not survive it.
         self.state.offsets.cancel_action();
+        self.state.cancel_macro_run();
         self.state.connection = ConnectionState::Disconnected;
         self.state.push_console(
             ConsoleLevel::Warn,
@@ -1238,6 +1342,22 @@ impl Shell {
                 false,
                 None,
             ),
+            SettingsEntryPurpose::MacroName => (
+                self.macro_editor
+                    .as_ref()
+                    .map(|editor| editor.name.clone())
+                    .unwrap_or_default(),
+                false,
+                None,
+            ),
+            SettingsEntryPurpose::MacroCommand => (
+                self.macro_editor
+                    .as_ref()
+                    .map(|editor| editor.command.clone())
+                    .unwrap_or_default(),
+                false,
+                None,
+            ),
             SettingsEntryPurpose::HeightMapName => (default_map_name(now_unix_s()), false, None),
         };
         let input = if let Some(entry) = self.settings_entry.as_ref() {
@@ -1284,6 +1404,51 @@ impl Shell {
                 editor.error = None;
             }
             self.settings_entry = None;
+            cx.notify();
+            return;
+        }
+        if purpose == SettingsEntryPurpose::MacroName {
+            let original = self
+                .macro_editor
+                .as_ref()
+                .and_then(|editor| editor.original.clone());
+            let macros = self.state.user_macro_list().to_vec();
+            match crate::macros::validate_name(&value, original.as_deref(), &macros) {
+                Ok(name) => {
+                    if let Some(editor) = self.macro_editor.as_mut() {
+                        editor.name = name;
+                        editor.error = None;
+                    }
+                    self.settings_entry = None;
+                }
+                Err(message) => {
+                    self.state
+                        .push_console(ConsoleLevel::Warn, format!("Macro name: {message}"));
+                    if let Some(entry) = self.settings_entry.as_mut() {
+                        entry.error = Some(message);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if purpose == SettingsEntryPurpose::MacroCommand {
+            match crate::macros::validate_command(&value) {
+                Ok(command) => {
+                    if let Some(editor) = self.macro_editor.as_mut() {
+                        editor.command = command;
+                        editor.error = None;
+                    }
+                    self.settings_entry = None;
+                }
+                Err(message) => {
+                    self.state
+                        .push_console(ConsoleLevel::Warn, format!("Macro command: {message}"));
+                    if let Some(entry) = self.settings_entry.as_mut() {
+                        entry.error = Some(message);
+                    }
+                }
+            }
             cx.notify();
             return;
         }
@@ -1592,6 +1757,149 @@ impl Shell {
         cx.notify();
     }
 
+    // --------------------------------------------------------------- macros
+
+    /// Open the local macro add/edit sheet. Nothing is persisted here.
+    fn open_macro_editor(&mut self, mac: Option<&ConfigMacro>, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.settings_entry = None;
+        self.tool_editor = None;
+        self.macro_editor = Some(mac.map_or_else(MacroEditor::new, MacroEditor::from_macro));
+        cx.notify();
+    }
+
+    /// Open the shared text sheet for the editor's name field.
+    fn open_macro_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_entry(SettingsEntryPurpose::MacroName, window, cx);
+    }
+
+    /// Open the shared text sheet for the editor's command field.
+    fn open_macro_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_entry(SettingsEntryPurpose::MacroCommand, window, cx);
+    }
+
+    /// Validate the local draft and save the full list in the profile.
+    fn save_macro_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.macro_editor.clone() else {
+            return;
+        };
+        match self.state.save_macro(
+            editor.original.as_deref(),
+            &editor.name,
+            &editor.command,
+            editor.confirm,
+        ) {
+            Ok(path) => {
+                self.macro_editor = None;
+                self.settings_entry = None;
+                self.state.push_console(
+                    ConsoleLevel::Ok,
+                    format!(
+                        "Macro '{}' saved to the controller profile: {}",
+                        editor.name.trim(),
+                        path.display()
+                    ),
+                );
+            }
+            Err(message) => {
+                if let Some(editor) = self.macro_editor.as_mut() {
+                    editor.error = Some(message.clone());
+                }
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Macro not saved: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open the deletion confirmation for one stored macro.
+    fn request_delete_macro(&mut self, name: String, cx: &mut Context<Self>) {
+        self.macro_editor = None;
+        self.settings_entry = None;
+        self.macro_delete = Some(name);
+        cx.notify();
+    }
+
+    fn cancel_delete_macro(&mut self, cx: &mut Context<Self>) {
+        self.macro_delete = None;
+        cx.notify();
+    }
+
+    fn confirm_delete_macro(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.macro_delete.take() else {
+            return;
+        };
+        match self.state.delete_macro(&name) {
+            Ok(path) => self.state.push_console(
+                ConsoleLevel::Ok,
+                format!(
+                    "Macro '{name}' deleted from the controller profile: {}",
+                    path.display()
+                ),
+            ),
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Error,
+                format!("Macro '{name}' not deleted: {message}"),
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Handle one explicit RUN click on a stored macro.
+    ///
+    /// The state model refuses mock/not-ready/Alarm/Door/job-active runs and
+    /// captures a `confirm` macro. Only the confirmation path or a direct
+    /// `confirm = false` macro produces a command.
+    fn run_user_macro(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.state.request_macro_run(name) {
+            Ok(MacroRunRequest::Confirm(_)) => {}
+            Ok(MacroRunRequest::Send(mac)) => {
+                let command = Command::Mdi(mac.command.clone());
+                self.send_macro_command(&mac.name, command);
+            }
+            Err(message) => self.state.push_console(ConsoleLevel::Warn, message),
+        }
+        cx.notify();
+    }
+
+    /// Send exactly one confirmed/direct macro command through the guarded MDI
+    /// gateway. A rejection is reported once and is never retried.
+    fn send_macro_command(&mut self, name: &str, command: Command) {
+        match self.send_command_quiet(command) {
+            Ok(()) => {
+                self.state.macro_sent();
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!("Macro '{name}' sent through the guarded MDI path"),
+                );
+            }
+            Err(error) => {
+                let message = format!("Macro '{name}' not sent: {error}");
+                self.state.macro_send_failed(message.clone());
+                self.state.push_console(ConsoleLevel::Error, message);
+            }
+        }
+    }
+
+    /// Confirm a captured macro run and send its one MDI command.
+    fn confirm_macro_run(&mut self, cx: &mut Context<Self>) {
+        let name = self
+            .state
+            .macro_run_pending()
+            .map_or_else(|| "macro".to_string(), |mac| mac.name.clone());
+        match self.state.confirm_macro_run() {
+            Ok(command) => self.send_macro_command(&name, command),
+            Err(message) => self.state.push_console(ConsoleLevel::Warn, message),
+        }
+        cx.notify();
+    }
+
+    /// Close the macro run confirmation without producing a command.
+    fn cancel_macro_run(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_macro_run();
+        cx.notify();
+    }
+
     /// Save tools, offsets, and the settings snapshot into the local profile.
     fn save_profile(&mut self, cx: &mut Context<Self>) {
         if self.state.config.has_pending_profile() {
@@ -1710,6 +2018,9 @@ impl Shell {
     fn use_pending_profile(&mut self, cx: &mut Context<Self>) {
         if let Some(tools) = self.state.config.use_pending_profile() {
             self.state.clear_saved_map_selection();
+            self.state.reset_macro_runs();
+            self.macro_editor = None;
+            self.macro_delete = None;
             self.state.load_probe_offset();
             let path = self.state.config.profile_path();
             let count = tools.len();
@@ -1801,6 +2112,9 @@ impl Shell {
         self.backup_import_armed = false;
         match self.state.config.import_backup(allow_warning) {
             Ok(import) => {
+                self.state.reset_macro_runs();
+                self.macro_editor = None;
+                self.macro_delete = None;
                 if let Some(tools) = import.tools {
                     self.state.clear_saved_map_selection();
                     self.state.load_probe_offset();
@@ -7573,6 +7887,191 @@ impl Shell {
             .into_any_element()
     }
 
+    /// User macros: list, add/edit, delete, and the explicit RUN action.
+    ///
+    /// The list comes from the active controller profile. The built-in actions
+    /// in the right rail are separate and stay untouched.
+    fn macro_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let macros = self.state.user_macro_list().to_vec();
+        let save_blocker = self.state.macro_save_blocker();
+        let run_lock = self.state.macro_gate().blocked_reason();
+        let last_error = self.state.macro_last_error().map(str::to_string);
+        let new_view = view.clone();
+        let count = macros.len();
+
+        let mut list = v_flex().gap_1();
+        if macros.is_empty() {
+            list = list.child(
+                div()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(p.panel)
+                    .text_size(px(11.0))
+                    .text_color(p.text_dim)
+                    .child(
+                        "No user macros for this controller profile. Add a named, single-line \
+                         MDI command; it is saved only here and never runs on connect.",
+                    ),
+            );
+        }
+        for (index, mac) in macros.into_iter().enumerate() {
+            let run_view = view.clone();
+            let edit_view = view.clone();
+            let delete_view = view.clone();
+            let run_name = mac.name.clone();
+            let delete_name = mac.name.clone();
+            let record = mac.clone();
+            let confirm = mac.confirm;
+            let name = mac.name;
+            let command = mac.command;
+            list = list.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .p_1()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w(px(0.0))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text)
+                                            .child(name),
+                                    )
+                                    .child(chip(if confirm { "CONFIRM" } else { "DIRECT" }, p)),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child(command),
+                            ),
+                    )
+                    .child(
+                        Button::new(format!("macro-run-{index}"))
+                            .label("RUN")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(62.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                run_view.update(cx, |this, cx| {
+                                    this.run_user_macro(&run_name, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(format!("macro-edit-{index}"))
+                            .label("EDIT")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(62.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(save_blocker.is_some())
+                            .on_click(move |_, _, cx| {
+                                edit_view.update(cx, |this, cx| {
+                                    this.open_macro_editor(Some(&record), cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(format!("macro-delete-{index}"))
+                            .label("DEL")
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(54.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(save_blocker.is_some())
+                            .on_click(move |_, _, cx| {
+                                delete_view.update(cx, |this, cx| {
+                                    this.request_delete_macro(delete_name.clone(), cx);
+                                });
+                            }),
+                    ),
+            );
+        }
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label("MACROS", p))
+                            .child(chip(&format!("{count} DEFINED"), p))
+                            .child(chip("USER-DEFINED", p)),
+                    )
+                    .child(
+                        Button::new("macro-new")
+                            .label("NEW MACRO")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(124.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(save_blocker.is_some())
+                            .on_click(move |_, _, cx| {
+                                new_view.update(cx, |this, cx| {
+                                    this.open_macro_editor(None, cx);
+                                });
+                            }),
+                    ),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "Named single-line MDI commands, saved in this controller profile. RUN sends only \
+                 after a click; CONFIRM macros require a second explicit confirmation.",
+            ))
+            .child(list)
+            .when_some(save_blocker, |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(format!("MACRO SAVES LOCKED: {}", reason.to_uppercase())),
+                )
+            })
+            .when_some(run_lock, |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(format!("MACRO RUNS LOCKED: {}", reason.to_uppercase())),
+                )
+            })
+            .when_some(last_error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let config = &self.state.config;
@@ -7937,8 +8436,9 @@ impl Shell {
                     .child(format!("PATH   {backup_path}")),
             )
             .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "Export writes app prefs, identity, settings, offsets, and tools; \
-                         import validates before writing and never pushes to the controller.",
+                "Export writes app prefs, identity, settings, offsets, tools, macros, startup \
+                 lines, and keymap; import validates before writing and never pushes to the \
+                 controller.",
             ))
             .child(
                 h_flex()
@@ -7994,6 +8494,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.macro_card(p, cx))
             .child(startup_card)
             .child(profile_card)
             .child(backup_card)
@@ -8767,6 +9268,8 @@ impl Shell {
             ),
             SettingsEntryPurpose::StartupLine(index) => format!("STARTUP LINE $N{index}"),
             SettingsEntryPurpose::ToolName => "TOOL NAME".to_string(),
+            SettingsEntryPurpose::MacroName => "MACRO NAME".to_string(),
+            SettingsEntryPurpose::MacroCommand => "MACRO COMMAND".to_string(),
             SettingsEntryPurpose::HeightMapName => "SAVE HEIGHT MAP".to_string(),
         };
         let hint = match entry.purpose {
@@ -8787,6 +9290,17 @@ impl Shell {
             ),
             SettingsEntryPurpose::ToolName => {
                 "Display name for the M6 sheet; 128 characters, no control characters.".to_string()
+            }
+            SettingsEntryPurpose::MacroName => {
+                "Unique in this controller profile; up to 128 characters, no control characters."
+                    .to_string()
+            }
+            SettingsEntryPurpose::MacroCommand => {
+                format!(
+                    "One MDI G-code line up to {} bytes. System ($) commands, newlines, and \
+                     control characters are rejected in this pass.",
+                    crate::macros::MAX_MACRO_COMMAND_BYTES
+                )
             }
             SettingsEntryPurpose::HeightMapName => {
                 "Short label for this controller profile; the same name replaces that map."
@@ -10106,6 +10620,461 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Add or edit one user macro. Nothing is persisted until SAVE MACRO.
+    fn macro_editor_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.macro_editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let save_view = view.clone();
+        let name_view = view.clone();
+        let command_view = view.clone();
+        let confirm_view = view.clone();
+        let scrim_view = view;
+        let title = match &editor.original {
+            Some(name) => format!("EDIT MACRO / {name}"),
+            None => "NEW MACRO".to_string(),
+        };
+        let name = editor.name.clone();
+        let command = editor.command.clone();
+        let confirm = editor.confirm;
+        let error = editor.error.clone();
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("macro-editor-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| {
+                            shell.macro_editor = None;
+                            shell.settings_entry = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(560.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(title),
+                            )
+                            .child(chip(
+                                if editor.original.is_some() {
+                                    "PROFILE RECORD"
+                                } else {
+                                    "NEW RECORD"
+                                },
+                                p,
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(92.0))
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child("NAME"),
+                            )
+                            .child(
+                                Button::new("macro-editor-name")
+                                    .label(if name.trim().is_empty() {
+                                        "--".to_string()
+                                    } else {
+                                        name
+                                    })
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .rounded_lg()
+                                    .text_size(px(14.0))
+                                    .on_click(move |_, window, cx| {
+                                        name_view.update(cx, |this, cx| {
+                                            this.open_macro_name(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(92.0))
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child("COMMAND"),
+                            )
+                            .child(
+                                Button::new("macro-editor-command")
+                                    .label(if command.trim().is_empty() {
+                                        "--".to_string()
+                                    } else {
+                                        command
+                                    })
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .rounded_lg()
+                                    .text_size(px(13.0))
+                                    .on_click(move |_, window, cx| {
+                                        command_view.update(cx, |this, cx| {
+                                            this.open_macro_command(window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .h(px(48.0))
+                            .child(
+                                Switch::new("macro-editor-confirm")
+                                    .checked(confirm)
+                                    .label("Ask before running")
+                                    .text_size(px(11.0))
+                                    .on_change(move |checked, _, cx| {
+                                        confirm_view.update(cx, |this, cx| {
+                                            if let Some(editor) = this.macro_editor.as_mut() {
+                                                editor.confirm = *checked;
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                                "New macros default to CONFIRM. A direct macro runs on one click.",
+                            )),
+                    )
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    })
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                        "Single-line MDI G-code. System ($) commands and newlines are rejected in \
+                         this pass. SAVE MACRO writes only this controller profile.",
+                    ))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("macro-editor-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.macro_editor = None;
+                                            this.settings_entry = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("macro-editor-save")
+                                    .label("SAVE MACRO")
+                                    .primary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .disabled(self.state.macro_save_blocker().is_some())
+                                    .on_click(move |_, _, cx| {
+                                        save_view.update(cx, |this, cx| {
+                                            this.save_macro_editor(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Confirmation sheet for one user macro. The exact command is captured
+    /// when RUN is pressed and is shown before anything is sent.
+    fn macro_run_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(mac) = self.state.macro_run_pending() else {
+            return div().into_any_element();
+        };
+        let name = mac.name.clone();
+        let command = mac.command.clone();
+        let lock = self.state.macro_gate().blocked_reason();
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let run_view = view.clone();
+        let scrim_view = view;
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("macro-run-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_macro_run(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(580.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(format!("RUN MACRO / {name}")),
+                            )
+                            .child(chip("CONFIRM REQUIRED", p)),
+                    )
+                    .child(div().text_size(px(11.0)).text_color(p.warning).child(
+                        "This command can move the machine, start the spindle, or change \
+                                 offsets. Keep hands clear and know where the E-stop is.",
+                    ))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child("EXACT COMMAND TO SEND"),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(15.0))
+                                    .text_color(p.text)
+                                    .child(command),
+                            ),
+                    )
+                    .when_some(lock, |this, reason| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.danger)
+                                .child(format!("RUN LOCKED: {}", reason.to_uppercase())),
+                        )
+                    })
+                    .child(div().text_size(px(10.0)).text_color(p.text_dim).child(
+                        "RUN MACRO sends exactly this one MDI command. A controller rejection is \
+                         shown in the console and is not retried.",
+                    ))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("macro-run-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.cancel_macro_run(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("macro-run-confirm")
+                                    .label("RUN MACRO")
+                                    .warning()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .disabled(lock.is_some())
+                                    .on_click(move |_, _, cx| {
+                                        run_view.update(cx, |this, cx| {
+                                            this.confirm_macro_run(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Deletion confirmation for one stored macro.
+    fn macro_delete_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(name) = self.macro_delete.as_ref() else {
+            return div().into_any_element();
+        };
+        let name = name.clone();
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let delete_view = view.clone();
+        let scrim_view = view;
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("macro-delete-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_delete_macro(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(520.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child("DELETE MACRO"),
+                            )
+                            .child(chip("PROFILE RECORD", p)),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .font_family(self.mono.clone())
+                            .text_size(px(14.0))
+                            .text_color(p.text)
+                            .child(name),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                        "This removes the macro from this controller profile. It never sends a \
+                         command to the controller.",
+                    ))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("macro-delete-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.cancel_delete_macro(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("macro-delete-confirm")
+                                    .label("DELETE MACRO")
+                                    .warning()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        delete_view.update(cx, |this, cx| {
+                                            this.confirm_delete_macro(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Manual tool-change sheet.
     ///
     /// It starts below the 56 px top bar so RESET and STOP stay visible and
@@ -10786,6 +11755,12 @@ impl Render for Shell {
         if self.tool_editor.is_some() {
             root = root.child(self.tool_editor_overlay(p, cx));
         }
+        if self.macro_editor.is_some() {
+            root = root.child(self.macro_editor_overlay(p, cx));
+        }
+        if self.macro_delete.is_some() {
+            root = root.child(self.macro_delete_overlay(p, cx));
+        }
         if let Some(keypad) = keypad_state.as_ref() {
             root = root.child(keypad::overlay(
                 keypad,
@@ -10801,6 +11776,9 @@ impl Render for Shell {
         }
         if self.startup_confirm.is_some() {
             root = root.child(self.startup_confirm_overlay(p, cx));
+        }
+        if self.state.macro_run_pending().is_some() {
+            root = root.child(self.macro_run_overlay(p, cx));
         }
         if self.state.job.tool_change.is_some() {
             root = root.child(self.tool_change_overlay(p, cx));

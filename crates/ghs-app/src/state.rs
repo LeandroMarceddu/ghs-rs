@@ -13,18 +13,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ghs_config::{HeightMapRecord, ProbeOffsetRecord};
+use ghs_config::{HeightMapRecord, Macro as ConfigMacro, ProbeOffsetRecord};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
-    Axis as CoreAxis, ControllerInfo, EngineEvent, JobAbortReason, JobInfo, JobPauseReason,
-    JobState, MachineSnapshot, Offsets, Program, ProgramLine as EngineProgramLine, SettingValue,
-    Signals as CoreSignals, StartupLine, StatusReport, ToolEntry, Wcs,
+    Axis as CoreAxis, Command, ControllerInfo, EngineEvent, JobAbortReason, JobInfo,
+    JobPauseReason, JobState, MachineSnapshot, Offsets, Program, ProgramLine as EngineProgramLine,
+    SettingValue, Signals as CoreSignals, StartupLine, StatusReport, ToolEntry, Wcs,
 };
 use ghs_probe::XyPoint;
 
 use crate::config::ConfigModel;
 use crate::height_compensation::HeightMapCompensation;
 use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_run};
+use crate::macros::{MacroModel, MacroRunGate, MacroRunRequest};
 use crate::offsets::OffsetModel;
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
@@ -1025,6 +1026,11 @@ pub struct AppState {
     pub controller_tools: ControllerToolTable,
     /// `$N0`/`$N1` read state and the local edit/confirmation model.
     pub startup_lines: StartupLinesModel,
+    /// User-defined macro execution: pending confirmation and last error.
+    ///
+    /// The macro records themselves live in the active controller profile
+    /// (`ConfigModel`); this model never stores a second copy.
+    pub user_macros: MacroModel,
     /// Local app preferences, controller profile, and backup helpers.
     pub config: ConfigModel,
 }
@@ -1103,6 +1109,7 @@ impl AppState {
             tools: ToolTableModel::new(),
             controller_tools: ControllerToolTable::new(),
             startup_lines: StartupLinesModel::new(),
+            user_macros: MacroModel::new(),
             config,
         };
         state.sync_offset_context();
@@ -1158,6 +1165,7 @@ impl AppState {
         // Controller-reported data belongs to this session only.
         self.controller_tools = ControllerToolTable::new();
         self.startup_lines.reset();
+        self.user_macros.reset();
         self.probe = ProbeModel::default();
         self.height_map.reset();
         self.height_map_library.reset();
@@ -1200,8 +1208,10 @@ impl AppState {
         );
         self.sync_offset_context();
         if let Some(load) = self.config.on_controller(info) {
-            // A newly loaded profile owns a different set of saved maps.
+            // A newly loaded profile owns a different set of saved maps and
+            // macros; an unconfirmed run from the previous controller dies here.
             self.height_map_library.reset();
+            self.user_macros.reset();
             let unverified = load.unverified;
             let corrupt = self.config.corrupt_profile();
             let status = if corrupt {
@@ -1468,6 +1478,150 @@ impl AppState {
             alarm_or_door: matches!(self.machine_state, "Alarm" | "Door"),
             job_active: self.job.is_active(),
         }
+    }
+
+    // ------------------------------------------------------------ user macros
+
+    /// User-defined macros stored in the active controller profile.
+    #[must_use]
+    pub fn user_macro_list(&self) -> &[ConfigMacro] {
+        self.config.macros()
+    }
+
+    /// Why a macro cannot be written to the active profile, if any.
+    #[must_use]
+    pub fn macro_save_blocker(&self) -> Option<String> {
+        self.config.macro_save_blocker()
+    }
+
+    /// Connection/machine gate for running a user macro.
+    ///
+    /// This mirrors the engine's MDI rules: live and ready, not Alarm/Door, no
+    /// active job, and the controller must report Idle.
+    #[must_use]
+    pub fn macro_gate(&self) -> MacroRunGate {
+        MacroRunGate {
+            live: self.live,
+            ready: self.connection.is_ready_like(),
+            machine_state: self.machine_state,
+            job_active: self.job.is_active(),
+        }
+    }
+
+    /// Add or update one macro and persist the full list in the profile.
+    ///
+    /// `original` is the stored name when editing. Names are trimmed and unique
+    /// per profile. Nothing is sent to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation message, a missing profile, the corrupt/unverified
+    /// save gate, or a write error.
+    pub fn save_macro(
+        &mut self,
+        original: Option<&str>,
+        name: &str,
+        command: &str,
+        confirm: bool,
+    ) -> Result<PathBuf, String> {
+        let mut macros = self.config.macros().to_vec();
+        let record = crate::macros::build_macro(name, command, confirm, original, &macros)?;
+        if let Some(original) = original {
+            let original = original.trim();
+            let Some(index) = macros.iter().position(|mac| mac.name.trim() == original) else {
+                return Err(format!(
+                    "the macro '{original}' no longer exists in this profile"
+                ));
+            };
+            macros[index] = record;
+        } else {
+            macros.push(record);
+        }
+        self.config.save_macros(macros)
+    }
+
+    /// Delete one macro from the active profile by stored name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the name is not stored, the profile cannot be
+    /// written, or the write fails.
+    pub fn delete_macro(&mut self, name: &str) -> Result<PathBuf, String> {
+        let name = name.trim();
+        let mut macros = self.config.macros().to_vec();
+        let before = macros.len();
+        macros.retain(|mac| mac.name.trim() != name);
+        if macros.len() == before {
+            return Err(format!("no macro named '{name}' is stored in this profile"));
+        }
+        if self
+            .user_macros
+            .pending()
+            .is_some_and(|pending| pending.name.trim() == name)
+        {
+            self.user_macros.cancel();
+        }
+        self.config.save_macros(macros)
+    }
+
+    /// Handle one explicit RUN click.
+    ///
+    /// A macro marked `confirm` returns [`MacroRunRequest::Confirm`] and no
+    /// command is produced until [`AppState::confirm_macro_run`]. A direct
+    /// macro returns [`MacroRunRequest::Send`] once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate reason (mock, not connected, Alarm/Door, job active,
+    /// not Idle), an unknown name, or a record that fails current validation.
+    pub fn request_macro_run(&mut self, name: &str) -> Result<MacroRunRequest, String> {
+        let gate = self.macro_gate();
+        self.user_macros
+            .request_run(self.config.macros(), name, gate)
+    }
+
+    /// Produce the one MDI command for a captured macro confirmation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no run is waiting or the gate closed.
+    pub fn confirm_macro_run(&mut self) -> Result<Command, String> {
+        let gate = self.macro_gate();
+        self.user_macros.confirm(gate)
+    }
+
+    /// Close the macro confirmation sheet without producing a command.
+    pub fn cancel_macro_run(&mut self) -> bool {
+        self.user_macros.cancel().is_some()
+    }
+
+    /// Macro waiting for confirmation, if any.
+    #[must_use]
+    pub fn macro_run_pending(&self) -> Option<&ConfigMacro> {
+        self.user_macros.pending()
+    }
+
+    /// Last macro gate refusal or send error.
+    #[must_use]
+    pub fn macro_last_error(&self) -> Option<&str> {
+        self.user_macros.last_error()
+    }
+
+    /// Record an engine rejection. The caller must not retry.
+    pub fn macro_send_failed(&mut self, message: impl Into<String>) {
+        self.user_macros.send_failed(message);
+    }
+
+    /// Clear the last error after the engine accepted a macro.
+    pub fn macro_sent(&mut self) {
+        self.user_macros.sent();
+    }
+
+    /// Drop a pending macro confirmation and its error.
+    ///
+    /// Used after a profile import or an explicit "use local data" action.
+    pub fn reset_macro_runs(&mut self) {
+        self.user_macros.reset();
     }
 
     /// Update the active WCS used by the offsets workspace.
@@ -2153,6 +2307,16 @@ mod tests {
         (state, dir, info)
     }
 
+    fn ready_state_with_macro(label: &str, confirm: bool) -> (AppState, TempRoot, ControllerInfo) {
+        let (mut state, dir, info) = state_with_profile(label);
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state
+            .save_macro(None, "Safe Z", "G53 G0 Z0", confirm)
+            .expect("save macro");
+        (state, dir, info)
+    }
+
     #[test]
     fn units_round_trip_between_millimetres_and_inch() {
         assert_eq!(Units::Millimetre.to_mm(12.5), 12.5);
@@ -2725,5 +2889,366 @@ mod tests {
 
         state.machine_state = "Idle";
         assert_eq!(state.startup_write_gate().blocked_reason(), None);
+    }
+
+    #[test]
+    fn user_macro_add_edit_delete_round_trips_through_the_profile() {
+        let (mut state, dir, info) = state_with_profile("macro-roundtrip");
+        let store = ConfigStore::new(&dir.path);
+        let key = ProfileKey::from_controller(&info);
+
+        let path = state
+            .save_macro(None, "Zero XY", "G10 L20 P1 X0 Y0", true)
+            .expect("add macro");
+        assert!(path.exists());
+        assert_eq!(state.user_macro_list().len(), 1);
+        assert!(state.user_macro_list()[0].confirm);
+
+        state
+            .save_macro(Some("Zero XY"), "Zero work XY", "G10 L20 P1 X0 Y0", false)
+            .expect("edit macro");
+        state
+            .save_macro(None, "Spindle off", "M5", false)
+            .expect("second macro");
+        assert_eq!(state.user_macro_list().len(), 2);
+        assert_eq!(state.user_macro_list()[0].name, "Zero work XY");
+        assert!(!state.user_macro_list()[0].confirm);
+
+        state
+            .delete_macro("Spindle off")
+            .expect("delete second macro");
+        assert_eq!(state.user_macro_list().len(), 1);
+
+        let stored = store
+            .load_controller_data(&key)
+            .expect("load")
+            .expect("profile");
+        assert_eq!(stored.macros, state.user_macro_list());
+
+        let mut reopened = ConfigModel::from_store(store);
+        reopened.on_controller(&info).expect("reload");
+        assert_eq!(reopened.macros(), state.user_macro_list());
+        assert_eq!(reopened.macros()[0].name, "Zero work XY");
+        assert_eq!(reopened.macros()[0].command, "G10 L20 P1 X0 Y0");
+    }
+
+    #[test]
+    fn macro_save_rejects_duplicate_names_and_bad_commands_without_writing() {
+        let (mut state, dir, _info) = state_with_profile("macro-validation");
+        state
+            .save_macro(None, "Safe Z", "G53 G0 Z0", true)
+            .expect("first macro");
+        let path = state.config.profile_path().expect("profile path");
+        let before = fs::read(&path).expect("read profile");
+
+        let duplicate = state
+            .save_macro(None, " Safe Z ", "M5", false)
+            .expect_err("duplicate name");
+        assert!(duplicate.contains("already exists"), "{duplicate}");
+
+        let control = state
+            .save_macro(None, "Bad\nName", "M5", false)
+            .expect_err("control character");
+        assert!(control.contains("control"), "{control}");
+
+        let empty = state
+            .save_macro(None, "Empty", "  ", false)
+            .expect_err("empty command");
+        assert!(empty.contains("required"), "{empty}");
+
+        let system = state
+            .save_macro(None, "Home", "$H", false)
+            .expect_err("system command");
+        assert!(system.contains("system"), "{system}");
+
+        let multi = state
+            .save_macro(None, "Two lines", "G0 X0\nG0 Y0", false)
+            .expect_err("multi-line command");
+        assert!(multi.contains("single MDI line"), "{multi}");
+
+        assert_eq!(state.user_macro_list().len(), 1);
+        assert_eq!(fs::read(&path).expect("read profile"), before);
+        let _ = dir;
+    }
+
+    #[test]
+    fn user_macros_never_cross_a_controller_profile() {
+        let dir = TempRoot::new("macro-profiles");
+        let store = ConfigStore::new(&dir.path);
+        let first = parse_controller_info(FLEXIHAL);
+        let mut second = parse_controller_info(FLEXIHAL);
+        second.board = Some("OtherBoard".into());
+
+        let mut writer = AppState::new();
+        writer.config = ConfigModel::from_store(store.clone());
+        writer.begin_live("first transport");
+        writer.apply_controller_info(&first);
+        writer
+            .save_macro(None, "First only", "M5", false)
+            .expect("save first profile macro");
+
+        let mut reader = AppState::new();
+        reader.config = ConfigModel::from_store(store.clone());
+        reader.begin_live("second transport");
+        reader.apply_controller_info(&second);
+        assert!(
+            reader.user_macro_list().is_empty(),
+            "a different controller must not inherit macros"
+        );
+        reader
+            .save_macro(None, "Second only", "M3", false)
+            .expect("save second profile macro");
+
+        let first_data = store
+            .load_controller_data(&ProfileKey::from_controller(&first))
+            .expect("first load")
+            .expect("first profile");
+        let second_data = store
+            .load_controller_data(&ProfileKey::from_controller(&second))
+            .expect("second load")
+            .expect("second profile");
+        assert_eq!(
+            first_data
+                .macros
+                .iter()
+                .map(|mac| mac.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First only"]
+        );
+        assert_eq!(
+            second_data
+                .macros
+                .iter()
+                .map(|mac| mac.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Second only"]
+        );
+
+        let mut reopened = AppState::new();
+        reopened.config = ConfigModel::from_store(store);
+        reopened.begin_live("first transport again");
+        reopened.apply_controller_info(&first);
+        assert_eq!(
+            reopened
+                .user_macro_list()
+                .iter()
+                .map(|mac| mac.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First only"]
+        );
+    }
+
+    #[test]
+    fn macro_save_is_refused_for_a_corrupt_profile() {
+        let dir = TempRoot::new("macro-corrupt");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let path = store.profile_path(&ProfileKey::from_controller(&info));
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let corrupt = b"{ not json";
+        fs::write(&path, corrupt).expect("write corrupt profile");
+
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store);
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+        assert!(state.config.corrupt_profile());
+
+        let error = state
+            .save_macro(None, "Safe Z", "G53 G0 Z0", true)
+            .expect_err("corrupt profile refused");
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(fs::read(&path).expect("read"), corrupt);
+        assert!(state.user_macro_list().is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_macro_is_not_sent_before_the_second_click() {
+        let (mut state, _dir, _info) = ready_state_with_macro("macro-confirm", true);
+        let request = state.request_macro_run("Safe Z").expect("run request");
+        assert!(matches!(request, MacroRunRequest::Confirm(_)));
+        assert_eq!(
+            state.macro_run_pending().map(|mac| mac.name.as_str()),
+            Some("Safe Z")
+        );
+
+        // No command is produced by the request itself. The captured record is
+        // the only thing that can produce one.
+        assert!(state.cancel_macro_run());
+        assert!(state.confirm_macro_run().is_err());
+        assert!(state.macro_run_pending().is_none());
+    }
+
+    #[test]
+    fn a_confirmed_macro_produces_exactly_one_mdi_command() {
+        let (mut state, _dir, _info) = ready_state_with_macro("macro-one-command", true);
+        let request = state.request_macro_run("Safe Z").expect("run request");
+        assert!(matches!(request, MacroRunRequest::Confirm(_)));
+
+        let command = state.confirm_macro_run().expect("confirmed command");
+        assert_eq!(command, Command::Mdi("G53 G0 Z0".into()));
+        assert!(state.confirm_macro_run().is_err());
+        assert!(state.macro_run_pending().is_none());
+    }
+
+    #[test]
+    fn cancelling_a_macro_confirmation_sends_nothing() {
+        let (mut state, _dir, _info) = ready_state_with_macro("macro-cancel", true);
+        state.request_macro_run("Safe Z").expect("run request");
+        assert!(state.cancel_macro_run());
+        assert!(state.confirm_macro_run().is_err());
+        assert!(state.macro_run_pending().is_none());
+    }
+
+    #[test]
+    fn macro_run_gate_refuses_mock_not_ready_alarm_door_job_and_not_idle() {
+        let mut mock = AppState::new();
+        assert_eq!(
+            mock.macro_gate().blocked_reason(),
+            Some("mock mode: no controller")
+        );
+        let error = mock
+            .request_macro_run("Safe Z")
+            .expect_err("mock mode refused");
+        assert!(error.contains("mock"), "{error}");
+
+        let (mut state, _dir, _info) = state_with_profile("macro-gates");
+        state
+            .save_macro(None, "Safe Z", "G53 G0 Z0", false)
+            .expect("macro");
+        assert_eq!(state.macro_gate().blocked_reason(), Some("not connected"));
+        let error = state
+            .request_macro_run("Safe Z")
+            .expect_err("not ready refused");
+        assert!(error.contains("not connected"), "{error}");
+
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Alarm";
+        assert_eq!(state.macro_gate().blocked_reason(), Some("alarm or door"));
+        assert!(state.request_macro_run("Safe Z").is_err());
+
+        state.machine_state = "Door";
+        assert_eq!(state.macro_gate().blocked_reason(), Some("alarm or door"));
+
+        state.machine_state = "Idle";
+        let program = sample_program();
+        state.job.loaded("job.nc".into(), program, 4);
+        state.job.started(1, 4);
+        assert_eq!(state.macro_gate().blocked_reason(), Some("job active"));
+        let error = state
+            .request_macro_run("Safe Z")
+            .expect_err("active job refused");
+        assert!(error.contains("job active"), "{error}");
+
+        state.job.completed(Duration::from_secs(1));
+        state.machine_state = "Run";
+        assert_eq!(
+            state.macro_gate().blocked_reason(),
+            Some("controller not Idle")
+        );
+        assert!(state.request_macro_run("Safe Z").is_err());
+
+        state.machine_state = "Idle";
+        assert_eq!(state.macro_gate().blocked_reason(), None);
+        assert!(matches!(
+            state.request_macro_run("Safe Z"),
+            Ok(MacroRunRequest::Send(_))
+        ));
+    }
+
+    #[test]
+    fn macro_save_requires_a_verified_profile() {
+        let dir = TempRoot::new("macro-save-gates");
+        let store = ConfigStore::new(&dir.path);
+
+        let mut no_profile = AppState::new();
+        no_profile.config = ConfigModel::from_store(store.clone());
+        let error = no_profile
+            .save_macro(None, "Safe Z", "G53 G0 Z0", true)
+            .expect_err("no profile");
+        assert!(error.contains("no controller profile"), "{error}");
+
+        let mut anonymous = ControllerInfo::new();
+        anonymous.version = "1.1f".into();
+        let key = ProfileKey::from_controller(&anonymous);
+        assert!(!key.is_identified());
+        store
+            .save_controller_data(&key, &ControllerData::new())
+            .expect("anonymous profile");
+        let mut unverified = AppState::new();
+        unverified.config = ConfigModel::from_store(store);
+        unverified.begin_live("test transport");
+        unverified.apply_controller_info(&anonymous);
+        assert!(unverified.config.unverified_identity());
+        assert!(unverified.config.has_pending_profile());
+        let error = unverified
+            .save_macro(None, "Safe Z", "G53 G0 Z0", true)
+            .expect_err("unverified profile");
+        assert!(
+            error.contains("unverified") || error.contains("not verified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn loading_or_connecting_never_runs_or_arms_a_macro() {
+        let dir = TempRoot::new("macro-no-auto-run");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut data = ControllerData::new();
+        data.macros = vec![
+            ConfigMacro {
+                name: "Direct".into(),
+                command: "G0 X1".into(),
+                confirm: false,
+            },
+            ConfigMacro {
+                name: "Confirmed".into(),
+                command: "G0 X2".into(),
+                confirm: true,
+            },
+        ];
+        store.save_controller_data(&key, &data).expect("profile");
+
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store);
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+
+        assert_eq!(state.user_macro_list().len(), 2);
+        assert!(state.macro_run_pending().is_none());
+        assert!(state.macro_last_error().is_none());
+        assert!(!state.cancel_macro_run());
+        assert!(state.confirm_macro_run().is_err());
+        assert!(
+            state
+                .console
+                .iter()
+                .all(|line| !line.text.starts_with("Macro '")),
+            "loading a profile must not send a macro"
+        );
+
+        // The handshake completing is also not a trigger.
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.apply_controller_info(&info);
+        assert!(state.macro_run_pending().is_none());
+        assert!(state.macro_last_error().is_none());
+    }
+
+    #[test]
+    fn a_macro_send_rejection_is_recorded_once_and_not_retried() {
+        let (mut state, _dir, _info) = ready_state_with_macro("macro-rejection", false);
+        let request = state.request_macro_run("Safe Z").expect("run request");
+        assert!(matches!(request, MacroRunRequest::Send(_)));
+        state.macro_send_failed("Macro 'Safe Z' not sent: busy");
+        assert!(
+            state
+                .macro_last_error()
+                .is_some_and(|error| error.contains("busy"))
+        );
+        assert!(state.confirm_macro_run().is_err());
+        assert!(state.macro_run_pending().is_none());
     }
 }

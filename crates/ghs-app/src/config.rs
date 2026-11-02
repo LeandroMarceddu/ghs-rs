@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use ghs_config::{
     AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
-    IdentityPolicy, ImportOutcome, MAX_HEIGHT_MAPS, OffsetSnapshot, ProbeOffsetRecord, ProfileKey,
-    ThemeMode, ToolTable,
+    IdentityPolicy, ImportOutcome, MAX_HEIGHT_MAPS, Macro, OffsetSnapshot, ProbeOffsetRecord,
+    ProfileKey, ThemeMode, ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -257,6 +257,57 @@ impl ConfigModel {
     #[must_use]
     pub fn height_maps(&self) -> &[HeightMapRecord] {
         &self.data.height_maps
+    }
+
+    /// User-defined macros for the active controller profile.
+    ///
+    /// The slice is empty before a profile loads or when the profile has none;
+    /// macros never cross a controller boundary and loading them never sends a
+    /// command.
+    #[must_use]
+    pub fn macros(&self) -> &[Macro] {
+        &self.data.macros
+    }
+
+    /// Why a macro cannot be written to the current profile, if any.
+    ///
+    /// This mirrors the gate used by [`ConfigModel::save_macros`] and by the
+    /// tools/maps profile writes so the UI can explain a refusal.
+    #[must_use]
+    pub fn macro_save_blocker(&self) -> Option<String> {
+        if self.store.is_none() {
+            return Some("no platform configuration directory".to_string());
+        }
+        if self.corrupt_profile {
+            return Some(
+                "the stored profile is corrupt; it was not overwritten. Repair or remove it first"
+                    .to_string(),
+            );
+        }
+        if self.pending_data.is_some() {
+            return Some(
+                "the controller profile is unverified; confirm or discard it in Utility first"
+                    .to_string(),
+            );
+        }
+        if self.unverified_identity {
+            return Some(
+                "the controller identity is not verified; macros are saved only for a known \
+                 controller"
+                    .to_string(),
+            );
+        }
+        match self.key.as_ref() {
+            None => {
+                Some("no controller profile is active; connect and finish the handshake".into())
+            }
+            Some(key) if !key.is_identified() => Some(
+                "the controller identity is not verified; macros are saved only for a known \
+                 controller"
+                    .to_string(),
+            ),
+            Some(_) => None,
+        }
     }
 
     /// Why a height map cannot be written to the current profile, if any.
@@ -712,6 +763,70 @@ impl ConfigModel {
                 "Height map saved to {} ({} stored)",
                 path.display(),
                 self.data.height_maps.len()
+            ),
+        });
+        Ok(path)
+    }
+
+    /// Save the full ordered macro list into the current controller profile.
+    ///
+    /// Every record is validated for the single-line/no-system-command policy
+    /// and names are unique within the profile. The write goes through the same
+    /// atomic `ConfigStore` profile path as tools and maps and never sends
+    /// anything to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no verified profile is active, the profile file is
+    /// corrupt, a record fails validation, a name is duplicated, or writing
+    /// fails. A refusal leaves the previous list in place.
+    pub fn save_macros(&mut self, macros: Vec<Macro>) -> Result<PathBuf, String> {
+        if let Some(blocker) = self.macro_save_blocker() {
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Macro not saved: {blocker}"),
+            });
+            return Err(blocker);
+        }
+        for (index, mac) in macros.iter().enumerate() {
+            if let Err(error) = crate::macros::validate_for_run(mac) {
+                return Err(format!("macro is invalid: {error}"));
+            }
+            if macros[..index]
+                .iter()
+                .any(|previous| previous.name.trim() == mac.name.trim())
+            {
+                return Err(format!(
+                    "a macro named '{}' already exists in this profile",
+                    mac.name.trim()
+                ));
+            }
+        }
+        let Some(key) = self.key.clone() else {
+            return Err("no controller profile is active".to_string());
+        };
+        let Some(store) = self.store.clone() else {
+            return Err("no platform configuration directory".to_string());
+        };
+        let mut data = self.data.clone();
+        data.macros = macros;
+        let path = store.profile_path(&key);
+        if let Err(error) = store.save_controller_data(&key, &data) {
+            let message = error.to_string();
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Macro save failed: {message}"),
+            });
+            return Err(message);
+        }
+        self.data = data;
+        self.profile_error = None;
+        self.last_result = Some(ConfigStatus {
+            ok: true,
+            text: format!(
+                "Macros saved to {} ({} stored)",
+                path.display(),
+                self.data.macros.len()
             ),
         });
         Ok(path)

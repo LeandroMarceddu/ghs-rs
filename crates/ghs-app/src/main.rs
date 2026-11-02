@@ -18,7 +18,11 @@
 //! pending/Apply/read-back path for the applied screenshot. `--offsets`,
 //! `--tools`, `--utility`, `--startup-lines`, and `--probe` open those
 //! workspaces directly. `--demo-tools` seeds the app-side tool table after the
-//! controller profile loads. `--demo-startup-write` edits `$N0` and presses the
+//! controller profile loads. `--macros` opens the Utility workspace with the
+//! user-macro section, while `--demo-macros` seeds two profile macros through
+//! the normal save path; `--demo-macro-edit` then opens the macro editor and
+//! `--demo-macro-confirm` opens the run confirmation without confirming it.
+//! `--demo-startup-write` edits `$N0` and presses the
 //! same APPLY / CONFIRM WRITE actions as a tap, then waits for the read-back so
 //! the VERIFIED state can be captured; normal startup never writes a startup
 //! line. `--demo-offsets-write` sends one real `G10 L20` through MDI and
@@ -53,6 +57,7 @@ mod height_compensation;
 mod height_map_library;
 mod keypad;
 mod live;
+mod macros;
 mod offsets;
 mod probe;
 mod settings;
