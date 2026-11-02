@@ -76,10 +76,10 @@ use crate::probe::{
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
-    AppState, Axis, BreakpointOutcome, ConnectionState, ConsoleLevel, JobView, KeypadAction,
-    KeypadTarget, LeftTab, Mode, ProgramBreakpoints, ProgramKind, ProgramLoadRefusal,
-    ProgramSearch, ProgramSearchMode, RunOption, RunOptionOutcome, RunToOutcome, SignalState,
-    format_elapsed,
+    AppState, Axis, BreakpointOutcome, ConnectionState, ConsoleLevel, FEED_OVERRIDE_MAX,
+    FEED_OVERRIDE_MIN, FEED_OVERRIDE_RESET, JobView, KeypadAction, KeypadTarget, LeftTab, Mode,
+    ProgramBreakpoints, ProgramKind, ProgramLoadRefusal, ProgramSearch, ProgramSearchMode,
+    RunOption, RunOptionOutcome, RunToOutcome, SignalState, SleepOutcome, format_elapsed,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -546,6 +546,14 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--macros") {
             state.mode = Mode::Utility;
         }
+        // Screenshot switch: seed a non-empty local MDI history and recall the
+        // newest line. Nothing is sent and no engine state changes.
+        if std::env::args().any(|arg| arg == "--demo-mdi-history") {
+            for line in ["G0 X10 Y10", "G1 Z-1 F200", "M3 S12000"] {
+                state.remember_mdi(line);
+            }
+            state.mdi_history_previous();
+        }
         let demo_tools = std::env::args().any(|arg| arg == "--demo-tools");
         let demo_macro_edit = std::env::args().any(|arg| arg == "--demo-macro-edit");
         let demo_macro_confirm = std::env::args().any(|arg| arg == "--demo-macro-confirm");
@@ -687,6 +695,12 @@ impl Shell {
         };
         if !mock {
             shell.connect_demo(cx);
+        }
+        // Screenshot switch: open the sleep confirmation after `begin_live`
+        // resets the session. Opening sends nothing; normal startup keeps the
+        // sheet closed.
+        if std::env::args().any(|arg| arg == "--demo-sleep-confirm") {
+            shell.state.open_sleep_confirm();
         }
         // Screenshot switch: start in the orbit view. 2D top remains the
         // default for every normal launch.
@@ -1617,6 +1631,7 @@ impl Shell {
         self.state.offsets.cancel_action();
         self.state.offsets_backup.close_preview();
         self.state.cancel_macro_run();
+        self.state.cancel_sleep_confirm();
         self.state.connection = ConnectionState::Disconnected;
         self.state.push_console(
             ConsoleLevel::Warn,
@@ -2758,13 +2773,23 @@ impl Shell {
             cx.notify();
             return;
         }
+        if !self.mdi_allowed() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "MDI is available only when the link is ready and the machine is Idle",
+            );
+            cx.notify();
+            return;
+        }
         let text = self.state.mdi.trim().to_string();
         if text.is_empty() {
             self.state.push_console(ConsoleLevel::Warn, "MDI is empty");
             cx.notify();
             return;
         }
-        self.send_mdi_line(text);
+        if self.send_mdi_line(text.clone()) {
+            self.state.remember_mdi(text);
+        }
         cx.notify();
     }
 
@@ -3751,6 +3776,66 @@ impl Shell {
         self.send_command(Command::SetFeedOverride(target.clamp(10, 200)));
     }
 
+    /// Move the feed override by one fine or coarse step.
+    ///
+    /// The command is built by the state gate, so mock and a non-ready link
+    /// send nothing. While a slider drag owns the displayed percentage the
+    /// value is left alone: only a later snapshot may replace it.
+    fn step_feed_override(&mut self, delta: i16, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.state.feed_override_target(delta);
+        if !self.state.live {
+            self.set_feed_override_display(target, window, cx);
+            cx.notify();
+            return;
+        }
+        match self.state.feed_override_step(delta) {
+            Ok(command) => {
+                if !self.feed_slider_active {
+                    self.set_feed_override_display(target, window, cx);
+                }
+                self.send_command(command);
+            }
+            Err(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+        }
+        cx.notify();
+    }
+
+    /// Send the exact `RESET 100%` feed override through the guarded path.
+    fn reset_feed_override(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.live {
+            self.set_feed_override_display(FEED_OVERRIDE_RESET, window, cx);
+            cx.notify();
+            return;
+        }
+        match self.state.feed_override_reset() {
+            Ok(command) => {
+                if !self.feed_slider_active {
+                    self.set_feed_override_display(FEED_OVERRIDE_RESET, window, cx);
+                }
+                self.send_command(command);
+            }
+            Err(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+        }
+        cx.notify();
+    }
+
+    fn set_feed_override_display(
+        &mut self,
+        target: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = target.clamp(FEED_OVERRIDE_MIN, FEED_OVERRIDE_MAX);
+        self.state.feed_override = target;
+        let value = f32::from(target);
+        self.feed_slider
+            .update(cx, |slider, cx| slider.set_value(value, window, cx));
+    }
+
     fn request_spindle_override(&mut self, target: u16) {
         if !self.state.live {
             return;
@@ -3785,6 +3870,44 @@ impl Shell {
     /// Close the run-options sheet. Closing sends nothing.
     fn close_run_options(&mut self, cx: &mut Context<Self>) {
         self.state.close_run_options();
+        cx.notify();
+    }
+
+    /// Open the sleep confirmation. Opening sends nothing.
+    fn open_sleep_confirm(&mut self, cx: &mut Context<Self>) {
+        self.state.open_sleep_confirm();
+        cx.notify();
+    }
+
+    /// Close the sleep confirmation without sending anything.
+    fn cancel_sleep_confirm(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_sleep_confirm();
+        cx.notify();
+    }
+
+    /// Confirm sleep and send exactly one `Command::Sleep`.
+    ///
+    /// The gate is re-checked after the sheet is consumed; a refusal or a
+    /// sender rejection is reported in the console and nothing is claimed.
+    fn confirm_sleep(&mut self, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome = self.state.dispatch_sleep(|command| match link {
+            Some(link) => link.send(command).map_err(|error| error.to_string()),
+            None => Err("no engine connection".to_string()),
+        });
+        match outcome {
+            SleepOutcome::Sent => self.state.push_console(
+                ConsoleLevel::Info,
+                "Sleep requested; polling stops until RESET or a status wake",
+            ),
+            SleepOutcome::Rejected(detail) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("SLEEP NOT SENT: {detail}")),
+            SleepOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+            SleepOutcome::NotConfirmed => {}
+        }
         cx.notify();
     }
 
@@ -10512,6 +10635,7 @@ impl Shell {
 
         let startup = &self.state.startup_lines;
         let startup_lock = self.state.startup_write_gate().blocked_reason();
+        let sleep_refusal = self.state.sleep_refusal();
         let startup_result = startup
             .last_result()
             .map(|text| (startup.last_result_ok(), text.to_string()));
@@ -10740,6 +10864,58 @@ impl Shell {
                 )
             });
 
+        let sleep_view = cx.entity();
+        let sleep_card = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(section_label("CONTROLLER SLEEP", p))
+                    .child(chip("$SLP", p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(
+                "Sleep stops controller status polling until RESET or a status wake. \
+                         The app does not wake the controller automatically; the DRO and job \
+                         view stay frozen until the controller answers again.",
+            ))
+            .when_some(sleep_refusal, |this, refusal| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.danger)
+                        .child(refusal.message().to_uppercase()),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("sleep-open")
+                            .label("SLEEP")
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(120.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(sleep_refusal.is_some())
+                            .on_click(move |_, _, cx| {
+                                sleep_view.update(cx, |this, cx| this.open_sleep_confirm(cx));
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("CONFIRM FIRST; CANCEL SENDS NOTHING"),
+                    ),
+            );
+
         let save_view = view.clone();
         let app_view = view.clone();
         let pending_view = view.clone();
@@ -10911,6 +11087,7 @@ impl Shell {
             .overflow_y_scrollbar()
             .child(self.macro_card(p, cx))
             .child(startup_card)
+            .child(sleep_card)
             .child(profile_card)
             .child(backup_card)
             .into_any_element()
@@ -11988,6 +12165,123 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Sleep confirmation: explains that polling stops until a manual wake.
+    ///
+    /// The sheet sends nothing on open, scrim click, or CANCEL. CONFIRM SLEEP
+    /// consumes the sheet and hands exactly one `Command::Sleep` to the gate.
+    fn sleep_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.state.sleep_confirm_open {
+            return div().into_any_element();
+        }
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let scrim_view = view;
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("sleep-confirm-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_sleep_confirm(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(560.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child("PUT CONTROLLER TO SLEEP"),
+                            )
+                            .child(chip("$SLP", p)),
+                    )
+                    .child(div().text_size(px(11.0)).text_color(p.warning).child(
+                        "Sleep stops controller status polling until RESET or a status \
+                                 wake. The app will not wake the controller automatically; the \
+                                 DRO, signals, and job status stay frozen until it answers again.",
+                    ))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child("BEFORE YOU CONFIRM"),
+                            )
+                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(
+                                "The controller must report Idle and no job may be \
+                                         running or paused. One confirmed tap sends one sleep \
+                                         command; CANCEL sends nothing.",
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("sleep-confirm-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_sleep_confirm(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("sleep-confirm-send")
+                                    .label("CONFIRM SLEEP")
+                                    .warning()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |shell, cx| {
+                                            shell.confirm_sleep(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Tall right cell: Coolant, Macros, Signals and Work in one continuous
     /// card. There is deliberately no divider between Signals and Work, and the
     /// card's bottom edge is the MDI/DRO baseline (the Spindle card below it is
@@ -12216,12 +12510,18 @@ impl Shell {
             )
     }
 
-    /// MDI: one 48 px field plus a Send button on a single row, one hint line.
+    /// MDI: one 48 px field plus a Send button on a single row, one hint line
+    /// with the compact UP/DOWN history recall chips.
     fn mdi_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let empty = self.state.mdi.trim().is_empty();
         let field_view = view.clone();
         let send_view = view.clone();
+        let up_view = view.clone();
+        let down_view = view.clone();
+        let history_len = self.state.mdi_history.len();
+        let history_empty = history_len == 0;
+        let can_recall_next = self.state.mdi_history_index.is_some();
 
         card(&p)
             .h(px(ROW_H))
@@ -12287,10 +12587,47 @@ impl Shell {
                         },
                     ))
                     .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(p.text_faint)
-                            .child("TAP FIELD FOR KEYPAD"),
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(format!("HIST {history_len}")),
+                            )
+                            .child(
+                                Button::new("mdi-history-up")
+                                    .label("UP")
+                                    .secondary()
+                                    .h(px(30.0))
+                                    .w(px(48.0))
+                                    .rounded(px(6.0))
+                                    .text_size(px(10.0))
+                                    .disabled(history_empty)
+                                    .on_click(move |_, _, cx| {
+                                        up_view.update(cx, |this, cx| {
+                                            this.state.mdi_history_previous();
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("mdi-history-down")
+                                    .label("DN")
+                                    .secondary()
+                                    .h(px(30.0))
+                                    .w(px(48.0))
+                                    .rounded(px(6.0))
+                                    .text_size(px(10.0))
+                                    .disabled(!can_recall_next)
+                                    .on_click(move |_, _, cx| {
+                                        down_view.update(cx, |this, cx| {
+                                            this.state.mdi_history_next();
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
                     ),
             )
     }
@@ -12431,36 +12768,62 @@ impl Shell {
             .child(h_flex().gap_2().flex_1().min_h(px(0.0)).children(tiles))
     }
 
-    /// Feed: label and 24 px percentage, then a full-width slider flanked by
-    /// 48 px -10/+10 buttons.
+    /// Feed: label and 24 px percentage with `RESET 100%`, then a full-width
+    /// slider. Coarse `-10`/`+10` and fine `-1`/`+1` are 48 px targets.
     fn feed_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let down_view = view.clone();
+        let fine_down_view = view.clone();
+        let fine_up_view = view.clone();
         let up_view = view.clone();
-        let down_slider = self.feed_slider.clone();
-        let up_slider = self.feed_slider.clone();
+        let reset_view = view.clone();
 
         card(&p)
             .h(px(ROW_H))
             .flex_shrink_0()
+            .gap_1()
+            .py_1()
+            .px_2()
             .child(
                 h_flex()
-                    .items_end()
+                    .items_center()
                     .justify_between()
-                    .child(section_label("FEED OVERRIDE", p))
+                    .gap_2()
+                    .h(px(48.0))
                     .child(
-                        div()
-                            .font_family(self.mono.clone())
-                            .text_size(px(24.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(p.accent)
-                            .child(format!("{}%", self.state.feed_override)),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label("FEED OVERRIDE", p))
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(24.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.accent)
+                                    .child(format!("{}%", self.state.feed_override)),
+                            ),
+                    )
+                    .child(
+                        Button::new("feed-reset")
+                            .label("RESET 100%")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(104.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!self.ready())
+                            .on_click(move |_, window, cx| {
+                                reset_view.update(cx, |this, cx| {
+                                    this.reset_feed_override(window, cx);
+                                });
+                            }),
                     ),
             )
             .child(
                 h_flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .h(px(48.0))
                     .child(
                         Button::new("feed-down")
@@ -12475,14 +12838,24 @@ impl Shell {
                             .disabled(!self.ready())
                             .on_click(move |_, window, cx| {
                                 down_view.update(cx, |this, cx| {
-                                    this.state.feed_override =
-                                        this.state.feed_override.saturating_sub(10).max(10);
-                                    let value = f32::from(this.state.feed_override);
-                                    down_slider.update(cx, |slider, cx| {
-                                        slider.set_value(value, window, cx);
-                                    });
-                                    this.request_feed_override(value.round() as u16);
-                                    cx.notify();
+                                    this.step_feed_override(-10, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("feed-fine-down")
+                            .label("-1")
+                            .h(px(48.0))
+                            .w(px(48.0))
+                            .rounded_lg()
+                            .text_size(px(12.0))
+                            .custom(mode_variant(cx, p, false))
+                            .border_1()
+                            .border_color(p.border)
+                            .disabled(!self.ready())
+                            .on_click(move |_, window, cx| {
+                                fine_down_view.update(cx, |this, cx| {
+                                    this.step_feed_override(-1, window, cx);
                                 });
                             }),
                     )
@@ -12491,6 +12864,23 @@ impl Shell {
                             .flex_1()
                             .min_w(px(0.0))
                             .child(Slider::new(&self.feed_slider).h(px(24.0))),
+                    )
+                    .child(
+                        Button::new("feed-fine-up")
+                            .label("+1")
+                            .h(px(48.0))
+                            .w(px(48.0))
+                            .rounded_lg()
+                            .text_size(px(12.0))
+                            .custom(mode_variant(cx, p, false))
+                            .border_1()
+                            .border_color(p.border)
+                            .disabled(!self.ready())
+                            .on_click(move |_, window, cx| {
+                                fine_up_view.update(cx, |this, cx| {
+                                    this.step_feed_override(1, window, cx);
+                                });
+                            }),
                     )
                     .child(
                         Button::new("feed-up")
@@ -12505,14 +12895,7 @@ impl Shell {
                             .disabled(!self.ready())
                             .on_click(move |_, window, cx| {
                                 up_view.update(cx, |this, cx| {
-                                    this.state.feed_override =
-                                        this.state.feed_override.saturating_add(10).min(200);
-                                    let value = f32::from(this.state.feed_override);
-                                    up_slider.update(cx, |slider, cx| {
-                                        slider.set_value(value, window, cx);
-                                    });
-                                    this.request_feed_override(value.round() as u16);
-                                    cx.notify();
+                                    this.step_feed_override(10, window, cx);
                                 });
                             }),
                     ),
@@ -14191,6 +14574,9 @@ impl Render for Shell {
         }
         if self.startup_confirm.is_some() {
             root = root.child(self.startup_confirm_overlay(p, cx));
+        }
+        if self.state.sleep_confirm_open {
+            root = root.child(self.sleep_confirm_overlay(p, cx));
         }
         if self.state.macro_run_pending().is_some() {
             root = root.child(self.macro_run_overlay(p, cx));

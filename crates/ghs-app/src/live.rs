@@ -494,6 +494,7 @@ impl LiveLink {
                 state.job.interrupted();
                 state.settings.cancel_writes("disconnected");
                 state.startup_lines.on_disconnected();
+                state.cancel_sleep_confirm();
                 self.startup_requested = false;
                 if state.offsets.status().is_pending() {
                     state.offsets.failed("disconnected");

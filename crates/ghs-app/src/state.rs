@@ -1601,6 +1601,78 @@ impl RapidOverrideRefusal {
     }
 }
 
+/// Smallest feed override percentage the controller accepts.
+pub const FEED_OVERRIDE_MIN: u16 = 10;
+/// Largest feed override percentage the controller accepts.
+pub const FEED_OVERRIDE_MAX: u16 = 200;
+/// Feed override percentage restored by `RESET 100%`.
+pub const FEED_OVERRIDE_RESET: u16 = 100;
+/// Bounded session history of lines sent through the MDI field.
+pub const MDI_HISTORY_LIMIT: usize = 10;
+
+/// Why a feed-override control cannot send a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedOverrideRefusal {
+    /// `--mock` has no engine to send a command to.
+    Mock,
+    /// The transport is connecting, disconnected, or failed.
+    NotReady,
+}
+
+impl FeedOverrideRefusal {
+    /// Operator-facing reason shown in the console.
+    pub fn message(self) -> &'static str {
+        match self {
+            FeedOverrideRefusal::Mock => "MOCK MODE: feed override needs a live controller",
+            FeedOverrideRefusal::NotReady => {
+                "LINK NOT READY: feed override is disabled until the handshake completes"
+            }
+        }
+    }
+}
+
+/// Why the controller cannot be put to sleep right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepRefusal {
+    /// `--mock` has no engine to send a command to.
+    Mock,
+    /// The transport is connecting, disconnected, or failed.
+    NotReady,
+    /// The controller reports a state other than `Idle`.
+    NotIdle,
+    /// A job is running or paused; sleep would interrupt it.
+    JobActive,
+}
+
+impl SleepRefusal {
+    /// Operator-facing reason shown in the console and the utility card.
+    pub fn message(self) -> &'static str {
+        match self {
+            SleepRefusal::Mock => "MOCK MODE: sleep needs a live controller",
+            SleepRefusal::NotReady => {
+                "LINK NOT READY: sleep is disabled until the handshake completes"
+            }
+            SleepRefusal::NotIdle => {
+                "NOT IDLE: sleep is available only while the controller reports Idle"
+            }
+            SleepRefusal::JobActive => "JOB ACTIVE: stop or finish the job before sleep",
+        }
+    }
+}
+
+/// Result of confirming the sleep sheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SleepOutcome {
+    /// Exactly one `Command::Sleep` was handed to the sender.
+    Sent,
+    /// The sender rejected the one command; nothing is claimed.
+    Rejected(String),
+    /// The gate refused the confirmation; nothing was sent.
+    Refused(SleepRefusal),
+    /// No confirmation sheet was open; nothing was sent.
+    NotConfirmed,
+}
+
 /// One controller run switch exposed by the Job `RUN OPTIONS` sheet.
 ///
 /// The displayed value is always the engine accessor copied into [`AppState`];
@@ -1714,6 +1786,8 @@ pub struct AppState {
     pub run_options_open: bool,
     /// Last refusal or engine rejection shown inside the run-options sheet.
     pub run_options_error: Option<String>,
+    /// The sleep confirmation sheet is open. Opening sends nothing.
+    pub sleep_confirm_open: bool,
     pub feed_override_active: bool,
     pub spindle_override_active: bool,
     pub spindle_on: bool,
@@ -1732,6 +1806,12 @@ pub struct AppState {
     pub program_search: ProgramSearch,
     pub keypad: Option<KeypadState>,
     pub mdi: String,
+    /// Bounded session history of MDI lines that were accepted for sending.
+    /// Oldest entry first; this is never persisted.
+    pub mdi_history: Vec<String>,
+    /// Index of the entry currently recalled into [`Self::mdi`], if any.
+    /// `None` means the field is a fresh draft, not a history entry.
+    pub mdi_history_index: Option<usize>,
     pub macros: Vec<Macro>,
     pub signals: Vec<Signal>,
     pub signal_caps: String,
@@ -1798,6 +1878,7 @@ impl AppState {
             block_delete: false,
             run_options_open: false,
             run_options_error: None,
+            sleep_confirm_open: false,
             feed_override_active: false,
             spindle_override_active: false,
             spindle_on: true,
@@ -1823,6 +1904,8 @@ impl AppState {
             program_search: ProgramSearch::default(),
             keypad: None,
             mdi: "G0 X10 Y10".to_string(),
+            mdi_history: Vec::new(),
+            mdi_history_index: None,
             macros: vec![
                 mac("Zero XY", MacroAction::ZeroXy),
                 mac("Zero Z", MacroAction::ZeroZ),
@@ -1884,6 +1967,8 @@ impl AppState {
         self.block_delete = false;
         self.run_options_open = false;
         self.run_options_error = None;
+        self.sleep_confirm_open = false;
+        self.mdi_history_index = None;
         self.feed_override_active = false;
         self.spindle_override_active = false;
         self.spindle_on = false;
@@ -2130,6 +2215,112 @@ impl AppState {
         Ok(Command::SetRapidOverride(next_rapid_override(
             self.rapid_override,
         )))
+    }
+
+    /// Feed override percentage produced by a fine or coarse step.
+    ///
+    /// The result is always inside the controller's `10..=200` range; the
+    /// command itself is built by [`Self::feed_override_step`].
+    pub fn feed_override_target(&self, delta: i16) -> u16 {
+        let target = i32::from(self.feed_override) + i32::from(delta);
+        target.clamp(i32::from(FEED_OVERRIDE_MIN), i32::from(FEED_OVERRIDE_MAX)) as u16
+    }
+
+    /// One fine (`-1`/`+1`) or coarse (`-10`/`+10`) feed-override command.
+    ///
+    /// This never changes [`Self::feed_override`]: the shell may update its
+    /// optimistic display only when no slider drag owns the value, and the
+    /// next snapshot remains authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason in mock mode or while the link is not ready.
+    pub fn feed_override_step(&self, delta: i16) -> Result<Command, FeedOverrideRefusal> {
+        self.feed_override_command(self.feed_override_target(delta))
+    }
+
+    /// The exact `RESET 100%` feed-override command.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason in mock mode or while the link is not ready.
+    pub fn feed_override_reset(&self) -> Result<Command, FeedOverrideRefusal> {
+        self.feed_override_command(FEED_OVERRIDE_RESET)
+    }
+
+    fn feed_override_command(&self, percent: u16) -> Result<Command, FeedOverrideRefusal> {
+        if !self.live {
+            return Err(FeedOverrideRefusal::Mock);
+        }
+        if !self.connection.is_ready_like() {
+            return Err(FeedOverrideRefusal::NotReady);
+        }
+        Ok(Command::SetFeedOverride(
+            percent.clamp(FEED_OVERRIDE_MIN, FEED_OVERRIDE_MAX),
+        ))
+    }
+
+    /// Why the controller cannot sleep right now, or `None` when it can.
+    ///
+    /// The engine refuses `Sleep` unless the controller reports `Idle`; this
+    /// mirror also blocks a paused job so the sheet is never a trap.
+    pub fn sleep_refusal(&self) -> Option<SleepRefusal> {
+        if !self.live {
+            Some(SleepRefusal::Mock)
+        } else if !self.connection.is_ready_like() {
+            Some(SleepRefusal::NotReady)
+        } else if self.job.is_active() {
+            Some(SleepRefusal::JobActive)
+        } else if self.machine_state != "Idle" {
+            Some(SleepRefusal::NotIdle)
+        } else {
+            None
+        }
+    }
+
+    /// The one command sent after the sleep sheet is confirmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate refusal when sleep is not available.
+    pub fn sleep_command(&self) -> Result<Command, SleepRefusal> {
+        match self.sleep_refusal() {
+            Some(refusal) => Err(refusal),
+            None => Ok(Command::Sleep),
+        }
+    }
+
+    /// Open the sleep confirmation sheet. Opening sends nothing.
+    pub fn open_sleep_confirm(&mut self) {
+        self.sleep_confirm_open = true;
+    }
+
+    /// Close the sleep confirmation sheet without sending anything.
+    pub fn cancel_sleep_confirm(&mut self) {
+        self.sleep_confirm_open = false;
+    }
+
+    /// Send exactly one confirmed `Sleep` through `send`.
+    ///
+    /// The sheet must already be open. It is consumed before the gate is
+    /// checked, so a refusal or rejection closes the sheet and changes no
+    /// displayed value. Without an open confirmation nothing is sent.
+    pub fn dispatch_sleep(
+        &mut self,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> SleepOutcome {
+        if !self.sleep_confirm_open {
+            return SleepOutcome::NotConfirmed;
+        }
+        self.sleep_confirm_open = false;
+        let command = match self.sleep_command() {
+            Ok(command) => command,
+            Err(refusal) => return SleepOutcome::Refused(refusal),
+        };
+        match send(command) {
+            Ok(()) => SleepOutcome::Sent,
+            Err(detail) => SleepOutcome::Rejected(detail),
+        }
     }
 
     /// Copy the engine's run-switch accessors into the view model.
@@ -3175,12 +3366,69 @@ impl AppState {
         self.push_console(ConsoleLevel::Ok, "ok (mock)");
     }
 
+    /// Remember one accepted MDI line for UP/DOWN recall.
+    ///
+    /// Empty text and a duplicate of the newest entry are ignored. The newest
+    /// [`MDI_HISTORY_LIMIT`] entries are kept; the oldest is dropped first.
+    /// Recording never sends and never changes [`Self::mdi`].
+    pub fn remember_mdi(&mut self, text: impl AsRef<str>) -> bool {
+        let text = text.as_ref().trim();
+        if text.is_empty() {
+            return false;
+        }
+        self.mdi_history_index = None;
+        if self.mdi_history.last().is_some_and(|last| last == text) {
+            return false;
+        }
+        if self.mdi_history.len() == MDI_HISTORY_LIMIT {
+            self.mdi_history.remove(0);
+        }
+        self.mdi_history.push(text.to_string());
+        true
+    }
+
+    /// Recall the previous MDI history entry into the field.
+    ///
+    /// The first call recalls the newest entry. Returns `false` when the
+    /// history is empty. This never sends and never touches the console.
+    pub fn mdi_history_previous(&mut self) -> bool {
+        if self.mdi_history.is_empty() {
+            return false;
+        }
+        let index = match self.mdi_history_index {
+            Some(index) => index.saturating_sub(1),
+            None => self.mdi_history.len() - 1,
+        };
+        self.mdi_history_index = Some(index);
+        self.mdi = self.mdi_history[index].clone();
+        true
+    }
+
+    /// Recall the next MDI history entry, or return to an empty draft.
+    ///
+    /// Returns `false` when no entry is currently recalled. Moving past the
+    /// newest entry clears the field; nothing is sent either way.
+    pub fn mdi_history_next(&mut self) -> bool {
+        let Some(index) = self.mdi_history_index else {
+            return false;
+        };
+        if index + 1 < self.mdi_history.len() {
+            self.mdi_history_index = Some(index + 1);
+            self.mdi = self.mdi_history[index + 1].clone();
+        } else {
+            self.mdi_history_index = None;
+            self.mdi.clear();
+        }
+        true
+    }
+
     pub fn send_mdi(&mut self) {
         let text = self.mdi.trim().to_string();
         if text.is_empty() {
             self.push_console(ConsoleLevel::Warn, "MDI is empty");
             return;
         }
+        self.remember_mdi(&text);
         self.push_console(ConsoleLevel::Command, format!("> {text}"));
         self.push_console(ConsoleLevel::Ok, "ok (mock, nothing was sent)");
         self.machine_state = "MDI";
@@ -3772,6 +4020,269 @@ mod tests {
             state.rapid_override_step(),
             Ok(Command::SetRapidOverride(50))
         );
+    }
+
+    #[test]
+    fn mdi_history_recalls_without_sending_or_touching_the_console() {
+        let mut state = AppState::new();
+        assert!(state.remember_mdi("G0 X1"));
+        assert!(state.remember_mdi("G1 Z-1 F200"));
+        let console_len = state.console.len();
+        let machine = state.machine_state;
+        state.mdi.clear();
+
+        assert!(state.mdi_history_previous());
+        assert_eq!(state.mdi, "G1 Z-1 F200");
+        assert!(state.mdi_history_previous());
+        assert_eq!(state.mdi, "G0 X1");
+        assert!(state.mdi_history_next());
+        assert_eq!(state.mdi, "G1 Z-1 F200");
+        assert!(state.mdi_history_next());
+        assert!(
+            state.mdi.is_empty(),
+            "past the newest entry is an empty draft"
+        );
+        assert!(!state.mdi_history_next());
+
+        assert_eq!(state.console.len(), console_len, "recall must not append");
+        assert_eq!(state.machine_state, machine, "recall must not send");
+    }
+
+    #[test]
+    fn mdi_history_ignores_empty_duplicates_and_caps_the_length() {
+        let mut state = AppState::new();
+        assert!(!state.remember_mdi(""));
+        assert!(!state.remember_mdi("   "));
+        for index in 0..12 {
+            assert!(state.remember_mdi(format!("G0 X{index}")));
+        }
+        assert_eq!(state.mdi_history.len(), MDI_HISTORY_LIMIT);
+        assert_eq!(state.mdi_history.first().map(String::as_str), Some("G0 X2"));
+        assert_eq!(state.mdi_history.last().map(String::as_str), Some("G0 X11"));
+
+        assert!(
+            !state.remember_mdi("G0 X11"),
+            "a consecutive duplicate is ignored"
+        );
+        assert_eq!(state.mdi_history.len(), MDI_HISTORY_LIMIT);
+
+        assert!(state.remember_mdi("G0 X0"));
+        assert_eq!(state.mdi_history.len(), MDI_HISTORY_LIMIT);
+        assert_eq!(
+            state.mdi_history.first().map(String::as_str),
+            Some("G0 X3"),
+            "the oldest entry is dropped at the cap"
+        );
+        assert_eq!(state.mdi_history.last().map(String::as_str), Some("G0 X0"));
+    }
+
+    #[test]
+    fn mock_mdi_send_records_one_history_entry() {
+        let mut state = AppState::new();
+        state.mdi = "G0 X1".to_string();
+        state.send_mdi();
+        assert_eq!(state.mdi_history, vec!["G0 X1".to_string()]);
+        state.send_mdi();
+        assert_eq!(state.mdi_history.len(), 1, "resend is a duplicate");
+    }
+
+    #[test]
+    fn feed_fine_step_and_reset_are_exact_and_clamped() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+
+        state.feed_override = 100;
+        assert_eq!(
+            state.feed_override_step(1),
+            Ok(Command::SetFeedOverride(101))
+        );
+        assert_eq!(
+            state.feed_override_step(-1),
+            Ok(Command::SetFeedOverride(99))
+        );
+        state.feed_override = 200;
+        assert_eq!(
+            state.feed_override_step(1),
+            Ok(Command::SetFeedOverride(200))
+        );
+        state.feed_override = 10;
+        assert_eq!(
+            state.feed_override_step(-1),
+            Ok(Command::SetFeedOverride(10))
+        );
+
+        state.feed_override = 37;
+        assert_eq!(
+            state.feed_override_reset(),
+            Ok(Command::SetFeedOverride(100))
+        );
+        assert_eq!(
+            state.feed_override, 37,
+            "building a command does not claim it"
+        );
+    }
+
+    #[test]
+    fn feed_override_is_refused_when_mock_or_not_ready() {
+        let mut state = AppState::new();
+        assert_eq!(state.feed_override_step(1), Err(FeedOverrideRefusal::Mock));
+
+        state.begin_live("test transport");
+        assert_eq!(
+            state.feed_override_step(1),
+            Err(FeedOverrideRefusal::NotReady)
+        );
+        assert_eq!(
+            state.feed_override_reset(),
+            Err(FeedOverrideRefusal::NotReady)
+        );
+
+        state.connection = ConnectionState::Disconnected;
+        assert_eq!(
+            state.feed_override_step(1),
+            Err(FeedOverrideRefusal::NotReady)
+        );
+
+        state.connection = ConnectionState::Ready;
+        assert_eq!(
+            state.feed_override_step(1),
+            Ok(Command::SetFeedOverride(101))
+        );
+    }
+
+    #[test]
+    fn feed_commands_leave_spindle_and_rapid_overrides_alone() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        state.feed_override = 100;
+        state.spindle_override = 55;
+        state.rapid_override = 25;
+
+        let _ = state.feed_override_step(1);
+        let _ = state.feed_override_reset();
+
+        assert_eq!(state.feed_override, 100);
+        assert_eq!(state.spindle_override, 55);
+        assert_eq!(state.rapid_override, 25);
+    }
+
+    #[test]
+    fn sleep_requires_confirmation_and_sends_exactly_once() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+
+        let mut sends = Vec::new();
+        assert_eq!(
+            state.dispatch_sleep(|command| {
+                sends.push(command);
+                Ok(())
+            }),
+            SleepOutcome::NotConfirmed
+        );
+        assert!(sends.is_empty(), "no confirmation means no send");
+
+        state.open_sleep_confirm();
+        assert!(state.sleep_confirm_open);
+        assert_eq!(
+            state.dispatch_sleep(|command| {
+                sends.push(command);
+                Ok(())
+            }),
+            SleepOutcome::Sent
+        );
+        assert_eq!(sends, vec![Command::Sleep]);
+        assert!(!state.sleep_confirm_open, "the sheet is consumed");
+
+        assert_eq!(
+            state.dispatch_sleep(|command| {
+                sends.push(command);
+                Ok(())
+            }),
+            SleepOutcome::NotConfirmed
+        );
+        assert_eq!(sends.len(), 1, "a second confirmation sends nothing");
+    }
+
+    #[test]
+    fn sleep_cancel_sends_nothing() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.open_sleep_confirm();
+        state.cancel_sleep_confirm();
+        assert!(!state.sleep_confirm_open);
+
+        let mut sent = false;
+        assert_eq!(
+            state.dispatch_sleep(|_| {
+                sent = true;
+                Ok(())
+            }),
+            SleepOutcome::NotConfirmed
+        );
+        assert!(!sent);
+    }
+
+    #[test]
+    fn sleep_is_refused_when_not_idle_ready_or_job_free() {
+        let mut state = AppState::new();
+        state.open_sleep_confirm();
+        let mut sends = 0;
+        assert_eq!(
+            state.dispatch_sleep(|_| {
+                sends += 1;
+                Ok(())
+            }),
+            SleepOutcome::Refused(SleepRefusal::Mock)
+        );
+        assert_eq!(sends, 0);
+
+        state.begin_live("test transport");
+        state.open_sleep_confirm();
+        assert_eq!(
+            state.dispatch_sleep(|_| {
+                sends += 1;
+                Ok(())
+            }),
+            SleepOutcome::Refused(SleepRefusal::NotReady)
+        );
+        assert_eq!(sends, 0);
+
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Run";
+        state.open_sleep_confirm();
+        assert_eq!(
+            state.dispatch_sleep(|_| {
+                sends += 1;
+                Ok(())
+            }),
+            SleepOutcome::Refused(SleepRefusal::NotIdle)
+        );
+        assert_eq!(sends, 0);
+
+        let mut job = JobView::default();
+        job.loaded("sample.nc".into(), sample_program(), 10);
+        job.started(1, 10);
+        state.job = job;
+        state.machine_state = "Idle";
+        state.open_sleep_confirm();
+        assert_eq!(
+            state.dispatch_sleep(|_| {
+                sends += 1;
+                Ok(())
+            }),
+            SleepOutcome::Refused(SleepRefusal::JobActive)
+        );
+        assert_eq!(sends, 0);
+
+        state.job = JobView::default();
+        state.open_sleep_confirm();
+        assert_eq!(state.sleep_command(), Ok(Command::Sleep));
     }
 
     #[test]
