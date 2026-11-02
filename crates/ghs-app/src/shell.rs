@@ -76,6 +76,10 @@ use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
 use crate::macros::MacroRunRequest;
 use crate::offsets::{OffsetAction, OffsetGate, OffsetStatus};
+use crate::pins::{
+    PinsGate, PinsRequest, PinsStatus, ReportState, pin_bits_text, pin_direction_label,
+    signal_mask_text,
+};
 use crate::probe::{
     FieldProblem, PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight,
     ProbeRun, ProbeTarget, RowState, format_duration, format_estimate, format_mm,
@@ -305,6 +309,9 @@ pub struct Shell {
     demo_program: DemoProgram,
     demo_start: bool,
     demo_start_sent: bool,
+    /// Screenshot switch: open the read-only pins/limits diagnostics sheet.
+    demo_pins: bool,
+    demo_pins_done: bool,
     /// Screenshot switch: open the run-options sheet and flip two switches.
     demo_run_options: bool,
     demo_run_options_done: bool,
@@ -557,6 +564,7 @@ impl Shell {
             DemoProgram::Pocket
         };
         let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+        let demo_pins = std::env::args().any(|arg| arg == "--pins");
         let demo_run_options = std::env::args().any(|arg| arg == "--demo-run-options");
         let demo_load_file = std::env::args()
             .find_map(|arg| arg.strip_prefix("--demo-load-file=").map(PathBuf::from));
@@ -683,6 +691,8 @@ impl Shell {
             demo_program,
             demo_start,
             demo_start_sent: false,
+            demo_pins,
+            demo_pins_done: false,
             demo_run_options,
             demo_run_options_done: false,
             demo_breakpoints,
@@ -895,6 +905,14 @@ impl Shell {
         // Startup lines: one queued write, then a read-back retry while the
         // engine is busy. Never update the row from the write itself.
         changed |= self.pump_startup_writes();
+        // Read-only pins/limits diagnostics: opening the sheet or pressing
+        // REFRESH queues the four reports; Busy is retried with a backoff.
+        if self.demo_pins && !self.demo_pins_done && (self.ready() || !self.state.live) {
+            self.demo_pins_done = true;
+            self.open_pins_panel(cx);
+            changed = true;
+        }
+        changed |= self.pump_pins();
         if let Some(name) = self.settings_demo_group.clone()
             && !self.settings_demo_group_done
         {
@@ -3394,6 +3412,64 @@ impl Shell {
                 }
             }
         }));
+    }
+
+    // ------------------------------------------------- pins/limits diagnostics
+
+    /// Gate inputs for the read-only diagnostics refresh.
+    fn pins_gate(&self) -> PinsGate {
+        PinsGate {
+            live: self.state.live,
+            ready: self.ready(),
+            locked: self.locked(),
+            job_active: self.state.job.is_active(),
+        }
+    }
+
+    /// Open the diagnostics sheet and immediately request its four reports.
+    ///
+    /// Opening is the explicit request documented for this panel; closing it
+    /// never sends anything.
+    fn open_pins_panel(&mut self, cx: &mut Context<Self>) {
+        self.state.pins.open();
+        self.request_pins_refresh(cx);
+    }
+
+    /// Close the sheet without touching the machine or the controller.
+    fn close_pins_panel(&mut self, cx: &mut Context<Self>) {
+        self.state.pins.close();
+        cx.notify();
+    }
+
+    /// Queue and pump one explicit refresh of the four read-only reports.
+    fn request_pins_refresh(&mut self, cx: &mut Context<Self>) {
+        if let Err(refusal) = self.state.pins.begin_refresh(self.pins_gate()) {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Pins/limits refresh: {}", refusal.message()),
+            );
+        } else {
+            self.pump_pins();
+        }
+        cx.notify();
+    }
+
+    /// Send the next queued diagnostics report through the engine gateway.
+    ///
+    /// The model owns the Busy backoff and request bookkeeping, so this method
+    /// cannot duplicate a report or turn a Busy reply into a retry storm.
+    fn pump_pins(&mut self) -> bool {
+        if !self.state.pins.needs_pump() {
+            return false;
+        }
+        let gate = self.pins_gate();
+        let link = self.link.as_ref();
+        self.state
+            .pins
+            .pump(Instant::now(), gate, |command| match link {
+                Some(link) => link.send(command),
+                None => Err(EngineError::NotConnected),
+            })
     }
 
     fn pump_offset_refresh(&mut self) -> bool {
@@ -11499,6 +11575,82 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Read-only controller pin/limit diagnostics entry point.
+    ///
+    /// The right rail keeps its live `Pn` signals card; this Utility card opens
+    /// the detailed `$PINS`/`$PINSTATE`/`$LIM`/`$LEV` sheet.
+    fn pins_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let pins = &self.state.pins;
+        let status_color = match pins.status() {
+            PinsStatus::Idle => p.text_faint,
+            PinsStatus::Refreshing | PinsStatus::Busy => p.warning,
+            PinsStatus::Requested => p.success,
+            PinsStatus::Stopped(_) => p.danger,
+        };
+        let status_text = pins.status().label().to_string();
+        let map_state = pins.pin_map_report();
+        let summary = match map_state {
+            ReportState::Missing => "No $PINS report in this session".to_string(),
+            ReportState::Empty => "The controller reported no pin entries".to_string(),
+            ReportState::Reported => {
+                format!(
+                    "{} pin entries reported",
+                    pins.pin_map().map_or(0, |map| map.len())
+                )
+            }
+        };
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(section_label("CONTROLLER DIAGNOSTICS", p))
+                    .child(chip("READ-ONLY", p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                "Pin map, auxiliary pin levels, limit switches and last control events. \
+                 Opening the panel sends nothing; REFRESH sends only $PINS, $PINSTATE, \
+                 $LIM and $LEV.",
+            ))
+            .child(
+                h_flex().items_center().gap_2().children(
+                    PinsRequest::ALL
+                        .into_iter()
+                        .map(|request| chip(request.label(), p)),
+                ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(status_color)
+                    .child(status_text),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(summary),
+            )
+            .child(
+                Button::new("pins-open")
+                    .label("OPEN PINS / LIMITS")
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(220.0))
+                    .rounded_lg()
+                    .text_size(px(10.0))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |shell, cx| shell.open_pins_panel(cx));
+                    }),
+            )
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let config = &self.state.config;
@@ -11974,6 +12126,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.pins_card(p, cx))
             .child(self.keymap_card(p, cx))
             .child(self.macro_card(p, cx))
             .child(startup_card)
@@ -13355,6 +13508,372 @@ impl Shell {
                                             shell.confirm_sleep(cx);
                                         });
                                     }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Read-only `$PINS` / `$PINSTATE` / `$LIM` / `$LEV` sheet.
+    ///
+    /// The panel is controller diagnostic data, separate from the live `Pn`
+    /// signals card. It has no motion, MDI or setting control; REFRESH and
+    /// CLOSE are the only actions.
+    fn pins_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.state.pins.is_open() {
+            return div().into_any_element();
+        }
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let refresh_view = view.clone();
+        let close_view = view;
+        let mono = self.mono.clone();
+        let pins = &self.state.pins;
+
+        let status_color = match pins.status() {
+            PinsStatus::Idle => p.text_faint,
+            PinsStatus::Refreshing | PinsStatus::Busy => p.warning,
+            PinsStatus::Requested => p.success,
+            PinsStatus::Stopped(_) => p.danger,
+        };
+        let status_text = pins.status().label().to_string();
+
+        let pin_count = pins.pin_map().map_or(0, |map| map.len());
+        let mut map_list = v_flex()
+            .id("pins-map-list")
+            .gap_1()
+            .max_h(px(250.0))
+            .overflow_y_scrollbar();
+        match pins.pin_map() {
+            None | Some([]) => {
+                map_list = map_list.child(pins_empty(pins.pin_map_note(), p));
+            }
+            Some(map) => {
+                for pin in map {
+                    map_list = map_list.child(
+                        h_flex()
+                            .h(px(30.0))
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .rounded(px(5.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .w(px(46.0))
+                                    .flex_shrink_0()
+                                    .font_family(mono.clone())
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_faint)
+                                    .child(format!("#{}", pin.id)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(p.text)
+                                    .child(pin.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(58.0))
+                                    .flex_shrink_0()
+                                    .text_size(px(9.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text_dim)
+                                    .child(pin_direction_label(pin.direction)),
+                            ),
+                    );
+                }
+            }
+        }
+
+        let pin_state_card = match pins.pin_state() {
+            Some(state) => pins_section("PIN STATE ($PINSTATE)", p)
+                .child(pins_key_value(
+                    "RAW MASK",
+                    signal_mask_text(state.mask),
+                    p,
+                    &mono,
+                ))
+                .child(pins_key_value(
+                    "INPUTS",
+                    format!("{} reported", state.inputs.len()),
+                    p,
+                    &mono,
+                ))
+                .child(pins_bits(
+                    "pins-input-bits",
+                    pin_bits_text(&state.inputs),
+                    p,
+                    &mono,
+                ))
+                .child(pins_key_value(
+                    "OUTPUTS",
+                    format!("{} reported", state.outputs.len()),
+                    p,
+                    &mono,
+                ))
+                .child(pins_bits(
+                    "pins-output-bits",
+                    pin_bits_text(&state.outputs),
+                    p,
+                    &mono,
+                )),
+            None => {
+                pins_section("PIN STATE ($PINSTATE)", p).child(pins_empty(pins.pin_state_note(), p))
+            }
+        };
+
+        let limits_card = match pins.limit_state() {
+            Some(state) => {
+                let mut rows = v_flex().gap_1();
+                for axis in &self.state.profile.capabilities.axes {
+                    let asserted = CoreAxis::from_index(axis.index())
+                        .is_some_and(|axis| state.is_asserted(axis));
+                    rows = rows.child(
+                        h_flex()
+                            .h(px(24.0))
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(p.text_dim)
+                                    .child(format!("{} LIMIT", axis.label())),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .h(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(4.0))
+                                    .bg(if asserted {
+                                        p.danger.opacity(0.16)
+                                    } else {
+                                        p.panel
+                                    })
+                                    .text_size(px(9.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(if asserted { p.danger } else { p.success })
+                                    .child(if asserted { "ASSERTED" } else { "CLEAR" }),
+                            ),
+                    );
+                }
+                if self.state.profile.capabilities.axes.is_empty() {
+                    rows = rows.child(pins_empty("No axes have been reported by $I+", p));
+                }
+                pins_section("LIMITS ($LIM)", p)
+                    .child(rows)
+                    .child(pins_key_value(
+                        "RAW MASK",
+                        format!("0x{:04X}", state.mask),
+                        p,
+                        &mono,
+                    ))
+            }
+            None => pins_section("LIMITS ($LIM)", p).child(pins_empty(pins.limits_note(), p)),
+        };
+
+        let events_card = match pins.last_events() {
+            Some(events) => pins_section("LAST EVENTS ($LEV)", p)
+                .child(pins_key_value("COUNT", events.count.to_string(), p, &mono))
+                .child(pins_key_value(
+                    "SIGNALS",
+                    if events.signals.is_empty() {
+                        "none".to_string()
+                    } else {
+                        events.signals.to_string()
+                    },
+                    p,
+                    &mono,
+                ))
+                .child(pins_key_value(
+                    "RAW MASK",
+                    signal_mask_text(events.signals),
+                    p,
+                    &mono,
+                )),
+            None => {
+                pins_section("LAST EVENTS ($LEV)", p).child(pins_empty(pins.last_events_note(), p))
+            }
+        };
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("pins-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.close_pins_panel(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(1080.0))
+                    .max_w_full()
+                    .max_h_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                v_flex()
+                                    .min_w(px(0.0))
+                                    .gap_0()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text)
+                                            .child("PINS / LIMITS"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(p.text_faint)
+                                            .child("CONTROLLER DIAGNOSTIC DATA - READ-ONLY"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(560.0))
+                                    .truncate()
+                                    .px_2()
+                                    .h(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(5.0))
+                                    .bg(status_color.opacity(0.16))
+                                    .border_1()
+                                    .border_color(status_color.opacity(0.5))
+                                    .text_size(px(9.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(status_color)
+                                    .child(status_text),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .line_height(px(14.0))
+                            .text_color(p.text_dim)
+                            .child(
+                                "Read-only controller evidence. Pin levels and limit state are \
+                                 instantaneous reports; the pin map is controller configuration. \
+                                 Missing and empty reports are shown explicitly.",
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .items_stretch()
+                            .gap_2()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .gap_2()
+                                    .child(
+                                        pins_section("PIN MAP ($PINS)", p)
+                                            .child(
+                                                div()
+                                                    .text_size(px(9.5))
+                                                    .text_color(p.text_faint)
+                                                    .child(format!("{pin_count} entries")),
+                                            )
+                                            .child(map_list),
+                                    )
+                                    .child(events_card),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .gap_2()
+                                    .child(pin_state_card)
+                                    .child(limits_card),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(9.5))
+                                    .text_color(p.text_faint)
+                                    .child(
+                                        "REFRESH sends $PINS, $PINSTATE, $LIM and $LEV. \
+                                         Closing this sheet sends nothing.",
+                                    ),
+                            )
+                            .child(
+                                Button::new("pins-refresh")
+                                    .label("REFRESH")
+                                    .primary()
+                                    .h(px(48.0))
+                                    .w(px(120.0))
+                                    .flex_shrink_0()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        refresh_view.update(cx, |shell, cx| {
+                                            shell.request_pins_refresh(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("pins-close")
+                                    .h(px(48.0))
+                                    .w(px(120.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_lg()
+                                    .bg(p.panel_alt)
+                                    .border_1()
+                                    .border_color(p.border_strong)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(p.raised_hover).border_color(p.accent))
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .on_click(move |_, _, cx| {
+                                        close_view.update(cx, |shell, cx| {
+                                            shell.close_pins_panel(cx);
+                                        });
+                                    })
+                                    .child("CLOSE"),
                             ),
                     ),
             )
@@ -15696,6 +16215,9 @@ impl Render for Shell {
         if self.state.sleep_confirm_open {
             root = root.child(self.sleep_confirm_overlay(p, cx));
         }
+        if self.state.pins.is_open() {
+            root = root.child(self.pins_overlay(p, cx));
+        }
         if self.state.macro_run_pending().is_some() {
             root = root.child(self.macro_run_overlay(p, cx));
         }
@@ -16378,6 +16900,75 @@ fn tab_button(cx: &App, p: Palette, label: LeftTab, active: bool, view: Entity<S
                 cx.notify();
             });
         })
+}
+
+/// One titled block inside the read-only diagnostics sheet.
+fn pins_section(title: &'static str, p: Palette) -> Div {
+    v_flex()
+        .gap(px(6.0))
+        .p_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(p.border)
+        .bg(p.panel_alt)
+        .child(section_label(title, p))
+}
+
+/// Explicit missing/empty report state for one diagnostics block.
+fn pins_empty(note: &str, p: Palette) -> Div {
+    div()
+        .p_2()
+        .rounded(px(5.0))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.panel)
+        .text_size(px(10.0))
+        .text_color(p.text_dim)
+        .child(note.to_string())
+}
+
+/// One label/value row inside the diagnostics sheet.
+fn pins_key_value(label: &'static str, value: String, p: Palette, mono: &SharedString) -> Div {
+    h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .h(px(20.0))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(9.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .font_family(mono.clone())
+                .text_size(px(10.0))
+                .text_color(p.text)
+                .child(value),
+        )
+}
+
+/// Bounded monospace bit block; long reports scroll vertically only.
+fn pins_bits(id: &'static str, text: String, p: Palette, mono: &SharedString) -> impl IntoElement {
+    div()
+        .id(id)
+        .max_h(px(80.0))
+        .overflow_y_scrollbar()
+        .rounded(px(5.0))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.panel)
+        .p_1()
+        .font_family(mono.clone())
+        .text_size(px(9.0))
+        .line_height(px(12.0))
+        .text_color(p.text_dim)
+        .child(text)
 }
 
 fn card(p: &Palette) -> Div {

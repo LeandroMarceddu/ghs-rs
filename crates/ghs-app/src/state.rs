@@ -17,8 +17,9 @@ use ghs_config::{HeightMapRecord, Macro as ConfigMacro, ProbeOffsetRecord};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, Command, ControllerInfo, EngineEvent, JobAbortReason, JobInfo,
-    JobPauseReason, JobState, MachineSnapshot, Offsets, Program, ProgramLine as EngineProgramLine,
-    SettingValue, Signals as CoreSignals, StartupLine, StatusReport, ToolEntry, Wcs,
+    JobPauseReason, JobState, LastEvents, LimitState, MachineSnapshot, Offsets, PinMapping,
+    PinState, Program, ProgramLine as EngineProgramLine, SettingValue, Signals as CoreSignals,
+    StartupLine, StatusReport, ToolEntry, Wcs,
 };
 use ghs_probe::XyPoint;
 
@@ -29,6 +30,7 @@ use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_ru
 use crate::macros::{MacroModel, MacroRunGate, MacroRunRequest};
 use crate::offsets::OffsetModel;
 use crate::offsets_export::{OffsetsBackupModel, OffsetsExport};
+use crate::pins::PinsModel;
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
@@ -1999,6 +2001,8 @@ pub struct AppState {
     pub controller_tools: ControllerToolTable,
     /// `$N0`/`$N1` read state and the local edit/confirmation model.
     pub startup_lines: StartupLinesModel,
+    /// Read-only `$PINS`/`$PINSTATE`/`$LIM`/`$LEV` diagnostics mirrors.
+    pub pins: PinsModel,
     /// User-defined macro execution: pending confirmation and last error.
     ///
     /// The macro records themselves live in the active controller profile
@@ -2093,6 +2097,7 @@ impl AppState {
             tools: ToolTableModel::new(),
             controller_tools: ControllerToolTable::new(),
             startup_lines: StartupLinesModel::new(),
+            pins: PinsModel::new(),
             user_macros: MacroModel::new(),
             config,
         };
@@ -2163,6 +2168,9 @@ impl AppState {
         // Controller-reported data belongs to this session only.
         self.controller_tools = ControllerToolTable::new();
         self.startup_lines.reset();
+        // Pin/limit diagnostics are read-only controller reports; the engine
+        // clears them for a new session and the mirrors follow it.
+        self.pins.reset_session();
         self.user_macros.reset();
         self.probe = ProbeModel::default();
         self.height_map.reset();
@@ -3067,6 +3075,26 @@ impl AppState {
     /// and compared with the requested text.
     pub fn apply_startup_lines(&mut self, lines: &[StartupLine]) -> bool {
         self.startup_lines.apply_reported(lines)
+    }
+
+    /// Install a `$PINS` map from the engine event or accessor.
+    pub fn apply_pin_map(&mut self, map: Arc<Vec<PinMapping>>) -> bool {
+        self.pins.apply_pin_map(map)
+    }
+
+    /// Install or clear the `$PINSTATE` auxiliary pin levels.
+    pub fn apply_pin_state(&mut self, state: Option<Arc<PinState>>) -> bool {
+        self.pins.apply_pin_state(state)
+    }
+
+    /// Install or clear the `$LIM` limit-switch state.
+    pub fn apply_limit_state(&mut self, state: Option<Arc<LimitState>>) -> bool {
+        self.pins.apply_limit_state(state)
+    }
+
+    /// Install or clear the `$LEV` last control and limit events.
+    pub fn apply_last_events(&mut self, events: Option<Arc<LastEvents>>) -> bool {
+        self.pins.apply_last_events(events)
     }
 
     /// Machine/connection gate for a `$N<n>` write.

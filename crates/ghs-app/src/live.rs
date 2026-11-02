@@ -15,8 +15,9 @@ use std::sync::Arc;
 use ghs_demo::{SimProfile, SimSession};
 use ghs_engine::{
     Command, ConnectTarget, ControllerInfo, Engine, EngineConfig, EngineError, EngineEvent,
-    EngineHandle, JobAbortReason, JobPauseReason, LogLevel, MachineSnapshot, SerialConfig, Setting,
-    SettingDescription, SettingGroup, StartupLine, StatusReport, SystemCommand, ToolEntry,
+    EngineHandle, JobAbortReason, JobPauseReason, LastEvents, LimitState, LogLevel,
+    MachineSnapshot, PinMapping, PinState, SerialConfig, Setting, SettingDescription, SettingGroup,
+    StartupLine, StatusReport, SystemCommand, ToolEntry,
 };
 
 use crate::state::{
@@ -142,6 +143,10 @@ pub struct LiveLink {
     last_groups: Option<Arc<Vec<SettingGroup>>>,
     last_controller_tools: Option<Arc<Vec<ToolEntry>>>,
     last_startup_lines: Option<Arc<Vec<StartupLine>>>,
+    last_pin_map: Option<Arc<Vec<PinMapping>>>,
+    last_pin_state: Option<Arc<PinState>>,
+    last_limit_state: Option<Arc<LimitState>>,
+    last_limit_events: Option<Arc<LastEvents>>,
     /// `$N` was accepted once for this connection.
     startup_requested: bool,
 }
@@ -178,6 +183,10 @@ impl LiveLink {
             last_groups: None,
             last_controller_tools: None,
             last_startup_lines: None,
+            last_pin_map: None,
+            last_pin_state: None,
+            last_limit_state: None,
+            last_limit_events: None,
             startup_requested: false,
         };
         link.connect(mode)?;
@@ -458,6 +467,37 @@ impl LiveLink {
                 changed |= state.apply_startup_lines(&startup_lines);
                 self.last_startup_lines = Some(startup_lines);
             }
+
+            // `$PINS` is only read after the operator asked for it. The engine
+            // clears its map when it accepts the request, so an empty accessor
+            // then is an explicit empty report; before the first request the
+            // same empty accessor means "not asked" and is ignored.
+            if state.pins.pin_map_requested() {
+                let pin_map = self.engine.pin_map();
+                if option_arc_changed(&self.last_pin_map, &Some(Arc::clone(&pin_map))) {
+                    changed |= state.apply_pin_map(Arc::clone(&pin_map));
+                    self.last_pin_map = Some(pin_map);
+                }
+            }
+
+            // Live pin/limit reports are accessor-backed as well as event-fed.
+            // Reading them here recovers a report whose event was drained and
+            // clears the mirrors when a soft reset makes the engine drop them.
+            let pin_state = self.engine.pin_state();
+            if option_arc_changed(&self.last_pin_state, &pin_state) {
+                changed |= state.apply_pin_state(pin_state.clone());
+                self.last_pin_state = pin_state;
+            }
+            let limit_state = self.engine.limit_state();
+            if option_arc_changed(&self.last_limit_state, &limit_state) {
+                changed |= state.apply_limit_state(limit_state.clone());
+                self.last_limit_state = limit_state;
+            }
+            let limit_events = self.engine.limit_events();
+            if option_arc_changed(&self.last_limit_events, &limit_events) {
+                changed |= state.apply_last_events(limit_events.clone());
+                self.last_limit_events = limit_events;
+            }
         }
 
         // A write/read-back result updates the row and the console once.
@@ -494,8 +534,12 @@ impl LiveLink {
                 state.job.interrupted();
                 state.settings.cancel_writes("disconnected");
                 state.startup_lines.on_disconnected();
+                state.pins.on_disconnected();
                 state.cancel_sleep_confirm();
                 self.startup_requested = false;
+                self.last_pin_state = None;
+                self.last_limit_state = None;
+                self.last_limit_events = None;
                 if state.offsets.status().is_pending() {
                     state.offsets.failed("disconnected");
                 }
@@ -522,6 +566,7 @@ impl LiveLink {
                 state.machine_state = "Alarm";
                 state.probe.on_alarm(code);
                 state.startup_lines.on_alarm(code);
+                state.pins.on_alarm(code);
                 if state.offsets.status().is_pending() {
                     state.offsets.failed(format!("ALARM:{code}"));
                 }
@@ -605,6 +650,22 @@ impl LiveLink {
             EngineEvent::StartupLines(lines) => {
                 self.last_startup_lines = Some(Arc::clone(&lines));
                 state.apply_startup_lines(&lines)
+            }
+            EngineEvent::PinMap(map) => {
+                self.last_pin_map = Some(Arc::clone(&map));
+                state.apply_pin_map(map)
+            }
+            EngineEvent::PinState(report) => {
+                self.last_pin_state = Some(Arc::clone(&report));
+                state.apply_pin_state(Some(report))
+            }
+            EngineEvent::LimitState(limit) => {
+                self.last_limit_state = Some(Arc::clone(&limit));
+                state.apply_limit_state(Some(limit))
+            }
+            EngineEvent::LastEvents(events) => {
+                self.last_limit_events = Some(Arc::clone(&events));
+                state.apply_last_events(Some(events))
             }
             EngineEvent::CodeTables { .. } => false,
             EngineEvent::Probe(result) => {
@@ -726,6 +787,10 @@ impl LiveLink {
         self.last_groups = None;
         self.last_controller_tools = None;
         self.last_startup_lines = None;
+        self.last_pin_map = None;
+        self.last_pin_state = None;
+        self.last_limit_state = None;
+        self.last_limit_events = None;
         self.startup_requested = false;
     }
 }
@@ -1292,6 +1357,72 @@ mod tests {
                 .any(|line| line.text.contains("$N0 VERIFIED")),
             "the verified read-back was not mapped to the console"
         );
+        link.disconnect();
+    }
+
+    #[test]
+    fn demo_link_answers_the_read_only_pin_and_limit_reports() {
+        use crate::pins::{PinsGate, ReportState};
+
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    link.engine.is_ready()
+                },
+                Duration::from_secs(5)
+            ),
+            "demo handshake did not complete"
+        );
+
+        state.pins.open();
+        state
+            .pins
+            .begin_refresh(PinsGate::default())
+            .expect("ready gate");
+        let gate = PinsGate {
+            live: true,
+            ready: true,
+            locked: false,
+            job_active: false,
+        };
+        assert!(
+            wait_until(
+                || {
+                    let _ = state
+                        .pins
+                        .pump(Instant::now(), gate, |command| link.send(command));
+                    link.poll(&mut state);
+                    state.pins.pin_map_report() == ReportState::Reported
+                        && state.pins.pin_state_report() == ReportState::Reported
+                        && state.pins.limits_report() == ReportState::Reported
+                        && state.pins.last_events_report() != ReportState::Missing
+                },
+                Duration::from_secs(10)
+            ),
+            "the simulator did not answer all four read-only reports: {:?}, {:?}, {:?}, {:?}",
+            state.pins.pin_map_report(),
+            state.pins.pin_state_report(),
+            state.pins.limits_report(),
+            state.pins.last_events_report()
+        );
+
+        assert!(
+            state
+                .pins
+                .pin_map()
+                .is_some_and(|map| map.iter().any(|pin| pin.name.contains("E-stop"))),
+            "the reference profile pin map did not include its E-stop input"
+        );
+        assert_eq!(
+            state.pins.limit_state().map(|state| state.mask),
+            Some(0),
+            "the idle simulator reports no asserted axis limits"
+        );
+        assert!(state.pins.last_events().is_some());
         link.disconnect();
     }
 

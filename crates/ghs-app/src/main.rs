@@ -18,7 +18,9 @@
 //! `--demo-settings-write` changes one safe integer through the normal
 //! pending/Apply/read-back path for the applied screenshot. `--offsets`,
 //! `--tools`, `--utility`, `--startup-lines`, and `--probe` open those
-//! workspaces directly. `--keymap` opens the Utility workspace at the machine
+//! workspaces directly. `--pins` opens the read-only controller pin/limit
+//! diagnostics sheet and runs the same explicit REFRESH the Utility button
+//! uses. `--keymap` opens the Utility workspace at the machine
 //! keymap section. `--demo-tools` seeds the app-side tool table after the
 //! controller profile loads. `--macros` opens the Utility workspace with the
 //! user-macro section, while `--demo-macros` seeds two profile macros through
@@ -83,6 +85,7 @@ mod live;
 mod macros;
 mod offsets;
 mod offsets_export;
+mod pins;
 mod probe;
 mod settings;
 mod shell;
