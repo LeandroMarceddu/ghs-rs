@@ -384,6 +384,22 @@ impl HeightMapCompensation {
         });
     }
 
+    /// Discard an exact source whose `LoadProgram` the engine rejected.
+    ///
+    /// The source is registered before the command for the `JobLoaded` event.
+    /// When the engine refuses the parse, no event arrives and the previous
+    /// program stays loaded; leaving the failed text registered could let a
+    /// later same-name load adopt bytes that never ran.
+    pub fn discard_exact_source(&mut self, name: &str) {
+        if self
+            .exact_source
+            .as_ref()
+            .is_some_and(|source| source.name == name)
+        {
+            self.exact_source = None;
+        }
+    }
+
     /// Adopt a `JobLoaded` program as the original, unless it belongs to the
     /// probe workflow or is the compensated program Apply just loaded.
     ///
@@ -394,10 +410,25 @@ impl HeightMapCompensation {
         if probe_program {
             return;
         }
-        if self
-            .applied
+        // A file with the same display name can come from another directory.
+        // The exact source registered before the load is the only reliable
+        // identity; never let it inherit an original or applied program just
+        // because the base name matches.
+        let exact_is_new = self
+            .exact_source
             .as_ref()
-            .is_some_and(|applied| applied.program_name == name)
+            .is_some_and(|exact| exact.name == name)
+            && (self.applied.as_ref().is_some_and(|applied| {
+                applied.program_name == name
+                    && applied.compensated_source != self.exact_source_text(name)
+            }) || self.original.as_ref().is_some_and(|original| {
+                original.name == name && original.source != self.exact_source_text(name)
+            }));
+        if !exact_is_new
+            && self
+                .applied
+                .as_ref()
+                .is_some_and(|applied| applied.program_name == name)
         {
             return;
         }
@@ -410,10 +441,11 @@ impl HeightMapCompensation {
             ));
             return;
         }
-        if self
-            .original
-            .as_ref()
-            .is_some_and(|original| original.name == name)
+        if !exact_is_new
+            && self
+                .original
+                .as_ref()
+                .is_some_and(|original| original.name == name)
         {
             // A reload of the same original (for example after Revert).
             self.pending = None;
@@ -433,6 +465,13 @@ impl HeightMapCompensation {
             Some(_) => Some(ProgramSource::from_program(name, program)),
             None => Some(ProgramSource::from_program(name, program)),
         };
+    }
+
+    fn exact_source_text(&self, name: &str) -> &str {
+        self.exact_source
+            .as_ref()
+            .filter(|source| source.name == name)
+            .map_or("", |source| source.source.as_str())
     }
 
     /// Snapshot the current part program as the original before a probe run
@@ -1085,6 +1124,27 @@ M30
         assert_eq!(
             model.status(Some(&snapshot)),
             HeightMapApplyStatus::ReadyToApply
+        );
+    }
+
+    #[test]
+    fn same_name_different_source_is_a_new_program() {
+        let mut model = model_with_original();
+        assert!(model.original().is_some());
+
+        let next_source = "G21\nG0 X2\nM30\n";
+        model.remember_exact_source("part.nc", next_source);
+        let next = ghs_gcode::parse_program(next_source).expect("next program");
+        model.on_job_loaded("part.nc", &next, false);
+        assert!(
+            model.original().is_none(),
+            "same base name from another directory must not inherit the old original"
+        );
+
+        model.on_probe_run_started();
+        assert_eq!(
+            model.original().map(|source| source.source.as_str()),
+            Some(next_source)
         );
     }
 

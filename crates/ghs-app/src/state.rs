@@ -1244,6 +1244,35 @@ pub fn abort_reason_label(reason: JobAbortReason) -> &'static str {
     }
 }
 
+/// Why the app refuses to replace the loaded program.
+///
+/// The engine also rejects a load while its runner is active or the link is
+/// down; this gate makes the UI explain the refusal before the file is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramLoadRefusal {
+    /// `--mock` has no engine; browsing is allowed, loading is not.
+    Mock,
+    /// The transport is connecting, disconnected, or failed.
+    NotReady,
+    /// A program is running or paused; stop it before choosing another file.
+    JobActive,
+}
+
+impl ProgramLoadRefusal {
+    /// Operator-facing reason shown in the file browser and the console.
+    pub fn message(self) -> &'static str {
+        match self {
+            ProgramLoadRefusal::Mock => "MOCK MODE: browsing only; loading needs a live controller",
+            ProgramLoadRefusal::NotReady => {
+                "LINK NOT READY: finish the connection handshake before loading a program"
+            }
+            ProgramLoadRefusal::JobActive => {
+                "JOB ACTIVE: stop the running job before loading another program"
+            }
+        }
+    }
+}
+
 /// `MM:SS` (or `H:MM:SS` past an hour) for job time.
 pub fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
@@ -1644,6 +1673,49 @@ impl AppState {
         } else {
             "shop-sign-pocket.nc"
         }
+    }
+
+    /// Why a program file may not be loaded right now, or `None` when allowed.
+    ///
+    /// Browsing is deliberately independent of this gate: the file picker can
+    /// stay open and useful in mock mode even though selecting a file cannot
+    /// send a command.
+    pub fn program_load_refusal(&self) -> Option<ProgramLoadRefusal> {
+        if !self.live {
+            Some(ProgramLoadRefusal::Mock)
+        } else if !self.connection.is_ready_like() {
+            Some(ProgramLoadRefusal::NotReady)
+        } else if self.job.is_active() {
+            Some(ProgramLoadRefusal::JobActive)
+        } else {
+            None
+        }
+    }
+
+    /// Register the exact program source and build the one load command.
+    ///
+    /// The source is remembered before the engine parses it, because
+    /// `JobLoaded` only carries the parsed program. This is what keeps the
+    /// height-map Apply/Revert workflow on the exact bytes that were sent.
+    /// The command loads the program for review; it never starts, applies, or
+    /// changes offsets or settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason when mock, not ready, or a job is active.
+    pub fn program_load(
+        &mut self,
+        name: &str,
+        source: &str,
+    ) -> Result<Command, ProgramLoadRefusal> {
+        if let Some(refusal) = self.program_load_refusal() {
+            return Err(refusal);
+        }
+        self.height_map.remember_exact_source(name, source);
+        Ok(Command::LoadProgram {
+            name: name.to_string(),
+            source: source.to_string(),
+        })
     }
 
     /// Lines parsed in the Program tab: the engine program or the mock list.

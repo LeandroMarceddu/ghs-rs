@@ -45,7 +45,12 @@
 //! `--demo-height-map-save` saves the completed demo map through the normal
 //! profile path, and `--demo-height-map-open-saved` then opens that record in
 //! the read-only saved-map browser. Normal startup never applies or starts
-//! anything. `--size WxH` (or `--size=WxH`)
+//! anything.
+//! `--file-browser=PATH` opens the in-app program file browser at PATH (a
+//! folder, or a program file whose folder opens with the file selected);
+//! `--demo-load-file=PATH` loads that file through the same bounded reader and
+//! guarded `LoadProgram` path once the simulator is ready, without starting it.
+//! `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
 //!
@@ -57,6 +62,7 @@
 
 mod config;
 mod connection;
+mod file_browser;
 mod height_compensation;
 mod height_map_library;
 mod keypad;

@@ -30,7 +30,7 @@
 //!   than shrinking controls.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +57,7 @@ use gpui_kit::{
 };
 
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
+use crate::file_browser::{BrowserEntry, FileBrowser, compact_path, format_size, read_program};
 use crate::height_compensation::{
     HeightApplyGate, HeightApplyPreview, HeightMapApplyStatus, HeightMapSnapshot,
 };
@@ -76,8 +77,8 @@ use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScop
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
-    Mode, ProgramKind, ProgramSearch, ProgramSearchMode, SignalState, format_elapsed,
-    pause_reason_label,
+    Mode, ProgramKind, ProgramLoadRefusal, ProgramSearch, ProgramSearchMode, SignalState,
+    format_elapsed, pause_reason_label,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -260,6 +261,16 @@ pub struct Shell {
     console_scroll: ScrollHandle,
     program_scroll: UniformListScrollHandle,
     program_search_input: Entity<InputState>,
+    /// Open in-app program file browser, when the modal is visible.
+    file_browser: Option<FileBrowser>,
+    /// Editable path field in the browser modal.
+    file_browser_input: Entity<InputState>,
+    file_browser_scroll: UniformListScrollHandle,
+    /// Last folder visited, reused the next time the browser opens.
+    browser_dir: PathBuf,
+    /// Screenshot switch: load this file once the demo link is ready.
+    demo_load_file: Option<PathBuf>,
+    demo_load_file_done: bool,
     viewer: viewer::ViewerHandle,
     last_job_line: u32,
     demo_program: DemoProgram,
@@ -445,6 +456,51 @@ impl Shell {
             }),
         );
 
+        // The file browser starts at home, or at the folder/file named by the
+        // screenshot switch. Browsing stays available in every mode; loading
+        // is gated separately.
+        let browser_arg =
+            std::env::args().find_map(|arg| arg.strip_prefix("--file-browser=").map(PathBuf::from));
+        let browser_dir = browser_arg
+            .as_deref()
+            .map(Path::to_path_buf)
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                browser_arg
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(crate::file_browser::default_root);
+        let file_browser = browser_arg
+            .as_deref()
+            .map(crate::file_browser::FileBrowser::open);
+        let browser_input_value = file_browser.as_ref().map_or_else(
+            || browser_dir.to_string_lossy().into_owned(),
+            FileBrowser::path_display,
+        );
+        let file_browser_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(browser_input_value)
+                .placeholder("/path/to/folder")
+                .clean_on_escape()
+                .submit_on_enter(true)
+        });
+        subscriptions.push(cx.subscribe(
+            &file_browser_input,
+            |this, input, event, cx| match event {
+                InputEvent::Change => {
+                    let draft = input.read(cx).value().to_string();
+                    if let Some(browser) = this.file_browser.as_mut() {
+                        browser.set_path_draft(draft);
+                    }
+                }
+                InputEvent::PressEnter { .. } => this.commit_browser_path(cx),
+                _ => {}
+            },
+        ));
+
         // Screenshot/demo switches. They only select a bundled demo source or
         // press the same Start action a tap would; normal startup ignores them.
         let demo_program = if std::env::args().any(|arg| arg == "--demo-toolchange") {
@@ -455,6 +511,8 @@ impl Shell {
             DemoProgram::Pocket
         };
         let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+        let demo_load_file = std::env::args()
+            .find_map(|arg| arg.strip_prefix("--demo-load-file=").map(PathBuf::from));
         let settings_demo_write = std::env::args().any(|arg| arg == "--demo-settings-write");
         let settings_demo_group = std::env::args().find_map(|arg| {
             arg.strip_prefix("--settings-group=")
@@ -545,6 +603,12 @@ impl Shell {
             console_scroll: ScrollHandle::new(),
             program_scroll: UniformListScrollHandle::new(),
             program_search_input,
+            file_browser,
+            file_browser_input,
+            file_browser_scroll: UniformListScrollHandle::new(),
+            browser_dir,
+            demo_load_file,
+            demo_load_file_done: false,
             viewer: viewer::ViewerHandle::new(),
             last_job_line: 0,
             demo_program,
@@ -764,6 +828,23 @@ impl Shell {
         {
             self.demo_start_sent = true;
             self.start_job(cx);
+            changed = true;
+        }
+        // Screenshot switch: load a real program file through the same bounded
+        // reader and guarded `LoadProgram` path as the browser. It never starts
+        // or applies anything.
+        if let Some(path) = self.demo_load_file.clone()
+            && !self.demo_load_file_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_load_file_done = true;
+            match self.load_program_file(&path) {
+                Ok(message) => {
+                    self.state.left_tab = LeftTab::Program;
+                    self.state.push_console(ConsoleLevel::Info, message);
+                }
+                Err(message) => self.state.push_console(ConsoleLevel::Error, message),
+            }
             changed = true;
         }
         // Screenshot switch: seed the app-side table once the controller
@@ -1172,6 +1253,191 @@ impl Shell {
             && let Some(index) = self.state.program_search_scroll_index()
         {
             self.scroll_program_to_visible(index);
+        }
+        cx.notify();
+    }
+
+    // ------------------------------------------------------- program file load
+
+    /// Open the modal file browser at the last visited folder (home initially).
+    ///
+    /// Browsing is always allowed: mock mode and a down link can inspect files,
+    /// while the modal's LOAD action applies the live/idle gate.
+    fn open_program_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let browser = FileBrowser::open(&self.browser_dir);
+        let path = browser.path_display();
+        self.file_browser = Some(browser);
+        self.state.keypad = None;
+        self.file_browser_input.update(cx, |state, cx| {
+            state.set_value(path, window, cx);
+            state.focus(window, cx);
+        });
+        self.file_browser_scroll
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Close the browser and remember the folder for the next open.
+    fn close_program_browser(&mut self, cx: &mut Context<Self>) {
+        if let Some(browser) = self.file_browser.take() {
+            self.browser_dir = browser.cwd().to_path_buf();
+        }
+        cx.notify();
+    }
+
+    /// Tap on a browser row: enter a folder, or select a program file.
+    fn browser_row_clicked(
+        &mut self,
+        index: usize,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut new_path = None;
+        if let Some(browser) = self.file_browser.as_mut() {
+            if is_dir {
+                if browser.enter(index) {
+                    self.browser_dir = browser.cwd().to_path_buf();
+                    new_path = Some(browser.path_display());
+                }
+            } else {
+                browser.select(index);
+            }
+        }
+        if let Some(path) = new_path {
+            self.file_browser_input.update(cx, |state, cx| {
+                state.set_value(path, window, cx);
+            });
+            self.file_browser_scroll
+                .scroll_to_item(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// UP: move to the parent folder and refresh the list.
+    fn browser_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut new_path = None;
+        if let Some(browser) = self.file_browser.as_mut()
+            && browser.up()
+        {
+            self.browser_dir = browser.cwd().to_path_buf();
+            new_path = Some(browser.path_display());
+        }
+        if let Some(path) = new_path {
+            self.file_browser_input.update(cx, |state, cx| {
+                state.set_value(path, window, cx);
+            });
+            self.file_browser_scroll
+                .scroll_to_item(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// Enter the typed path. Used by the path field's Enter key, which has no
+    /// window handle; the model is authoritative and the field keeps the typed
+    /// folder or file path.
+    fn commit_browser_path(&mut self, cx: &mut Context<Self>) {
+        let mut navigated = false;
+        if let Some(browser) = self.file_browser.as_mut() {
+            navigated = browser.commit_path();
+            if navigated {
+                self.browser_dir = browser.cwd().to_path_buf();
+            }
+        }
+        if navigated {
+            self.file_browser_scroll
+                .scroll_to_item(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// GO: enter the typed path and mirror the resolved folder in the field.
+    fn browser_go(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut new_path = None;
+        if let Some(browser) = self.file_browser.as_mut()
+            && browser.commit_path()
+        {
+            self.browser_dir = browser.cwd().to_path_buf();
+            new_path = Some(browser.path_display());
+        }
+        if let Some(path) = new_path {
+            self.file_browser_input.update(cx, |state, cx| {
+                state.set_value(path, window, cx);
+            });
+            self.file_browser_scroll
+                .scroll_to_item(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// Read, validate, remember, and send one program file.
+    ///
+    /// This is the only load path in the app besides the bundled demo and the
+    /// height-map workflow. It sends exactly one `LoadProgram`; parsing and
+    /// `JobLoaded` stay in the engine. On rejection the previous program stays
+    /// loaded and the failed exact source is discarded.
+    fn load_program_file(&mut self, path: &Path) -> Result<String, String> {
+        if let Some(refusal) = self.state.program_load_refusal() {
+            return Err(refusal.message().to_string());
+        }
+        let file = read_program(path).map_err(|error| error.to_string())?;
+        let command = self
+            .state
+            .program_load(&file.name, &file.source)
+            .map_err(|refusal| refusal.message().to_string())?;
+        match self.send_command_quiet(command) {
+            Ok(()) => Ok(format!(
+                "Loading program: {} ({})",
+                file.name,
+                format_size(file.byte_len() as u64)
+            )),
+            // `send` waits one second for the engine to accept the command. A
+            // timeout is not a rejection: the load is already queued and the
+            // engine continues parsing in the background. Waiting for
+            // `JobLoaded` is safer than reporting a failure and discarding the
+            // exact source.
+            Err(EngineError::Timeout { .. }) => Ok(format!(
+                "Program load accepted; waiting for the engine to parse {} ({})",
+                file.name,
+                format_size(file.byte_len() as u64)
+            )),
+            Err(error) => {
+                self.state.height_map.discard_exact_source(&file.name);
+                let message = format!("Program load rejected: {error}");
+                self.state
+                    .push_console(ConsoleLevel::Error, message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// LOAD PROGRAM: load the selected file, or explain why it is unavailable.
+    fn browser_load_selected(&mut self, cx: &mut Context<Self>) {
+        let path = self
+            .file_browser
+            .as_ref()
+            .and_then(FileBrowser::selected_entry)
+            .map(|entry| entry.path.clone());
+        let Some(path) = path else {
+            if let Some(browser) = self.file_browser.as_mut() {
+                browser.set_error("Select a program file first");
+            }
+            cx.notify();
+            return;
+        };
+        match self.load_program_file(&path) {
+            Ok(message) => {
+                if let Some(browser) = self.file_browser.take() {
+                    self.browser_dir = browser.cwd().to_path_buf();
+                }
+                self.state.left_tab = LeftTab::Program;
+                self.state.push_console(ConsoleLevel::Info, message);
+            }
+            Err(message) => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.set_error(message);
+                }
+            }
         }
         cx.notify();
     }
@@ -4130,7 +4396,9 @@ impl Shell {
         let source = if let Some(program) = self.state.job.program() {
             ProgramSource::Engine(Arc::clone(program))
         } else if self.state.live {
-            return empty_program_notice(p).into_any_element();
+            return self
+                .empty_program_prompt("program-empty-load", p, cx)
+                .into_any_element();
         } else {
             ProgramSource::Mock(self.state.program.clone())
         };
@@ -4139,9 +4407,11 @@ impl Shell {
             return if self.state.job.has_program() {
                 empty_program_lines_notice(p).into_any_element()
             } else {
-                empty_program_notice(p).into_any_element()
+                self.empty_program_prompt("program-empty-load", p, cx)
+                    .into_any_element()
             };
         }
+        let name = self.state.job_title().to_string();
         let toolbar = self.program_search_toolbar(p, line_count, cx);
         let search = self.state.program_search.clone();
         let visible_count = self.state.program_search_visible_count();
@@ -4172,9 +4442,105 @@ impl Shell {
         v_flex()
             .size_full()
             .min_h(px(0.0))
+            .child(self.program_name_strip(&name, p))
             .child(toolbar)
             .child(body)
             .into_any_element()
+    }
+
+    /// Slim strip naming the loaded program above the Program search toolbar.
+    fn program_name_strip(&self, name: &str, p: Palette) -> Div {
+        h_flex()
+            .h(px(24.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("PROGRAM"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(p.text)
+                    .child(name.to_string()),
+            )
+    }
+
+    /// Empty-program prompt with the one action that fixes it.
+    ///
+    /// `id` must be unique per call site: the Program tab and the Job viewer can
+    /// both render this prompt in the same frame.
+    fn empty_program_prompt(&self, id: &'static str, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let refusal = self.state.program_load_refusal();
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                v_flex()
+                    .w(px(360.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child("NO PROGRAM LOADED"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .line_height(px(14.0))
+                            .text_color(p.text_dim)
+                            .child(
+                                "Choose a .nc, .gcode, .tap, or .ngc file. Loading only prepares \
+                                 the job; START is always a separate action.",
+                            ),
+                    )
+                    .when_some(refusal, |this, refusal| {
+                        this.child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(p.warning)
+                                .child(refusal.message()),
+                        )
+                    })
+                    .child(
+                        Button::new(id)
+                            .label("LOAD PROGRAM")
+                            .primary()
+                            .h(px(48.0))
+                            .w_full()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_program_browser(window, cx);
+                                });
+                            }),
+                    ),
+            )
     }
 
     /// Viewer card: fills the centre column's first row.
@@ -4295,6 +4661,7 @@ impl Shell {
     /// job controls. Keeping it here preserves the approved three-column grid.
     fn job_toolbar(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
+        let load_view = view.clone();
         let start_view = view.clone();
         let pause_view = view.clone();
         let resume_view = view.clone();
@@ -4385,6 +4752,20 @@ impl Shell {
                     .items_center()
                     .gap_2()
                     .child(
+                        Button::new("job-load")
+                            .label("LOAD PROGRAM")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(132.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, window, cx| {
+                                load_view.update(cx, |this, cx| {
+                                    this.open_program_browser(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
                         Button::new("job-start")
                             .label("START")
                             .primary()
@@ -4441,6 +4822,7 @@ impl Shell {
 
     fn job_view(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let program = self.state.job.program().cloned();
+        let has_program = program.is_some();
         // Real geometry comes from `JobLoaded`; the synthetic sketch remains
         // only for `--mock` and for a live session with nothing loaded.
         let path_label = match (&program, self.state.live) {
@@ -4563,6 +4945,385 @@ impl Shell {
                         "TOOL 3 | 6 mm FLAT | S12000".to_string()
                     }),
             )
+            .when(self.state.live && !has_program, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(56.0))
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .child(self.empty_program_prompt("job-empty-load", p, cx)),
+                )
+            })
+    }
+
+    // ------------------------------------------------------- file browser
+
+    /// Modal file browser: path field, parent/up, virtualized rows, and the
+    /// gated LOAD PROGRAM action.
+    fn file_browser_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(browser) = self.file_browser.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let close_view = view.clone();
+        let up_view = view.clone();
+        let go_view = view.clone();
+        let load_view = view.clone();
+        let selected = browser.selected_entry().cloned();
+        let selected_index = browser.selected_index();
+        let entries = browser.entries_arc();
+        let current = compact_path(browser.cwd(), 86);
+        let folder_count = browser
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_dir)
+            .count();
+        let file_count = browser.file_count();
+        let folder_label = if folder_count == 1 {
+            "FOLDER"
+        } else {
+            "FOLDERS"
+        };
+        let file_label = if file_count == 1 {
+            "PROGRAM"
+        } else {
+            "PROGRAMS"
+        };
+        let error = browser.error().map(str::to_string);
+        let refusal = self.state.program_load_refusal();
+        let can_load = selected.is_some() && refusal.is_none();
+        let (link_label, link_color) = match refusal {
+            Some(ProgramLoadRefusal::Mock) => ("MOCK / BROWSE ONLY", p.warning),
+            Some(ProgramLoadRefusal::NotReady) => ("LINK NOT READY", p.warning),
+            Some(ProgramLoadRefusal::JobActive) => ("JOB ACTIVE", p.warning),
+            None => ("LIVE / READY", p.success),
+        };
+        let selected_name = selected.as_ref().map_or_else(
+            || "No file selected".to_string(),
+            |entry| entry.name.clone(),
+        );
+        let selected_meta = match (&selected, refusal) {
+            (Some(entry), None) => format!("{} | READY TO LOAD", format_size(entry.size)),
+            (Some(entry), Some(reason)) => {
+                format!("{} | {}", format_size(entry.size), reason.message())
+            }
+            (None, _) => "Tap a program file to select it".to_string(),
+        };
+        let load_disabled = !can_load;
+
+        let focus_input = self.file_browser_input.clone();
+        let path_field = div()
+            .h(px(48.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                focus_input.update(cx, |state, cx| state.focus(window, cx));
+            })
+            .child(
+                Input::new(&self.file_browser_input)
+                    .with_size(Size::Large)
+                    .w_full()
+                    .text_size(px(12.0)),
+            );
+
+        let list: AnyElement = if entries.is_empty() {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .p_3()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(p.text_dim)
+                        .child("No folders or program files here"),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(p.text_faint)
+                        .child("Tap UP or type another folder path."),
+                )
+                .into_any_element()
+        } else {
+            let row_view = view.clone();
+            uniform_list("file-browser-list", entries.len(), move |range, _, _| {
+                range
+                    .filter_map(|index| {
+                        let entry = entries.get(index)?.clone();
+                        Some(file_browser_row(
+                            index,
+                            entry,
+                            Some(index) == selected_index,
+                            p,
+                            row_view.clone(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flex_1()
+            .min_h(px(0.0))
+            .track_scroll(&self.file_browser_scroll)
+            .into_any_element()
+        };
+
+        let mut card = v_flex()
+            .relative()
+            .w(px(820.0))
+            .max_w_full()
+            .h(px(640.0))
+            .max_h_full()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border_strong)
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .h(px(48.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child("LOAD PROGRAM"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(p.text_dim)
+                                    .child("Choose a file for the job; loading never starts it."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(22.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.0))
+                            .bg(link_color.opacity(0.16))
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(link_color)
+                            .child(link_label),
+                    )
+                    .child(
+                        Button::new("file-browser-close")
+                            .label("CLOSE")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(88.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                close_view.update(cx, |this, cx| this.close_program_browser(cx));
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(22.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_faint)
+                            .child("CURRENT"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(self.mono.clone())
+                            .text_size(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(current),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child(format!(
+                                "{folder_count} {folder_label} / {file_count} {file_label}"
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(48.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(path_field)
+                    .child(
+                        Button::new("file-browser-up")
+                            .label("UP")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(64.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, window, cx| {
+                                up_view.update(cx, |this, cx| this.browser_up(window, cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("file-browser-go")
+                            .label("GO")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(64.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, window, cx| {
+                                go_view.update(cx, |this, cx| this.browser_go(window, cx));
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.panel)
+                    .child(list),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .line_height(px(12.0))
+                    .text_color(p.text_faint)
+                    .child(
+                        "48 px rows | folders open on tap | hidden files and symlinks are not \
+                         shown | .nc .gcode .tap .ngc | 20 MB limit",
+                    ),
+            );
+
+        if let Some(error) = error {
+            card = card.child(
+                div()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.danger.opacity(0.14))
+                    .text_size(px(10.0))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+
+        card = card.child(
+            h_flex()
+                .h(px(56.0))
+                .flex_shrink_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if selected.is_some() {
+                                    p.text
+                                } else {
+                                    p.text_dim
+                                })
+                                .child(selected_name),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(9.0))
+                                .text_color(if refusal.is_some() {
+                                    p.warning
+                                } else {
+                                    p.text_faint
+                                })
+                                .child(selected_meta),
+                        ),
+                )
+                .child(
+                    Button::new("file-browser-cancel")
+                        .label("CANCEL")
+                        .secondary()
+                        .h(px(48.0))
+                        .w(px(96.0))
+                        .rounded_lg()
+                        .text_size(px(11.0))
+                        .on_click({
+                            let view = scrim_view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| this.close_program_browser(cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("file-browser-load")
+                        .label("LOAD PROGRAM")
+                        .primary()
+                        .h(px(48.0))
+                        .w(px(150.0))
+                        .rounded_lg()
+                        .text_size(px(11.0))
+                        .disabled(load_disabled)
+                        .on_click(move |_, _, cx| {
+                            load_view.update(cx, |this, cx| this.browser_load_selected(cx));
+                        }),
+                ),
+        );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("file-browser-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_program_browser(cx));
+                    }),
+            )
+            .child(card)
+            .into_any_element()
     }
 
     // ---------------------------------------------------------- probe views
@@ -12530,6 +13291,9 @@ impl Render for Shell {
         if self.state.offsets.pending_action().is_some() {
             root = root.child(self.offset_confirm_overlay(p, cx));
         }
+        if self.file_browser.is_some() {
+            root = root.child(self.file_browser_overlay(p, cx));
+        }
         root
     }
 }
@@ -12658,25 +13422,104 @@ fn program_row(row: ProgramRow, p: Palette) -> Div {
         )
 }
 
-fn empty_program_notice(p: Palette) -> Div {
-    v_flex()
-        .size_full()
+/// One 48 px row in the file browser's virtualized list.
+///
+/// Folder rows enter on tap; file rows only select. The selected row keeps its
+/// full border and tone change, so selection is visible without colour alone.
+fn file_browser_row(
+    index: usize,
+    entry: BrowserEntry,
+    selected: bool,
+    p: Palette,
+    view: Entity<Shell>,
+) -> AnyElement {
+    let is_dir = entry.is_dir;
+    let kind = entry.kind_label();
+    let detail = if is_dir {
+        "FOLDER".to_string()
+    } else {
+        format_size(entry.size)
+    };
+    let name = entry.name.clone();
+    let action = if selected {
+        "SELECTED"
+    } else if is_dir {
+        "OPEN"
+    } else {
+        "SELECT"
+    };
+    let action_color = if selected { p.accent } else { p.text_faint };
+    div()
+        .id(format!("file-browser-row-{index}"))
+        .h(px(48.0))
+        .w_full()
+        .flex_shrink_0()
+        .flex()
         .items_center()
-        .justify_center()
-        .gap_1()
-        .p_3()
+        .gap_2()
+        .px_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(if selected { p.accent } else { p.border })
+        .bg(if selected {
+            p.accent_muted
+        } else {
+            p.panel_alt
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(p.raised_hover))
+        .on_click(move |_, window, cx| {
+            view.update(cx, |shell, cx| {
+                shell.browser_row_clicked(index, is_dir, window, cx);
+            });
+        })
         .child(
             div()
-                .text_size(px(12.0))
-                .text_color(p.text_dim)
-                .child("No program loaded"),
+                .w(px(38.0))
+                .h(px(24.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .bg(if is_dir {
+                    p.info.opacity(0.16)
+                } else {
+                    p.accent.opacity(0.14)
+                })
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(if is_dir { p.info } else { p.accent })
+                .child(kind),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(p.text)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(p.text_faint)
+                        .child(detail),
+                ),
         )
         .child(
             div()
-                .text_size(px(10.0))
-                .text_color(p.text_faint)
-                .child("Demo mode sends a bundled program when the controller is ready."),
+                .flex_shrink_0()
+                .text_size(px(9.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(action_color)
+                .child(action),
         )
+        .into_any_element()
 }
 
 fn empty_program_lines_notice(p: Palette) -> Div {
