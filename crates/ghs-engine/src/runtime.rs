@@ -606,6 +606,7 @@ impl EngineRuntime {
             .streamer
             .set_rx_buffer_size(self.config.default_rx_buffer);
         self.shared.reset();
+        self.job.reset_toggles();
 
         self.phase = Phase::Disconnected;
         self.discovery = None;
@@ -671,6 +672,9 @@ impl EngineRuntime {
         self.last_status_at = None;
         self.shared.connected.store(false, Ordering::Release);
         self.shared.ready.store(false, Ordering::Release);
+        // The virtual switches belong to the closed controller session.
+        self.job.reset_toggles();
+        self.shared.reset_toggles();
 
         if was_connected {
             let aborted = self
@@ -1330,6 +1334,9 @@ impl EngineRuntime {
                 if enabled { "enabled" } else { "disabled" }
             ));
         }
+        // The command is accepted: publish the authoritative value even when it
+        // was already current, so a UI toggle can always re-read it.
+        self.shared.set_optional_stop(enabled);
         Ok(())
     }
 
@@ -1344,6 +1351,7 @@ impl EngineRuntime {
                 if enabled { "enabled" } else { "disabled" }
             ));
         }
+        self.shared.set_single_block(enabled);
         Ok(())
     }
 
@@ -1357,18 +1365,23 @@ impl EngineRuntime {
                 state: self.job.job_state(),
             });
         }
+        if self.job.block_delete() == enabled {
+            // Idempotent: a repeated value sends nothing and stays readable,
+            // even while the previous `$B` line is still in flight.
+            self.shared.set_block_delete(enabled);
+            return Ok(());
+        }
         if !self.streamer.is_idle() || self.current_purpose.is_some() {
             return Err(EngineError::Busy);
         }
-        if self.job.block_delete() != enabled {
-            let line = SystemCommand::ToggleBlockDelete.encode()?;
-            self.enqueue_line(&line, LinePurpose::System)?;
-            self.job.set_block_delete(enabled);
-            self.log_info(format!(
-                "Block delete {}",
-                if enabled { "enabled" } else { "disabled" }
-            ));
-        }
+        let line = SystemCommand::ToggleBlockDelete.encode()?;
+        self.enqueue_line(&line, LinePurpose::System)?;
+        self.job.set_block_delete(enabled);
+        self.log_info(format!(
+            "Block delete {}",
+            if enabled { "enabled" } else { "disabled" }
+        ));
+        self.shared.set_block_delete(enabled);
         Ok(())
     }
 
@@ -1613,6 +1626,11 @@ impl EngineRuntime {
         self.watchdog_paused = false;
         self.write_bytes(&[0x18])?;
         self.log_command("0x18 soft reset");
+        // grblHAL clears its runtime `sys` block on a soft reset, so the
+        // virtual switches return to false. A physical switch is still
+        // reported by the controller in the status `Pn` field.
+        self.job.reset_toggles();
+        self.shared.reset_toggles();
         // The controller drops its stored probe result on a soft reset; the
         // cached copy must not survive and show a stale `PRB`.
         self.invalidate_probe_result();

@@ -49,6 +49,9 @@ pub(crate) struct SharedState {
     pub(crate) connected: AtomicBool,
     pub(crate) ready: AtomicBool,
     pub(crate) shutdown: AtomicBool,
+    optional_stop: AtomicBool,
+    single_block: AtomicBool,
+    block_delete: AtomicBool,
 }
 
 impl SharedState {
@@ -157,10 +160,42 @@ impl SharedState {
         telemetry.error_codes = errors;
     }
 
+    pub(crate) fn optional_stop(&self) -> bool {
+        self.optional_stop.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_optional_stop(&self, enabled: bool) {
+        self.optional_stop.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn single_block(&self) -> bool {
+        self.single_block.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_single_block(&self, enabled: bool) {
+        self.single_block.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn block_delete(&self) -> bool {
+        self.block_delete.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_block_delete(&self, enabled: bool) {
+        self.block_delete.store(enabled, Ordering::Release);
+    }
+
+    /// Reset the virtual optional-stop, single-block and block-delete flags.
+    pub(crate) fn reset_toggles(&self) {
+        self.optional_stop.store(false, Ordering::Release);
+        self.single_block.store(false, Ordering::Release);
+        self.block_delete.store(false, Ordering::Release);
+    }
+
     /// Reset every piece of session telemetry and mark the session
     /// disconnected.
     pub(crate) fn reset(&self) {
         *self.telemetry() = Telemetry::default();
+        self.reset_toggles();
         self.connected.store(false, Ordering::Release);
         self.ready.store(false, Ordering::Release);
     }
@@ -300,6 +335,51 @@ impl EngineHandle {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.shared.ready.load(Ordering::Acquire)
+    }
+
+    /// Current virtual optional-stop (`M1`) flag.
+    ///
+    /// The value starts `false` for a new session, changes only after
+    /// [`EngineHandle::send`] accepts [`Command::SetOptionalStop`], and is never
+    /// inferred from console text. Poll it when rendering the toggle.
+    ///
+    /// A soft reset returns it to `false`: grblHAL clears its runtime switch
+    /// state on reset, and a physical `T` switch is reported separately in the
+    /// status `Pn` field. A disconnect or a new session also resets it to
+    /// `false`.
+    #[must_use]
+    pub fn optional_stop(&self) -> bool {
+        self.shared.optional_stop()
+    }
+
+    /// Current virtual single-block flag.
+    ///
+    /// The value starts `false` for a new session, changes only after
+    /// [`EngineHandle::send`] accepts [`Command::SetSingleBlock`], and is never
+    /// inferred from console text. Poll it when rendering the toggle.
+    ///
+    /// A soft reset returns it to `false`: grblHAL clears its runtime switch
+    /// state on reset, and a physical `Q` switch is reported separately in the
+    /// status `Pn` field. A disconnect or a new session also resets it to
+    /// `false`.
+    #[must_use]
+    pub fn single_block(&self) -> bool {
+        self.shared.single_block()
+    }
+
+    /// Current block-delete flag.
+    ///
+    /// The value starts `false` for a new session, changes only after
+    /// [`EngineHandle::send`] accepts [`Command::SetBlockDelete`], and is never
+    /// inferred from console text. Poll it when rendering the toggle.
+    ///
+    /// A soft reset returns it to `false`: grblHAL clears its runtime switch
+    /// state on reset, and a physical `L` switch is reported separately in the
+    /// status `Pn` field. A disconnect or a new session also resets it to
+    /// `false`.
+    #[must_use]
+    pub fn block_delete(&self) -> bool {
+        self.shared.block_delete()
     }
 
     /// Last raw status report, including fields that are not part of
@@ -485,5 +565,29 @@ mod tests {
         shared.reset();
         assert!(!shared.connected.load(Ordering::Acquire));
         assert!(!shared.ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shared_toggles_start_off_and_reset_together() {
+        let shared = SharedState::default();
+        assert!(!shared.optional_stop());
+        assert!(!shared.single_block());
+        assert!(!shared.block_delete());
+
+        shared.set_optional_stop(true);
+        shared.set_single_block(true);
+        shared.set_block_delete(true);
+        assert!(shared.optional_stop());
+        assert!(shared.single_block());
+        assert!(shared.block_delete());
+
+        shared.reset_toggles();
+        assert!(!shared.optional_stop());
+        assert!(!shared.single_block());
+        assert!(!shared.block_delete());
+
+        shared.set_optional_stop(true);
+        shared.reset();
+        assert!(!shared.optional_stop());
     }
 }

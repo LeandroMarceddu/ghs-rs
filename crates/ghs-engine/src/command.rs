@@ -70,6 +70,11 @@ pub enum Command {
     /// Unlock the alarm state (`$X`). Explicit intent.
     Unlock,
     /// Soft reset (`0x18`).
+    ///
+    /// Clears the virtual optional-stop, single-block and block-delete flags
+    /// and invalidates the cached probe result. grblHAL clears its runtime
+    /// switch state on reset; a physical switch is re-read by the controller
+    /// and reported in the status `Pn` field.
     Reset,
     /// Enter sleep (`$SLP`); idle only.
     Sleep,
@@ -109,10 +114,16 @@ pub enum Command {
     /// Acknowledge a pending manual tool change with `0xA3`.
     AcknowledgeToolChange,
     /// Enable or disable the virtual optional-stop flag.
+    ///
+    /// The accepted value is published by [`crate::EngineHandle::optional_stop`].
     SetOptionalStop(bool),
     /// Enable or disable the virtual single-block flag.
+    ///
+    /// The accepted value is published by [`crate::EngineHandle::single_block`].
     SetSingleBlock(bool),
     /// Enable or disable block delete.
+    ///
+    /// The accepted value is published by [`crate::EngineHandle::block_delete`].
     SetBlockDelete(bool),
     /// Enable or disable a breakpoint at a 1-based source line.
     SetBreakpoint {

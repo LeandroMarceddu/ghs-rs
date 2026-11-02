@@ -441,6 +441,7 @@ fn optional_stop_pauses_only_when_enabled() {
     handle
         .send(Command::SetOptionalStop(true))
         .expect("optional stop on");
+    assert!(handle.optional_stop());
     assert!(control.sent_bytes().contains(&0x88));
     start(&handle);
     let paused = wait_event(&handle, Duration::from_secs(2), |event| {
@@ -469,6 +470,7 @@ fn single_block_pauses_after_each_acknowledged_line() {
     handle
         .send(Command::SetSingleBlock(true))
         .expect("single block on");
+    assert!(handle.single_block());
     assert!(control.sent_bytes().contains(&0x89));
     start(&handle);
 
@@ -537,6 +539,7 @@ fn block_delete_skips_marked_lines() {
     handle
         .send(Command::SetBlockDelete(true))
         .expect("block delete on");
+    assert!(handle.block_delete());
     start(&handle);
     wait_event(&handle, Duration::from_secs(2), |event| {
         matches!(event, EngineEvent::JobCompleted { .. })

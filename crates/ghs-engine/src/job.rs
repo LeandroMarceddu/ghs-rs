@@ -572,6 +572,13 @@ impl JobRunner {
         self.block_delete
     }
 
+    /// Clears the virtual optional-stop, single-block and block-delete flags.
+    pub(crate) fn reset_toggles(&mut self) {
+        self.optional_stop = false;
+        self.single_block = false;
+        self.block_delete = false;
+    }
+
     /// Begins the tool-change handshake after an acknowledged `M6`.
     pub(crate) fn begin_tool_change(
         &mut self,
@@ -772,6 +779,31 @@ mod tests {
         runner.set_breakpoint(2, true).expect("breakpoint");
         assert!(runner.breakpoint_hit(2));
         assert!(!runner.breakpoint_hit(2));
+    }
+
+    #[test]
+    fn toggles_default_off_and_reset_together() {
+        let mut runner = JobRunner::new();
+        assert!(!runner.optional_stop());
+        assert!(!runner.single_block());
+        assert!(!runner.block_delete());
+
+        runner.set_optional_stop(true);
+        assert!(runner.optional_stop());
+        assert!(!runner.single_block(), "optional stop is independent");
+        assert!(!runner.block_delete(), "optional stop is independent");
+
+        runner.set_single_block(true);
+        assert!(runner.single_block());
+        assert!(!runner.block_delete(), "single block is independent");
+
+        runner.set_block_delete(true);
+        assert!(runner.block_delete());
+
+        runner.reset_toggles();
+        assert!(!runner.optional_stop());
+        assert!(!runner.single_block());
+        assert!(!runner.block_delete());
     }
 
     #[test]
