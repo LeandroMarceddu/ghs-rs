@@ -40,8 +40,9 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 - **Jobs** — streaming, pause/resume/stop, tool-change sheet, progress and
   current line, a real parsed program list, and job recovery that never
   auto-resumes after an alarm or disconnect.
-- **Viewer** — parsed toolpath, fit/pan/zoom/pinch, world grid and work
-  envelope, motion-style paths, and a live tool marker.
+- **Viewer** — parsed toolpath in 2D top or 3D orbit view, fit/pan/zoom/pinch,
+  ground grid and work envelope, motion-style paths, height-map overlay, and a
+  live tool marker.
 - **Settings** — generated from `$ES`/`$EG` metadata, grouped and searchable,
   with boolean, bitfield, axis-mask, radio, numeric, text and password controls,
   range validation, read-back-verified writes, and `$N0`/`$N1` startup-line
@@ -74,8 +75,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 ## In progress
 
 - Keymap editing.
-- Start-from-line/check mode, 3D view, i18n, packaging, and the post-v1.0
-  SD/ATC/MPG surfaces.
+- Start-from-line/check mode, i18n, packaging, and the post-v1.0 SD/ATC/MPG
+  surfaces.
 - Hardware validation on the reference FlexiHAL.
 
 ## Build

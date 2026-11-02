@@ -25,7 +25,7 @@ documented, and is localized.
 | Engine | Implemented (M3) | M2 session + job runner; 20 job tests, simulator-over-loopback |
 | App shell | Live demo + job UI | approved layout; live DRO/MDI/console; serial picker |
 | Program UI | Implemented (M3) | real parsed list, progress/current line, job controls, tool-change sheet |
-| Viewer UI | Implemented (M4) | real toolpath, camera, marker, pan/zoom; 31 app tests |
+| Viewer UI | Implemented (M4/M7) | real toolpath, 2D + 3D camera, marker, pan/zoom; 177 app tests |
 | Settings UI | Implemented (M5) | generated from `$ES`/`$EG`; verified writes |
 | Offsets/tools | Implemented (M5) | live `$#`, G10 L20 edits, app-side persisted tool table |
 | Probing | Cycles implemented; height map pending | `ghs-probe` 76 tests; Z/edge/corner/center cards with preflight and apply |
@@ -123,7 +123,7 @@ implemented before its UI or hardware validation row is complete.
 | VIEW-04 | 2D pan, zoom, fit, grid, bounds | M4 | todo | 60 fps |
 | VIEW-05 | Live tool marker | M4 | todo | Status-driven |
 | VIEW-06 | Color by motion type, layer, or tool | M4 | todo | Configurable, color-blind safe |
-| VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | todo | Software projection first |
+| VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | partial | 3D camera/grid/envelope/marker; stock mesh open |
 | VIEW-08 | Height map overlay | M6 | todo | Surface visualization |
 | VIEW-09 | 1M-line and 200k-segment performance | M4 | todo | Budgets in PLAN.md |
 | VIEW-10 | Program limits and outline display | M4 | todo | Confirmation before running |
