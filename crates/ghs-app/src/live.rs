@@ -260,6 +260,21 @@ impl LiveLink {
         self.engine.is_connected()
     }
 
+    /// Current virtual optional-stop flag, straight from the engine.
+    pub fn optional_stop(&self) -> bool {
+        self.engine.optional_stop()
+    }
+
+    /// Current virtual single-block flag, straight from the engine.
+    pub fn single_block(&self) -> bool {
+        self.engine.single_block()
+    }
+
+    /// Current block-delete flag, straight from the engine.
+    pub fn block_delete(&self) -> bool {
+        self.engine.block_delete()
+    }
+
     /// Transport requested for the current session, if one was opened.
     pub fn mode(&self) -> Option<&LinkMode> {
         self.mode.as_ref()
@@ -310,6 +325,15 @@ impl LiveLink {
             state.connection = ConnectionState::Disconnected;
             changed = true;
         }
+
+        // The engine owns the three virtual run switches. Copy its accessors
+        // on every poll: the UI never keeps an optimistic target, and a reset
+        // or disconnect clears the rows as soon as the engine clears them.
+        changed |= state.sync_run_options(
+            self.optional_stop(),
+            self.single_block(),
+            self.block_delete(),
+        );
 
         // Demo mode supplies its own source: send it exactly once per
         // connection after the handshake, never on every poll.
@@ -1268,5 +1292,103 @@ mod tests {
             "the verified read-back was not mapped to the console"
         );
         link.disconnect();
+    }
+
+    fn send_run_option(link: &LiveLink, command: Command) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match link.send(command.clone()) {
+                Ok(()) => return,
+                Err(EngineError::Busy) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("run-option send failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn demo_link_copies_run_option_accessors_and_clears_on_reset_and_disconnect() {
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    link.engine.is_ready()
+                },
+                Duration::from_secs(5)
+            ),
+            "demo handshake did not complete"
+        );
+
+        for command in [
+            Command::SetOptionalStop(true),
+            Command::SetSingleBlock(true),
+            Command::SetBlockDelete(true),
+        ] {
+            send_run_option(&link, command);
+        }
+        assert!(link.optional_stop());
+        assert!(link.single_block());
+        assert!(link.block_delete());
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.optional_stop && state.single_block && state.block_delete
+                },
+                Duration::from_secs(2)
+            ),
+            "the view model did not copy the run-switch accessors"
+        );
+
+        link.send(Command::Reset).expect("soft reset");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    !link.optional_stop()
+                        && !link.single_block()
+                        && !link.block_delete()
+                        && !state.optional_stop
+                        && !state.single_block
+                        && !state.block_delete
+                },
+                Duration::from_secs(2)
+            ),
+            "reset did not clear the run switches in the engine and the view model"
+        );
+
+        send_run_option(&link, Command::SetOptionalStop(true));
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.optional_stop
+                },
+                Duration::from_secs(2)
+            ),
+            "optional stop did not become visible again before disconnect"
+        );
+
+        link.disconnect();
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    !link.is_connected()
+                        && !link.optional_stop()
+                        && !link.single_block()
+                        && !link.block_delete()
+                        && !state.optional_stop
+                        && !state.single_block
+                        && !state.block_delete
+                },
+                Duration::from_secs(2)
+            ),
+            "disconnect did not clear the run switches in the engine and the view model"
+        );
     }
 }

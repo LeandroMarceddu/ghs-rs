@@ -77,8 +77,8 @@ use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScop
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
-    Mode, ProgramKind, ProgramLoadRefusal, ProgramSearch, ProgramSearchMode, SignalState,
-    format_elapsed, pause_reason_label,
+    Mode, ProgramKind, ProgramLoadRefusal, ProgramSearch, ProgramSearchMode, RunOption,
+    RunOptionOutcome, SignalState, format_elapsed, pause_reason_label,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -276,6 +276,9 @@ pub struct Shell {
     demo_program: DemoProgram,
     demo_start: bool,
     demo_start_sent: bool,
+    /// Screenshot switch: open the run-options sheet and flip two switches.
+    demo_run_options: bool,
+    demo_run_options_done: bool,
     settings_entry: Option<SettingsEntry>,
     tool_editor: Option<ToolEditor>,
     macro_editor: Option<MacroEditor>,
@@ -511,6 +514,7 @@ impl Shell {
             DemoProgram::Pocket
         };
         let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+        let demo_run_options = std::env::args().any(|arg| arg == "--demo-run-options");
         let demo_load_file = std::env::args()
             .find_map(|arg| arg.strip_prefix("--demo-load-file=").map(PathBuf::from));
         let settings_demo_write = std::env::args().any(|arg| arg == "--demo-settings-write");
@@ -614,6 +618,8 @@ impl Shell {
             demo_program,
             demo_start,
             demo_start_sent: false,
+            demo_run_options,
+            demo_run_options_done: false,
             settings_entry: None,
             tool_editor: None,
             macro_editor: None,
@@ -828,6 +834,20 @@ impl Shell {
         {
             self.demo_start_sent = true;
             self.start_job(cx);
+            changed = true;
+        }
+        // Screenshot switch: open the RUN OPTIONS sheet and flip optional stop
+        // and single block through the same guarded path as a tap. The values
+        // are not forced here; the rows follow the controller accessors.
+        if self.demo_run_options
+            && !self.demo_run_options_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_run_options_done = true;
+            self.state.mode = Mode::Job;
+            self.state.open_run_options();
+            self.toggle_run_option(RunOption::OptionalStop, cx);
+            self.toggle_run_option(RunOption::SingleBlock, cx);
             changed = true;
         }
         // Screenshot switch: load a real program file through the same bounded
@@ -3720,6 +3740,45 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the run-options sheet. Opening sends nothing.
+    fn open_run_options(&mut self, cx: &mut Context<Self>) {
+        self.state.open_run_options();
+        cx.notify();
+    }
+
+    /// Close the run-options sheet. Closing sends nothing.
+    fn close_run_options(&mut self, cx: &mut Context<Self>) {
+        self.state.close_run_options();
+        cx.notify();
+    }
+
+    /// Send one run-option toggle through the guarded engine gateway.
+    ///
+    /// Exactly one command leaves this method. The displayed value is not
+    /// changed here: the next poll copies the engine accessor, so a rejection
+    /// leaves the old value and shows the reason in the sheet.
+    fn toggle_run_option(&mut self, option: RunOption, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome = self
+            .state
+            .dispatch_run_option(option, |command| match link {
+                Some(link) => link.send(command).map_err(|error| error.to_string()),
+                None => Err("no engine connection".to_string()),
+            });
+        match outcome {
+            RunOptionOutcome::Sent => {}
+            RunOptionOutcome::Rejected(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("Engine: {message}"));
+            }
+            RunOptionOutcome::Refused(refusal) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, refusal.message());
+            }
+        }
+        cx.notify();
+    }
+
     fn reset(&mut self, cx: &mut Context<Self>) {
         if !self.state.live {
             self.state.machine_state = "Idle";
@@ -4656,7 +4715,18 @@ impl Shell {
             header
         };
 
-        let header = header.child(self.rapid_override_chip(p, cx));
+        let header = if self.state.mode == Mode::Job {
+            header.child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(self.run_options_chip(p, cx))
+                    .child(self.rapid_override_chip(p, cx)),
+            )
+        } else {
+            header.child(self.rapid_override_chip(p, cx))
+        };
 
         let body = if self.state.mode == Mode::Job {
             v_flex()
@@ -4686,6 +4756,64 @@ impl Shell {
             .overflow_hidden()
             .child(header)
             .child(div().flex_1().min_h(px(0.0)).child(body))
+    }
+
+    /// Compact `RUN OPTIONS` chip in the Job viewer header.
+    ///
+    /// The badge counts the switches the controller reports, never a target
+    /// this UI requested. Opening the sheet sends nothing.
+    fn run_options_chip(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = RunOption::ALL
+            .iter()
+            .filter(|option| self.state.run_option_value(**option))
+            .count();
+        let any = count > 0;
+        let color = if any { p.accent } else { p.text_dim };
+        let background = if any {
+            p.accent.opacity(0.16)
+        } else {
+            p.panel_alt
+        };
+        let border = if any { p.accent.opacity(0.6) } else { p.border };
+        let view = cx.entity();
+        let mono = self.mono.clone();
+
+        h_flex()
+            .id("run-options")
+            .h(px(48.0))
+            .w(px(104.0))
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .rounded_lg()
+            .bg(background)
+            .border_1()
+            .border_color(border)
+            .cursor_pointer()
+            .hover(|style| style.bg(p.raised_hover).border_color(p.accent))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| this.open_run_options(cx));
+            })
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("RUN OPTIONS"),
+            )
+            .child(
+                div()
+                    .font_family(mono)
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child(if any {
+                        format!("{count} ON")
+                    } else {
+                        "OFF".to_string()
+                    }),
+            )
     }
 
     /// Compact rapid-override control for the viewer header.
@@ -4746,6 +4874,212 @@ impl Shell {
                     .text_color(value_color)
                     .child(format!("{current}%")),
             )
+    }
+
+    /// The `RUN OPTIONS` sheet: three 48 px rows showing the controller's
+    /// authoritative switch values. Opening, closing, or dismissing it never
+    /// sends a command.
+    fn run_options_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.state.run_options_open {
+            return div().into_any_element();
+        }
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let close_view = view.clone();
+        let rows = RunOption::ALL.into_iter().map(|option| {
+            let value = self.state.run_option_value(option);
+            let enabled = self.state.run_option_refusal(option).is_none();
+            let hint = self.state.run_option_hint(option);
+            let id = match option {
+                RunOption::OptionalStop => "run-option-optional-stop",
+                RunOption::SingleBlock => "run-option-single-block",
+                RunOption::BlockDelete => "run-option-block-delete",
+            };
+            let row_view = view.clone();
+
+            h_flex()
+                .id(id)
+                .h(px(48.0))
+                .w_full()
+                .flex_shrink_0()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .rounded(px(7.0))
+                .bg(if value {
+                    p.accent.opacity(0.16)
+                } else {
+                    p.panel_alt
+                })
+                .border_1()
+                .border_color(if value {
+                    p.accent.opacity(0.6)
+                } else {
+                    p.border
+                })
+                .when(enabled, |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.bg(p.raised_hover).border_color(p.accent))
+                        .on_click(move |_, _, cx| {
+                            row_view.update(cx, |shell, cx| {
+                                shell.toggle_run_option(option, cx);
+                            });
+                        })
+                })
+                .when(!enabled, |this| this.opacity(0.55))
+                .child(
+                    v_flex()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .gap_0()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if enabled { p.text } else { p.text_dim })
+                                .child(option.label()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(9.5))
+                                .text_color(if enabled { p.text_faint } else { p.warning })
+                                .child(hint),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .w(px(62.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(999.0))
+                        .bg(if value { p.accent } else { p.panel })
+                        .border_1()
+                        .border_color(if value { p.accent } else { p.border })
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if value { p.on_accent } else { p.text_dim })
+                        .child(if value { "ON" } else { "OFF" }),
+                )
+        });
+        let error = self.state.run_options_error.clone();
+        let lock_reason = self.state.run_options_lock_reason();
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("run-options-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.close_run_options(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(520.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child("RUN OPTIONS"),
+                            )
+                            .child(chip("CONTROLLER STATE", p)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .line_height(px(14.0))
+                            .text_color(p.text_dim)
+                            .child(
+                                "Each tap sends one command. A row keeps showing the value the \
+                                 controller reports; it changes on the next poll, not when the \
+                                 button is pressed.",
+                            ),
+                    )
+                    .children(rows)
+                    .when_some(error, |this, error| {
+                        this.child(
+                            div()
+                                .p_2()
+                                .rounded(px(6.0))
+                                .bg(p.danger.opacity(0.16))
+                                .border_1()
+                                .border_color(p.danger.opacity(0.6))
+                                .text_size(px(10.0))
+                                .text_color(p.danger)
+                                .child(error),
+                        )
+                    })
+                    .when_some(lock_reason, |this, reason| {
+                        this.child(div().text_size(px(9.5)).text_color(p.warning).child(reason))
+                    })
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(9.5))
+                                    .text_color(p.text_faint)
+                                    .child("Closing this sheet sends nothing."),
+                            )
+                            .child(
+                                div()
+                                    .id("run-options-close")
+                                    .h(px(48.0))
+                                    .w(px(120.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_lg()
+                                    .bg(p.panel_alt)
+                                    .border_1()
+                                    .border_color(p.border_strong)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(p.raised_hover).border_color(p.accent))
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .on_click(move |_, _, cx| {
+                                        close_view.update(cx, |shell, cx| {
+                                            shell.close_run_options(cx);
+                                        });
+                                    })
+                                    .child("CLOSE"),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Slim toolbar inside the viewer: job state, elapsed time and the four
@@ -13369,6 +13703,9 @@ impl Render for Shell {
         }
         if self.state.macro_run_pending().is_some() {
             root = root.child(self.macro_run_overlay(p, cx));
+        }
+        if self.state.run_options_open {
+            root = root.child(self.run_options_overlay(p, cx));
         }
         if self.state.job.tool_change.is_some() {
             root = root.child(self.tool_change_overlay(p, cx));

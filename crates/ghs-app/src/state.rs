@@ -1371,6 +1371,87 @@ impl RapidOverrideRefusal {
     }
 }
 
+/// One controller run switch exposed by the Job `RUN OPTIONS` sheet.
+///
+/// The displayed value is always the engine accessor copied into [`AppState`];
+/// this enum only names the switch and its command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOption {
+    /// Virtual optional stop, `M1`.
+    OptionalStop,
+    /// Virtual single block.
+    SingleBlock,
+    /// Block delete, `$B`; idle-only on the engine.
+    BlockDelete,
+}
+
+impl RunOption {
+    /// Sheet order. All three switches are independent.
+    pub const ALL: [Self; 3] = [Self::OptionalStop, Self::SingleBlock, Self::BlockDelete];
+
+    /// Uppercase label in the sheet.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OptionalStop => "OPTIONAL STOP",
+            Self::SingleBlock => "SINGLE BLOCK",
+            Self::BlockDelete => "BLOCK DELETE",
+        }
+    }
+
+    /// Short explanation shown under the label while the toggle is enabled.
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::OptionalStop => "M1 optional stops are honored",
+            Self::SingleBlock => "Hold after each block",
+            Self::BlockDelete => "Skip blocks marked with /",
+        }
+    }
+}
+
+/// Why a run-option toggle cannot send a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOptionRefusal {
+    /// `--mock` has no engine.
+    Mock,
+    /// The transport is connecting, disconnected, or failed.
+    NotReady,
+    /// Block delete is idle-only; a running or paused job locks it.
+    JobActive,
+}
+
+impl RunOptionRefusal {
+    /// Operator-facing reason shown in the sheet and console.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Mock => "MOCK MODE: run options need a live controller",
+            Self::NotReady => {
+                "LINK NOT READY: run options are disabled until the handshake completes"
+            }
+            Self::JobActive => "BLOCK DELETE IS LOCKED WHILE A JOB IS RUNNING OR PAUSED",
+        }
+    }
+
+    /// One-line reason used inside a disabled toggle row.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Mock => "Mock mode: no controller",
+            Self::NotReady => "Link not ready",
+            Self::JobActive => "Locked while a job runs or pauses",
+        }
+    }
+}
+
+/// Result of asking the engine to flip one run switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOptionOutcome {
+    /// Exactly one command was handed to the sender.
+    Sent,
+    /// The sender rejected that one command. The displayed value is unchanged.
+    Rejected(String),
+    /// No command was built or sent.
+    Refused(RunOptionRefusal),
+}
+
 /// Everything the shell draws. Plain data, no GPUI types.
 pub struct AppState {
     pub profile: Profile,
@@ -1393,6 +1474,16 @@ pub struct AppState {
     pub feed_override: u16,
     pub spindle_override: u16,
     pub rapid_override: u16,
+    /// Authoritative virtual optional-stop flag, copied from the engine.
+    pub optional_stop: bool,
+    /// Authoritative virtual single-block flag, copied from the engine.
+    pub single_block: bool,
+    /// Authoritative block-delete flag, copied from the engine.
+    pub block_delete: bool,
+    /// Whether the Job `RUN OPTIONS` sheet is open. Opening sends nothing.
+    pub run_options_open: bool,
+    /// Last refusal or engine rejection shown inside the run-options sheet.
+    pub run_options_error: Option<String>,
     pub feed_override_active: bool,
     pub spindle_override_active: bool,
     pub spindle_on: bool,
@@ -1472,6 +1563,11 @@ impl AppState {
             feed_override: 100,
             spindle_override: 100,
             rapid_override: 100,
+            optional_stop: false,
+            single_block: false,
+            block_delete: false,
+            run_options_open: false,
+            run_options_error: None,
             feed_override_active: false,
             spindle_override_active: false,
             spindle_on: true,
@@ -1551,6 +1647,13 @@ impl AppState {
         self.feed_override = 100;
         self.spindle_override = 100;
         self.rapid_override = 100;
+        // Runtime switches belong to the controller session and clear on a
+        // new one; the next poll copies the engine accessors again.
+        self.optional_stop = false;
+        self.single_block = false;
+        self.block_delete = false;
+        self.run_options_open = false;
+        self.run_options_error = None;
         self.feed_override_active = false;
         self.spindle_override_active = false;
         self.spindle_on = false;
@@ -1797,6 +1900,142 @@ impl AppState {
         Ok(Command::SetRapidOverride(next_rapid_override(
             self.rapid_override,
         )))
+    }
+
+    /// Copy the engine's run-switch accessors into the view model.
+    ///
+    /// This is the only writer of the three displayed values after startup.
+    /// There is no optimistic target: a tap sends a command, and the row
+    /// changes only when a later poll reads the accepted accessor back.
+    ///
+    /// Returns `true` when at least one displayed value changed.
+    pub fn sync_run_options(
+        &mut self,
+        optional_stop: bool,
+        single_block: bool,
+        block_delete: bool,
+    ) -> bool {
+        let mut changed = false;
+        if self.optional_stop != optional_stop {
+            self.optional_stop = optional_stop;
+            changed = true;
+        }
+        if self.single_block != single_block {
+            self.single_block = single_block;
+            changed = true;
+        }
+        if self.block_delete != block_delete {
+            self.block_delete = block_delete;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Authoritative value displayed for one run switch.
+    pub fn run_option_value(&self, option: RunOption) -> bool {
+        match option {
+            RunOption::OptionalStop => self.optional_stop,
+            RunOption::SingleBlock => self.single_block,
+            RunOption::BlockDelete => self.block_delete,
+        }
+    }
+
+    /// Whether one run switch can be changed right now.
+    ///
+    /// Optional stop and single block are real-time switches the engine accepts
+    /// whenever the link is ready, including while a job runs. Block delete is
+    /// idle-only, so a running or paused job locks it before the command is
+    /// built.
+    pub fn run_option_refusal(&self, option: RunOption) -> Option<RunOptionRefusal> {
+        if !self.live {
+            return Some(RunOptionRefusal::Mock);
+        }
+        if !self.connection.is_ready_like() {
+            return Some(RunOptionRefusal::NotReady);
+        }
+        if option == RunOption::BlockDelete && self.job.is_active() {
+            return Some(RunOptionRefusal::JobActive);
+        }
+        None
+    }
+
+    /// The single command that flips one run switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason when the switch is locked in this state.
+    pub fn run_option_command(&self, option: RunOption) -> Result<Command, RunOptionRefusal> {
+        if let Some(refusal) = self.run_option_refusal(option) {
+            return Err(refusal);
+        }
+        let enabled = !self.run_option_value(option);
+        Ok(match option {
+            RunOption::OptionalStop => Command::SetOptionalStop(enabled),
+            RunOption::SingleBlock => Command::SetSingleBlock(enabled),
+            RunOption::BlockDelete => Command::SetBlockDelete(enabled),
+        })
+    }
+
+    /// Send one run-switch toggle through `send`, exactly once.
+    ///
+    /// The displayed value is never changed here. A gate refusal sends nothing;
+    /// a sender rejection keeps the previous value and records the reason for
+    /// the open sheet.
+    pub fn dispatch_run_option(
+        &mut self,
+        option: RunOption,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> RunOptionOutcome {
+        let command = match self.run_option_command(option) {
+            Ok(command) => command,
+            Err(refusal) => {
+                self.run_options_error =
+                    Some(format!("{} BLOCKED: {}", option.label(), refusal.message()));
+                return RunOptionOutcome::Refused(refusal);
+            }
+        };
+        match send(command) {
+            Ok(()) => {
+                self.run_options_error = None;
+                RunOptionOutcome::Sent
+            }
+            Err(detail) => {
+                let message = format!("{} NOT CHANGED: {detail}", option.label());
+                self.run_options_error = Some(message.clone());
+                RunOptionOutcome::Rejected(message)
+            }
+        }
+    }
+
+    /// Reason line shown under one run-option row.
+    pub fn run_option_hint(&self, option: RunOption) -> &'static str {
+        self.run_option_refusal(option)
+            .map_or_else(|| option.detail(), RunOptionRefusal::hint)
+    }
+
+    /// Sheet-wide lock notice, or `None` when every switch is available.
+    pub fn run_options_lock_reason(&self) -> Option<&'static str> {
+        if !self.live {
+            Some(RunOptionRefusal::Mock.message())
+        } else if !self.connection.is_ready_like() {
+            Some(RunOptionRefusal::NotReady.message())
+        } else if self.job.is_active() {
+            Some(RunOptionRefusal::JobActive.message())
+        } else {
+            None
+        }
+    }
+
+    /// Open the `RUN OPTIONS` sheet. Nothing is sent.
+    pub fn open_run_options(&mut self) {
+        self.run_options_open = true;
+        self.run_options_error = None;
+    }
+
+    /// Close the `RUN OPTIONS` sheet. Nothing is sent.
+    pub fn close_run_options(&mut self) {
+        self.run_options_open = false;
+        self.run_options_error = None;
     }
 
     /// Estimated remaining job time for the Job header, when meaningful.
@@ -4222,5 +4461,186 @@ mod tests {
 
         state.set_program_search_mode(ProgramSearchMode::Highlight);
         assert_eq!(state.program_search_visible_count(), 0);
+    }
+
+    fn ready_run_options_state() -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("run options test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state
+    }
+
+    #[test]
+    fn run_option_accessors_copy_into_state_and_mark_changes() {
+        let mut state = ready_run_options_state();
+        assert!(!state.optional_stop);
+        assert!(!state.single_block);
+        assert!(!state.block_delete);
+
+        assert!(!state.sync_run_options(false, false, false));
+        assert!(state.sync_run_options(true, false, false));
+        assert!(state.optional_stop);
+        assert!(!state.single_block);
+        assert!(!state.block_delete);
+
+        assert!(!state.sync_run_options(true, false, false));
+        assert!(state.sync_run_options(false, true, true));
+        assert!(!state.optional_stop);
+        assert!(state.single_block);
+        assert!(state.block_delete);
+    }
+
+    #[test]
+    fn each_run_option_toggle_sends_exactly_one_command() {
+        for (option, expected) in [
+            (RunOption::OptionalStop, Command::SetOptionalStop(true)),
+            (RunOption::SingleBlock, Command::SetSingleBlock(true)),
+            (RunOption::BlockDelete, Command::SetBlockDelete(true)),
+        ] {
+            let mut state = ready_run_options_state();
+            let mut sent = Vec::new();
+            let outcome = state.dispatch_run_option(option, |command| {
+                sent.push(command);
+                Ok(())
+            });
+
+            assert_eq!(outcome, RunOptionOutcome::Sent);
+            assert_eq!(sent, vec![expected]);
+            assert_eq!(sent.len(), 1, "a toggle must send exactly one command");
+            assert!(
+                !state.run_option_value(option),
+                "a sent command must not update the displayed value optimistically"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_run_option_leaves_the_displayed_value_unchanged() {
+        let mut state = ready_run_options_state();
+        assert!(state.sync_run_options(true, false, false));
+        assert!(state.optional_stop);
+
+        let mut sent = 0;
+        let outcome = state.dispatch_run_option(RunOption::OptionalStop, |command| {
+            sent += 1;
+            assert_eq!(command, Command::SetOptionalStop(false));
+            Err("controller refused the switch".to_string())
+        });
+
+        assert_eq!(sent, 1);
+        assert!(matches!(
+            outcome,
+            RunOptionOutcome::Rejected(ref message)
+                if message.contains("OPTIONAL STOP NOT CHANGED")
+                    && message.contains("controller refused the switch")
+        ));
+        assert!(state.optional_stop, "the old state must stay displayed");
+        assert!(state.run_options_error.as_deref().is_some_and(|error| {
+            error.contains("OPTIONAL STOP NOT CHANGED")
+                && error.contains("controller refused the switch")
+        }));
+    }
+
+    #[test]
+    fn block_delete_is_refused_while_a_job_is_running_or_paused() {
+        let mut state = ready_run_options_state();
+        assert!(state.sync_run_options(false, false, true));
+        state.job.state = JobState::Paused;
+
+        assert_eq!(
+            state.run_option_command(RunOption::BlockDelete),
+            Err(RunOptionRefusal::JobActive)
+        );
+        assert!(state.run_option_command(RunOption::OptionalStop).is_ok());
+        assert!(state.run_option_command(RunOption::SingleBlock).is_ok());
+
+        let mut sent = Vec::new();
+        let outcome = state.dispatch_run_option(RunOption::BlockDelete, |command| {
+            sent.push(command);
+            Ok(())
+        });
+        assert_eq!(
+            outcome,
+            RunOptionOutcome::Refused(RunOptionRefusal::JobActive)
+        );
+        assert!(sent.is_empty(), "a refused toggle must send nothing");
+        assert!(state.block_delete, "the authoritative value stays visible");
+
+        state.job.state = JobState::Running;
+        assert_eq!(
+            state.run_option_command(RunOption::BlockDelete),
+            Err(RunOptionRefusal::JobActive)
+        );
+    }
+
+    #[test]
+    fn mock_mode_keeps_the_sheet_visible_but_disables_every_toggle() {
+        let mut state = AppState::new();
+        assert!(!state.live);
+
+        state.open_run_options();
+        assert!(state.run_options_open);
+        for option in RunOption::ALL {
+            assert_eq!(
+                state.run_option_refusal(option),
+                Some(RunOptionRefusal::Mock)
+            );
+            assert_eq!(
+                state.run_option_command(option),
+                Err(RunOptionRefusal::Mock)
+            );
+            assert_eq!(state.run_option_hint(option), "Mock mode: no controller");
+        }
+        assert_eq!(
+            state.run_options_lock_reason(),
+            Some("MOCK MODE: run options need a live controller")
+        );
+    }
+
+    #[test]
+    fn reset_and_disconnect_clear_the_three_run_options() {
+        let mut state = ready_run_options_state();
+        assert!(state.sync_run_options(true, true, true));
+        state.open_run_options();
+
+        // A new session clears the switches and the sheet; the demo/mock
+        // defaults are never carried into a controller session.
+        state.begin_live("new session");
+        assert!(!state.optional_stop);
+        assert!(!state.single_block);
+        assert!(!state.block_delete);
+        assert!(!state.run_options_open);
+
+        // The accessor copy is also what clears the UI after a disconnect.
+        state.connection = ConnectionState::Ready;
+        assert!(state.sync_run_options(true, true, true));
+        assert!(state.sync_run_options(false, false, false));
+        assert!(!state.optional_stop);
+        assert!(!state.single_block);
+        assert!(!state.block_delete);
+    }
+
+    #[test]
+    fn opening_and_closing_the_run_options_sheet_sends_nothing() {
+        let mut state = ready_run_options_state();
+        assert!(state.sync_run_options(false, true, false));
+        let before = (state.optional_stop, state.single_block, state.block_delete);
+
+        state.open_run_options();
+        assert!(state.run_options_open);
+        assert_eq!(
+            (state.optional_stop, state.single_block, state.block_delete,),
+            before
+        );
+
+        state.run_options_error = Some("previous rejection".to_string());
+        state.close_run_options();
+        assert!(!state.run_options_open);
+        assert_eq!(
+            (state.optional_stop, state.single_block, state.block_delete,),
+            before
+        );
+        assert_eq!(state.run_options_error, None);
     }
 }
