@@ -38,8 +38,10 @@
 //! This is a protocol and engine test double, not a machine emulator:
 //!
 //! - Arc blocks move to their endpoint; no intermediate arc path is generated.
-//! - `G38.x` probing completes successfully at its endpoint; probe contact is
-//!   not simulated.
+//! - `G38.x` probing completes successfully at its endpoint. The live probe
+//!   input asserts on contact and opens on the next non-probe motion, while
+//!   the last `[PRB]` result stays latched for `$#` until a reset or another
+//!   probe.
 //! - Stored startup lines are acknowledged as `>N<n>=...:ok` on reset but their
 //!   G-code is not executed.
 //! - `$REBOOT` performs a soft reset and prints the banner; it emits no `ok`.

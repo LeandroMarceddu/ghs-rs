@@ -128,6 +128,13 @@ pub struct SimSnapshot {
     pub mpg_active: bool,
     /// Whether the virtual probe-connected signal is asserted.
     pub probe_connected: bool,
+    /// Whether a completed probe cycle is still in contact.
+    ///
+    /// This is separate from [`SimSnapshot::probe_result`]: contact asserts on
+    /// a successful probe and clears on the next non-probe motion (the
+    /// retract), while the result stays latched for `$#`/`[PRB]`. Raw inputs
+    /// in [`SimSnapshot::signals`] are separate; `Pn` reports either source.
+    pub probe_triggered: bool,
     /// Last probe result.
     pub probe_result: Option<ProbeResult>,
     /// Axes known to be homed.
@@ -225,6 +232,7 @@ pub struct Simulator {
     aux_in: Vec<bool>,
     aux_out: Vec<bool>,
     probe_connected: bool,
+    probe_triggered: bool,
     probe_result: Option<ProbeResult>,
     line_number: u32,
     startup_lines: [String; 2],
@@ -334,6 +342,7 @@ impl Simulator {
             aux_in: vec![false; usize::from(aux.digital_in.min(MAX_SIM_AUX_IO))],
             aux_out: vec![false; usize::from(aux.digital_out.min(MAX_SIM_AUX_IO))],
             probe_connected: false,
+            probe_triggered: false,
             probe_result: None,
             line_number: 0,
             startup_lines: std::array::from_fn(|_| String::new()),
@@ -406,6 +415,7 @@ impl Simulator {
             tool_change_acknowledged: self.tool_change.is_some_and(|change| change.acknowledged),
             mpg_active: self.mpg,
             probe_connected: self.probe_connected,
+            probe_triggered: self.probe_triggered,
             probe_result: self.probe_result,
             homed: self.homed,
             homing_complete: self.axes.difference(self.homed).is_empty(),
@@ -1079,6 +1089,12 @@ impl Simulator {
         feed_override: Option<f64>,
         out: &mut Vec<u8>,
     ) {
+        // A probe move keeps (or establishes) contact. Any other commanded
+        // motion is a retract or a departure, so the live input opens while the
+        // latched PRB result stays available to `$#`.
+        if kind != MotionKind::Probe {
+            self.clear_probe_contact();
+        }
         let feed = feed_override.unwrap_or_else(|| {
             if kind == MotionKind::Rapid {
                 self.rapid_feed_rate()
@@ -1145,6 +1161,7 @@ impl Simulator {
     fn record_probe(&mut self, position: Position, out: &mut Vec<u8>) {
         let result = ProbeResult::new(true, position);
         self.probe_result = Some(result);
+        self.probe_triggered = result.success;
         emit(
             out,
             &format!(
@@ -1152,6 +1169,11 @@ impl Simulator {
                 crate::util::format_position_mm(position, self.axes)
             ),
         );
+    }
+
+    /// Clear the live probe contact without touching the latched PRB result.
+    fn clear_probe_contact(&mut self) {
+        self.probe_triggered = false;
     }
 
     fn fail(&mut self, code: u16, out: &mut Vec<u8>) {
@@ -1196,6 +1218,8 @@ impl Simulator {
         self.mist = false;
         self.fan = false;
         self.error = None;
+        self.probe_result = None;
+        self.clear_probe_contact();
         self.auto_report_accum = Duration::ZERO;
         if self.alarm == Some(11) {
             self.state = MachineState::Alarm;

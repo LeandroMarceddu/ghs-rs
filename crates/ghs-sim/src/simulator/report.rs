@@ -442,7 +442,7 @@ impl Simulator {
         if self.alarm == Some(10) {
             pins.insert(Signals::ESTOP);
         }
-        if self.probe_result.is_some_and(|probe| probe.success) {
+        if self.probe_triggered {
             pins.insert(Signals::PROBE);
         }
         pins

@@ -21,6 +21,14 @@ fn settle(sim: &mut Simulator) {
     let _ = sim.tick(Duration::from_secs(60));
 }
 
+/// Asserted pins from one realtime status report.
+fn probe_pins(sim: &mut Simulator) -> ghs_core::Signals {
+    parse_status(text(&sim.feed(b"?")).trim())
+        .expect("status")
+        .pins
+        .expect("pins")
+}
+
 #[test]
 fn status_report_round_trips_through_the_parser() {
     let mut sim = Simulator::new(SimProfile::FlexiHal);
@@ -627,6 +635,114 @@ fn probing_reports_a_prb_result() {
 
     let offsets = text(&sim.feed(b"$#\n"));
     assert!(offsets.contains("[PRB:0.000,0.000,-5.000:1]"), "{offsets}");
+}
+
+#[test]
+fn a_retract_clears_probe_contact_but_keeps_the_last_prb() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-5 F100\n")), "ok");
+    let out = text(&sim.tick(Duration::from_secs(10)));
+    assert!(out.contains("[PRB:0.000,0.000,-5.000:1]"), "{out}");
+    assert!(sim.snapshot().probe_triggered);
+    assert!(probe_pins(&mut sim).contains(ghs_core::Signals::PROBE));
+
+    assert_eq!(single_line(&sim.feed(b"G0 Z5\n")), "ok");
+    assert!(!sim.snapshot().probe_triggered);
+    assert!(!probe_pins(&mut sim).contains(ghs_core::Signals::PROBE));
+
+    // The live input opened, but the last result stays available to `$#`.
+    let offsets = text(&sim.feed(b"$#\n"));
+    assert!(offsets.contains("[PRB:0.000,0.000,-5.000:1]"), "{offsets}");
+    assert_eq!(
+        sim.snapshot().probe_result.map(|probe| probe.position),
+        Some(Position::xyz(0.0, 0.0, -5.0))
+    );
+}
+
+#[test]
+fn a_second_probe_after_a_retract_replaces_the_prb() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-5 F100\n")), "ok");
+    let first = text(&sim.tick(Duration::from_secs(10)));
+    assert!(first.contains("[PRB:0.000,0.000,-5.000:1]"), "{first}");
+
+    assert_eq!(single_line(&sim.feed(b"G0 Z5\n")), "ok");
+    settle(&mut sim);
+    assert!(!sim.snapshot().probe_triggered);
+
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-3 F100\n")), "ok");
+    let second = text(&sim.tick(Duration::from_secs(10)));
+    assert!(second.contains("[PRB:0.000,0.000,-3.000:1]"), "{second}");
+    assert!(sim.snapshot().probe_triggered);
+    assert!(probe_pins(&mut sim).contains(ghs_core::Signals::PROBE));
+
+    let offsets = text(&sim.feed(b"$#\n"));
+    assert!(offsets.contains("[PRB:0.000,0.000,-3.000:1]"), "{offsets}");
+    assert!(!offsets.contains("[PRB:0.000,0.000,-5.000:1]"), "{offsets}");
+}
+
+#[test]
+fn reset_clears_probe_contact_and_the_last_prb() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-5 F100\n")), "ok");
+    let out = text(&sim.tick(Duration::from_secs(10)));
+    assert!(out.contains("[PRB:"), "{out}");
+    assert!(sim.snapshot().probe_triggered);
+
+    let reset = text(&sim.feed(&[0x18]));
+    assert!(reset.starts_with("GrblHAL 1.1f"), "{reset}");
+    assert!(!sim.snapshot().probe_triggered);
+    assert_eq!(sim.snapshot().probe_result, None);
+    assert!(!probe_pins(&mut sim).contains(ghs_core::Signals::PROBE));
+    let offsets = text(&sim.feed(b"$#\n"));
+    assert!(offsets.contains("[PRB:0.000,0.000,0.000:0]"), "{offsets}");
+
+    // An offset reset also drops the last result and any live contact.
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-4 F100\n")), "ok");
+    let out = text(&sim.tick(Duration::from_secs(10)));
+    assert!(out.contains("[PRB:0.000,0.000,-4.000:1]"), "{out}");
+    assert_eq!(single_line(&sim.feed(b"$RST=#\n")), "ok");
+    assert!(!sim.snapshot().probe_triggered);
+    assert_eq!(sim.snapshot().probe_result, None);
+    let offsets = text(&sim.feed(b"$#\n"));
+    assert!(offsets.contains("[PRB:0.000,0.000,0.000:0]"), "{offsets}");
+}
+
+#[test]
+fn unlock_keeps_the_probe_result_and_live_contact() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-5 F100\n")), "ok");
+    let out = text(&sim.tick(Duration::from_secs(10)));
+    assert!(out.contains("[PRB:"), "{out}");
+
+    let alarm = text(&sim.feed(&[0x9F]));
+    assert_eq!(alarm, "ALARM:10\r\n");
+    assert!(text(&sim.feed(b"$X\n")).ends_with("ok\r\n"));
+    assert!(sim.snapshot().probe_triggered);
+    assert!(sim.snapshot().probe_result.is_some());
+
+    // Retracting after unlock opens the input and keeps the result.
+    assert_eq!(single_line(&sim.feed(b"G0 Z5\n")), "ok");
+    assert!(!sim.snapshot().probe_triggered);
+    assert!(sim.snapshot().probe_result.is_some());
+}
+
+#[test]
+fn an_alarm_mid_probe_does_not_emit_or_latch_a_result() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    assert_eq!(single_line(&sim.feed(b"G38.2 Z-5 F100\n")), "ok");
+    let _ = sim.tick(Duration::from_secs(1));
+
+    let alarm = text(&sim.raise_alarm(4));
+    assert_eq!(alarm, "ALARM:4\r\n");
+    assert_eq!(sim.snapshot().state, MachineState::Alarm);
+    assert!(!sim.snapshot().probe_triggered);
+    assert_eq!(sim.snapshot().probe_result, None);
+    assert!(!probe_pins(&mut sim).contains(ghs_core::Signals::PROBE));
+
+    let drained = text(&sim.tick(Duration::from_secs(10)));
+    assert!(!drained.contains("[PRB:"), "{drained}");
+    assert_eq!(sim.snapshot().probe_result, None);
 }
 
 #[test]

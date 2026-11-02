@@ -403,6 +403,7 @@ impl Simulator {
         self.tlo = Position::new(self.axes);
         self.tlr = None;
         self.probe_result = None;
+        self.clear_probe_contact();
     }
 
     fn reset_tools(&mut self) {
@@ -419,6 +420,9 @@ impl Simulator {
     }
 
     fn unlock(&mut self, out: &mut Vec<u8>) {
+        // Unlock is a recovery action, not a reset: the last PRB and the live
+        // probe input are left as they were. The operator retracts after
+        // unlocking, which opens the input without losing the result.
         let was_locked =
             self.alarm.is_some() || matches!(self.state, MachineState::Alarm | MachineState::Door);
         self.alarm = None;
@@ -471,6 +475,7 @@ impl Simulator {
     fn probe_tool_plate(&mut self, out: &mut Vec<u8>) {
         self.tlr = Some(self.tlo.get(Axis::Z));
         self.probe_result = Some(ghs_core::ProbeResult::new(true, self.mpos));
+        self.probe_triggered = true;
         emit(out, "ok");
     }
 
@@ -512,6 +517,7 @@ impl Simulator {
         }
 
         self.settle_motion(out);
+        self.clear_probe_contact();
         for axis in targets.iter() {
             self.mpos.set(axis, self.home_position.get(axis));
         }
