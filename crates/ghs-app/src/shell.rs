@@ -558,6 +558,11 @@ impl Shell {
         if !mock {
             shell.connect_demo(cx);
         }
+        // Screenshot switch: start in the orbit view. 2D top remains the
+        // default for every normal launch.
+        if std::env::args().any(|arg| arg == "--viewer-3d") {
+            shell.viewer.set_mode(viewer::ViewerMode::ThreeD);
+        }
         if shell.demo_probe_run
             || shell.demo_height_map
             || std::env::args().any(|arg| arg == "--demo-probe-check")
@@ -4181,8 +4186,9 @@ impl Shell {
         let segments = program
             .as_ref()
             .map(|program| format!("{} SEG", program.toolpath.segment_count()));
-        let marker = viewer::marker_mm(self.state.profile.capabilities.units, &self.state.dro);
+        let marker = viewer::marker_mm3(self.state.profile.capabilities.units, &self.state.dro);
         let zoom = format!("{}%", self.viewer.zoom_percent());
+        let mode = self.viewer.mode();
 
         let fit_view = cx.entity();
         let fit = chip_button("viewer-fit", "FIT", p, move |_, cx| {
@@ -4211,7 +4217,18 @@ impl Shell {
                     .left(px(8.0))
                     .flex()
                     .gap_1()
-                    .child(chip("2D TOP", p))
+                    .child(viewer_mode_chip(
+                        viewer::ViewerMode::Top2D,
+                        mode,
+                        p,
+                        cx.entity(),
+                    ))
+                    .child(viewer_mode_chip(
+                        viewer::ViewerMode::ThreeD,
+                        mode,
+                        p,
+                        cx.entity(),
+                    ))
                     .child(chip(path_label, p))
                     .when_some(segments, |this, segments| this.child(chip(&segments, p))),
             )
@@ -4243,7 +4260,18 @@ impl Shell {
                     .border_color(p.border)
                     .child(legend(p.path_cut, "Cut", p))
                     .child(legend(p.path_rapid, "Rapid", p))
-                    .child(legend(p.path_plunge, "Plunge", p)),
+                    .child(legend(p.path_plunge, "Plunge", p))
+                    .when(mode.is_three_d(), |this| {
+                        this.child(
+                            div()
+                                .pl_3()
+                                .border_l_1()
+                                .border_color(p.border)
+                                .text_size(px(9.0))
+                                .text_color(p.text_faint)
+                                .child("DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM"),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -5936,7 +5964,7 @@ impl Shell {
             .height_map_base_program
             .clone()
             .or_else(|| self.state.job.program().cloned());
-        let marker = viewer::marker_mm(self.state.profile.capabilities.units, &self.state.dro);
+        let marker = viewer::marker_mm3(self.state.profile.capabilities.units, &self.state.dro);
 
         let min_z = summary.min_z_mm.map_or_else(|| "--".to_string(), format_mm);
         let max_z = summary.max_z_mm.map_or_else(|| "--".to_string(), format_mm);
@@ -6389,7 +6417,7 @@ impl Shell {
             .height_map_base_program
             .clone()
             .or_else(|| self.state.job.program().cloned());
-        let marker = viewer::marker_mm(self.state.profile.capabilities.units, &self.state.dro);
+        let marker = viewer::marker_mm3(self.state.profile.capabilities.units, &self.state.dro);
         let export_view = cx.entity();
         let export_path = self.height_map_export_path();
         let path_text = export_path.as_ref().map_or_else(
@@ -12691,6 +12719,51 @@ fn chip(text: &str, p: Palette) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(p.text_dim)
         .child(text.to_string())
+}
+
+/// Projection chip in the viewer toolbar.
+///
+/// The active mode is tinted with the accent and acts as a no-op; the other
+/// chip switches mode and lets the viewer fit the destination camera once.
+fn viewer_mode_chip(
+    candidate: viewer::ViewerMode,
+    active: viewer::ViewerMode,
+    p: Palette,
+    view: Entity<Shell>,
+) -> impl IntoElement {
+    let selected = candidate == active;
+    let id = if candidate.is_three_d() {
+        "viewer-mode-3d"
+    } else {
+        "viewer-mode-2d"
+    };
+    div()
+        .id(id)
+        .px_2()
+        .h(px(22.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .rounded(px(5.0))
+        .bg(if selected {
+            p.accent_muted
+        } else {
+            p.panel_alt
+        })
+        .border_1()
+        .border_color(if selected { p.accent } else { p.border })
+        .text_size(px(10.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(if selected { p.accent } else { p.text_dim })
+        .hover(|style| style.bg(p.raised_hover).text_color(p.text))
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                if this.viewer.set_mode(candidate) {
+                    cx.notify();
+                }
+            });
+        })
+        .child(candidate.label())
 }
 
 /// A chip-sized action button, used for the viewer FIT control.
