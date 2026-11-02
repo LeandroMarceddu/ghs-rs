@@ -282,6 +282,20 @@ highlighted as the job runs. The footer shows total lines and
 `ETA MM:SS` estimate while a job is running or paused with usable progress.
 Search supports `FILTER` and `HIGHLIGHT`, with `PREV`, `NEXT`, and `JUMP`.
 
+### Run options
+
+The `RUN OPTIONS` chip in the viewer header opens three controller-reported
+toggles:
+
+- `OPTIONAL STOP` — honor `M1` stops.
+- `SINGLE BLOCK` — hold after each block.
+- `BLOCK DELETE` — skip lines marked `/`.
+
+Each tap sends one command and the row updates only when the next status poll
+reports the new value. Block delete is disabled while a job is running or
+paused; optional stop and single block can be changed when the engine accepts
+them. Mock mode shows the sheet but disables every toggle.
+
 ### Start, pause, resume, stop
 
 - `START` is enabled for a loaded program when the link is ready, the machine
@@ -760,8 +774,6 @@ Exports are user-initiated. There is no telemetry and no network transport.
 - **No start-from-line, run-to-line, breakpoints, or check mode.** The job
   toolbar starts from the beginning; `StartProgram` has a `from_line` API but
   the UI does not expose it.
-- **No optional-stop or single-block controls in the UI.** The engine/protocol
-  support exists; the shell does not expose the toggles.
 - **No drag-and-drop or recent-files list.** The in-app browser lists one
   directory at a time and remembers the last folder only for the session.
 - **Advanced macros are absent.** User macros are single-line MDI commands;

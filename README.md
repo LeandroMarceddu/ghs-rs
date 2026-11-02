@@ -38,8 +38,9 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 - **Manual control** — live DRO, hold-to-jog, MDI, feed/spindle/rapid
   overrides, spindle and coolant controls, reset/stop, and a console.
 - **Jobs** — in-app program file browser and loading, streaming, pause/resume/
-  stop, tool-change sheet, progress, ETA and current line, a real parsed program
-  list, and job recovery that never auto-resumes after an alarm or disconnect.
+  stop, tool-change sheet, optional-stop/single-block/block-delete run options,
+  progress, ETA and current line, a real parsed program list, and job recovery
+  that never auto-resumes after an alarm or disconnect.
 - **Viewer** — parsed toolpath in 2D top or 3D orbit view, fit/pan/zoom/pinch,
   ground grid and work envelope, motion-style paths, height-map overlay, and a
   live tool marker.
