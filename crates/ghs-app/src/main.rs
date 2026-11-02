@@ -50,6 +50,9 @@
 //! folder, or a program file whose folder opens with the file selected);
 //! `--demo-load-file=PATH` loads that file through the same bounded reader and
 //! guarded `LoadProgram` path once the simulator is ready, without starting it.
+//! `--demo-breakpoints` enables three demo breakpoints through the normal
+//! toggle action and shows the Program tab; `--demo-run-to` does the same and
+//! opens the run-to confirmation without confirming it.
 //! `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.

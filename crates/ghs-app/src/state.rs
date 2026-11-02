@@ -8,7 +8,7 @@
 //! path; a generic or extended controller can supply a different value without
 //! touching this module's consumers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -874,6 +874,221 @@ pub struct ToolChangeView {
     pub acknowledged: bool,
 }
 
+/// One pending run-to-line confirmation.
+///
+/// Captured when the operator opens the sheet. Confirming builds commands from
+/// this captured line and source, never from a later selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunToConfirmation {
+    /// 1-based source line where the job should pause.
+    pub line: u32,
+    /// Source text shown in the confirmation sheet.
+    pub source: String,
+}
+
+/// App-side mirror of the engine's breakpoint set for the loaded program.
+///
+/// The engine owns the authoritative breakpoints. This model only remembers
+/// which lines the app enabled so the Program list can mark and count them,
+/// plus the selected row and the pending run-to confirmation. It is cleared by
+/// [`JobView::loaded`] because the engine clears its own set on every load.
+#[derive(Clone, Debug, Default)]
+pub struct ProgramBreakpoints {
+    lines: BTreeSet<u32>,
+    selected: Option<u32>,
+    pending_run_to: Option<RunToConfirmation>,
+    /// Last refusal or engine rejection shown in the run-to sheet.
+    pub error: Option<String>,
+}
+
+impl ProgramBreakpoints {
+    /// Whether one 1-based source line has an enabled breakpoint.
+    pub fn contains(&self, line: u32) -> bool {
+        self.lines.contains(&line)
+    }
+
+    /// Number of enabled breakpoints.
+    pub fn count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Enabled breakpoints before `line`, in ascending order.
+    ///
+    /// Used by the run-to sheet so an operator knows earlier breakpoints will
+    /// pause the job before it reaches the requested line.
+    #[must_use]
+    pub fn earlier_than(&self, line: u32) -> Vec<u32> {
+        self.lines.range(..line).copied().collect()
+    }
+
+    /// Selected 1-based source line, when one row is selected.
+    pub fn selected(&self) -> Option<u32> {
+        self.selected
+    }
+
+    /// Select one source line, or clear the selection.
+    pub fn select(&mut self, line: Option<u32>) {
+        self.selected = line;
+    }
+
+    /// Pending run-to confirmation, when the sheet is open.
+    pub fn pending_run_to(&self) -> Option<&RunToConfirmation> {
+        self.pending_run_to.as_ref()
+    }
+
+    /// Record one engine-accepted breakpoint change.
+    ///
+    /// Returns `true` when the set changed.
+    pub fn set_line(&mut self, line: u32, enabled: bool) -> bool {
+        if enabled {
+            self.lines.insert(line)
+        } else {
+            self.lines.remove(&line)
+        }
+    }
+
+    /// Clear every breakpoint and transient selection state.
+    ///
+    /// Called for a new program, where the engine also clears its own set.
+    fn clear_for_program(&mut self) {
+        self.lines.clear();
+        self.selected = None;
+        self.pending_run_to = None;
+        self.error = None;
+    }
+}
+
+/// Why a breakpoint or run-to action is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakpointRefusal {
+    /// `--mock` has no engine to receive `SetBreakpoint`.
+    Mock,
+    /// The link is connecting, disconnected, or failed.
+    NotReady,
+    /// The machine is in `Alarm` or `Door`.
+    MachineLocked,
+    /// No program is loaded in the engine.
+    NoProgram,
+    /// The line is zero or beyond the streamed program.
+    LineOutOfRange,
+    /// The job is already paused at this line; re-arming it would pause again.
+    PausedAtLine,
+}
+
+impl BreakpointRefusal {
+    /// Operator-facing refusal text.
+    pub fn message(self) -> &'static str {
+        match self {
+            BreakpointRefusal::Mock => "Mock mode: breakpoints need a live controller",
+            BreakpointRefusal::NotReady => "The controller link is not ready",
+            BreakpointRefusal::MachineLocked => "The machine is in Alarm or Door",
+            BreakpointRefusal::NoProgram => "No program is loaded",
+            BreakpointRefusal::LineOutOfRange => "That line is outside the streamed program",
+            BreakpointRefusal::PausedAtLine => {
+                "The job is paused at this line; resume or stop before re-arming it"
+            }
+        }
+    }
+}
+
+/// Why run-to-line is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunToRefusal {
+    /// `--mock` has no engine to receive the breakpoint or start commands.
+    Mock,
+    /// The link is connecting, disconnected, or failed.
+    NotReady,
+    /// The machine is in `Alarm` or `Door`.
+    MachineLocked,
+    /// No program is loaded in the engine.
+    NoProgram,
+    /// No row is selected in the Program list.
+    NoSelection,
+    /// The selected line is zero or beyond the streamed program.
+    LineOutOfRange,
+    /// The job is already paused at this breakpoint line.
+    PausedAtLine,
+    /// A generated probe program owns the job; re-running it is unsafe.
+    ProbeProgram,
+    /// No job is active, but the machine is not Idle, so a start would fail.
+    MachineNotIdle,
+    /// The confirmation sheet is not open.
+    NoPending,
+}
+
+impl RunToRefusal {
+    /// Operator-facing refusal text.
+    pub fn message(self) -> &'static str {
+        match self {
+            RunToRefusal::Mock => "Mock mode: run-to needs a live controller",
+            RunToRefusal::NotReady => "The controller link is not ready",
+            RunToRefusal::MachineLocked => "Run-to is blocked in Alarm or Door",
+            RunToRefusal::NoProgram => "Load a program before selecting a run-to line",
+            RunToRefusal::NoSelection => "Select a program line first",
+            RunToRefusal::LineOutOfRange => "That line is outside the streamed program",
+            RunToRefusal::PausedAtLine => "The job is already paused at this line",
+            RunToRefusal::ProbeProgram => "A generated probe program cannot be started from run-to",
+            RunToRefusal::MachineNotIdle => "The machine must be Idle to start the job",
+            RunToRefusal::NoPending => "No run-to confirmation is open",
+        }
+    }
+}
+
+impl From<BreakpointRefusal> for RunToRefusal {
+    fn from(refusal: BreakpointRefusal) -> Self {
+        match refusal {
+            BreakpointRefusal::Mock => RunToRefusal::Mock,
+            BreakpointRefusal::NotReady => RunToRefusal::NotReady,
+            BreakpointRefusal::MachineLocked => RunToRefusal::MachineLocked,
+            BreakpointRefusal::NoProgram => RunToRefusal::NoProgram,
+            BreakpointRefusal::LineOutOfRange => RunToRefusal::LineOutOfRange,
+            BreakpointRefusal::PausedAtLine => RunToRefusal::PausedAtLine,
+        }
+    }
+}
+
+/// Result of one breakpoint toggle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BreakpointOutcome {
+    /// The engine accepted the command.
+    Sent {
+        /// 1-based source line.
+        line: u32,
+        /// New breakpoint state.
+        enabled: bool,
+    },
+    /// The gate refused before any command was built.
+    Refused(BreakpointRefusal),
+    /// The engine rejected the command; the local set is unchanged.
+    Rejected(String),
+}
+
+/// Result of one confirmed run-to action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunToOutcome {
+    /// The breakpoint and the job start were both accepted.
+    Started {
+        /// 1-based source line where the job pauses.
+        line: u32,
+    },
+    /// Only the breakpoint was set because a job was already active.
+    BreakpointOnly {
+        /// 1-based source line where the job will pause.
+        line: u32,
+    },
+    /// The breakpoint was accepted but the start was rejected.
+    StartRejected {
+        /// 1-based source line whose breakpoint is now enabled.
+        line: u32,
+        /// Engine rejection text.
+        message: String,
+    },
+    /// The gate refused before any command was built.
+    Refused(RunToRefusal),
+    /// The breakpoint command was rejected; nothing else was sent.
+    Rejected(String),
+}
+
 /// Live job-runner view model.
 ///
 /// Plain data updated from [`EngineEvent`] job events and
@@ -900,6 +1115,8 @@ pub struct JobView {
     pub pause_reason: Option<JobPauseReason>,
     /// Pending manual tool change.
     pub tool_change: Option<ToolChangeView>,
+    /// Breakpoint mirror, selected row, and pending run-to confirmation.
+    pub breakpoints: ProgramBreakpoints,
 }
 
 impl JobView {
@@ -929,6 +1146,14 @@ impl JobView {
     pub fn line_source(&self, line: u32) -> Option<&str> {
         let index = usize::try_from(line).ok()?.checked_sub(1)?;
         self.line(index).map(|line| line.source.as_str())
+    }
+
+    /// Whether a 1-based line is inside the engine's streamed program.
+    ///
+    /// The engine stops its line count at `M2`/`M30`; lines parsed after that
+    /// are not streamed and cannot carry a breakpoint or run-to target.
+    pub fn has_runnable_line(&self, line: u32) -> bool {
+        line > 0 && line <= self.total && self.line_source(line).is_some()
     }
 
     /// Resolved fraction of the streamed lines, clamped to `0.0..=1.0`.
@@ -992,6 +1217,10 @@ impl JobView {
     }
 
     /// Installs a parsed program from `JobLoaded`.
+    ///
+    /// A new program invalidates every app-side breakpoint, the selected row,
+    /// and any open run-to confirmation. The engine still owns the real set and
+    /// clears it in the same load (verified in `JobRunner::load`).
     pub fn loaded(&mut self, name: String, program: Arc<Program>, total: u32) {
         self.program = Some(program);
         self.name = name;
@@ -1002,6 +1231,7 @@ impl JobView {
         self.elapsed = Duration::ZERO;
         self.pause_reason = None;
         self.tool_change = None;
+        self.breakpoints.clear_for_program();
     }
 
     /// Records `JobStarted`.
@@ -2023,6 +2253,230 @@ impl AppState {
             Some(RunOptionRefusal::JobActive.message())
         } else {
             None
+        }
+    }
+
+    // ------------------------------------------- program breakpoints / run-to
+
+    /// Shared gate for breakpoint and run-to actions.
+    ///
+    /// Breakpoints can be changed while a job runs or pauses, but never in
+    /// mock mode, on a stale link, or while the machine is locked.
+    pub fn breakpoint_refusal(&self) -> Option<BreakpointRefusal> {
+        if !self.live {
+            return Some(BreakpointRefusal::Mock);
+        }
+        if !self.connection.is_ready_like() {
+            return Some(BreakpointRefusal::NotReady);
+        }
+        if matches!(self.machine_state, "Alarm" | "Door") {
+            return Some(BreakpointRefusal::MachineLocked);
+        }
+        if !self.job.has_program() {
+            return Some(BreakpointRefusal::NoProgram);
+        }
+        None
+    }
+
+    /// The one command that flips one breakpoint.
+    ///
+    /// The command always carries the resulting `enabled` state, never a target
+    /// that the shell has to infer. Re-arming the line where the job is already
+    /// paused is refused so RESUME cannot immediately pause there again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate or line refusal before any command exists.
+    pub fn breakpoint_command(&self, line: u32) -> Result<Command, BreakpointRefusal> {
+        if let Some(refusal) = self.breakpoint_refusal() {
+            return Err(refusal);
+        }
+        if !self.job.has_runnable_line(line) {
+            return Err(BreakpointRefusal::LineOutOfRange);
+        }
+        let enabled = !self.job.breakpoints.contains(line);
+        if enabled
+            && self.job.pause_reason == Some(JobPauseReason::Breakpoint)
+            && self.job.current_line == line
+        {
+            return Err(BreakpointRefusal::PausedAtLine);
+        }
+        Ok(Command::SetBreakpoint { line, enabled })
+    }
+
+    /// Send one breakpoint toggle through `send`, exactly once.
+    ///
+    /// The local mirror changes only after the engine accepts the command. A
+    /// gate refusal sends nothing; a sender rejection leaves the marker and
+    /// count unchanged.
+    pub fn dispatch_toggle_breakpoint(
+        &mut self,
+        line: u32,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> BreakpointOutcome {
+        let command = match self.breakpoint_command(line) {
+            Ok(command) => command,
+            Err(refusal) => {
+                let message = format!("Breakpoint line {line}: {}", refusal.message());
+                self.job.breakpoints.error = Some(message);
+                return BreakpointOutcome::Refused(refusal);
+            }
+        };
+        let enabled = matches!(command, Command::SetBreakpoint { enabled: true, .. });
+        match send(command) {
+            Ok(()) => {
+                self.job.breakpoints.set_line(line, enabled);
+                self.job.breakpoints.error = None;
+                BreakpointOutcome::Sent { line, enabled }
+            }
+            Err(detail) => {
+                let message = format!("Breakpoint at line {line} not changed: {detail}");
+                self.job.breakpoints.error = Some(message.clone());
+                BreakpointOutcome::Rejected(message)
+            }
+        }
+    }
+
+    /// Select one Program-list row, or clear the selection.
+    pub fn select_program_line(&mut self, line: Option<u32>) {
+        self.job.breakpoints.select(line);
+    }
+
+    /// Why run-to is unavailable for one line.
+    ///
+    /// An active running or paused job is not a refusal: the confirmation then
+    /// only sets the breakpoint. A start needs a ready link, an unlocked
+    /// machine, an idle machine, and a startable job state.
+    pub fn run_to_refusal(&self, line: Option<u32>) -> Option<RunToRefusal> {
+        if let Some(refusal) = self.breakpoint_refusal() {
+            return Some(refusal.into());
+        }
+        if self.probe.owns_program(&self.job.name) {
+            return Some(RunToRefusal::ProbeProgram);
+        }
+        let Some(line) = line else {
+            return Some(RunToRefusal::NoSelection);
+        };
+        if !self.job.has_runnable_line(line) {
+            return Some(RunToRefusal::LineOutOfRange);
+        }
+        if self.job.pause_reason == Some(JobPauseReason::Breakpoint)
+            && self.job.current_line == line
+        {
+            return Some(RunToRefusal::PausedAtLine);
+        }
+        if !self.job.is_active() {
+            if !matches!(
+                self.job.state,
+                JobState::Idle | JobState::Completed | JobState::Aborted | JobState::Interrupted
+            ) {
+                return Some(RunToRefusal::MachineNotIdle);
+            }
+            if self.machine_state != "Idle" {
+                return Some(RunToRefusal::MachineNotIdle);
+            }
+        }
+        None
+    }
+
+    /// Open the run-to confirmation for one line. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate or line refusal; no sheet opens then.
+    pub fn request_run_to(&mut self, line: u32) -> Result<(), RunToRefusal> {
+        if let Some(refusal) = self.run_to_refusal(Some(line)) {
+            self.job.breakpoints.error = Some(refusal.message().to_string());
+            return Err(refusal);
+        }
+        let source = self.job.line_source(line).unwrap_or_default().to_string();
+        self.job.breakpoints.select(Some(line));
+        self.job.breakpoints.pending_run_to = Some(RunToConfirmation { line, source });
+        self.job.breakpoints.error = None;
+        Ok(())
+    }
+
+    /// Open run-to for the selected row. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunToRefusal::NoSelection`] when no row is selected.
+    pub fn request_run_to_selected(&mut self) -> Result<(), RunToRefusal> {
+        let Some(line) = self.job.breakpoints.selected() else {
+            self.job.breakpoints.error = Some(RunToRefusal::NoSelection.message().to_string());
+            return Err(RunToRefusal::NoSelection);
+        };
+        self.request_run_to(line)
+    }
+
+    /// Close the run-to confirmation. Nothing is sent.
+    pub fn cancel_run_to(&mut self) -> bool {
+        let had = self.job.breakpoints.pending_run_to.take().is_some();
+        self.job.breakpoints.error = None;
+        had
+    }
+
+    /// Whether confirming the open sheet would also start the job.
+    pub fn run_to_will_start(&self) -> bool {
+        let Some(pending) = self.job.breakpoints.pending_run_to() else {
+            return false;
+        };
+        self.run_to_refusal(Some(pending.line)).is_none() && !self.job.is_active()
+    }
+
+    /// Confirm the open run-to sheet.
+    ///
+    /// Always sends exactly one `SetBreakpoint { enabled: true }`. It sends
+    /// exactly one `StartProgram { from_line: None }` only when no job is
+    /// active at confirmation time. The engine intentionally rejects
+    /// `from_line > 1`, so this never claims start-from-line.
+    pub fn confirm_run_to(
+        &mut self,
+        mut send: impl FnMut(Command) -> Result<(), String>,
+    ) -> RunToOutcome {
+        let Some(pending) = self.job.breakpoints.pending_run_to().cloned() else {
+            return RunToOutcome::Refused(RunToRefusal::NoPending);
+        };
+        let line = pending.line;
+        if let Some(refusal) = self.run_to_refusal(Some(line)) {
+            self.job.breakpoints.error = Some(refusal.message().to_string());
+            return RunToOutcome::Refused(refusal);
+        }
+        // An active job (running or paused) keeps its position: set the
+        // breakpoint only, never start or resume it.
+        let will_start = !self.job.is_active();
+
+        if let Err(detail) = send(Command::SetBreakpoint {
+            line,
+            enabled: true,
+        }) {
+            let message = format!("Breakpoint at line {line} not set: {detail}");
+            self.job.breakpoints.error = Some(message.clone());
+            return RunToOutcome::Rejected(message);
+        }
+        self.job.breakpoints.set_line(line, true);
+        self.job.breakpoints.pending_run_to = None;
+        self.job.breakpoints.error = None;
+
+        if !will_start {
+            return RunToOutcome::BreakpointOnly { line };
+        }
+        if let Err(detail) = send(Command::StartProgram { from_line: None }) {
+            let message = format!("Breakpoint set at line {line}; start rejected: {detail}");
+            self.job.breakpoints.error = Some(message.clone());
+            return RunToOutcome::StartRejected { line, message };
+        }
+        RunToOutcome::Started { line }
+    }
+
+    /// Detail line for the current pause, including the breakpoint line.
+    pub fn pause_detail(&self) -> Option<String> {
+        match self.job.pause_reason {
+            Some(JobPauseReason::Breakpoint) => {
+                Some(format!("BREAKPOINT AT LINE {}", self.job.current_line))
+            }
+            Some(reason) => Some(pause_reason_label(reason).to_string()),
+            None => None,
         }
     }
 
@@ -4642,5 +5096,306 @@ mod tests {
             before
         );
         assert_eq!(state.run_options_error, None);
+    }
+
+    // ------------------------------------------- program breakpoints / run-to
+
+    fn breakpoint_state() -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("breakpoint test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state
+            .job
+            .loaded("breakpoints.nc".into(), sample_program(), 4);
+        state
+    }
+
+    fn recorded_send(sent: &mut Vec<Command>) -> impl FnMut(Command) -> Result<(), String> + '_ {
+        move |command| {
+            sent.push(command);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn breakpoint_toggle_adds_removes_and_maps_source_lines() {
+        let mut state = breakpoint_state();
+        assert_eq!(state.job.breakpoints.count(), 0);
+
+        let mut sent = Vec::new();
+        let outcome = state.dispatch_toggle_breakpoint(2, recorded_send(&mut sent));
+        assert_eq!(
+            outcome,
+            BreakpointOutcome::Sent {
+                line: 2,
+                enabled: true
+            }
+        );
+        assert_eq!(
+            sent,
+            vec![Command::SetBreakpoint {
+                line: 2,
+                enabled: true
+            }]
+        );
+        assert!(state.job.breakpoints.contains(2));
+        assert_eq!(state.job.breakpoints.count(), 1);
+
+        sent.clear();
+        let outcome = state.dispatch_toggle_breakpoint(2, recorded_send(&mut sent));
+        assert_eq!(
+            outcome,
+            BreakpointOutcome::Sent {
+                line: 2,
+                enabled: false
+            }
+        );
+        assert_eq!(
+            sent,
+            vec![Command::SetBreakpoint {
+                line: 2,
+                enabled: false
+            }]
+        );
+        assert!(!state.job.breakpoints.contains(2));
+        assert_eq!(state.job.breakpoints.count(), 0);
+    }
+
+    #[test]
+    fn breakpoint_command_rejects_lines_outside_the_streamed_program() {
+        let state = breakpoint_state();
+        assert_eq!(
+            state.breakpoint_command(0),
+            Err(BreakpointRefusal::LineOutOfRange)
+        );
+        assert_eq!(
+            state.breakpoint_command(5),
+            Err(BreakpointRefusal::LineOutOfRange)
+        );
+        assert_eq!(
+            state.breakpoint_command(4),
+            Ok(Command::SetBreakpoint {
+                line: 4,
+                enabled: true
+            })
+        );
+    }
+
+    #[test]
+    fn run_to_requires_confirmation_then_sends_breakpoint_and_start_once() {
+        let mut state = breakpoint_state();
+        let mut sent = Vec::new();
+
+        state.request_run_to(2).expect("run-to request");
+        assert!(sent.is_empty(), "opening the sheet sends nothing");
+        assert_eq!(
+            state
+                .job
+                .breakpoints
+                .pending_run_to()
+                .map(|pending| { (pending.line, pending.source.as_str()) }),
+            Some((2, "G0 X10"))
+        );
+        assert_eq!(state.job.breakpoints.count(), 0);
+
+        let outcome = state.confirm_run_to(recorded_send(&mut sent));
+        assert_eq!(outcome, RunToOutcome::Started { line: 2 });
+        assert_eq!(
+            sent,
+            vec![
+                Command::SetBreakpoint {
+                    line: 2,
+                    enabled: true
+                },
+                Command::StartProgram { from_line: None },
+            ]
+        );
+        assert_eq!(state.job.breakpoints.count(), 1);
+        assert!(state.job.breakpoints.contains(2));
+        assert!(state.job.breakpoints.pending_run_to().is_none());
+    }
+
+    #[test]
+    fn cancelling_run_to_sends_nothing_and_leaves_no_breakpoint() {
+        let mut state = breakpoint_state();
+        let mut sent = Vec::new();
+        state.request_run_to(3).expect("run-to request");
+
+        assert!(state.cancel_run_to());
+        assert!(sent.is_empty(), "cancel sends no command");
+        assert!(state.job.breakpoints.pending_run_to().is_none());
+        assert_eq!(state.job.breakpoints.count(), 0);
+
+        let outcome = state.confirm_run_to(recorded_send(&mut sent));
+        assert_eq!(outcome, RunToOutcome::Refused(RunToRefusal::NoPending));
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn run_to_while_a_job_is_active_only_sets_the_breakpoint() {
+        let mut state = breakpoint_state();
+        state.job.started(1, 4);
+        let mut sent = Vec::new();
+
+        state
+            .request_run_to(3)
+            .expect("run-to request while running");
+        let outcome = state.confirm_run_to(recorded_send(&mut sent));
+        assert_eq!(outcome, RunToOutcome::BreakpointOnly { line: 3 });
+        assert_eq!(
+            sent,
+            vec![Command::SetBreakpoint {
+                line: 3,
+                enabled: true
+            }],
+            "an active job must not be started or restarted"
+        );
+        assert!(state.job.is_running());
+        assert!(state.job.breakpoints.contains(3));
+
+        state.job.paused(2, JobPauseReason::Operator);
+        sent.clear();
+        state
+            .request_run_to(2)
+            .expect("run-to request while paused");
+        let outcome = state.confirm_run_to(recorded_send(&mut sent));
+        assert_eq!(outcome, RunToOutcome::BreakpointOnly { line: 2 });
+        assert_eq!(
+            sent,
+            vec![Command::SetBreakpoint {
+                line: 2,
+                enabled: true
+            }]
+        );
+        assert!(state.job.is_paused());
+    }
+
+    #[test]
+    fn breakpoint_and_run_to_refuse_mock_not_ready_alarm_and_door() {
+        let mut mock = AppState::new();
+        mock.job.loaded("mock.nc".into(), sample_program(), 4);
+        let mut sent = Vec::new();
+        assert_eq!(
+            mock.dispatch_toggle_breakpoint(2, recorded_send(&mut sent)),
+            BreakpointOutcome::Refused(BreakpointRefusal::Mock)
+        );
+        assert_eq!(mock.request_run_to(2), Err(RunToRefusal::Mock));
+        assert!(sent.is_empty());
+
+        let mut connecting = AppState::new();
+        connecting.begin_live("connecting");
+        connecting.job.loaded("c.nc".into(), sample_program(), 4);
+        assert_eq!(
+            connecting.dispatch_toggle_breakpoint(2, recorded_send(&mut sent)),
+            BreakpointOutcome::Refused(BreakpointRefusal::NotReady)
+        );
+        assert_eq!(connecting.request_run_to(2), Err(RunToRefusal::NotReady));
+
+        for machine in ["Alarm", "Door"] {
+            let mut locked = breakpoint_state();
+            locked.machine_state = machine;
+            assert_eq!(
+                locked.dispatch_toggle_breakpoint(2, recorded_send(&mut sent)),
+                BreakpointOutcome::Refused(BreakpointRefusal::MachineLocked),
+                "{machine}"
+            );
+            assert_eq!(
+                locked.request_run_to(2),
+                Err(RunToRefusal::MachineLocked),
+                "{machine}"
+            );
+        }
+        assert!(sent.is_empty(), "every refusal sends nothing");
+    }
+
+    #[test]
+    fn earlier_breakpoints_are_listed_for_the_run_to_warning() {
+        let mut state = breakpoint_state();
+        let mut sent = Vec::new();
+        state.dispatch_toggle_breakpoint(2, recorded_send(&mut sent));
+        state.dispatch_toggle_breakpoint(4, recorded_send(&mut sent));
+        assert_eq!(state.job.breakpoints.earlier_than(2), Vec::<u32>::new());
+        assert_eq!(state.job.breakpoints.earlier_than(4), vec![2]);
+        assert_eq!(state.job.breakpoints.earlier_than(5), vec![2, 4]);
+    }
+
+    #[test]
+    fn a_new_program_clears_breakpoints_selection_and_run_to() {
+        let mut state = breakpoint_state();
+        let mut sent = Vec::new();
+        state.dispatch_toggle_breakpoint(2, recorded_send(&mut sent));
+        state.select_program_line(Some(3));
+        state.request_run_to(3).expect("pending run-to");
+        assert_eq!(state.job.breakpoints.count(), 1);
+        assert_eq!(state.job.breakpoints.selected(), Some(3));
+        assert!(state.job.breakpoints.pending_run_to().is_some());
+
+        let next = Arc::new(
+            ghs_gcode::parse_program("G21\nG1 X1 F800\nM30\n").expect("next program parses"),
+        );
+        state.job.loaded("next.nc".into(), next, 3);
+
+        assert_eq!(state.job.breakpoints.count(), 0);
+        assert_eq!(state.job.breakpoints.selected(), None);
+        assert!(state.job.breakpoints.pending_run_to().is_none());
+        assert_eq!(state.job.breakpoints.error, None);
+    }
+
+    #[test]
+    fn a_breakpoint_pause_shows_the_line_and_keeps_resume_available() {
+        let mut state = breakpoint_state();
+        let mut sent = Vec::new();
+        state.dispatch_toggle_breakpoint(3, recorded_send(&mut sent));
+        state.job.started(1, 4);
+
+        state.job.paused(3, JobPauseReason::Breakpoint);
+        assert_eq!(
+            state.pause_detail().as_deref(),
+            Some("BREAKPOINT AT LINE 3")
+        );
+        assert_eq!(state.job.current_line, 3);
+        assert!(state.job.is_paused());
+        assert!(!state.job.tool_change_pending());
+        assert_eq!(state.job.pause_reason, Some(JobPauseReason::Breakpoint));
+        // The shell's RESUME gate requires a ready, unlocked, paused job with
+        // no pending tool change and no watchdog pause; a breakpoint pause
+        // satisfies all of them.
+        assert!(state.live);
+        assert!(state.connection.is_ready_like());
+        assert!(!matches!(state.machine_state, "Alarm" | "Door"));
+        assert_ne!(state.job.pause_reason, Some(JobPauseReason::Watchdog));
+
+        // Clearing the app-side marker must not clear the pause itself.
+        sent.clear();
+        assert_eq!(
+            state.dispatch_toggle_breakpoint(3, recorded_send(&mut sent)),
+            BreakpointOutcome::Sent {
+                line: 3,
+                enabled: false
+            }
+        );
+        assert!(state.job.is_paused());
+        assert_eq!(state.job.pause_reason, Some(JobPauseReason::Breakpoint));
+
+        // Re-arming the pause line is refused; after resume it is allowed, so
+        // RESUME cannot be trapped in a pause loop by a stray toggle tap.
+        assert_eq!(
+            state.breakpoint_command(3),
+            Err(BreakpointRefusal::PausedAtLine)
+        );
+        assert_eq!(
+            state.run_to_refusal(Some(3)),
+            Some(RunToRefusal::PausedAtLine)
+        );
+        state.job.resumed();
+        assert_eq!(state.pause_detail(), None);
+        assert_eq!(
+            state.breakpoint_command(3),
+            Ok(Command::SetBreakpoint {
+                line: 3,
+                enabled: true
+            })
+        );
     }
 }

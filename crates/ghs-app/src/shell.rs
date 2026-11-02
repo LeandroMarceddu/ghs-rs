@@ -76,9 +76,10 @@ use crate::probe::{
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
-    AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
-    Mode, ProgramKind, ProgramLoadRefusal, ProgramSearch, ProgramSearchMode, RunOption,
-    RunOptionOutcome, SignalState, format_elapsed, pause_reason_label,
+    AppState, Axis, BreakpointOutcome, ConnectionState, ConsoleLevel, JobView, KeypadAction,
+    KeypadTarget, LeftTab, Mode, ProgramBreakpoints, ProgramKind, ProgramLoadRefusal,
+    ProgramSearch, ProgramSearchMode, RunOption, RunOptionOutcome, RunToOutcome, SignalState,
+    format_elapsed,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -279,6 +280,11 @@ pub struct Shell {
     /// Screenshot switch: open the run-options sheet and flip two switches.
     demo_run_options: bool,
     demo_run_options_done: bool,
+    /// Screenshot switch: enable demo breakpoints and show the Program tab.
+    demo_breakpoints: bool,
+    demo_breakpoints_done: bool,
+    /// Screenshot switch: also select a line and open the run-to sheet.
+    demo_run_to: bool,
     settings_entry: Option<SettingsEntry>,
     tool_editor: Option<ToolEditor>,
     macro_editor: Option<MacroEditor>,
@@ -517,6 +523,9 @@ impl Shell {
         let demo_run_options = std::env::args().any(|arg| arg == "--demo-run-options");
         let demo_load_file = std::env::args()
             .find_map(|arg| arg.strip_prefix("--demo-load-file=").map(PathBuf::from));
+        let demo_run_to = std::env::args().any(|arg| arg == "--demo-run-to");
+        let demo_breakpoints =
+            demo_run_to || std::env::args().any(|arg| arg == "--demo-breakpoints");
         let settings_demo_write = std::env::args().any(|arg| arg == "--demo-settings-write");
         let settings_demo_group = std::env::args().find_map(|arg| {
             arg.strip_prefix("--settings-group=")
@@ -620,6 +629,9 @@ impl Shell {
             demo_start_sent: false,
             demo_run_options,
             demo_run_options_done: false,
+            demo_breakpoints,
+            demo_breakpoints_done: false,
+            demo_run_to,
             settings_entry: None,
             tool_editor: None,
             macro_editor: None,
@@ -848,6 +860,30 @@ impl Shell {
             self.state.open_run_options();
             self.toggle_run_option(RunOption::OptionalStop, cx);
             self.toggle_run_option(RunOption::SingleBlock, cx);
+            changed = true;
+        }
+        // Screenshot switch: enable a few breakpoints through the same guarded
+        // toggle path as a tap, then optionally open the run-to sheet without
+        // confirming it. Nothing starts unless the operator confirms.
+        if self.demo_breakpoints
+            && !self.demo_breakpoints_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+        {
+            self.demo_breakpoints_done = true;
+            self.state.mode = Mode::Job;
+            self.state.left_tab = LeftTab::Program;
+            let total = self.state.job.total;
+            for line in [2, 3, 4] {
+                if line <= total {
+                    self.toggle_program_breakpoint(line, cx);
+                }
+            }
+            if self.demo_run_to && total > 0 {
+                let line = 4.min(total);
+                self.select_program_line(line, cx);
+                let _ = self.state.request_run_to(line);
+            }
             changed = true;
         }
         // Screenshot switch: load a real program file through the same bounded
@@ -3911,6 +3947,86 @@ impl Shell {
             && !self.state.job.tool_change_acknowledged()
     }
 
+    // -------------------------------------------- breakpoints and run-to
+
+    /// Send exactly one breakpoint toggle for one source line.
+    fn toggle_program_breakpoint(&mut self, line: u32, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome = self
+            .state
+            .dispatch_toggle_breakpoint(line, |command| match link {
+                Some(link) => link.send(command).map_err(|error| error.to_string()),
+                None => Err("no engine connection".to_string()),
+            });
+        match outcome {
+            BreakpointOutcome::Sent { line, enabled } => {
+                let action = if enabled { "set" } else { "cleared" };
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!("Breakpoint {action} at line {line}"),
+                );
+            }
+            BreakpointOutcome::Rejected(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Engine: {message}")),
+            BreakpointOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+        }
+        cx.notify();
+    }
+
+    /// Select one Program-list row. Nothing is sent.
+    fn select_program_line(&mut self, line: u32, cx: &mut Context<Self>) {
+        self.state.select_program_line(Some(line));
+        cx.notify();
+    }
+
+    /// Open the run-to confirmation for the selected row. Nothing is sent.
+    fn request_run_to(&mut self, cx: &mut Context<Self>) {
+        if let Err(refusal) = self.state.request_run_to_selected() {
+            self.state
+                .push_console(ConsoleLevel::Warn, refusal.message());
+        }
+        cx.notify();
+    }
+
+    /// Close the run-to sheet. Nothing is sent.
+    fn cancel_run_to(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_run_to();
+        cx.notify();
+    }
+
+    /// Confirm the captured run-to line.
+    ///
+    /// The state builds the commands and sends the start only when no job is
+    /// active; the shell never sends motion directly. Cancel never reaches this
+    /// method.
+    fn confirm_run_to(&mut self, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome = self.state.confirm_run_to(|command| match link {
+            Some(link) => link.send(command).map_err(|error| error.to_string()),
+            None => Err("no engine connection".to_string()),
+        });
+        match outcome {
+            RunToOutcome::Started { line } => self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Run to line {line}: breakpoint set; job started from line 1"),
+            ),
+            RunToOutcome::BreakpointOnly { line } => self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Breakpoint set at line {line}; active job was not restarted"),
+            ),
+            RunToOutcome::StartRejected { message, .. } | RunToOutcome::Rejected(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Engine: {message}")),
+            RunToOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+        }
+        cx.notify();
+    }
+
     fn run_macro(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(mac) = self.state.macros.get(index).copied() else {
             return;
@@ -4469,6 +4585,121 @@ impl Shell {
             )
     }
 
+    /// Selected-row breakpoint and run-to actions under the search toolbar.
+    ///
+    /// The gutter remains the direct toggle; this row makes the same action and
+    /// the confirmed run-to reachable for the selected line. Opening the run-to
+    /// sheet sends nothing.
+    fn program_breakpoint_toolbar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let toggle_view = view.clone();
+        let run_view = view;
+        let selected = self.state.job.breakpoints.selected();
+        let toggle_line = selected;
+        let count = self.state.job.breakpoints.count();
+        let gate = self.state.breakpoint_refusal();
+        let breakpoint_refusal =
+            selected.and_then(|line| self.state.breakpoint_command(line).err());
+        let run_refusal = self.state.run_to_refusal(selected);
+        let has_breakpoint = selected.is_some_and(|line| self.state.job.breakpoints.contains(line));
+        let active = self.state.job.is_active();
+        let toggle_ok = selected.is_some() && breakpoint_refusal.is_none();
+        let run_ok = run_refusal.is_none();
+
+        let (headline, detail, detail_color) = match selected {
+            Some(line) => {
+                let detail = if let Some(refusal) = breakpoint_refusal {
+                    refusal.message().to_string()
+                } else if has_breakpoint {
+                    format!("BREAKPOINT ON | {count} TOTAL")
+                } else if active {
+                    format!("JOB ACTIVE: RUN TO SETS BP ONLY | {count} TOTAL")
+                } else {
+                    format!("NO BREAKPOINT | {count} TOTAL")
+                };
+                let color = if breakpoint_refusal.is_some() {
+                    p.warning
+                } else if has_breakpoint {
+                    p.danger
+                } else {
+                    p.text_faint
+                };
+                (format!("LINE {line} SELECTED"), detail, color)
+            }
+            None => {
+                let detail = gate
+                    .map(|refusal| refusal.message().to_string())
+                    .unwrap_or_else(|| "TAP A LINE TO SELECT".to_string());
+                (String::from("NO LINE SELECTED"), detail, p.text_faint)
+            }
+        };
+
+        h_flex()
+            .h(px(64.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if selected.is_some() {
+                                p.text
+                            } else {
+                                p.text_dim
+                            })
+                            .child(headline),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(8.5))
+                            .text_color(detail_color)
+                            .child(detail),
+                    ),
+            )
+            .child(
+                Button::new("program-toggle-breakpoint")
+                    .label("BP")
+                    .secondary()
+                    .h(px(48.0))
+                    .w(px(58.0))
+                    .rounded_lg()
+                    .text_size(px(10.0))
+                    .disabled(!toggle_ok)
+                    .on_click(move |_, _, cx| {
+                        let Some(line) = toggle_line else {
+                            return;
+                        };
+                        toggle_view.update(cx, |shell, cx| {
+                            shell.toggle_program_breakpoint(line, cx);
+                        });
+                    }),
+            )
+            .child(
+                Button::new("program-run-to")
+                    .label("RUN TO")
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(88.0))
+                    .rounded_lg()
+                    .text_size(px(10.0))
+                    .disabled(!run_ok)
+                    .on_click(move |_, _, cx| {
+                        run_view.update(cx, |shell, cx| shell.request_run_to(cx));
+                    }),
+            )
+    }
+
     fn program(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let source = if let Some(program) = self.state.job.program() {
             ProgramSource::Engine(Arc::clone(program))
@@ -4490,24 +4721,42 @@ impl Shell {
         }
         let name = self.state.job_title().to_string();
         let toolbar = self.program_search_toolbar(p, line_count, cx);
+        let actions = self.program_breakpoint_toolbar(p, cx);
         let search = self.state.program_search.clone();
+        let breakpoints = self.state.job.breakpoints.clone();
         let visible_count = self.state.program_search_visible_count();
+        let breakpoint_enabled = self.state.breakpoint_refusal().is_none();
+        let editable_through = if self.state.job.has_program() {
+            self.state.job.total
+        } else {
+            u32::try_from(line_count).unwrap_or(u32::MAX)
+        };
         let no_matches =
             search.is_active() && search.mode() == ProgramSearchMode::Filter && visible_count == 0;
         let body = if no_matches {
             no_program_matches_notice(p, search.query()).into_any_element()
         } else {
             let active_line = self.state.display_line();
+            let list_view = cx.entity();
             // The uniform list still owns virtualization: filter mode maps a
             // visible row through the match index, highlight mode uses the
             // identity mapping, and only the visible range becomes widgets.
+            // Breakpoint markers are looked up by original source line, so
+            // both modes show the same set.
             uniform_list("program-list", visible_count, move |range, _, _| {
                 range
                     .filter_map(|visible| {
                         let index = search.visible_source_index(visible, line_count)?;
                         source
-                            .row(index, active_line, &search)
-                            .map(|row| program_row(row, p))
+                            .row(
+                                index,
+                                active_line,
+                                &search,
+                                &breakpoints,
+                                breakpoint_enabled,
+                                editable_through,
+                            )
+                            .map(|row| program_row(row, p, list_view.clone()))
                     })
                     .collect::<Vec<_>>()
             })
@@ -4521,12 +4770,14 @@ impl Shell {
             .min_h(px(0.0))
             .child(self.program_name_strip(&name, p))
             .child(toolbar)
+            .child(actions)
             .child(body)
             .into_any_element()
     }
 
     /// Slim strip naming the loaded program above the Program search toolbar.
     fn program_name_strip(&self, name: &str, p: Palette) -> Div {
+        let breakpoints = self.state.job.breakpoints.count();
         h_flex()
             .h(px(24.0))
             .flex_shrink_0()
@@ -4554,6 +4805,22 @@ impl Shell {
                     .text_color(p.text)
                     .child(name.to_string()),
             )
+            .when(breakpoints > 0, |this| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .h(px(16.0))
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.0))
+                        .bg(p.danger.opacity(0.16))
+                        .text_size(px(8.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.danger)
+                        .child(format!("{breakpoints} BP")),
+                )
+            })
     }
 
     /// Empty-program prompt with the one action that fixes it.
@@ -4876,6 +5143,235 @@ impl Shell {
             )
     }
 
+    /// Confirmation sheet for one run-to line.
+    ///
+    /// The sheet captures the line and source when `RUN TO` was pressed. The
+    /// scrim and CANCEL only close it; nothing is sent until the explicit
+    /// confirm button.
+    fn run_to_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pending) = self.state.job.breakpoints.pending_run_to() else {
+            return div().into_any_element();
+        };
+        let line = pending.line;
+        let source = pending.source.clone();
+        let will_start = self.state.run_to_will_start();
+        let refusal = self.state.run_to_refusal(Some(line));
+        let active = self.state.job.is_active();
+        let error = self.state.job.breakpoints.error.clone();
+        let earlier = self.state.job.breakpoints.earlier_than(line);
+        let earlier_note = if !active && !earlier.is_empty() {
+            let list = earlier
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Existing breakpoints at line(s) {list} will pause first; RESUME through them to \
+                 reach line {line}."
+            )
+        } else {
+            String::new()
+        };
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let scrim_view = view;
+
+        let warning = if active {
+            format!(
+                "A job is already running or paused. Confirming only sets a breakpoint at line \
+                 {line}; it does not start, restart, or resume the job."
+            )
+        } else {
+            format!(
+                "All lines before line {line} still run from the beginning. The job starts at \
+                 line 1 and pauses before line {line}. Start-from-line is not supported."
+            )
+        };
+        let confirm_label = if will_start {
+            "SET BP + START"
+        } else {
+            "SET BREAKPOINT"
+        };
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("run-to-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_run_to(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(560.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.warning.opacity(0.6))
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.warning)
+                                    .child(format!("RUN TO LINE {line}")),
+                            )
+                            .child(chip("CONFIRM REQUIRED", p)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .font_family(self.mono.clone())
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.0))
+                                    .text_color(p.text_faint)
+                                    .child(format!("{line:>4}")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_size(px(13.0))
+                                    .text_color(p.text)
+                                    .child(source),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(p.warning)
+                            .child(warning),
+                    )
+                    .when(!earlier_note.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(p.warning)
+                                .child(earlier_note),
+                        )
+                    })
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel_alt)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text_faint)
+                                    .child("CONFIRMING WILL"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(p.text)
+                                    .child(format!("SET BREAKPOINT AT LINE {line}")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(if will_start { p.accent } else { p.text_dim })
+                                    .child(if will_start {
+                                        format!("START PROGRAM AT LINE 1 | PAUSE AT LINE {line}")
+                                    } else {
+                                        "LEAVE THE ACTIVE JOB AT ITS CURRENT POSITION".to_string()
+                                    }),
+                            ),
+                    )
+                    .when_some(refusal, |this, refusal| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.danger)
+                                .child(format!(
+                                    "RUN TO BLOCKED: {}",
+                                    refusal.message().to_uppercase()
+                                )),
+                        )
+                    })
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.warning).child(error))
+                    })
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(p.text_faint)
+                            .child("CANCEL, the scrim, and closing this sheet send nothing."),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("run-to-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_run_to(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("run-to-confirm")
+                                    .label(confirm_label)
+                                    .warning()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .disabled(refusal.is_some())
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |shell, cx| {
+                                            shell.confirm_run_to(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The `RUN OPTIONS` sheet: three 48 px rows showing the controller's
     /// authoritative switch values. Opening, closing, or dismissing it never
     /// sends a command.
@@ -5094,12 +5590,7 @@ impl Shell {
 
         let status = self.state.display_job_status();
         let color = job_status_color(&self.state.job, p);
-        let detail = self
-            .state
-            .job
-            .pause_reason
-            .map(pause_reason_label)
-            .map(str::to_string);
+        let detail = self.state.pause_detail();
         let elapsed = format_elapsed(self.state.job.elapsed);
         let start_ok = self.job_start_allowed();
         let pause_ok = self.job_pause_allowed();
@@ -13707,6 +14198,9 @@ impl Render for Shell {
         if self.state.run_options_open {
             root = root.child(self.run_options_overlay(p, cx));
         }
+        if self.state.job.breakpoints.pending_run_to().is_some() {
+            root = root.child(self.run_to_overlay(p, cx));
+        }
         if self.state.job.tool_change.is_some() {
             root = root.child(self.tool_change_overlay(p, cx));
         }
@@ -13741,7 +14235,15 @@ impl ProgramSource {
         }
     }
 
-    fn row(&self, index: usize, active_line: u32, search: &ProgramSearch) -> Option<ProgramRow> {
+    fn row(
+        &self,
+        index: usize,
+        active_line: u32,
+        search: &ProgramSearch,
+        breakpoints: &ProgramBreakpoints,
+        breakpoint_enabled: bool,
+        editable_through: u32,
+    ) -> Option<ProgramRow> {
         match self {
             ProgramSource::Engine(program) => {
                 let line = program.lines.get(index)?;
@@ -13755,6 +14257,11 @@ impl ProgramSource {
                     active: active_line != 0 && number == active_line,
                     matched: search.is_match(index),
                     current_match: search.current_source_index() == Some(index),
+                    breakpoint: breakpoints.contains(number),
+                    selected: breakpoints.selected() == Some(number),
+                    breakpoint_enabled: breakpoint_enabled
+                        && number > 0
+                        && number <= editable_through,
                 })
             }
             ProgramSource::Mock(lines) => {
@@ -13768,6 +14275,11 @@ impl ProgramSource {
                     active: active_line != 0 && number == active_line,
                     matched: search.is_match(index),
                     current_match: search.current_source_index() == Some(index),
+                    breakpoint: breakpoints.contains(number),
+                    selected: breakpoints.selected() == Some(number),
+                    breakpoint_enabled: breakpoint_enabled
+                        && number > 0
+                        && number <= editable_through,
                 })
             }
         }
@@ -13785,11 +14297,20 @@ struct ProgramRow {
     matched: bool,
     /// The row is the current search match.
     current_match: bool,
+    /// The source line has an enabled breakpoint.
+    breakpoint: bool,
+    /// The source line is the selected row.
+    selected: bool,
+    /// The gutter may send a breakpoint toggle for this line right now.
+    breakpoint_enabled: bool,
 }
 
-fn program_row(row: ProgramRow, p: Palette) -> Div {
+fn program_row(row: ProgramRow, p: Palette, view: Entity<Shell>) -> impl IntoElement {
     let active = row.active;
-    let text_color = if active || row.current_match || row.matched {
+    let selected = row.selected;
+    let breakpoint = row.breakpoint;
+    let number = row.number;
+    let text_color = if active || selected || row.current_match || row.matched {
         p.accent
     } else if row.comment {
         p.text_faint
@@ -13807,44 +14328,96 @@ fn program_row(row: ProgramRow, p: Palette) -> Div {
         p.accent.opacity(0.22)
     } else if active {
         p.accent_muted
+    } else if selected {
+        p.raised
     } else if row.matched {
         p.accent.opacity(0.08)
     } else {
         p.panel
     };
-    let border_color = if active || row.current_match {
+    let border_color = if active || selected || row.current_match {
         p.accent
     } else if row.matched {
         p.accent.opacity(0.55)
     } else {
         p.panel
     };
-    h_flex()
+    let select_view = view.clone();
+    let gutter_view = view;
+    let gutter = h_flex()
+        .id(format!("program-gutter-{number}"))
+        .w(px(58.0))
+        .h_full()
+        .flex_shrink_0()
         .items_center()
-        .gap_2()
-        .h(px(23.0))
-        .px_2()
-        .bg(background)
-        .border_l(px(3.0))
-        .border_color(border_color)
+        .gap_1()
+        .when(row.breakpoint_enabled, |this| {
+            let toggle = gutter_view;
+            this.cursor_pointer()
+                .hover(|style| style.bg(p.raised_hover))
+                .on_click(move |_, _, cx| {
+                    toggle.update(cx, |shell, cx| {
+                        shell.toggle_program_breakpoint(number, cx);
+                    });
+                })
+        })
         .child(
             div()
-                .w(px(44.0))
+                .w(px(10.0))
+                .h(px(10.0))
                 .flex_shrink_0()
-                .text_size(px(10.0))
-                .text_color(if active || row.current_match || row.matched {
-                    p.accent
+                .rounded(px(999.0))
+                .border_1()
+                .border_color(if breakpoint {
+                    p.danger
                 } else {
-                    p.text_faint
+                    p.border_strong
                 })
-                .child(row.number.to_string()),
+                .bg(if breakpoint { p.danger } else { p.panel }),
         )
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
+                .text_size(px(10.0))
+                .font_weight(if breakpoint || selected {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if breakpoint {
+                    p.danger
+                } else if active || selected || row.current_match || row.matched {
+                    p.accent
+                } else {
+                    p.text_faint
+                })
+                .child(number.to_string()),
+        );
+
+    h_flex()
+        .id(format!("program-row-{number}"))
+        .items_center()
+        .gap_2()
+        .h(px(48.0))
+        .px_2()
+        .bg(background)
+        .border_l(px(3.0))
+        .border_color(border_color)
+        .cursor_pointer()
+        .on_click(move |_, _, cx| {
+            select_view.update(cx, |shell, cx| {
+                shell.select_program_line(number, cx);
+            });
+        })
+        .child(gutter)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
                 .overflow_hidden()
-                .text_size(px(11.5))
+                .truncate()
+                .text_size(px(12.0))
                 .text_color(text_color)
                 .child(row.text),
         )
@@ -15296,6 +15869,7 @@ mod tests {
     #[test]
     fn program_rows_map_source_numbers_and_current_line() {
         let search = ProgramSearch::default();
+        let breakpoints = ProgramBreakpoints::default();
         let mock = ProgramSource::Mock(vec![
             crate::state::ProgramLine {
                 number: 1,
@@ -15308,25 +15882,93 @@ mod tests {
                 kind: ProgramKind::Setup,
             },
         ]);
-        let row = mock.row(1, 2, &search).expect("second mock row");
+        let row = mock
+            .row(1, 2, &search, &breakpoints, true, 2)
+            .expect("second mock row");
         assert_eq!(row.number, 2);
         assert_eq!(row.text, "M30");
         assert!(row.active);
         assert!(!row.comment);
-        assert!(mock.row(2, 2, &search).is_none());
+        assert!(mock.row(2, 2, &search, &breakpoints, true, 2).is_none());
 
         let program = Arc::new(
             ghs_gcode::parse_program("G21\n(Groove)\nM30\n").expect("sample program parses"),
         );
         let live = ProgramSource::Engine(program);
         assert_eq!(live.len(), 3);
-        assert_eq!(live.row(0, 3, &search).map(|row| row.number), Some(1));
-        let comment = live.row(1, 3, &search).expect("comment row");
+        assert_eq!(
+            live.row(0, 3, &search, &breakpoints, true, 3)
+                .map(|row| row.number),
+            Some(1)
+        );
+        let comment = live
+            .row(1, 3, &search, &breakpoints, true, 3)
+            .expect("comment row");
         assert!(comment.comment);
         assert!(!comment.active);
         assert_eq!(comment.text, "(Groove)");
-        let current = live.row(2, 3, &search).expect("current row");
+        let current = live
+            .row(2, 3, &search, &breakpoints, true, 3)
+            .expect("current row");
         assert!(current.active);
         assert!(!current.comment);
+    }
+
+    #[test]
+    fn program_filter_and_highlight_preserve_breakpoint_markers() {
+        let program = Arc::new(
+            ghs_gcode::parse_program("G21\nG0 X1\nG1 Y1 F800\nG0 X2\n")
+                .expect("search program parses"),
+        );
+        let source = ProgramSource::Engine(Arc::clone(&program));
+        let mut breakpoints = ProgramBreakpoints::default();
+        breakpoints.set_line(2, true);
+        breakpoints.set_line(4, true);
+        breakpoints.select(Some(4));
+
+        let mut filter = ProgramSearch::default();
+        filter.set_query("G0");
+        filter.refresh(program.as_ref(), 7);
+        assert_eq!(filter.visible_count(4), 2);
+        let filtered: Vec<ProgramRow> = (0..filter.visible_count(4))
+            .filter_map(|visible| {
+                let index = filter.visible_source_index(visible, 4)?;
+                source.row(index, 0, &filter, &breakpoints, true, 4)
+            })
+            .collect();
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| (row.number, row.breakpoint))
+                .collect::<Vec<_>>(),
+            vec![(2, true), (4, true)]
+        );
+        assert_eq!(
+            filtered
+                .iter()
+                .filter(|row| row.selected)
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+
+        let mut highlight = ProgramSearch::default();
+        highlight.set_mode(ProgramSearchMode::Highlight);
+        highlight.set_query("G0");
+        highlight.refresh(program.as_ref(), 8);
+        assert_eq!(highlight.visible_count(4), 4);
+        let marked: Vec<(u32, bool)> = (0..4)
+            .filter_map(|index| {
+                source
+                    .row(index, 0, &highlight, &breakpoints, true, 4)
+                    .map(|row| (row.number, row.breakpoint))
+            })
+            .collect();
+        assert_eq!(marked, vec![(1, false), (2, true), (3, false), (4, true)]);
+        let selected = source
+            .row(3, 0, &highlight, &breakpoints, true, 4)
+            .expect("highlight row");
+        assert!(selected.selected);
+        assert!(selected.breakpoint);
     }
 }
