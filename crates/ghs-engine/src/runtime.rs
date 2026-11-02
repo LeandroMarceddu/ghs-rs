@@ -13,8 +13,8 @@ use ghs_core::{
 };
 use ghs_proto::{
     CodeTable, ExtendedCommand, JogCommand, Offsets, ParserState, RealtimeCommand, ResetTarget,
-    Response, ResponseParser, SettingDescription, SettingGroup, StatusReport, Streamer,
-    StreamerError, SystemCommand, validate_line,
+    Response, ResponseParser, SettingDescription, SettingGroup, StartupLine, StatusReport,
+    Streamer, StreamerError, SystemCommand, validate_line,
 };
 use ghs_serial::{SerialTransport, Transport, TransportError, TransportEvent};
 
@@ -22,7 +22,7 @@ use crate::command::{Command, ConnectTarget};
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::event::{EngineEvent, JobAbortReason, JobPauseReason, LogLevel};
-use crate::handle::{EngineInput, SharedState};
+use crate::handle::{EngineInput, MAX_STARTUP_LINES, SharedState};
 use crate::job::JobRunner;
 use crate::overrides::{feed_override_commands, rapid_override_command, spindle_override_commands};
 use crate::telemetry::apply_status;
@@ -196,6 +196,7 @@ pub(crate) struct EngineRuntime {
     setting_descriptions: BTreeMap<u16, SettingDescription>,
     setting_groups: BTreeMap<u16, SettingGroup>,
     controller_tools: BTreeMap<u32, ToolEntry>,
+    startup_lines: BTreeMap<u8, StartupLine>,
     alarm_codes: CodeTable,
     error_codes: CodeTable,
     offsets: Offsets,
@@ -252,6 +253,7 @@ impl EngineRuntime {
             setting_descriptions: BTreeMap::new(),
             setting_groups: BTreeMap::new(),
             controller_tools: BTreeMap::new(),
+            startup_lines: BTreeMap::new(),
             alarm_codes: CodeTable::new(),
             error_codes: CodeTable::new(),
             offsets: Offsets::default(),
@@ -632,6 +634,7 @@ impl EngineRuntime {
         self.setting_descriptions.clear();
         self.setting_groups.clear();
         self.controller_tools.clear();
+        self.clear_startup_lines();
         self.alarm_codes = CodeTable::new();
         self.error_codes = CodeTable::new();
         self.offsets = Offsets::default();
@@ -1899,9 +1902,7 @@ impl EngineRuntime {
             Response::ToolEntry(entry) => self.on_controller_tool(entry),
             Response::Help(text) => self.log_info(format!("[HLP:{text}]")),
             Response::Echo(text) => self.log_info(format!("[echo:{text}]")),
-            Response::StartupLine(line) => {
-                self.log_info(format!("$N{}={}", line.index, line.line));
-            }
+            Response::StartupLine(line) => self.on_startup_line(line),
             Response::StartupLineResult(result) => match result.result {
                 Ok(()) => self.log_ok(format!("Startup line {}: ok", result.line)),
                 Err(code) => {
@@ -2250,6 +2251,26 @@ impl EngineRuntime {
         self.publish_controller_tools();
     }
 
+    /// Record one controller-reported `$N<n>=<line>` startup line.
+    ///
+    /// A repeated index replaces the earlier value and the store stays sorted by
+    /// index because it is a `BTreeMap`. Indexes above [`MAX_STARTUP_LINES`] are
+    /// ignored so a malformed `$N` report cannot grow the cache without bound.
+    /// The line is published on every value response, including an unchanged
+    /// read-back, so the app can observe that a verification read completed.
+    fn on_startup_line(&mut self, line: StartupLine) {
+        self.log_info(format!("$N{}={}", line.index, line.line));
+        if usize::from(line.index) >= MAX_STARTUP_LINES {
+            self.log_warn(format!(
+                "Ignoring startup line $N{}: at most {MAX_STARTUP_LINES} entries are kept",
+                line.index
+            ));
+            return;
+        }
+        self.startup_lines.insert(line.index, line);
+        self.publish_startup_lines();
+    }
+
     /// Forget the cached `PRB` result after the controller invalidates it.
     ///
     /// A soft reset and `$RST=#`/`$RST=*` clear the controller's stored probe
@@ -2581,6 +2602,26 @@ impl EngineRuntime {
         let tools = Arc::new(self.controller_tools.values().cloned().collect::<Vec<_>>());
         self.shared.set_controller_tools(Arc::clone(&tools));
         self.emit(EngineEvent::ControllerTools(tools));
+    }
+
+    fn publish_startup_lines(&mut self) {
+        let lines = Arc::new(self.startup_lines.values().cloned().collect::<Vec<_>>());
+        self.shared.set_startup_lines(Arc::clone(&lines));
+        self.emit(EngineEvent::StartupLines(lines));
+    }
+
+    /// Drop the cached startup lines at the start of a new session.
+    ///
+    /// Called from [`EngineRuntime::reset_session`]; a soft reset is
+    /// deliberately not included because the controller keeps its stored lines
+    /// across `0x18`.
+    fn clear_startup_lines(&mut self) {
+        if self.startup_lines.is_empty() {
+            self.shared.set_startup_lines(Arc::new(Vec::new()));
+            return;
+        }
+        self.startup_lines.clear();
+        self.publish_startup_lines();
     }
 
     /// Drop the cached controller tool table.

@@ -47,7 +47,7 @@ pub use command::{Command, ConnectTarget};
 pub use config::EngineConfig;
 pub use error::EngineError;
 pub use event::{EngineEvent, JobAbortReason, JobPauseReason, LogLevel};
-pub use handle::{Engine, EngineHandle};
+pub use handle::{Engine, EngineHandle, MAX_STARTUP_LINES};
 
 // Re-export the domain and protocol types used in the public API so a caller
 // can construct commands without depending on every crate directly.
@@ -58,7 +58,8 @@ pub use ghs_core::{
 pub use ghs_gcode::{Program, ProgramLine};
 pub use ghs_proto::{
     CodeTable, EncodeError, ExtendedCommand, JogCommand, JogMode, Offsets, ParserState,
-    RealtimeCommand, SettingDescription, SettingGroup, StatusReport, StreamerError, SystemCommand,
+    RealtimeCommand, SettingDescription, SettingGroup, StartupLine, StartupLineResult,
+    StatusReport, StreamerError, SystemCommand,
 };
 pub use ghs_serial::{SerialConfig, Transport, TransportEvent};
 

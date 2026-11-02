@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::RecvTimeoutError;
 use ghs_engine::{
     Command, ConnectTarget, Engine, EngineConfig, EngineError, EngineEvent, EngineHandle,
-    JogCommand, MachineSnapshot, MachineState, Position, RealtimeCommand, SettingValue, Signals,
-    StreamerError, SystemCommand, Wcs,
+    JogCommand, MAX_STARTUP_LINES, MachineSnapshot, MachineState, Position, RealtimeCommand,
+    SettingValue, Signals, StreamerError, SystemCommand, Wcs,
 };
 use support::{Control, ScriptedTransport, wait_until};
 
@@ -1139,6 +1139,316 @@ fn controller_tool_table_reset_rules_are_explicit() {
         ),
         "$RST=# must clear the cached controller tool table"
     );
+    handle.shutdown();
+}
+
+#[test]
+fn startup_line_responses_are_stored_sorted_by_index() {
+    let (handle, control) = connected_engine(standard_script);
+    wait_ready(&handle);
+
+    control.push_line("$N1=M3 S0");
+    control.push_line("$N0=G21 G90");
+    assert!(
+        wait_until(|| handle.startup_lines().len() == 2, Duration::from_secs(1)),
+        "startup lines were not collected: {:?}",
+        handle.startup_lines()
+    );
+
+    let lines = handle.startup_lines();
+    assert_eq!(
+        lines.iter().map(|line| line.index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(lines[0].line, "G21 G90");
+    assert_eq!(lines[1].line, "M3 S0");
+
+    let event = wait_event(
+        &handle,
+        Duration::from_secs(1),
+        |event| matches!(event, EngineEvent::StartupLines(lines) if lines.len() == 2),
+    );
+    match event {
+        EngineEvent::StartupLines(lines) => {
+            assert_eq!(lines[0].index, 0);
+            assert_eq!(lines[0].line, "G21 G90");
+            assert_eq!(lines[1].index, 1);
+            assert_eq!(lines[1].line, "M3 S0");
+        }
+        other => panic!("expected startup lines, got {other:?}"),
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn repeated_startup_line_index_replaces_the_previous_value() {
+    let (handle, control) = connected_engine(standard_script);
+    wait_ready(&handle);
+
+    control.push_line("$N0=G21");
+    assert!(
+        wait_until(|| handle.startup_lines().len() == 1, Duration::from_secs(1)),
+        "the first $N0 report was not collected: {:?}",
+        handle.startup_lines()
+    );
+
+    control.push_line("$N0=M3 S0");
+    assert!(
+        wait_until(
+            || {
+                let lines = handle.startup_lines();
+                lines.len() == 1 && lines[0].line == "M3 S0"
+            },
+            Duration::from_secs(1)
+        ),
+        "the repeated $N0 must replace the previous value: {:?}",
+        handle.startup_lines()
+    );
+    assert_eq!(handle.startup_lines().len(), 1);
+    handle.shutdown();
+}
+
+#[test]
+fn startup_line_reads_update_the_store() {
+    let (handle, control) = connected_engine(|control| {
+        standard_script(control);
+        control.expect_line("$N", &["$N1=M3 S0", "$N0=G21 G90", "ok"]);
+        control.expect_line("$N0", &["$N0=G17 G21", "ok"]);
+        control.expect_line("$N1", &["$N1=", "ok"]);
+    });
+    wait_ready(&handle);
+
+    send_retry(&handle, Command::System(SystemCommand::StartupLines))
+        .expect("read every startup line");
+    assert_sent_line(&control, "$N");
+    assert!(
+        wait_until(
+            || {
+                let lines = handle.startup_lines();
+                lines.len() == 2 && lines[0].line == "G21 G90" && lines[1].line == "M3 S0"
+            },
+            Duration::from_secs(1)
+        ),
+        "$N must populate the store in index order: {:?}",
+        handle.startup_lines()
+    );
+
+    send_retry(&handle, Command::System(SystemCommand::ReadStartupLine(0))).expect("read $N0");
+    assert_sent_line(&control, "$N0");
+    assert!(
+        wait_until(
+            || {
+                let lines = handle.startup_lines();
+                lines.len() == 2 && lines[0].line == "G17 G21"
+            },
+            Duration::from_secs(1)
+        ),
+        "$N0 must replace only index 0: {:?}",
+        handle.startup_lines()
+    );
+
+    send_retry(&handle, Command::System(SystemCommand::ReadStartupLine(1))).expect("read $N1");
+    assert_sent_line(&control, "$N1");
+    assert!(
+        wait_until(
+            || {
+                let lines = handle.startup_lines();
+                lines.len() == 2 && lines[1].line.is_empty()
+            },
+            Duration::from_secs(1)
+        ),
+        "an empty $N1 must still be kept as an entry: {:?}",
+        handle.startup_lines()
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn startup_line_write_is_idle_gated_and_not_optimistic() {
+    let (handle, control) = connected_engine(|control| {
+        standard_script(control);
+        control.expect_line("$N0=G54", &["ok"]);
+        control.expect_line("$N0", &["$N0=G54", "ok"]);
+        control.expect_line("$N1=M3 S0", &["ok"]);
+        control.expect_line("$N1", &["$N1=M3 S0", "ok"]);
+    });
+    wait_ready(&handle);
+
+    control.push_line("$N0=G21");
+    assert!(
+        wait_until(
+            || handle.startup_lines().iter().any(|line| line.line == "G21"),
+            Duration::from_secs(1)
+        ),
+        "the initial $N0 report was not collected: {:?}",
+        handle.startup_lines()
+    );
+
+    send_retry(
+        &handle,
+        Command::System(SystemCommand::WriteStartupLine {
+            index: 0,
+            line: "G54".into(),
+        }),
+    )
+    .expect("write $N0");
+    assert_sent_line(&control, "$N0=G54");
+    assert_eq!(
+        handle.startup_lines()[0].line,
+        "G21",
+        "a write must not update the store before the controller's read-back"
+    );
+
+    send_retry(&handle, Command::System(SystemCommand::ReadStartupLine(0))).expect("verify $N0");
+    assert_sent_line(&control, "$N0");
+    assert!(
+        wait_until(
+            || handle.startup_lines()[0].line == "G54",
+            Duration::from_secs(1)
+        ),
+        "the read-back must update the store: {:?}",
+        handle.startup_lines()
+    );
+
+    control.set_status("<Run|MPos:0.000,0.000,0.000|FS:1200,12000>");
+    wait_for_snapshot(&handle, |snapshot| snapshot.state == MachineState::Run);
+    let error = handle
+        .send(Command::System(SystemCommand::WriteStartupLine {
+            index: 1,
+            line: "M3 S0".into(),
+        }))
+        .expect_err("startup writes are idle-only");
+    assert!(
+        matches!(error, EngineError::NotIdle { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        !control.sent_lines().iter().any(|line| line == "$N1=M3 S0"),
+        "a startup write must not be sent outside Idle"
+    );
+
+    control.set_status(IDLE_STATUS);
+    wait_for_snapshot(&handle, |snapshot| snapshot.state == MachineState::Idle);
+    send_retry(
+        &handle,
+        Command::System(SystemCommand::WriteStartupLine {
+            index: 1,
+            line: "M3 S0".into(),
+        }),
+    )
+    .expect("write $N1 when idle");
+    assert_sent_line(&control, "$N1=M3 S0");
+    assert!(
+        !handle.startup_lines().iter().any(|line| line.index == 1),
+        "a write must not create a cached entry before a read-back: {:?}",
+        handle.startup_lines()
+    );
+
+    send_retry(&handle, Command::System(SystemCommand::ReadStartupLine(1))).expect("verify $N1");
+    assert_sent_line(&control, "$N1");
+    assert!(
+        wait_until(
+            || {
+                let lines = handle.startup_lines();
+                lines.len() == 2 && lines[1].line == "M3 S0"
+            },
+            Duration::from_secs(1)
+        ),
+        "the read-back must add index 1: {:?}",
+        handle.startup_lines()
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn startup_line_result_errors_are_surfaced() {
+    let (handle, control) = connected_engine(standard_script);
+    wait_ready(&handle);
+
+    control.push_line(">N0=G54:error:20");
+    let error = wait_event(&handle, Duration::from_secs(1), |event| {
+        matches!(event, EngineEvent::Error(20))
+    });
+    assert_eq!(error, EngineEvent::Error(20));
+    handle.shutdown();
+}
+
+#[test]
+fn reconnect_clears_startup_lines_and_soft_reset_preserves_them() {
+    let (handle, control) = connected_engine(|control| {
+        standard_script(control);
+        control.expect_byte(0x18, &[]);
+    });
+    wait_ready(&handle);
+
+    control.push_line("$N0=G21 G90");
+    control.push_line("$N1=M3 S0");
+    assert!(
+        wait_until(|| handle.startup_lines().len() == 2, Duration::from_secs(1)),
+        "startup lines were not collected: {:?}",
+        handle.startup_lines()
+    );
+
+    send_retry(&handle, Command::Reset).expect("soft reset");
+    assert_sent_byte(&control, 0x18);
+    assert_eq!(
+        handle.startup_lines().len(),
+        2,
+        "a soft reset must preserve the controller's stored startup lines"
+    );
+
+    handle.disconnect();
+    wait_event(&handle, Duration::from_secs(1), |event| {
+        matches!(event, EngineEvent::Disconnected)
+    });
+
+    let (transport, control2) = ScriptedTransport::new();
+    standard_script(&control2);
+    handle
+        .connect(ConnectTarget::Transport(Box::new(transport)))
+        .expect("reconnect");
+    assert!(
+        handle.startup_lines().is_empty(),
+        "a new session must clear the cached startup lines: {:?}",
+        handle.startup_lines()
+    );
+    wait_ready(&handle);
+    assert!(handle.startup_lines().is_empty());
+    handle.shutdown();
+}
+
+#[test]
+fn oversized_startup_line_indexes_are_bounded_and_ignored() {
+    let (handle, control) = connected_engine(standard_script);
+    wait_ready(&handle);
+
+    for index in 0..=MAX_STARTUP_LINES {
+        control.push_line(&format!("$N{index}=LINE{index}"));
+    }
+    control.push_line("$N255=LINE255");
+
+    assert!(
+        wait_until(
+            || handle.startup_lines().len() == MAX_STARTUP_LINES,
+            Duration::from_secs(1)
+        ),
+        "expected the startup-line store to stop at {MAX_STARTUP_LINES} entries: {:?}",
+        handle.startup_lines()
+    );
+
+    let lines = handle.startup_lines();
+    assert_eq!(
+        lines.iter().map(|line| line.index).collect::<Vec<_>>(),
+        (0..MAX_STARTUP_LINES as u8).collect::<Vec<_>>()
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.index as usize >= MAX_STARTUP_LINES),
+        "an out-of-range index must be ignored: {:?}",
+        lines
+    );
+    assert!(!lines.iter().any(|line| line.line == "LINE255"));
     handle.shutdown();
 }
 

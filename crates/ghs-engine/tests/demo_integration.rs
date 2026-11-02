@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use ghs_demo::{SimProfile, start};
 use ghs_engine::{
-    Axes, Axis, Command, ConnectTarget, Engine, EngineConfig, EngineEvent, EngineHandle, JobState,
-    JogCommand, JogMode, Position,
+    Axes, Axis, Command, ConnectTarget, Engine, EngineConfig, EngineError, EngineEvent,
+    EngineHandle, JobState, JogCommand, JogMode, Position, SystemCommand,
 };
 
 fn fast_config() -> EngineConfig {
@@ -103,6 +103,64 @@ fn connects_to_the_simulator_and_runs_mdi() {
     );
 
     engine.disconnect();
+    engine.shutdown();
+}
+
+#[test]
+fn reads_writes_and_verifies_startup_lines_on_the_simulator() {
+    let (engine, _session) = connect_simulator(fast_config());
+
+    engine
+        .send(Command::System(SystemCommand::StartupLines))
+        .expect("read startup lines");
+    assert!(
+        wait_until(|| engine.startup_lines().len() == 2, Duration::from_secs(2)),
+        "the simulator's startup lines were not collected: {:?}",
+        engine.startup_lines()
+    );
+    assert_eq!(
+        engine
+            .startup_lines()
+            .iter()
+            .map(|line| line.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    engine
+        .send(Command::System(SystemCommand::WriteStartupLine {
+            index: 0,
+            line: "G21 G90".into(),
+        }))
+        .expect("write $N0");
+    assert!(
+        !engine
+            .startup_lines()
+            .iter()
+            .any(|line| line.line == "G21 G90"),
+        "a write must not update the store before the controller's read-back"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match engine.send(Command::System(SystemCommand::ReadStartupLine(0))) {
+            Ok(()) => break,
+            Err(EngineError::Busy) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("read $N0: {error}"),
+        }
+    }
+    assert!(
+        wait_until(
+            || engine
+                .startup_lines()
+                .iter()
+                .any(|line| line.index == 0 && line.line == "G21 G90"),
+            Duration::from_secs(2)
+        ),
+        "the startup-line read-back was not stored: {:?}",
+        engine.startup_lines()
+    );
     engine.shutdown();
 }
 

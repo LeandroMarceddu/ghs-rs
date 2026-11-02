@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ghs_core::{ControllerInfo, ProbeResult, Setting, SettingValue, ToolEntry};
 use ghs_gcode::Program;
-use ghs_proto::{CodeTable, SettingDescription, SettingGroup};
+use ghs_proto::{CodeTable, SettingDescription, SettingGroup, StartupLine};
 
 /// Why a running job stopped feeding lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,6 +128,16 @@ pub enum EngineEvent {
     /// avoids polling and never mixes these entries with the application's own
     /// editable tool table.
     ControllerTools(Arc<Vec<ToolEntry>>),
+
+    /// The controller's stored startup lines from `$N` / `$N<n>` changed.
+    ///
+    /// The current `$N` startup lines, sorted by index.
+    ///
+    /// Entries are sorted by ascending index and bounded by
+    /// [`crate::MAX_STARTUP_LINES`]. The same list is available from
+    /// [`crate::EngineHandle::startup_lines`]; the event lets the UI repaint
+    /// without parsing console text.
+    StartupLines(Arc<Vec<StartupLine>>),
 
     /// A probe result from `[PRB:...]` or the status `PRB:` field.
     Probe(ProbeResult),

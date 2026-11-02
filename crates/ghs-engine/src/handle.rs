@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use ghs_core::{ControllerInfo, MachineSnapshot, Setting, ToolEntry};
 use ghs_proto::{
     CodeTable as ProtoCodeTable, Offsets, ParserState, SettingDescription, SettingGroup,
-    StatusReport, Streamer, StreamerConfig,
+    StartupLine, StatusReport, Streamer, StreamerConfig,
 };
 
 use crate::command::{Command, ConnectTarget};
@@ -17,6 +17,13 @@ use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::event::EngineEvent;
 use crate::runtime::EngineRuntime;
+
+/// Maximum number of controller startup lines retained by the engine.
+///
+/// grblHAL reports the two stored startup lines `$N0` and `$N1`. The bound
+/// protects the session from a malformed or hostile `$N` report that keeps
+/// returning new indexes.
+pub const MAX_STARTUP_LINES: usize = 8;
 
 /// Latest telemetry shared with the UI plus session bookkeeping.
 #[derive(Debug, Default)]
@@ -28,6 +35,7 @@ pub(crate) struct Telemetry {
     pub(crate) setting_descriptions: Arc<Vec<SettingDescription>>,
     pub(crate) setting_groups: Arc<Vec<SettingGroup>>,
     pub(crate) controller_tools: Arc<Vec<ToolEntry>>,
+    pub(crate) startup_lines: Arc<Vec<StartupLine>>,
     pub(crate) offsets: Arc<Offsets>,
     pub(crate) parser_state: Option<Arc<ParserState>>,
     pub(crate) alarm_codes: Arc<ProtoCodeTable>,
@@ -91,6 +99,14 @@ impl SharedState {
 
     pub(crate) fn set_controller_tools(&self, tools: Arc<Vec<ToolEntry>>) {
         self.telemetry().controller_tools = tools;
+    }
+
+    pub(crate) fn startup_lines(&self) -> Arc<Vec<StartupLine>> {
+        Arc::clone(&self.telemetry().startup_lines)
+    }
+
+    pub(crate) fn set_startup_lines(&self, lines: Arc<Vec<StartupLine>>) {
+        self.telemetry().startup_lines = lines;
     }
 
     pub(crate) fn offsets(&self) -> Arc<Offsets> {
@@ -326,6 +342,18 @@ impl EngineHandle {
     #[must_use]
     pub fn controller_tools(&self) -> Arc<Vec<ToolEntry>> {
         self.shared.controller_tools()
+    }
+
+    /// Controller startup lines read with `$N` / `$N<n>`.
+    ///
+    /// Entries are sorted by ascending index and bounded by
+    /// [`MAX_STARTUP_LINES`]; indexes beyond the bound are ignored. The list is
+    /// replaced by each controller report, is never updated optimistically from
+    /// a `$N<n>=<line>` write, and is cleared at the start of a new session.
+    /// A soft reset preserves it because the controller keeps the stored lines.
+    #[must_use]
+    pub fn startup_lines(&self) -> Arc<Vec<StartupLine>> {
+        self.shared.startup_lines()
     }
 
     /// Latest `$#` offsets.
