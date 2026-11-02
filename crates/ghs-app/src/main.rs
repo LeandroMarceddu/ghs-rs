@@ -53,6 +53,13 @@
 //! `--demo-breakpoints` enables three demo breakpoints through the normal
 //! toggle action and shows the Program tab; `--demo-run-to` does the same and
 //! opens the run-to confirmation without confirming it.
+//! `--console-filter=all|cmd|info|ok|warn|error` preselects a Console view
+//! filter after the session starts (view only; the ring buffer keeps every
+//! line), and `--demo-console-save` writes one `exports/console.log` snapshot
+//! through the same SAVE LOG action for the export screenshot. `--console-tab`
+//! reveals the Console after the demo program loads (a load normally shows the
+//! Program tab); `--console-filter` implies it. Normal startup filters nothing,
+//! writes no log file, and keeps the load behaviour unchanged.
 //! `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
@@ -65,6 +72,7 @@
 
 mod config;
 mod connection;
+mod console_log;
 mod file_browser;
 mod height_compensation;
 mod height_map_library;

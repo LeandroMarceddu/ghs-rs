@@ -57,6 +57,7 @@ use gpui_kit::{
 };
 
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
+use crate::console_log::ConsoleLogStatus;
 use crate::file_browser::{BrowserEntry, FileBrowser, compact_path, format_size, read_program};
 use crate::height_compensation::{
     HeightApplyGate, HeightApplyPreview, HeightMapApplyStatus, HeightMapSnapshot,
@@ -76,10 +77,11 @@ use crate::probe::{
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
-    AppState, Axis, BreakpointOutcome, ConnectionState, ConsoleLevel, FEED_OVERRIDE_MAX,
-    FEED_OVERRIDE_MIN, FEED_OVERRIDE_RESET, JobView, KeypadAction, KeypadTarget, LeftTab, Mode,
-    ProgramBreakpoints, ProgramKind, ProgramLoadRefusal, ProgramSearch, ProgramSearchMode,
-    RunOption, RunOptionOutcome, RunToOutcome, SignalState, SleepOutcome, format_elapsed,
+    AppState, Axis, BreakpointOutcome, ConnectionState, ConsoleCounts, ConsoleFilter, ConsoleLevel,
+    FEED_OVERRIDE_MAX, FEED_OVERRIDE_MIN, FEED_OVERRIDE_RESET, JobView, KeypadAction, KeypadTarget,
+    LeftTab, Mode, ProgramBreakpoints, ProgramKind, ProgramLoadRefusal, ProgramSearch,
+    ProgramSearchMode, RunOption, RunOptionOutcome, RunToOutcome, SignalState, SleepOutcome,
+    format_elapsed,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -260,6 +262,12 @@ pub struct Shell {
     feed_slider_active: bool,
     spindle_slider_active: bool,
     console_scroll: ScrollHandle,
+    /// Screenshot switch: save the console log once after the demo handshake.
+    demo_console_save: bool,
+    demo_console_save_done: bool,
+    /// Screenshot switch: reveal the Console tab after the demo program loads.
+    demo_console_tab: bool,
+    demo_console_tab_done: bool,
     program_scroll: UniformListScrollHandle,
     program_search_input: Entity<InputState>,
     /// Open in-app program file browser, when the modal is visible.
@@ -622,6 +630,11 @@ impl Shell {
             feed_slider_active: false,
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
+            demo_console_save: std::env::args().any(|arg| arg == "--demo-console-save"),
+            demo_console_save_done: false,
+            demo_console_tab: std::env::args().any(|arg| arg == "--console-tab")
+                || std::env::args().any(|arg| arg.starts_with("--console-filter=")),
+            demo_console_tab_done: false,
             program_scroll: UniformListScrollHandle::new(),
             program_search_input,
             file_browser,
@@ -695,6 +708,16 @@ impl Shell {
         };
         if !mock {
             shell.connect_demo(cx);
+        }
+        // Screenshot switch: preselect a Console filter. Applied after
+        // `connect_demo` because `begin_live` resets the filter for a new
+        // session. This changes only the view; no line is dropped.
+        if let Some(value) = std::env::args().find_map(|arg| {
+            arg.strip_prefix("--console-filter=")
+                .map(std::string::ToString::to_string)
+        }) && let Some(filter) = ConsoleFilter::parse(&value)
+        {
+            shell.state.set_console_filter(filter);
         }
         // Screenshot switch: open the sleep confirmation after `begin_live`
         // resets the session. Opening sends nothing; normal startup keeps the
@@ -849,6 +872,30 @@ impl Shell {
             changed = true;
         }
         if self.panel.poll() {
+            changed = true;
+        }
+        // Screenshot switch: the demo load reveals the Program tab, so a
+        // Console capture asks for it once the parsed program exists. Normal
+        // startup keeps the load behaviour unchanged.
+        if self.demo_console_tab
+            && !self.demo_console_tab_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+        {
+            self.demo_console_tab_done = true;
+            self.state.left_tab = LeftTab::Console;
+            changed = true;
+        }
+        // Screenshot switch: write one console snapshot after the demo
+        // handshake has produced a useful buffer. This is the same SAVE LOG
+        // action a tap uses; it never sends a command.
+        if self.demo_console_save
+            && !self.demo_console_save_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.console.len() >= 12
+        {
+            self.demo_console_save_done = true;
+            self.save_console_log(cx);
             changed = true;
         }
         // `--demo-start` presses the same action as the toolbar button, once.
@@ -3081,6 +3128,16 @@ impl Shell {
         cx.notify();
     }
 
+    /// Write one snapshot of the Console ring buffer to `exports/console.log`.
+    ///
+    /// Local only: no command is sent, no network or background writer starts,
+    /// and a missing configuration root is reported instead of falling back to
+    /// the working directory.
+    fn save_console_log(&mut self, cx: &mut Context<Self>) {
+        let _ = self.state.save_console_log(now_unix_s());
+        cx.notify();
+    }
+
     /// Fixed `exports/offsets.nc` path for the current configuration root.
     fn offsets_export_path(&self) -> Option<PathBuf> {
         self.state
@@ -4493,11 +4550,22 @@ impl Shell {
             p,
             LeftTab::Program,
             self.state.left_tab == LeftTab::Program,
-            view,
+            view.clone(),
         );
+        let save_log = Button::new("console-save-log")
+            .label("SAVE LOG")
+            .secondary()
+            .h(px(48.0))
+            .w(px(84.0))
+            .flex_shrink_0()
+            .rounded_lg()
+            .text_size(px(9.5))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |shell, cx| shell.save_console_log(cx));
+            });
 
         let body = match self.state.left_tab {
-            LeftTab::Console => self.console(p).into_any_element(),
+            LeftTab::Console => self.console(p, cx).into_any_element(),
             LeftTab::Program => self.program(p, cx).into_any_element(),
         };
 
@@ -4518,7 +4586,10 @@ impl Shell {
                     .border_b_1()
                     .border_color(p.border)
                     .child(console_tab)
-                    .child(program_tab),
+                    .child(program_tab)
+                    .when(self.state.left_tab == LeftTab::Console, |this| {
+                        this.child(save_log)
+                    }),
             )
             .child(
                 div()
@@ -4553,16 +4624,53 @@ impl Shell {
             )
     }
 
-    fn console(&self, p: Palette) -> impl IntoElement {
-        v_flex()
+    fn console(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let filter = self.state.console_filter;
+        let visible = self.state.console_visible_count();
+        let status = self.state.console_log_status.clone();
+
+        let mut scroll = v_flex()
             .gap_1()
             .p_2()
-            .h_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .min_w(px(0.0))
             .id("console-scroll")
             .track_scroll(&self.console_scroll)
             .overflow_y_scroll()
-            .font_family(self.mono.clone())
-            .children(self.state.console.iter().map(|line| {
+            .font_family(self.mono.clone());
+        if visible == 0 {
+            let empty_headline = if filter == ConsoleFilter::All {
+                "NO CONSOLE LINES".to_string()
+            } else {
+                format!("NO {} LINES", filter.label())
+            };
+            scroll = scroll.child(
+                v_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .pt_2()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_dim)
+                            .child(empty_headline),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child(format!(
+                                "The ring buffer keeps all {} lines; ALL restores the view.",
+                                self.state.console.len()
+                            )),
+                    ),
+            );
+        } else {
+            scroll = scroll.children(self.state.console_visible_lines().map(|line| {
                 h_flex()
                     .gap_2()
                     .items_start()
@@ -4582,7 +4690,42 @@ impl Shell {
                             .text_color(console_color(line.level, p))
                             .child(line.text.clone()),
                     )
-            }))
+            }));
+        }
+
+        v_flex()
+            .h_full()
+            .w_full()
+            .min_w(px(0.0))
+            .child(self.console_filter_bar(p, cx))
+            .when_some(status, |this, status| {
+                this.child(console_log_status_row(p, &status, self.mono.clone()))
+            })
+            .child(scroll)
+    }
+
+    /// Six 48 px filter chips with live per-level counts.
+    ///
+    /// The chips claim equal flex shares and never exceed the card width, so
+    /// the Console has no horizontal scroll at 1280x800.
+    fn console_filter_bar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let counts = self.state.console_counts();
+        let active = self.state.console_filter;
+        let view = cx.entity();
+        h_flex()
+            .h(px(48.0))
+            .w_full()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .pb_1()
+            .overflow_hidden()
+            .children(
+                ConsoleFilter::ALL
+                    .into_iter()
+                    .map(|filter| console_filter_chip(filter, active, counts, p, view.clone())),
+            )
     }
 
     /// Program-tab search toolbar: query field, mode toggle, match count, and
@@ -15532,6 +15675,97 @@ fn console_color(level: ConsoleLevel, p: Palette) -> Hsla {
         ConsoleLevel::Warn => p.warning,
         ConsoleLevel::Error => p.danger,
     }
+}
+
+/// One 48 px Console level chip with its count.
+///
+/// Chips share the row equally and have no minimum width, so six of them fit
+/// the 340 px Console card used at 1280x800 without a horizontal scroll.
+fn console_filter_chip(
+    filter: ConsoleFilter,
+    active: ConsoleFilter,
+    counts: ConsoleCounts,
+    p: Palette,
+    view: Entity<Shell>,
+) -> impl IntoElement {
+    let selected = filter == active;
+    let tint = match filter {
+        ConsoleFilter::All | ConsoleFilter::Info => p.text_dim,
+        ConsoleFilter::Command => p.info,
+        ConsoleFilter::Ok => p.success,
+        ConsoleFilter::Warn => p.warning,
+        ConsoleFilter::Error => p.danger,
+    };
+    div()
+        .id(format!("console-filter-{}", filter.id()))
+        .h(px(48.0))
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .border_1()
+        .border_color(if selected { p.accent } else { p.border })
+        .bg(if selected {
+            p.accent_muted
+        } else {
+            p.panel_alt
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(p.raised_hover))
+        .on_click(move |_, _, cx| {
+            view.update(cx, |shell, cx| {
+                shell.state.set_console_filter(filter);
+                shell.console_scroll.scroll_to_bottom();
+                cx.notify();
+            });
+        })
+        .child(
+            div()
+                .text_size(px(9.0))
+                .line_height(px(10.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(if selected { tint } else { p.text_dim })
+                .child(filter.label()),
+        )
+        .child(
+            div()
+                .text_size(px(9.0))
+                .line_height(px(10.0))
+                .text_color(if selected { tint } else { p.text_faint })
+                .child(counts.count(filter).to_string()),
+        )
+}
+
+/// Result of the last `SAVE LOG`: scope/status plus the full target path.
+fn console_log_status_row(p: Palette, status: &ConsoleLogStatus, mono: SharedString) -> Div {
+    let color = if status.ok { p.success } else { p.danger };
+    v_flex()
+        .w_full()
+        .flex_shrink_0()
+        .gap_0()
+        .px_2()
+        .pb_1()
+        .child(
+            div()
+                .text_size(px(9.0))
+                .line_height(px(10.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(status.text.clone()),
+        )
+        .when_some(status.path.clone(), |this, path| {
+            this.child(
+                div()
+                    .font_family(mono)
+                    .text_size(px(8.5))
+                    .line_height(px(10.5))
+                    .text_color(p.text_dim)
+                    .child(format!("PATH: {}", path.display())),
+            )
+        })
 }
 
 // ------------------------------------------------------------ settings rows

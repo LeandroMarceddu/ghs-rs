@@ -23,6 +23,7 @@ use ghs_engine::{
 use ghs_probe::XyPoint;
 
 use crate::config::ConfigModel;
+use crate::console_log::{ConsoleLogError, ConsoleLogExport, ConsoleLogStatus, write_console_log};
 use crate::height_compensation::HeightMapCompensation;
 use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_run};
 use crate::macros::{MacroModel, MacroRunGate, MacroRunRequest};
@@ -455,6 +456,151 @@ pub enum ConsoleLevel {
     Warn,
     Error,
 }
+
+impl ConsoleLevel {
+    /// Short uppercase label used by the filter chips and the exported log.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConsoleLevel::Info => "INFO",
+            ConsoleLevel::Command => "CMD",
+            ConsoleLevel::Ok => "OK",
+            ConsoleLevel::Warn => "WARN",
+            ConsoleLevel::Error => "ERROR",
+        }
+    }
+}
+
+/// View-only Console filter.
+///
+/// The ring buffer keeps every line regardless of this value; only the rendered
+/// list and the `SAVE LOG` scope change. The active filter survives normal
+/// telemetry polling and resets to [`ConsoleFilter::All`] when a new controller
+/// session begins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConsoleFilter {
+    /// Every line in the ring buffer.
+    #[default]
+    All,
+    /// Commands sent to the controller.
+    Command,
+    /// Informational protocol and status lines.
+    Info,
+    /// Controller acknowledgements.
+    Ok,
+    /// Warnings.
+    Warn,
+    /// Errors and alarms.
+    Error,
+}
+
+impl ConsoleFilter {
+    /// Chip order, left to right.
+    pub const ALL: [Self; 6] = [
+        Self::All,
+        Self::Command,
+        Self::Info,
+        Self::Ok,
+        Self::Warn,
+        Self::Error,
+    ];
+
+    /// Uppercase chip and export label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Command => "CMD",
+            Self::Info => "INFO",
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    /// Stable element-ID suffix for the chip.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Command => "cmd",
+            Self::Info => "info",
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse a screenshot/CLI value such as `warn` or `command`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "cmd" | "command" => Some(Self::Command),
+            "info" => Some(Self::Info),
+            "ok" => Some(Self::Ok),
+            "warn" | "warning" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    /// Whether one line belongs to this view.
+    pub fn matches(self, level: ConsoleLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Command => level == ConsoleLevel::Command,
+            Self::Info => level == ConsoleLevel::Info,
+            Self::Ok => level == ConsoleLevel::Ok,
+            Self::Warn => level == ConsoleLevel::Warn,
+            Self::Error => level == ConsoleLevel::Error,
+        }
+    }
+}
+
+/// Per-level line counts for the Console chips.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConsoleCounts {
+    /// Every line in the ring buffer.
+    pub all: usize,
+    pub command: usize,
+    pub info: usize,
+    pub ok: usize,
+    pub warn: usize,
+    pub error: usize,
+}
+
+impl ConsoleCounts {
+    /// Count one ring buffer in a single pass.
+    pub fn from_lines(lines: &[ConsoleLine]) -> Self {
+        let mut counts = Self::default();
+        for line in lines {
+            counts.all += 1;
+            match line.level {
+                ConsoleLevel::Info => counts.info += 1,
+                ConsoleLevel::Command => counts.command += 1,
+                ConsoleLevel::Ok => counts.ok += 1,
+                ConsoleLevel::Warn => counts.warn += 1,
+                ConsoleLevel::Error => counts.error += 1,
+            }
+        }
+        counts
+    }
+
+    /// Count represented by one chip.
+    pub fn count(&self, filter: ConsoleFilter) -> usize {
+        match filter {
+            ConsoleFilter::All => self.all,
+            ConsoleFilter::Command => self.command,
+            ConsoleFilter::Info => self.info,
+            ConsoleFilter::Ok => self.ok,
+            ConsoleFilter::Warn => self.warn,
+            ConsoleFilter::Error => self.error,
+        }
+    }
+}
+
+/// Explicit bound of the in-app Console ring buffer.
+///
+/// The console keeps the newest [`CONSOLE_LINE_LIMIT`] lines; older lines are
+/// dropped. Export writes a snapshot of what remains.
+pub const CONSOLE_LINE_LIMIT: usize = 200;
 
 #[derive(Clone, Debug)]
 pub struct ConsoleLine {
@@ -1515,6 +1661,19 @@ impl ProgramLoadRefusal {
     }
 }
 
+/// Short scope label for a successful console-log export.
+fn console_log_scope(export: &ConsoleLogExport) -> String {
+    let mut scope = if export.filtered {
+        format!("{} LINES ({} VIEW)", export.lines, export.filter.label())
+    } else {
+        format!("{} LINES (FULL BUFFER)", export.lines)
+    };
+    if export.skipped > 0 {
+        scope.push_str(&format!(", {} SKIPPED AT SIZE LIMIT", export.skipped));
+    }
+    scope
+}
+
 /// `MM:SS` (or `H:MM:SS` past an hour) for job time.
 pub fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
@@ -1799,6 +1958,10 @@ pub struct AppState {
     pub sd: Option<String>,
     pub coolant: [bool; 3],
     pub console: Vec<ConsoleLine>,
+    /// View-only level filter. The ring buffer keeps every line.
+    pub console_filter: ConsoleFilter,
+    /// Last `SAVE LOG` result shown under the filter chips.
+    pub console_log_status: Option<ConsoleLogStatus>,
     pub program: Vec<ProgramLine>,
     pub active_line: usize,
     pub progress: f32,
@@ -1890,6 +2053,8 @@ impl AppState {
             sd: None,
             coolant: [false, true, false],
             console: seed_console(),
+            console_filter: ConsoleFilter::All,
+            console_log_status: None,
             program: PROGRAM
                 .iter()
                 .enumerate()
@@ -1952,6 +2117,10 @@ impl AppState {
         self.active_line = 0;
         self.progress = 0.0;
         self.console.clear();
+        // A fresh session starts with the full view and no previous export
+        // result. Telemetry polling never changes the filter.
+        self.console_filter = ConsoleFilter::All;
+        self.console_log_status = None;
         self.mpos = vec![0.0; self.profile.capabilities.axes.len()];
         self.dro = vec![0.0; self.profile.capabilities.axes.len()];
         self.wco = vec![0.0; self.profile.capabilities.axes.len()];
@@ -3436,9 +3605,86 @@ impl AppState {
 
     pub fn push_console(&mut self, level: ConsoleLevel, text: impl Into<String>) {
         self.console.push(ConsoleLine::new(level, text));
-        if self.console.len() > 200 {
-            self.console.remove(0);
+        if self.console.len() > CONSOLE_LINE_LIMIT {
+            let excess = self.console.len() - CONSOLE_LINE_LIMIT;
+            self.console.drain(..excess);
         }
+    }
+
+    // ------------------------------------------------------------- console view
+
+    /// Select the Console level filter. This changes the view only.
+    pub fn set_console_filter(&mut self, filter: ConsoleFilter) {
+        self.console_filter = filter;
+    }
+
+    /// Counts for every filter chip, computed from the whole ring buffer.
+    pub fn console_counts(&self) -> ConsoleCounts {
+        ConsoleCounts::from_lines(&self.console)
+    }
+
+    /// Number of lines the active filter would show.
+    pub fn console_visible_count(&self) -> usize {
+        self.console
+            .iter()
+            .filter(|line| self.console_filter.matches(line.level))
+            .count()
+    }
+
+    /// Lines the Console should render for the active filter.
+    pub fn console_visible_lines(&self) -> impl Iterator<Item = &ConsoleLine> {
+        self.console
+            .iter()
+            .filter(|line| self.console_filter.matches(line.level))
+    }
+
+    /// Write one snapshot of the ring buffer through the active filter.
+    ///
+    /// The export is local only and never sends a command. The result is kept
+    /// in [`Self::console_log_status`] for the Console toolbar and is also
+    /// appended to the Console as an `OK` or `ERROR` line.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal or write error after recording it in the status
+    /// line. A missing configuration root writes nothing.
+    pub fn save_console_log(
+        &mut self,
+        now_unix_s: u64,
+    ) -> Result<ConsoleLogExport, ConsoleLogError> {
+        let root = self.config.store_root().map(std::path::Path::to_path_buf);
+        let result = write_console_log(
+            &self.console,
+            self.console_filter,
+            root.as_deref(),
+            now_unix_s,
+        );
+        match &result {
+            Ok(export) => {
+                let scope = console_log_scope(export);
+                self.console_log_status = Some(ConsoleLogStatus {
+                    ok: true,
+                    text: format!("SAVED {scope}"),
+                    path: Some(export.path.clone()),
+                });
+                self.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Console log saved: {} ({scope})", export.path.display()),
+                );
+            }
+            Err(error) => {
+                self.console_log_status = Some(ConsoleLogStatus {
+                    ok: false,
+                    text: format!("NOT SAVED: {error}"),
+                    path: error.path().map(std::path::Path::to_path_buf),
+                });
+                self.push_console(
+                    ConsoleLevel::Error,
+                    format!("Console log not saved: {error}"),
+                );
+            }
+        }
+        result
     }
 
     pub fn open_keypad(&mut self, target: KeypadTarget) {
@@ -4074,6 +4320,249 @@ mod tests {
             "the oldest entry is dropped at the cap"
         );
         assert_eq!(state.mdi_history.last().map(String::as_str), Some("G0 X0"));
+    }
+
+    // ------------------------------------------------------ console filter/log
+
+    #[test]
+    fn console_filter_shows_only_the_selected_level() {
+        let mut state = AppState::new();
+        state.console.clear();
+        state.push_console(ConsoleLevel::Info, "info one");
+        state.push_console(ConsoleLevel::Command, "> G0 X1");
+        state.push_console(ConsoleLevel::Warn, "warn one");
+        state.push_console(ConsoleLevel::Error, "error one");
+        state.push_console(ConsoleLevel::Ok, "ok one");
+
+        state.set_console_filter(ConsoleFilter::Warn);
+        let visible: Vec<&str> = state
+            .console_visible_lines()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(visible, vec!["warn one"]);
+        assert_eq!(state.console_visible_count(), 1);
+        assert_eq!(
+            state.console.len(),
+            5,
+            "filtering changes the view, not the ring buffer"
+        );
+        assert_eq!(state.console_counts().count(ConsoleFilter::All), 5);
+
+        state.set_console_filter(ConsoleFilter::Command);
+        assert_eq!(state.console_visible_count(), 1);
+        assert_eq!(
+            state
+                .console_visible_lines()
+                .next()
+                .map(|line| line.text.as_str()),
+            Some("> G0 X1")
+        );
+    }
+
+    #[test]
+    fn console_counts_cover_each_level_and_the_total() {
+        let mut state = AppState::new();
+        state.console.clear();
+        state.push_console(ConsoleLevel::Info, "info one");
+        state.push_console(ConsoleLevel::Info, "info two");
+        state.push_console(ConsoleLevel::Command, "> $I+");
+        state.push_console(ConsoleLevel::Ok, "ok");
+        state.push_console(ConsoleLevel::Warn, "warning");
+        state.push_console(ConsoleLevel::Error, "error");
+        let counts = state.console_counts();
+        assert_eq!(counts.all, 6);
+        assert_eq!(counts.info, 2);
+        assert_eq!(counts.command, 1);
+        assert_eq!(counts.ok, 1);
+        assert_eq!(counts.warn, 1);
+        assert_eq!(counts.error, 1);
+        for filter in ConsoleFilter::ALL {
+            assert_eq!(
+                counts.count(filter),
+                state
+                    .console
+                    .iter()
+                    .filter(|line| filter.matches(line.level))
+                    .count(),
+                "chip count matches the view for {}",
+                filter.label()
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_all_restores_the_full_console() {
+        let mut state = AppState::new();
+        state.console.clear();
+        state.push_console(ConsoleLevel::Info, "info one");
+        state.push_console(ConsoleLevel::Warn, "warn one");
+        state.push_console(ConsoleLevel::Error, "error one");
+
+        state.set_console_filter(ConsoleFilter::Error);
+        assert_eq!(state.console_visible_count(), 1);
+
+        state.set_console_filter(ConsoleFilter::All);
+        assert_eq!(state.console_visible_count(), 3);
+        let visible: Vec<&str> = state
+            .console_visible_lines()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(visible, vec!["info one", "warn one", "error one"]);
+    }
+
+    #[test]
+    fn a_new_session_resets_the_console_filter_and_export_status() {
+        let mut state = AppState::new();
+        state.set_console_filter(ConsoleFilter::Error);
+        state.console_log_status = Some(ConsoleLogStatus {
+            ok: true,
+            text: "SAVED".to_string(),
+            path: None,
+        });
+
+        state.begin_live("test transport");
+
+        assert_eq!(state.console_filter, ConsoleFilter::All);
+        assert!(state.console_log_status.is_none());
+        assert_eq!(state.console.len(), 1);
+        assert_eq!(state.console[0].text, "test transport");
+    }
+
+    #[test]
+    fn console_ring_buffer_is_bounded_while_filtering_is_view_only() {
+        let mut state = AppState::new();
+        state.console.clear();
+        for index in 0..CONSOLE_LINE_LIMIT + 7 {
+            state.push_console(ConsoleLevel::Info, format!("line {index}"));
+        }
+        assert_eq!(state.console.len(), CONSOLE_LINE_LIMIT);
+        assert_eq!(
+            state.console.first().map(|line| line.text.as_str()),
+            Some("line 7"),
+            "the oldest lines are dropped at the explicit cap"
+        );
+
+        state.set_console_filter(ConsoleFilter::Info);
+        assert_eq!(state.console_visible_count(), CONSOLE_LINE_LIMIT);
+        assert_eq!(state.console_counts().all, CONSOLE_LINE_LIMIT);
+    }
+
+    #[test]
+    fn save_console_log_writes_the_fixed_path_and_reports_the_filtered_scope() {
+        let dir = TempRoot::new("console-log");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        state.console.clear();
+        state.push_console(ConsoleLevel::Info, "hello");
+        state.push_console(ConsoleLevel::Warn, "careful");
+        state.set_console_filter(ConsoleFilter::Warn);
+
+        let export = state.save_console_log(1_700_000_000).expect("save log");
+        let expected = dir.path.join("exports").join("console.log");
+        assert_eq!(export.path, expected);
+        assert!(export.filtered);
+        assert_eq!(export.lines, 1);
+        assert_eq!(export.ring_lines, 2);
+
+        let text = fs::read_to_string(&expected).expect("read log");
+        assert!(text.contains("Generated: 2023-11-14 22:13:20 UTC"));
+        assert!(text.contains("Filter: WARN (filtered view; ring buffer has 2 lines)"));
+        assert!(text.contains("careful"));
+        assert!(!text.contains("hello"), "the filtered export omits INFO");
+
+        let status = state.console_log_status.as_ref().expect("status");
+        assert!(status.ok);
+        assert_eq!(status.path.as_ref(), Some(&expected));
+        assert!(
+            status.text.contains("1 LINES (WARN VIEW)"),
+            "{}",
+            status.text
+        );
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.level == ConsoleLevel::Ok && line.text.contains("saved")),
+            "the result is also appended to the Console"
+        );
+    }
+
+    #[test]
+    fn save_console_log_labels_a_full_buffer_export() {
+        let dir = TempRoot::new("console-log-full");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        state.console.clear();
+        state.push_console(ConsoleLevel::Info, "hello");
+        state.push_console(ConsoleLevel::Warn, "careful");
+
+        let export = state.save_console_log(0).expect("save log");
+        assert!(!export.filtered);
+        assert_eq!(export.lines, 2);
+        let text = fs::read_to_string(&export.path).expect("read log");
+        assert!(text.contains("Filter: ALL (full ring buffer)"));
+        assert!(text.contains("hello"));
+        assert!(text.contains("careful"));
+        let status = state.console_log_status.as_ref().expect("status");
+        assert!(
+            status.text.contains("2 LINES (FULL BUFFER)"),
+            "{}",
+            status.text
+        );
+    }
+
+    #[test]
+    fn save_console_log_reports_a_write_failure_and_keeps_the_previous_file() {
+        let dir = TempRoot::new("console-log-failure");
+        // A regular file where the exports directory belongs forces the write
+        // to fail without relying on permissions.
+        fs::write(dir.path.join("exports"), b"blocking file").expect("blocking file");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+
+        let error = state.save_console_log(0).expect_err("write must fail");
+        let status = state.console_log_status.as_ref().expect("status");
+        assert!(!status.ok);
+        assert!(status.text.contains("NOT SAVED"), "{}", status.text);
+        assert!(
+            status
+                .path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("exports/console.log")),
+            "the full target path is reported"
+        );
+        assert!(
+            error.to_string().contains("console.log"),
+            "the error names the target: {error}"
+        );
+        assert_eq!(
+            fs::read(dir.path.join("exports")).expect("blocking file"),
+            b"blocking file"
+        );
+    }
+
+    #[test]
+    fn save_console_log_is_refused_without_a_configuration_root() {
+        let mut state = AppState::new();
+        // Unit tests never open the developer's real config directory.
+        assert!(state.config.store_root().is_none());
+        let error = state.save_console_log(0).expect_err("no root");
+        assert_eq!(error, ConsoleLogError::NoConfigRoot);
+        let status = state.console_log_status.as_ref().expect("status");
+        assert!(!status.ok);
+        assert!(
+            status
+                .text
+                .contains("configuration directory is unavailable")
+        );
+        assert!(status.path.is_none());
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.level == ConsoleLevel::Error && line.text.contains("not saved")),
+            "the refusal is surfaced in the Console"
+        );
     }
 
     #[test]
