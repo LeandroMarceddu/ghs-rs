@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use ghs_core::{ControllerInfo, ProbeResult, Setting, SettingValue, ToolEntry};
 use ghs_gcode::Program;
-use ghs_proto::{CodeTable, SettingDescription, SettingGroup, StartupLine};
+use ghs_proto::{
+    CodeTable, LastEvents, LimitState, PinMapping, PinState, SettingDescription, SettingGroup,
+    StartupLine,
+};
 
 /// Why a running job stopped feeding lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,6 +141,29 @@ pub enum EngineEvent {
     /// [`crate::EngineHandle::startup_lines`]; the event lets the UI repaint
     /// without parsing console text.
     StartupLines(Arc<Vec<StartupLine>>),
+
+    /// The controller pin map from `$PINS` changed.
+    ///
+    /// Entries are sorted by pin id and bounded by
+    /// [`crate::MAX_PIN_MAPPINGS`]. A `$PINS` request replaces the map, so the
+    /// event may carry an empty list while a refresh is in progress. The same
+    /// list is available from [`crate::EngineHandle::pin_map`].
+    PinMap(Arc<Vec<PinMapping>>),
+
+    /// Auxiliary pin levels from a `$PINSTATE` report.
+    ///
+    /// The same value is available from [`crate::EngineHandle::pin_state`].
+    PinState(Arc<PinState>),
+
+    /// Limit-switch state from a `$LIM` report.
+    ///
+    /// The same value is available from [`crate::EngineHandle::limit_state`].
+    LimitState(Arc<LimitState>),
+
+    /// Last control and limit events from a `$LEV` report.
+    ///
+    /// The same value is available from [`crate::EngineHandle::limit_events`].
+    LastEvents(Arc<LastEvents>),
 
     /// A probe result from `[PRB:...]` or the status `PRB:` field.
     Probe(ProbeResult),

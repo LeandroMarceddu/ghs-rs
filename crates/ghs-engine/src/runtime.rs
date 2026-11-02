@@ -12,9 +12,10 @@ use ghs_core::{
     ToolEntry,
 };
 use ghs_proto::{
-    CodeTable, ExtendedCommand, JogCommand, Offsets, ParserState, RealtimeCommand, ResetTarget,
-    Response, ResponseParser, SettingDescription, SettingGroup, StartupLine, StatusReport,
-    Streamer, StreamerError, SystemCommand, validate_line,
+    CodeTable, ExtendedCommand, JogCommand, LastEvents, LimitState, Offsets, ParserState,
+    PinMapping, PinState, RealtimeCommand, ResetTarget, Response, ResponseParser,
+    SettingDescription, SettingGroup, StartupLine, StatusReport, Streamer, StreamerError,
+    SystemCommand, validate_line,
 };
 use ghs_serial::{SerialTransport, Transport, TransportError, TransportEvent};
 
@@ -22,7 +23,7 @@ use crate::command::{Command, ConnectTarget};
 use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::event::{EngineEvent, JobAbortReason, JobPauseReason, LogLevel};
-use crate::handle::{EngineInput, MAX_STARTUP_LINES, SharedState};
+use crate::handle::{EngineInput, MAX_PIN_MAPPINGS, MAX_STARTUP_LINES, SharedState};
 use crate::job::JobRunner;
 use crate::overrides::{feed_override_commands, rapid_override_command, spindle_override_commands};
 use crate::telemetry::apply_status;
@@ -201,6 +202,10 @@ pub(crate) struct EngineRuntime {
     error_codes: CodeTable,
     offsets: Offsets,
     parser_state: Option<ParserState>,
+    pin_map: BTreeMap<u16, PinMapping>,
+    pin_state: Option<Arc<PinState>>,
+    limit_state: Option<Arc<LimitState>>,
+    last_events: Option<Arc<LastEvents>>,
 
     next_poll_at: Instant,
     next_full_at: Instant,
@@ -258,6 +263,10 @@ impl EngineRuntime {
             error_codes: CodeTable::new(),
             offsets: Offsets::default(),
             parser_state: None,
+            pin_map: BTreeMap::new(),
+            pin_state: None,
+            limit_state: None,
+            last_events: None,
             next_poll_at: now,
             next_full_at: now,
         }
@@ -640,6 +649,10 @@ impl EngineRuntime {
         self.error_codes = CodeTable::new();
         self.offsets = Offsets::default();
         self.parser_state = None;
+        self.pin_map.clear();
+        self.pin_state = None;
+        self.limit_state = None;
+        self.last_events = None;
 
         self.next_poll_at = now;
         self.next_full_at = now;
@@ -670,6 +683,9 @@ impl EngineRuntime {
         self.mpg_active = false;
         self.watchdog_paused = false;
         self.last_status_at = None;
+        // Live pin levels and events belong to the link that just closed. The
+        // static `$PINS` mapping is retained until the next session starts.
+        self.clear_live_pin_reports();
         self.shared.connected.store(false, Ordering::Release);
         self.shared.ready.store(false, Ordering::Release);
         // The virtual switches belong to the closed controller session.
@@ -877,6 +893,7 @@ impl EngineRuntime {
         );
         let is_sleep = matches!(command, SystemCommand::Sleep);
         let is_offsets_dump = matches!(command, SystemCommand::Offsets);
+        let is_pins_dump = matches!(command, SystemCommand::Extended(ExtendedCommand::Pins));
         let line = command.encode()?;
         if is_dump {
             self.settings_dump_pending = true;
@@ -889,6 +906,12 @@ impl EngineRuntime {
                 if is_offsets_dump {
                     // A manual `$#` refresh replaces the controller table.
                     self.clear_controller_tools();
+                }
+                if is_pins_dump {
+                    // Each `$PINS` is a complete controller report. Drop the
+                    // previous map so entries the controller no longer sends do
+                    // not survive a refresh.
+                    self.clear_pin_map();
                 }
                 if matches!(
                     &command,
@@ -1634,6 +1657,10 @@ impl EngineRuntime {
         // The controller drops its stored probe result on a soft reset; the
         // cached copy must not survive and show a stale `PRB`.
         self.invalidate_probe_result();
+        // Pin levels, limits and last events are instantaneous snapshots from
+        // before the reset. The `$PINS` map is controller configuration and is
+        // kept until the next session.
+        self.clear_live_pin_reports();
         let now = Instant::now();
         self.next_poll_at = deadline(now, self.config.status_poll_idle);
         if self.sleeping {
@@ -1918,6 +1945,10 @@ impl EngineRuntime {
             }
             Response::Probe(result) => self.on_probe(result),
             Response::ToolEntry(entry) => self.on_controller_tool(entry),
+            Response::PinMapping(mapping) => self.on_pin_mapping(mapping),
+            Response::PinState(state) => self.on_pin_state(state),
+            Response::LimitState(state) => self.on_limit_state(state),
+            Response::LastEvents(events) => self.on_last_events(events),
             Response::Help(text) => self.log_info(format!("[HLP:{text}]")),
             Response::Echo(text) => self.log_info(format!("[echo:{text}]")),
             Response::StartupLine(line) => self.on_startup_line(line),
@@ -2289,6 +2320,63 @@ impl EngineRuntime {
         self.publish_startup_lines();
     }
 
+    /// Record one controller-reported `[PIN:...]` mapping entry.
+    ///
+    /// The map is replaced when a `$PINS` request is accepted, so entries are
+    /// accumulated for the current report only. A repeated id replaces the
+    /// earlier entry and ids beyond [`MAX_PIN_MAPPINGS`] are ignored, keeping a
+    /// malformed report from growing the cache without bound.
+    fn on_pin_mapping(&mut self, mapping: PinMapping) {
+        let direction = mapping
+            .direction
+            .map_or("unknown", |direction| direction.as_str());
+        self.log_info(format!(
+            "$PINS {} {} ({direction})",
+            mapping.id, mapping.name
+        ));
+        let id = mapping.id;
+        if self.pin_map.get(&id) == Some(&mapping) {
+            return;
+        }
+        if !self.pin_map.contains_key(&id) && self.pin_map.len() >= MAX_PIN_MAPPINGS {
+            self.log_warn(format!(
+                "Ignoring pin {id}: at most {MAX_PIN_MAPPINGS} entries are kept"
+            ));
+            return;
+        }
+        self.pin_map.insert(id, mapping);
+        self.publish_pin_map();
+    }
+
+    fn on_pin_state(&mut self, state: PinState) {
+        self.log_info(format!(
+            "$PINSTATE mask {} inputs {} outputs {}",
+            state.mask,
+            state.inputs.len(),
+            state.outputs.len()
+        ));
+        let state = Arc::new(state);
+        self.pin_state = Some(Arc::clone(&state));
+        self.shared.set_pin_state(Some(Arc::clone(&state)));
+        self.emit(EngineEvent::PinState(state));
+    }
+
+    fn on_limit_state(&mut self, state: LimitState) {
+        self.log_info(format!("$LIM mask {} axes {}", state.mask, state.axes));
+        let state = Arc::new(state);
+        self.limit_state = Some(Arc::clone(&state));
+        self.shared.set_limit_state(Some(Arc::clone(&state)));
+        self.emit(EngineEvent::LimitState(state));
+    }
+
+    fn on_last_events(&mut self, events: LastEvents) {
+        self.log_info(format!("$LEV {} {}", events.count, events.signals));
+        let events = Arc::new(events);
+        self.last_events = Some(Arc::clone(&events));
+        self.shared.set_limit_events(Some(Arc::clone(&events)));
+        self.emit(EngineEvent::LastEvents(events));
+    }
+
     /// Forget the cached `PRB` result after the controller invalidates it.
     ///
     /// A soft reset and `$RST=#`/`$RST=*` clear the controller's stored probe
@@ -2427,6 +2515,7 @@ impl EngineRuntime {
         self.error_latched = false;
         self.sleep_on_ack = false;
         self.wake_probe_pending = false;
+        self.clear_live_pin_reports();
 
         self.shared.set_info(None);
         self.shared.set_settings(Arc::new(Vec::new()));
@@ -2626,6 +2715,37 @@ impl EngineRuntime {
         let lines = Arc::new(self.startup_lines.values().cloned().collect::<Vec<_>>());
         self.shared.set_startup_lines(Arc::clone(&lines));
         self.emit(EngineEvent::StartupLines(lines));
+    }
+
+    fn publish_pin_map(&mut self) {
+        let map = Arc::new(self.pin_map.values().cloned().collect::<Vec<_>>());
+        self.shared.set_pin_map(Arc::clone(&map));
+        self.emit(EngineEvent::PinMap(map));
+    }
+
+    /// Drop the cached `$PINS` map before a fresh controller report.
+    ///
+    /// Called when a `$PINS` request is accepted. The map is controller
+    /// configuration, so a soft reset and a disconnect keep it; a new session
+    /// clears it through [`EngineRuntime::reset_session`].
+    fn clear_pin_map(&mut self) {
+        if self.pin_map.is_empty() {
+            self.shared.set_pin_map(Arc::new(Vec::new()));
+            return;
+        }
+        self.pin_map.clear();
+        self.publish_pin_map();
+    }
+
+    /// Drop the live pin levels, limit state and last events.
+    ///
+    /// These describe one instant and belong to the current link. The static
+    /// `$PINS` map is deliberately kept.
+    fn clear_live_pin_reports(&mut self) {
+        self.pin_state = None;
+        self.limit_state = None;
+        self.last_events = None;
+        self.shared.clear_live_pin_reports();
     }
 
     /// Drop the cached startup lines at the start of a new session.

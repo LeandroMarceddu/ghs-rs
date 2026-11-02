@@ -8,8 +8,9 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use ghs_core::{ControllerInfo, MachineSnapshot, Setting, ToolEntry};
 use ghs_proto::{
-    CodeTable as ProtoCodeTable, Offsets, ParserState, SettingDescription, SettingGroup,
-    StartupLine, StatusReport, Streamer, StreamerConfig,
+    CodeTable as ProtoCodeTable, LastEvents, LimitState, Offsets, ParserState, PinMapping,
+    PinState, SettingDescription, SettingGroup, StartupLine, StatusReport, Streamer,
+    StreamerConfig,
 };
 
 use crate::command::{Command, ConnectTarget};
@@ -24,6 +25,12 @@ use crate::runtime::EngineRuntime;
 /// protects the session from a malformed or hostile `$N` report that keeps
 /// returning new indexes.
 pub const MAX_STARTUP_LINES: usize = 8;
+
+/// Maximum number of `$PINS` mapping entries retained by the engine.
+///
+/// A controller reports a handful of pins. The bound protects the session from
+/// a malformed or hostile `$PINS` report that keeps returning new pin numbers.
+pub const MAX_PIN_MAPPINGS: usize = 256;
 
 /// Latest telemetry shared with the UI plus session bookkeeping.
 #[derive(Debug, Default)]
@@ -40,6 +47,10 @@ pub(crate) struct Telemetry {
     pub(crate) parser_state: Option<Arc<ParserState>>,
     pub(crate) alarm_codes: Arc<ProtoCodeTable>,
     pub(crate) error_codes: Arc<ProtoCodeTable>,
+    pub(crate) pin_map: Arc<Vec<PinMapping>>,
+    pub(crate) pin_state: Option<Arc<PinState>>,
+    pub(crate) limit_state: Option<Arc<LimitState>>,
+    pub(crate) limit_events: Option<Arc<LastEvents>>,
 }
 
 /// State shared between the engine thread and the handle.
@@ -158,6 +169,49 @@ impl SharedState {
         let mut telemetry = self.telemetry();
         telemetry.alarm_codes = alarms;
         telemetry.error_codes = errors;
+    }
+
+    pub(crate) fn pin_map(&self) -> Arc<Vec<PinMapping>> {
+        Arc::clone(&self.telemetry().pin_map)
+    }
+
+    pub(crate) fn set_pin_map(&self, map: Arc<Vec<PinMapping>>) {
+        self.telemetry().pin_map = map;
+    }
+
+    pub(crate) fn pin_state(&self) -> Option<Arc<PinState>> {
+        self.telemetry().pin_state.clone()
+    }
+
+    pub(crate) fn set_pin_state(&self, state: Option<Arc<PinState>>) {
+        self.telemetry().pin_state = state;
+    }
+
+    pub(crate) fn limit_state(&self) -> Option<Arc<LimitState>> {
+        self.telemetry().limit_state.clone()
+    }
+
+    pub(crate) fn set_limit_state(&self, state: Option<Arc<LimitState>>) {
+        self.telemetry().limit_state = state;
+    }
+
+    pub(crate) fn limit_events(&self) -> Option<Arc<LastEvents>> {
+        self.telemetry().limit_events.clone()
+    }
+
+    pub(crate) fn set_limit_events(&self, events: Option<Arc<LastEvents>>) {
+        self.telemetry().limit_events = events;
+    }
+
+    /// Drop the live `$PINSTATE`, `$LIM` and `$LEV` snapshots.
+    ///
+    /// The static `$PINS` mapping is kept: it describes controller
+    /// configuration, not a level at one instant.
+    pub(crate) fn clear_live_pin_reports(&self) {
+        let mut telemetry = self.telemetry();
+        telemetry.pin_state = None;
+        telemetry.limit_state = None;
+        telemetry.limit_events = None;
     }
 
     pub(crate) fn optional_stop(&self) -> bool {
@@ -452,6 +506,55 @@ impl EngineHandle {
     #[must_use]
     pub fn code_tables(&self) -> (Arc<ProtoCodeTable>, Arc<ProtoCodeTable>) {
         self.shared.code_tables()
+    }
+
+    /// Controller pin map read with `$PINS`, sorted by pin id.
+    ///
+    /// Each accepted `$PINS` request replaces the map; entries are bounded by
+    /// [`MAX_PIN_MAPPINGS`] and a repeated id replaces the earlier entry. The
+    /// map is controller configuration, not a live level: it is preserved
+    /// across a soft reset and a disconnect, and cleared at the start of a new
+    /// session.
+    ///
+    /// Request a report with
+    /// `Command::System(SystemCommand::Extended(ExtendedCommand::Pins))`.
+    #[must_use]
+    pub fn pin_map(&self) -> Arc<Vec<PinMapping>> {
+        self.shared.pin_map()
+    }
+
+    /// Latest auxiliary pin levels from `$PINSTATE`.
+    ///
+    /// `None` means the controller has not reported pin levels in this
+    /// session. A report replaces the previous value. The value is live: a
+    /// soft reset, a disconnect and a new session clear it, and a new
+    /// `$PINSTATE` request repopulates it.
+    ///
+    /// Request a report with
+    /// `Command::System(SystemCommand::Extended(ExtendedCommand::PinState))`.
+    #[must_use]
+    pub fn pin_state(&self) -> Option<Arc<PinState>> {
+        self.shared.pin_state()
+    }
+
+    /// Latest limit-switch state from `$LIM`.
+    ///
+    /// `None` means no report arrived in this session. The value is live: a
+    /// soft reset, a disconnect and a new session clear it. Request a report
+    /// with `Command::System(SystemCommand::Extended(ExtendedCommand::Limits))`.
+    #[must_use]
+    pub fn limit_state(&self) -> Option<Arc<LimitState>> {
+        self.shared.limit_state()
+    }
+
+    /// Latest control and limit events from `$LEV`.
+    ///
+    /// `None` means no report arrived in this session. The value is live: a
+    /// soft reset, a disconnect and a new session clear it. Request a report
+    /// with `Command::System(SystemCommand::Extended(ExtendedCommand::Events))`.
+    #[must_use]
+    pub fn limit_events(&self) -> Option<Arc<LastEvents>> {
+        self.shared.limit_events()
     }
 
     /// Stop the engine thread and wait for it to exit.

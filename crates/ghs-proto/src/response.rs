@@ -9,6 +9,7 @@ use crate::params::{
     parse_setting_description, parse_setting_group, parse_setting_line,
 };
 use crate::parser_state::ParserState;
+use crate::pins::{LastEvents, LimitState, PinMapping, PinState};
 use crate::status::{StatusReport, parse_status};
 use crate::util::{bounded, leading_u16};
 
@@ -78,6 +79,14 @@ pub enum Response {
     Probe(ProbeResult),
     /// `[T:...]` tool-table entry from `$#`.
     ToolEntry(ToolEntry),
+    /// One `[PIN:...]` mapping entry from `$PINS`.
+    PinMapping(PinMapping),
+    /// `[PINSTATE:...]` auxiliary pin levels from `$PINSTATE`.
+    PinState(PinState),
+    /// `[LIM:...]` limit-switch state from `$LIM`.
+    LimitState(LimitState),
+    /// `[LEV:...]` last control and limit events from `$LEV`.
+    LastEvents(LastEvents),
     /// `[HLP:...]` help text.
     Help(String),
     /// `[echo: ...]` echoed input.
@@ -233,6 +242,30 @@ fn parse_bracketed(line: &str) -> Response {
             Err(_) => Response::Unknown(line.to_string()),
         };
     }
+    if tag.eq_ignore_ascii_case("PIN") {
+        return match PinMapping::parse(rest) {
+            Some(mapping) => Response::PinMapping(mapping),
+            None => Response::Feedback(line.to_string()),
+        };
+    }
+    if tag.eq_ignore_ascii_case("PINSTATE") {
+        return match PinState::parse(rest) {
+            Some(state) => Response::PinState(state),
+            None => Response::Feedback(line.to_string()),
+        };
+    }
+    if tag.eq_ignore_ascii_case("LIM") {
+        return match LimitState::parse(rest) {
+            Some(state) => Response::LimitState(state),
+            None => Response::Feedback(line.to_string()),
+        };
+    }
+    if tag.eq_ignore_ascii_case("LEV") {
+        return match LastEvents::parse(rest) {
+            Some(events) => Response::LastEvents(events),
+            None => Response::Feedback(line.to_string()),
+        };
+    }
     if let Ok(offset) = parse_offset_line(line) {
         return Response::Offset(offset);
     }
@@ -280,6 +313,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Vec<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pins::PinDirection;
     use ghs_core::{Position, Wcs};
 
     #[test]
@@ -374,6 +408,114 @@ mod tests {
                 vec![1.0, 2.0, 3.0]
             ))
         );
+    }
+
+    #[test]
+    fn parses_pin_mapping_lines() {
+        let input = Response::parse("[PIN:0|X limit|input]");
+        match input {
+            Response::PinMapping(mapping) => {
+                assert_eq!(mapping.id, 0);
+                assert_eq!(mapping.name, "X limit");
+                assert_eq!(mapping.direction, Some(PinDirection::Input));
+            }
+            other => panic!("expected pin mapping, got {other:?}"),
+        }
+
+        let output = Response::parse("[PIN:12|Aux output 3|output|extra]");
+        assert!(matches!(
+            output,
+            Response::PinMapping(mapping)
+                if mapping.id == 12 && mapping.direction == Some(PinDirection::Output)
+        ));
+
+        // A malformed line stays visible as feedback instead of being dropped.
+        assert_eq!(
+            Response::parse("[PIN:not-a-number|X limit|input]"),
+            Response::Feedback("[PIN:not-a-number|X limit|input]".into())
+        );
+    }
+
+    #[test]
+    fn parses_pin_state_lines() {
+        let state = Response::parse("[PINSTATE:HSDEP|0101|1010]");
+        match state {
+            Response::PinState(state) => {
+                assert_eq!(state.mask, ghs_core::Signals::parse("HSDEP"));
+                assert_eq!(state.inputs, vec![false, true, false, true]);
+                assert_eq!(state.outputs, vec![true, false, true, false]);
+            }
+            other => panic!("expected pin state, got {other:?}"),
+        }
+
+        assert!(matches!(
+            Response::parse("[PINSTATE:0x3|1|0]"),
+            Response::PinState(state)
+                if state.mask == (ghs_core::Signals::X_LIMIT | ghs_core::Signals::Y_LIMIT)
+        ));
+        assert_eq!(
+            Response::parse("[PINSTATE:0|012|0]"),
+            Response::Feedback("[PINSTATE:0|012|0]".into())
+        );
+    }
+
+    #[test]
+    fn parses_limit_and_last_event_lines() {
+        let limits = Response::parse("[LIM:XYZ]");
+        match limits {
+            Response::LimitState(state) => {
+                assert_eq!(state.mask, 0b111);
+                assert_eq!(state.axes.to_string(), "XYZ");
+                assert!(state.is_asserted(ghs_core::Axis::Z));
+            }
+            other => panic!("expected limit state, got {other:?}"),
+        }
+
+        let events = Response::parse("[LEV:42|HSDEP]");
+        match events {
+            Response::LastEvents(events) => {
+                assert_eq!(events.count, 42);
+                assert_eq!(events.signals, ghs_core::Signals::parse("HSDEP"));
+            }
+            other => panic!("expected last events, got {other:?}"),
+        }
+
+        assert_eq!(
+            Response::parse("[LIM:X!]"),
+            Response::Feedback("[LIM:X!]".into())
+        );
+        assert_eq!(
+            Response::parse("[LEV:many|X]"),
+            Response::Feedback("[LEV:many|X]".into())
+        );
+    }
+
+    #[test]
+    fn malformed_pin_reports_never_panic() {
+        for line in [
+            "[PIN:]",
+            "[PIN:0|]",
+            "[PINSTATE:]",
+            "[PINSTATE:0|]",
+            "[PINSTATE:0|1|2|3|4]",
+            "[LIM:]",
+            "[LIM:garbage]",
+            "[LEV:]",
+            "[LEV:0|garbage]",
+            "[PIN:0|X limit|input",
+        ] {
+            let response = Response::parse(line);
+            assert!(
+                matches!(
+                    response,
+                    Response::Feedback(_)
+                        | Response::Unknown(_)
+                        | Response::PinState(_)
+                        | Response::LimitState(_)
+                ),
+                "{line:?} decoded as {response:?}"
+            );
+        }
     }
 
     #[test]

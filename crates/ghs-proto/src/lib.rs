@@ -30,6 +30,7 @@ mod line;
 mod offsets;
 mod params;
 mod parser_state;
+mod pins;
 mod response;
 mod status;
 mod streamer;
@@ -56,6 +57,7 @@ pub use parser_state::{
     CoolantMode, DistanceMode, FeedRateMode, ParserState, Plane, SpindleMode, parse_gc_word_list,
     parse_parser_state,
 };
+pub use pins::{LastEvents, LimitState, MAX_PIN_STATE_BITS, PinDirection, PinMapping, PinState};
 pub use response::{Response, StartupLine, StartupLineResult, parse_bytes};
 pub use status::{
     AccessoryState, HomingStatus, MalformedField, SdStatus, StatusReport, parse_status,
@@ -64,7 +66,7 @@ pub use streamer::{
     AckedLine, DEFAULT_RX_BUFFER_SIZE, MAX_QUEUED_LINES, Streamer, StreamerConfig, StreamerError,
 };
 
-pub use ghs_core::{Capabilities, ControllerInfo, ToolEntry};
+pub use ghs_core::{Axes, Axis, Capabilities, ControllerInfo, Signals, ToolEntry};
 
 /// Parse a `$I` or `$I+` response into controller capabilities.
 ///
