@@ -339,6 +339,129 @@ fn optional_stop_and_single_block_hold_the_program() {
 }
 
 #[test]
+fn soft_reset_clears_the_runtime_job_toggles() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    assert_eq!(single_line(&sim.feed(b"G10 L2 P1 X10\n")), "ok");
+    assert_eq!(single_line(&sim.feed(b"T3\n")), "ok");
+    assert_eq!(single_line(&sim.feed(b"$N0=G54 G17\n")), "ok");
+
+    // Set all three through the `$` toggles, the counterpart of the realtime
+    // codes a sender may use instead.
+    assert_eq!(single_line(&sim.feed(b"$O\n")), "ok");
+    assert_eq!(single_line(&sim.feed(b"$S\n")), "ok");
+    assert_eq!(single_line(&sim.feed(b"$B\n")), "ok");
+    let before = sim.snapshot();
+    assert!(before.optional_stop);
+    assert!(before.single_block);
+    assert!(before.block_delete);
+
+    let reset = text(&sim.feed(&[0x18]));
+    assert!(reset.starts_with("GrblHAL 1.1f"), "{reset}");
+    assert!(reset.contains(">N0=G54 G17:ok"), "{reset}");
+
+    // grblHAL's `sys_init()` clears the job toggles on reset.
+    let after = sim.snapshot();
+    assert!(!after.optional_stop, "optional stop survived the reset");
+    assert!(!after.single_block, "single block survived the reset");
+    assert!(!after.block_delete, "block delete survived the reset");
+
+    // The rest of the runtime state is untouched by this change.
+    assert_eq!(after.state, MachineState::Idle);
+    assert_eq!(after.tool, 3);
+    assert_eq!(after.startup_lines[0], "G54 G17");
+    assert!(
+        text(&sim.feed(b"$#\n")).contains("[G54:10.000,0.000,0.000]"),
+        "offsets were lost"
+    );
+}
+
+#[test]
+fn runtime_job_toggles_rearm_after_a_soft_reset() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    let _ = sim.feed(&[0x88]);
+    let _ = sim.feed(&[0x89]);
+    let _ = sim.feed(b"$B\n");
+    let _ = sim.feed(&[0x18]);
+    assert!(!sim.snapshot().optional_stop);
+    assert!(!sim.snapshot().single_block);
+    assert!(!sim.snapshot().block_delete);
+
+    // Optional stop off: `M1` does not hold. The realtime toggle re-arms it.
+    assert_eq!(single_line(&sim.feed(b"M1\n")), "ok");
+    assert_eq!(sim.snapshot().state, MachineState::Idle);
+    let _ = sim.feed(&[0x88]);
+    assert!(sim.snapshot().optional_stop);
+    assert_eq!(single_line(&sim.feed(b"M1\n")), "ok");
+    assert_eq!(sim.snapshot().state, MachineState::Hold);
+    let _ = sim.feed(&[0x81]);
+    assert_eq!(sim.snapshot().state, MachineState::Idle);
+
+    // Block delete off: a `/` line runs. `$B` flips it and the same line is
+    // discarded without moving.
+    assert_eq!(single_line(&sim.feed(b"/G1 X2 F600\n")), "ok");
+    settle(&mut sim);
+    assert!((sim.position().get(Axis::X) - 2.0).abs() < 1.0e-9);
+    assert_eq!(single_line(&sim.feed(b"$B\n")), "ok");
+    assert!(sim.snapshot().block_delete);
+    assert_eq!(single_line(&sim.feed(b"/G1 X9 F600\n")), "ok");
+    settle(&mut sim);
+    assert!(
+        (sim.position().get(Axis::X) - 2.0).abs() < 1.0e-9,
+        "a deleted block moved the machine"
+    );
+
+    // Single block off: a block completes directly. The realtime toggle then
+    // holds at the end of the next block.
+    assert_eq!(sim.snapshot().state, MachineState::Idle);
+    assert_eq!(single_line(&sim.feed(b"G1 X3 F600\n")), "ok");
+    settle(&mut sim);
+    assert_eq!(sim.snapshot().state, MachineState::Idle);
+    let _ = sim.feed(&[0x89]);
+    assert!(sim.snapshot().single_block);
+    assert_eq!(single_line(&sim.feed(b"G1 X4 F600\n")), "ok");
+    settle(&mut sim);
+    assert_eq!(sim.snapshot().state, MachineState::Hold);
+}
+
+#[test]
+fn alarm_door_stop_and_sleep_preserve_the_runtime_job_toggles() {
+    let mut sim = Simulator::new(SimProfile::FlexiHal);
+    let _ = sim.feed(&[0x88]);
+    let _ = sim.feed(&[0x89]);
+    let _ = sim.feed(b"$B\n");
+    let assert_set = |sim: &Simulator, where_: &str| {
+        let snapshot = sim.snapshot();
+        assert!(snapshot.optional_stop, "optional stop cleared by {where_}");
+        assert!(snapshot.single_block, "single block cleared by {where_}");
+        assert!(snapshot.block_delete, "block delete cleared by {where_}");
+    };
+
+    assert_eq!(text(&sim.raise_alarm(1)), "ALARM:1\r\n");
+    assert_set(&sim, "an alarm");
+    assert!(text(&sim.feed(b"$X\n")).ends_with("ok\r\n"));
+
+    let _ = sim.feed(&[0x84]);
+    assert_eq!(sim.snapshot().state, MachineState::Door);
+    assert_set(&sim, "the safety door");
+    let _ = sim.feed(&[0x84]);
+
+    let _ = sim.feed(&[0x19]);
+    assert_set(&sim, "a stop");
+
+    assert_eq!(single_line(&sim.feed(b"$SLP\n")), "ok");
+    assert_eq!(sim.snapshot().state, MachineState::Sleep);
+    assert_set(&sim, "sleep");
+
+    // Only a reset clears them.
+    let _ = sim.feed(&[0x18]);
+    assert_eq!(sim.snapshot().state, MachineState::Idle);
+    let after = sim.snapshot();
+    assert!(!after.optional_stop);
+    assert!(!after.single_block);
+    assert!(!after.block_delete);
+}
+
+#[test]
 fn tool_change_waits_for_acknowledge_and_cycle_start() {
     let mut sim = Simulator::new(SimProfile::FlexiHal);
     assert_eq!(single_line(&sim.feed(b"T3 M6\n")), "ok");

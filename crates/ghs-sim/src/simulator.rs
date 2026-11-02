@@ -1199,6 +1199,12 @@ impl Simulator {
         emit(out, &format!("ALARM:{code}"));
     }
 
+    /// Warm reset (`0x18`): clear volatile runtime state while keeping
+    /// configuration, offsets, the tool table and startup lines.
+    ///
+    /// Matching grblHAL's runtime `sys` initialization, the optional-stop,
+    /// single-block and block-delete toggles are runtime switches and do not
+    /// survive a reset. Alarm 11 (homing required) is preserved.
     fn soft_reset(&mut self, out: &mut Vec<u8>) {
         if let Some(motion) = self.motion.take() {
             self.mpos = motion.position();
@@ -1211,6 +1217,12 @@ impl Simulator {
         self.hold_after_motion = false;
         self.mpg = false;
         self.check_mode = false;
+        // grblHAL's runtime `sys` initialization (`sys_init()`) clears the job
+        // toggles on every reset. They are switches, not modal state, so they
+        // do not survive `0x18`.
+        self.optional_stop = false;
+        self.single_block = false;
+        self.block_delete = false;
         self.overrides = Overrides::DEFAULT;
         self.spindle_on = false;
         self.spindle_stop = false;
