@@ -166,11 +166,13 @@ The shell has a fixed three-column layout at 1280×800 and wider. Below
 
 - **Console** / **Program** tabs over one card.
 - `Console` is the live protocol log (commands, `ok`, messages, errors,
-  alarms). It keeps the last 200 lines.
+  alarms). It keeps the last 200 lines; `ALL/CMD/INFO/OK/WARN/ERROR` filter the
+  view, and `SAVE LOG` writes a snapshot to the config exports directory.
 - `Program` is the parsed program list, with search and the highlighted
   current line.
-- `MDI`: one-line command field and `SEND`.
-- `FEED OVERRIDE`: percentage, slider, `-10` and `+10`.
+- `MDI`: one-line command field, `SEND`, and a 10-entry `HIST` recall.
+- `FEED OVERRIDE`: percentage, slider, `-10`/`-1`/`+1`/`+10`, and
+  `RESET 100%`.
 
 ### Center column
 
@@ -779,8 +781,11 @@ link.
 ### Where logs live
 
 - The in-app **Console** tab is the live log; it keeps the last 200 lines.
-- The app does not write a persistent session log file in this build. Launch
-  it from a terminal to see stderr startup and window errors.
+  `SAVE LOG` writes the current buffer (or the active filter) to
+  `<config>/exports/console.log`, overwriting the previous snapshot. The file
+  has a timestamped header, is capped at 64 KiB, and is not a continuous
+  session recording.
+- Launch the app from a terminal to see stderr startup and window errors.
 - Configuration, profiles, exports, and rolling backups live under the
   platform config directory:
   - Linux: `~/.config/ghs-rs`
@@ -816,5 +821,7 @@ Exports are user-initiated. There is no telemetry and no network transport.
   the v1.0 shell does not expose them.
 - **No Park quick action.** A machine-specific park position is not configured;
   use the confirmed `GOTO G28` / `GOTO G30` actions in **Offsets**.
-- **No persistent session log or telemetry.** The Console is bounded in
-  memory, and there is no network transport.
+- **No continuous session recording or replay.** The Console keeps a bounded
+  in-memory log and `SAVE LOG` exports a 64 KiB snapshot; there is no
+  start/stop recorder, sequence-numbered trace, or replay mode. There is no
+  telemetry or network transport.

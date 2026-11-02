@@ -30,7 +30,8 @@ section exists to diff against.
 - **Engine and manual control** — a dedicated engine session with live DRO,
   hold-to-jog, MDI with session history, feed, spindle, and rapid overrides
   (including fine/reset), spindle and coolant controls, reset/stop/sleep, and a
-  console. All commands pass through one safety gateway.
+  filterable console with a bounded log snapshot. All commands pass through one
+  safety gateway.
 - **Jobs** — in-app program file browser and loading with a 20 MiB UTF-8
   bound; character-counting streaming against the reported receive buffer;
   pause, resume, and stop; a tool-change sheet; optional-stop, single-block, and

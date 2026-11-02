@@ -106,7 +106,7 @@ implemented before its UI or hardware validation row is complete.
 | JOB-06 | Optional stop, single block, block delete | M3 | done | RUN OPTIONS sheet |
 | JOB-07 | Start-from-line, run-to-line, breakpoints | M3 | partial | Run-to + breakpoints; start-from-line open |
 | JOB-08 | Progress, elapsed time, ETA | M3 | done | Progress/time and ETA |
-| JOB-09 | Console with filtering and file log | M3 | partial | Bounded console; file log open |
+| JOB-09 | Console with filtering and file log | M3 | done | Bounded console, filters, 64 KiB snapshot |
 | JOB-10 | Dry run and check mode | M3 | todo | Never moves |
 | JOB-11 | Defined reconnect and interruption policy | M3 | todo | No silent resume |
 | JOB-12 | Program list with follow, search, context menu | M4 | partial | Follow/search/jump done; context menu open |
