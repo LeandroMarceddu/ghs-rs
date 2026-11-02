@@ -7250,6 +7250,18 @@ impl Shell {
                 rows = rows.child(self.probe_circle_mode_row(p, cx));
                 rows = rows.child(self.probe_circle_touch_row(p, cx));
             }
+            ProbeCard::CenterRectangle => {
+                rows = rows.child(self.probe_rectangle_mode_row(p, cx));
+            }
+            ProbeCard::XyTouchPlate => {
+                rows = rows
+                    .child(self.probe_plate_approach_row(p, cx, "X", true))
+                    .child(self.probe_plate_approach_row(p, cx, "Y", false))
+                    .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                        "Touch plate is OUTSIDE only: each edge is approached from \
+                                 outside toward the plate.",
+                    ));
+            }
             ProbeCard::Rotation => {
                 rows = rows.child(self.probe_rotation_row(p, cx));
             }
@@ -7469,6 +7481,121 @@ impl Shell {
             ));
         }
         row
+    }
+
+    fn probe_rectangle_mode_row(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let pocket = self.state.probe.rectangle_mode == ghs_probe::EdgeMode::Inside;
+        let pocket_view = view.clone();
+        let boss_view = view;
+        h_flex()
+            .h(px(48.0))
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child("RECTANGLE"),
+            )
+            .child(probe_choice(
+                cx,
+                p,
+                "probe-rectangle-pocket",
+                "POCKET (INSIDE)",
+                pocket,
+                move |_, cx| {
+                    pocket_view.update(cx, |this, cx| {
+                        this.state.probe.rectangle_mode = ghs_probe::EdgeMode::Inside;
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(probe_choice(
+                cx,
+                p,
+                "probe-rectangle-boss",
+                "BOSS (OUTSIDE)",
+                !pocket,
+                move |_, cx| {
+                    boss_view.update(cx, |this, cx| {
+                        this.state.probe.rectangle_mode = ghs_probe::EdgeMode::Outside;
+                        cx.notify();
+                    });
+                },
+            ))
+    }
+
+    fn probe_plate_approach_row(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        axis: &'static str,
+        is_x: bool,
+    ) -> Div {
+        let view = cx.entity();
+        let current = if is_x {
+            self.state.probe.plate_x_approach
+        } else {
+            self.state.probe.plate_y_approach
+        };
+        let positive = current == ghs_probe::Sign::Positive;
+        let pos_view = view.clone();
+        let neg_view = view;
+        h_flex()
+            .h(px(48.0))
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(150.0))
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(format!("{axis} PLATE APPROACH")),
+            )
+            .child(probe_choice(
+                cx,
+                p,
+                format!("probe-plate-approach-{axis}-pos"),
+                &format!("+{axis}"),
+                positive,
+                move |_, cx| {
+                    pos_view.update(cx, |this, cx| {
+                        if is_x {
+                            this.state.probe.plate_x_approach = ghs_probe::Sign::Positive;
+                        } else {
+                            this.state.probe.plate_y_approach = ghs_probe::Sign::Positive;
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(probe_choice(
+                cx,
+                p,
+                format!("probe-plate-approach-{axis}-neg"),
+                &format!("-{axis}"),
+                !positive,
+                move |_, cx| {
+                    neg_view.update(cx, |this, cx| {
+                        if is_x {
+                            this.state.probe.plate_x_approach = ghs_probe::Sign::Negative;
+                        } else {
+                            this.state.probe.plate_y_approach = ghs_probe::Sign::Negative;
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(p.text_faint)
+                    .child(format!("plate extends {axis} from the corner")),
+            )
     }
 
     fn probe_rotation_row(&self, p: Palette, cx: &mut Context<Self>) -> Div {
@@ -15164,7 +15291,11 @@ fn parse_probe_card(name: &str) -> Option<ProbeCard> {
         "edge-y" | "y" => Some(ProbeCard::EdgeY),
         "corner" => Some(ProbeCard::Corner),
         "circle" | "center-circle" | "centre-circle" => Some(ProbeCard::CenterCircle),
+        "rectangle" | "rect" | "center-rectangle" | "centre-rectangle" => {
+            Some(ProbeCard::CenterRectangle)
+        }
         "rotation" => Some(ProbeCard::Rotation),
+        "xy-plate" | "xy-touch-plate" | "plate" | "xy" => Some(ProbeCard::XyTouchPlate),
         "tool" | "tool-length" => Some(ProbeCard::ToolLength),
         "height" | "height-map" => Some(ProbeCard::HeightMap),
         _ => None,

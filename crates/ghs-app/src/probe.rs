@@ -35,9 +35,9 @@ use ghs_probe::{
     MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM, MAX_HEIGHT_MAP_AXIS_POINTS,
     MAX_HEIGHT_MAP_POINTS, MAX_HEIGHT_MAP_Z_OFFSET_MM, MAX_PLATE_THICKNESS_MM,
     MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN, MAX_PROBE_OFFSET_MM, MAX_RADIUS_MM,
-    MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES, ProbeAxis,
-    ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue, RotationProbe, Sign, XyPoint,
-    validate_probe_offset,
+    MAX_RECTANGLE_MM, MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM,
+    MIN_CIRCLE_TOUCHES, ProbeAxis, ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue,
+    RotationProbe, Sign, XyPoint, validate_probe_offset,
 };
 use ghs_viewer::Point2;
 
@@ -101,11 +101,19 @@ pub enum ProbeField {
     ProbeOffsetY,
     /// Constant datum shift added to every measured height, in millimetres.
     MapZOffset,
+    /// Rectangle width for the centre cycle, in millimetres.
+    RectangleWidth,
+    /// Rectangle height for the centre cycle, in millimetres.
+    RectangleHeight,
+    /// X corner of the XY touch plate, in machine millimetres.
+    PlateX,
+    /// Y corner of the XY touch plate, in machine millimetres.
+    PlateY,
 }
 
 impl ProbeField {
     /// Number of editable fields.
-    pub const COUNT: usize = 27;
+    pub const COUNT: usize = 31;
 
     /// Every field, in edit order.
     pub const ALL: [ProbeField; ProbeField::COUNT] = [
@@ -136,6 +144,10 @@ impl ProbeField {
         ProbeField::ProbeOffsetX,
         ProbeField::ProbeOffsetY,
         ProbeField::MapZOffset,
+        ProbeField::RectangleWidth,
+        ProbeField::RectangleHeight,
+        ProbeField::PlateX,
+        ProbeField::PlateY,
     ];
 
     /// Stable zero-based index for the input array.
@@ -168,6 +180,10 @@ impl ProbeField {
             ProbeField::ProbeOffsetX => 24,
             ProbeField::ProbeOffsetY => 25,
             ProbeField::MapZOffset => 26,
+            ProbeField::RectangleWidth => 27,
+            ProbeField::RectangleHeight => 28,
+            ProbeField::PlateX => 29,
+            ProbeField::PlateY => 30,
         }
     }
 
@@ -201,6 +217,10 @@ impl ProbeField {
             ProbeField::ProbeOffsetX => "PROBE OFFSET X",
             ProbeField::ProbeOffsetY => "PROBE OFFSET Y",
             ProbeField::MapZOffset => "MAP Z OFFSET",
+            ProbeField::RectangleWidth => "RECT WIDTH",
+            ProbeField::RectangleHeight => "RECT HEIGHT",
+            ProbeField::PlateX => "PLATE CORNER X",
+            ProbeField::PlateY => "PLATE CORNER Y",
         }
     }
 
@@ -234,6 +254,10 @@ impl ProbeField {
             ProbeField::ProbeOffsetX => "probe-offset-x",
             ProbeField::ProbeOffsetY => "probe-offset-y",
             ProbeField::MapZOffset => "map-z-offset",
+            ProbeField::RectangleWidth => "rectangle-width",
+            ProbeField::RectangleHeight => "rectangle-height",
+            ProbeField::PlateX => "plate-x",
+            ProbeField::PlateY => "plate-y",
         }
     }
 
@@ -268,6 +292,7 @@ impl ProbeField {
             ProbeField::EdgeOffset => (0.0, MAX_EDGE_OFFSET_MM),
             ProbeField::PlateThickness => (0.0, MAX_PLATE_THICKNESS_MM),
             ProbeField::Radius => (0.0, MAX_RADIUS_MM),
+            ProbeField::RectangleWidth | ProbeField::RectangleHeight => (0.0, MAX_RECTANGLE_MM),
             ProbeField::Touches => (MIN_CIRCLE_TOUCHES as f64, MAX_CIRCLE_TOUCHES as f64),
             ProbeField::Separation => (0.0, MAX_SEPARATION_MM),
             ProbeField::StepX | ProbeField::StepY => (0.0, MAX_COORDINATE_MM),
@@ -307,6 +332,10 @@ impl ProbeField {
             ProbeField::Columns => "4".to_string(),
             ProbeField::Rows => "4".to_string(),
             ProbeField::SurfaceZ => "5.000".to_string(),
+            ProbeField::RectangleWidth => "60.000".to_string(),
+            ProbeField::RectangleHeight => "40.000".to_string(),
+            ProbeField::PlateX => "20.000".to_string(),
+            ProbeField::PlateY => "20.000".to_string(),
             // A zero offset is the identity: the plan and result math are
             // exactly the pre-offset workflow.
             ProbeField::ProbeOffsetX | ProbeField::ProbeOffsetY | ProbeField::MapZOffset => {
@@ -329,8 +358,12 @@ pub enum ProbeCard {
     Corner,
     /// Circle centre.
     CenterCircle,
+    /// Rectangle centre.
+    CenterRectangle,
     /// Two-point rotation.
     Rotation,
+    /// XY touch plate corner.
+    XyTouchPlate,
     /// Tool-length reference.
     ToolLength,
     /// Height map.
@@ -339,13 +372,15 @@ pub enum ProbeCard {
 
 impl ProbeCard {
     /// Every card, in display order.
-    pub const ALL: [ProbeCard; 8] = [
+    pub const ALL: [ProbeCard; 10] = [
         ProbeCard::ZTouchPlate,
         ProbeCard::EdgeX,
         ProbeCard::EdgeY,
         ProbeCard::Corner,
         ProbeCard::CenterCircle,
+        ProbeCard::CenterRectangle,
         ProbeCard::Rotation,
+        ProbeCard::XyTouchPlate,
         ProbeCard::ToolLength,
         ProbeCard::HeightMap,
     ];
@@ -358,7 +393,9 @@ impl ProbeCard {
             ProbeCard::EdgeY => "Edge Y",
             ProbeCard::Corner => "Corner",
             ProbeCard::CenterCircle => "Center circle",
+            ProbeCard::CenterRectangle => "Center rectangle",
             ProbeCard::Rotation => "Rotation",
+            ProbeCard::XyTouchPlate => "XY touch plate",
             ProbeCard::ToolLength => "Tool length",
             ProbeCard::HeightMap => "Height map",
         }
@@ -372,7 +409,13 @@ impl ProbeCard {
             ProbeCard::EdgeY => "Along Y into the edge; radius + edge offset applied.",
             ProbeCard::Corner => "X edge then Y edge; sets both zeros at the corner.",
             ProbeCard::CenterCircle => "Radial touches around a bore/boss; fits centre + radius.",
+            ProbeCard::CenterRectangle => {
+                "Four side touches; fits centre, width and height from the edges."
+            }
             ProbeCard::Rotation => "Two points on an X edge; reports angle, apply deferred.",
+            ProbeCard::XyTouchPlate => {
+                "Two outside plate edges; sets X/Y zero at the plate corner."
+            }
             ProbeCard::ToolLength => "Down onto the reference; reports delta, TLO apply deferred.",
             ProbeCard::HeightMap => {
                 "Bounded Z grid; measured map overlay and explicit Apply/Revert."
@@ -403,9 +446,19 @@ impl ProbeCard {
                 "Touches the bore or boss at evenly spaced angles, fits the contact circle, then \
                  corrects by the probe radius and reports the centre, radius and RMS error."
             }
+            ProbeCard::CenterRectangle => {
+                "Touches the midpoint of each rectangle side, derives the four edges from the probe \
+                 radius, and reports the fitted centre, measured width and measured height. A pocket \
+                 probes outward from the inside; a boss probes inward from the outside."
+            }
             ProbeCard::Rotation => {
                 "Probes two points on a nominally X-aligned edge and reports the measured angle and \
                  deviation. Applying work rotation is controller/app dependent and deferred."
+            }
+            ProbeCard::XyTouchPlate => {
+                "Probes the two outside edges of a conductive corner plate. The plate corner field is \
+                 the feature corner; each search starts outside and moves toward the plate along the \
+                 selected approach direction. The work zero is the corner plus the edge offset."
             }
             ProbeCard::ToolLength => {
                 "Probes down onto a reference surface and reports the signed tool-length delta. \
@@ -487,6 +540,32 @@ impl ProbeCard {
                 ProbeField::CenterY,
                 ProbeField::Radius,
                 ProbeField::Touches,
+            ],
+            ProbeCard::CenterRectangle => &[
+                // Geometry first so the rectangle-specific inputs are visible
+                // without scrolling past the shared search fields.
+                ProbeField::CenterX,
+                ProbeField::CenterY,
+                ProbeField::ProbingHeight,
+                ProbeField::RectangleWidth,
+                ProbeField::RectangleHeight,
+                ProbeField::Diameter,
+                ProbeField::EdgeOffset,
+                ProbeField::SafeZ,
+                ProbeField::Search,
+                ProbeField::Feed,
+                ProbeField::Retract,
+            ],
+            ProbeCard::XyTouchPlate => &[
+                ProbeField::PlateX,
+                ProbeField::PlateY,
+                ProbeField::ProbingHeight,
+                ProbeField::EdgeOffset,
+                ProbeField::Diameter,
+                ProbeField::SafeZ,
+                ProbeField::Search,
+                ProbeField::Feed,
+                ProbeField::Retract,
             ],
             ProbeCard::Rotation => &[
                 ProbeField::SafeZ,
@@ -822,10 +901,16 @@ pub struct ProbeModel {
     pub edge_y_mode: EdgeMode,
     /// Circle is a bore (`Inside`) or a boss (`Outside`).
     pub circle_mode: EdgeMode,
+    /// Rectangle is a pocket (`Inside`) or a boss (`Outside`).
+    pub rectangle_mode: EdgeMode,
     /// Circle touch count, `3..=8`.
     pub circle_touches: u8,
     /// Rotation approach along Y for a nominally X-aligned edge.
     pub rotation_approach: Sign,
+    /// X approach for the XY touch plate (the plate lies toward it).
+    pub plate_x_approach: Sign,
+    /// Y approach for the XY touch plate (the plate lies toward it).
+    pub plate_y_approach: Sign,
     run: Option<ProbeRun>,
     /// Name of the most recent probe program loaded into the job runner.
     last_probe_program: Option<String>,
@@ -845,8 +930,11 @@ impl Default for ProbeModel {
             edge_x_mode: EdgeMode::Outside,
             edge_y_mode: EdgeMode::Outside,
             circle_mode: EdgeMode::Inside,
+            rectangle_mode: EdgeMode::Inside,
             circle_touches: 4,
             rotation_approach: Sign::Negative,
+            plate_x_approach: Sign::Positive,
+            plate_y_approach: Sign::Positive,
             run: None,
             last_probe_program: None,
         };
@@ -1054,6 +1142,10 @@ impl ProbeModel {
             (ProbeField::CenterX, x_mm),
             (ProbeField::CenterY, y_mm),
             (ProbeField::Radius, 20.0),
+            (ProbeField::RectangleWidth, 60.0),
+            (ProbeField::RectangleHeight, 40.0),
+            (ProbeField::PlateX, x_mm + 20.0),
+            (ProbeField::PlateY, y_mm + 20.0),
             (ProbeField::ReferenceZ, z_mm - 5.0),
             // The grid origin is entered in work coordinates and converted
             // with the active offset when the plan is built.
@@ -1283,6 +1375,20 @@ impl ProbeModel {
                 problems.push(FieldProblem { field, message });
             }
         }
+        if matches!(
+            self.card,
+            Some(ProbeCard::CenterRectangle | ProbeCard::XyTouchPlate)
+        ) && let Err(message) = self.prepare(ctx)
+        {
+            let field = cycle_error_field(&message);
+            if field.is_some()
+                && !problems
+                    .iter()
+                    .any(|problem| problem.field == field && problem.message == message)
+            {
+                problems.push(FieldProblem { field, message });
+            }
+        }
         problems
     }
 
@@ -1391,6 +1497,24 @@ impl ProbeModel {
                 let radius = self.field_value(ProbeField::Radius)?;
                 (None, Some(Position::xyz(cx, cy, height)), Some(radius))
             }
+            ProbeCard::CenterRectangle => {
+                let cx = self.field_value(ProbeField::CenterX)?;
+                let cy = self.field_value(ProbeField::CenterY)?;
+                (None, Some(Position::xyz(cx, cy, height)), None)
+            }
+            ProbeCard::XyTouchPlate => {
+                let corner_x = self.field_value(ProbeField::PlateX)?;
+                let corner_y = self.field_value(ProbeField::PlateY)?;
+                let probe_radius = self.field_value(ProbeField::Diameter)? * 0.5;
+                let search = self.field_value(ProbeField::Search)?;
+                // Probe each edge in from the corner by the search corridor
+                // plus the tip radius, so the probe line is inside the plate
+                // body and a rounded corner cannot trigger the other axis.
+                let inboard = probe_radius + search;
+                let anchor_x = corner_x + self.plate_x_approach.as_f64() * inboard;
+                let anchor_y = corner_y + self.plate_y_approach.as_f64() * inboard;
+                (Some(Position::xyz(anchor_x, anchor_y, height)), None, None)
+            }
             ProbeCard::HeightMap => (None, None, None),
         })
     }
@@ -1438,6 +1562,27 @@ impl ProbeModel {
                     mode: self.circle_mode,
                 }
             }
+            ProbeCard::CenterRectangle => ProbeCycle::CenterRectangle {
+                width_mm: self.field_value(ProbeField::RectangleWidth)?,
+                height_mm: self.field_value(ProbeField::RectangleHeight)?,
+                mode: self.rectangle_mode,
+            },
+            ProbeCard::XyTouchPlate => ProbeCycle::XyTouchPlate(CornerProbe {
+                // A plate is a solid feature: both edges are approached from
+                // outside toward the plate, using the selected directions.
+                x: EdgeSpec {
+                    axis: ProbeAxis::X,
+                    mode: EdgeMode::Outside,
+                    approach: self.plate_x_approach,
+                    expected_edge_mm: self.field_value(ProbeField::PlateX)?,
+                },
+                y: EdgeSpec {
+                    axis: ProbeAxis::Y,
+                    mode: EdgeMode::Outside,
+                    approach: self.plate_y_approach,
+                    expected_edge_mm: self.field_value(ProbeField::PlateY)?,
+                },
+            }),
             ProbeCard::Rotation => ProbeCycle::Rotation(RotationProbe {
                 separation_mm: self.field_value(ProbeField::Separation)?,
                 edge_axis: ProbeAxis::X,
@@ -1939,6 +2084,17 @@ impl ProbeModel {
             run.paused_after_probe = None;
             run.stop_requested = true;
             run.map = partial_height_map(&run.setup, &run.results);
+        } else if !result.success || !result.position.is_finite() {
+            // A standard cycle has no partial value: a missed/alarmed search
+            // stops the run immediately, asks the shell to stop the job, and
+            // never resumes at a probe checkpoint.
+            let index = run.results.len().saturating_sub(1) + 1;
+            run.phase = ProbePhase::Failed;
+            run.error = Some(format!(
+                "probe {index} reported failure; the cycle stops and is never resumed"
+            ));
+            run.paused_after_probe = None;
+            run.stop_requested = true;
         }
         true
     }
@@ -2345,6 +2501,41 @@ fn height_map_error_field(message: &str) -> Option<ProbeField> {
     None
 }
 
+/// Best-effort mapping from a rectangle/plate validation message to an editor
+/// field, so a cross-field plan error is shown inline instead of only in the
+/// preflight `PLAN` row.
+fn cycle_error_field(message: &str) -> Option<ProbeField> {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("rectangle width") || lower.contains("width_mm") {
+        return Some(ProbeField::RectangleWidth);
+    }
+    if lower.contains("rectangle height") || lower.contains("height_mm") {
+        return Some(ProbeField::RectangleHeight);
+    }
+    if lower.contains("diameter") {
+        return Some(ProbeField::Diameter);
+    }
+    if lower.contains("probing height") {
+        return Some(ProbeField::ProbingHeight);
+    }
+    if lower.contains("safe_z") || lower.contains("safe z") {
+        return Some(ProbeField::SafeZ);
+    }
+    if lower.contains("edge_offset") {
+        return Some(ProbeField::EdgeOffset);
+    }
+    if lower.contains("search") {
+        return Some(ProbeField::Search);
+    }
+    if lower.contains("feed") {
+        return Some(ProbeField::Feed);
+    }
+    if lower.contains("retract") {
+        return Some(ProbeField::Retract);
+    }
+    None
+}
+
 /// Offset targets for a computed value: `(axis, machine coordinate)`.
 fn apply_targets(value: &ProbeValue) -> Result<Vec<(CoreAxis, f64)>, String> {
     Ok(match value {
@@ -2590,12 +2781,21 @@ fn expected_text(cycle: &ProbeCycle, params: &ProbeParams) -> String {
         ProbeCycle::CenterRectangle {
             width_mm,
             height_mm,
-            ..
-        } => format!(
-            "rectangle {} x {} mm",
-            format_mm(*width_mm),
-            format_mm(*height_mm)
-        ),
+            mode,
+        } => {
+            let (cx, cy) = params
+                .center
+                .map(|center| (center.get(CoreAxis::X), center.get(CoreAxis::Y)))
+                .unwrap_or((0.0, 0.0));
+            format!(
+                "center X{} Y{}, rectangle {} x {} mm, {}",
+                format_mm(cx),
+                format_mm(cy),
+                format_mm(*width_mm),
+                format_mm(*height_mm),
+                mode.as_str()
+            )
+        }
         ProbeCycle::Rotation(rotation) => format!(
             "edge {} mm, separation {} mm, {} approach",
             format_mm(rotation.expected_edge_mm),
@@ -2603,9 +2803,11 @@ fn expected_text(cycle: &ProbeCycle, params: &ProbeParams) -> String {
             rotation.approach.as_str()
         ),
         ProbeCycle::XyTouchPlate(corner) => format!(
-            "plate X {} mm, Y {} mm",
+            "plate corner X {} mm ({}), Y {} mm ({}), outside",
             format_mm(corner.x.expected_edge_mm),
-            format_mm(corner.y.expected_edge_mm)
+            corner.x.approach.as_str(),
+            format_mm(corner.y.expected_edge_mm),
+            corner.y.approach.as_str()
         ),
     }
 }
@@ -3487,6 +3689,567 @@ mod tests {
     }
 
     #[test]
+    fn new_probe_cards_have_fields_and_build_the_expected_plans() {
+        assert!(ProbeCard::ALL.contains(&ProbeCard::CenterRectangle));
+        assert!(ProbeCard::ALL.contains(&ProbeCard::XyTouchPlate));
+        assert_eq!(ProbeCard::ALL.len(), 10);
+
+        let ctx = context();
+        let rectangle = model(ProbeCard::CenterRectangle);
+        assert_eq!(
+            ProbeCard::CenterRectangle.fields(),
+            &[
+                ProbeField::CenterX,
+                ProbeField::CenterY,
+                ProbeField::ProbingHeight,
+                ProbeField::RectangleWidth,
+                ProbeField::RectangleHeight,
+                ProbeField::Diameter,
+                ProbeField::EdgeOffset,
+                ProbeField::SafeZ,
+                ProbeField::Search,
+                ProbeField::Feed,
+                ProbeField::Retract,
+            ]
+        );
+        let setup = rectangle.prepare(&ctx).expect("rectangle plan");
+        assert_eq!(setup.plan.kind, ghs_probe::CycleKind::CenterRectangle);
+        assert_eq!(setup.plan.name, "center-rectangle-inside");
+        assert_eq!(setup.plan.expected_probes, 4);
+        assert_eq!(
+            setup
+                .plan
+                .probes
+                .iter()
+                .map(|probe| probe.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x-plus", "x-minus", "y-plus", "y-minus"]
+        );
+        let ProbeTarget::Cycle(ProbeCycle::CenterRectangle {
+            width_mm,
+            height_mm,
+            mode,
+        }) = &setup.target
+        else {
+            panic!("wrong rectangle target");
+        };
+        assert_eq!(
+            (*width_mm, *height_mm, *mode),
+            (60.0, 40.0, EdgeMode::Inside)
+        );
+
+        let plate = model(ProbeCard::XyTouchPlate);
+        assert_eq!(
+            ProbeCard::XyTouchPlate.fields(),
+            &[
+                ProbeField::PlateX,
+                ProbeField::PlateY,
+                ProbeField::ProbingHeight,
+                ProbeField::EdgeOffset,
+                ProbeField::Diameter,
+                ProbeField::SafeZ,
+                ProbeField::Search,
+                ProbeField::Feed,
+                ProbeField::Retract,
+            ]
+        );
+        let setup = plate.prepare(&ctx).expect("plate plan");
+        assert_eq!(setup.plan.kind, ghs_probe::CycleKind::XyTouchPlate);
+        assert_eq!(setup.plan.name, "xy-touch-plate");
+        assert_eq!(setup.plan.expected_probes, 2);
+        assert_eq!(
+            setup
+                .plan
+                .probes
+                .iter()
+                .map(|probe| probe.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x-edge", "y-edge"]
+        );
+        let ProbeTarget::Cycle(ProbeCycle::XyTouchPlate(corner)) = &setup.target else {
+            panic!("wrong plate target");
+        };
+        assert_eq!(corner.x.axis, ProbeAxis::X);
+        assert_eq!(corner.y.axis, ProbeAxis::Y);
+        assert_eq!(corner.x.mode, EdgeMode::Outside);
+        assert_eq!(corner.y.mode, EdgeMode::Outside);
+        assert_eq!(corner.x.approach, Sign::Positive);
+        assert_eq!(corner.y.approach, Sign::Positive);
+        // Corner (20,20) plus one radius + search inboard = anchor (26.5, 26.5).
+        assert_eq!(setup.params.position, Some(Position::xyz(26.5, 26.5, 0.0)));
+    }
+
+    #[test]
+    fn rectangle_results_report_center_size_and_de_biased_g10() {
+        let ctx = context();
+        let mut model = model(ProbeCard::CenterRectangle);
+        for (field, text) in [
+            (ProbeField::CenterX, "10.000"),
+            (ProbeField::CenterY, "20.000"),
+            (ProbeField::ProbingHeight, "0.000"),
+            (ProbeField::Diameter, "2.000"),
+            (ProbeField::RectangleWidth, "20.000"),
+            (ProbeField::RectangleHeight, "10.000"),
+        ] {
+            model.set_field_text(field, text).expect("field");
+        }
+        let setup = model.prepare(&ctx).expect("plan");
+        model.begin(setup);
+        assert!(model.on_job_loaded("center-rectangle-inside"));
+        assert!(model.on_job_started());
+        // Inside a 20 x 10 rectangle centred at (10,20): x edges 0/20, y 15/25.
+        for position in [
+            Position::xyz(19.0, 20.0, 0.0),
+            Position::xyz(1.0, 20.0, 0.0),
+            Position::xyz(10.0, 24.0, 0.0),
+            Position::xyz(10.0, 16.0, 0.0),
+        ] {
+            assert!(model.bind_result(ProbeResult::new(true, position)));
+        }
+        assert!(model.on_job_completed());
+        let outcome = model
+            .run()
+            .and_then(|run| run.outcome.as_ref())
+            .expect("outcome");
+        let ProbeValue::RectangleCenter {
+            center,
+            width_mm,
+            height_mm,
+        } = &outcome.value
+        else {
+            panic!("wrong value");
+        };
+        assert!((center.x_mm - 10.0).abs() < 1.0e-9);
+        assert!((center.y_mm - 20.0).abs() < 1.0e-9);
+        assert!((*width_mm - 20.0).abs() < 1.0e-9);
+        assert!((*height_mm - 10.0).abs() < 1.0e-9);
+
+        let summary = outcome_summary(outcome);
+        assert_eq!(summary.headline, "CENTER 10.000 20.000");
+        assert!(
+            summary
+                .details
+                .iter()
+                .any(|(label, value)| label == "Measured width" && value == "20.000 mm")
+        );
+        assert!(
+            summary
+                .details
+                .iter()
+                .any(|(label, value)| label == "Measured height" && value == "10.000 mm")
+        );
+        // G92 X1/Y2 is preserved and removed from the stored WCS write.
+        assert_eq!(
+            model.apply_lines().expect("apply"),
+            vec!["G10 L2 P1 X9.000 Y18.000".to_string()]
+        );
+    }
+
+    #[test]
+    fn xy_plate_results_report_edge_zero_and_de_biased_g10() {
+        let ctx = context();
+        let mut model = model(ProbeCard::XyTouchPlate);
+        for (field, text) in [
+            (ProbeField::PlateX, "20.000"),
+            (ProbeField::PlateY, "30.000"),
+            (ProbeField::ProbingHeight, "0.000"),
+            (ProbeField::Diameter, "3.000"),
+            (ProbeField::EdgeOffset, "2.000"),
+        ] {
+            model.set_field_text(field, text).expect("field");
+        }
+        let setup = model.prepare(&ctx).expect("plan");
+        model.begin(setup);
+        assert!(model.on_job_loaded("xy-touch-plate"));
+        assert!(model.on_job_started());
+        // Outside +X/+Y with radius 1.5: contacts 18.5/28.5 give edges 20/30.
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(18.5, 0.0, 0.0))));
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(0.0, 28.5, 0.0))));
+        assert!(model.on_job_completed());
+        let outcome = model
+            .run()
+            .and_then(|run| run.outcome.as_ref())
+            .expect("outcome");
+        let ProbeValue::XyZero {
+            x_edge_mm,
+            y_edge_mm,
+            zero,
+        } = &outcome.value
+        else {
+            panic!("wrong value");
+        };
+        assert!((*x_edge_mm - 20.0).abs() < 1.0e-9);
+        assert!((*y_edge_mm - 30.0).abs() < 1.0e-9);
+        assert_eq!(*zero, XyPoint::new(22.0, 32.0));
+
+        let summary = outcome_summary(outcome);
+        assert_eq!(summary.headline, "WORK X0 Y0 22.000 32.000");
+        assert!(
+            summary
+                .details
+                .iter()
+                .any(|(label, value)| label == "Measured X edge" && value == "20.000 mm")
+        );
+        assert!(
+            summary
+                .details
+                .iter()
+                .any(|(label, value)| label == "Measured Y edge" && value == "30.000 mm")
+        );
+        // G92 X1/Y2 is preserved and removed from the stored WCS write.
+        assert_eq!(
+            model.apply_lines().expect("apply"),
+            vec!["G10 L2 P1 X21.000 Y30.000".to_string()]
+        );
+    }
+
+    #[test]
+    fn rectangle_dimensions_radius_and_plate_position_are_refused() {
+        let ctx = context();
+        let mut rectangle = model(ProbeCard::CenterRectangle);
+        rectangle
+            .set_field_text(ProbeField::RectangleWidth, "0.000")
+            .expect("zero is within the editor bound");
+        let error = rectangle.prepare(&ctx).expect_err("zero width");
+        assert!(error.contains("width_mm"), "{error}");
+        assert!(rectangle.field_problems(&ctx).iter().any(|problem| {
+            problem.field == Some(ProbeField::RectangleWidth)
+                && problem.message.contains("width_mm")
+        }));
+
+        rectangle
+            .set_field_text(ProbeField::RectangleWidth, "20.000")
+            .expect("width");
+        rectangle
+            .set_field_text(ProbeField::RectangleHeight, "0.000")
+            .expect("zero is within the editor bound");
+        let error = rectangle.prepare(&ctx).expect_err("zero height");
+        assert!(error.contains("height_mm"), "{error}");
+        assert!(rectangle.field_problems(&ctx).iter().any(|problem| {
+            problem.field == Some(ProbeField::RectangleHeight)
+                && problem.message.contains("height_mm")
+        }));
+
+        rectangle
+            .set_field_text(ProbeField::RectangleHeight, "10.000")
+            .expect("height");
+        rectangle
+            .set_field_text(ProbeField::Diameter, "50.000")
+            .expect("diameter");
+        let error = rectangle.prepare(&ctx).expect_err("probe too large");
+        assert!(error.contains("rectangle width"), "{error}");
+        assert!(rectangle.field_problems(&ctx).iter().any(|problem| {
+            problem.field == Some(ProbeField::RectangleWidth)
+                && problem.message.contains("rectangle width")
+        }));
+
+        let mut plate = model(ProbeCard::XyTouchPlate);
+        plate
+            .set_field_text(ProbeField::ProbingHeight, "20.000")
+            .expect("height");
+        let error = plate.prepare(&ctx).expect_err("height above safe Z");
+        assert!(error.contains("probing height"), "{error}");
+        assert!(plate.field_problems(&ctx).iter().any(|problem| {
+            problem.field == Some(ProbeField::ProbingHeight)
+                && problem.message.contains("probing height")
+        }));
+        let error = plate
+            .set_field_text(ProbeField::PlateX, "100001.000")
+            .expect_err("coordinate bound");
+        assert!(error.contains("PLATE CORNER X"), "{error}");
+        assert!(
+            plate
+                .field_error(ProbeField::PlateX)
+                .is_some_and(|message| message.contains("PLATE CORNER X"))
+        );
+    }
+
+    #[test]
+    fn probe_offset_shifts_both_new_plans_and_results() {
+        let ctx = context();
+        let offset = XyPoint::new(10.0, -5.0);
+
+        let mut rectangle = model(ProbeCard::CenterRectangle);
+        for (field, text) in [
+            (ProbeField::CenterX, "10.000"),
+            (ProbeField::CenterY, "20.000"),
+            (ProbeField::ProbingHeight, "0.000"),
+            (ProbeField::Diameter, "2.000"),
+            (ProbeField::RectangleWidth, "20.000"),
+            (ProbeField::RectangleHeight, "10.000"),
+        ] {
+            rectangle.set_field_text(field, text).expect("field");
+        }
+        rectangle.set_probe_offset(offset).expect("offset");
+        let zero_setup = {
+            let mut plain = rectangle.clone();
+            plain
+                .set_probe_offset(XyPoint::new(0.0, 0.0))
+                .expect("zero");
+            plain.prepare(&ctx).expect("zero plan")
+        };
+        let setup = rectangle.prepare(&ctx).expect("offset plan");
+        assert_eq!(setup.probe_offset, offset);
+        assert_eq!(setup.plan.expected_probes, 4);
+        assert_shifted_plan(&zero_setup.plan, &setup.plan, offset);
+        rectangle.begin(setup);
+        assert!(rectangle.on_job_loaded("center-rectangle-inside"));
+        assert!(rectangle.on_job_started());
+        for position in [
+            Position::xyz(9.0, 25.0, 0.0),
+            Position::xyz(-9.0, 25.0, 0.0),
+            Position::xyz(0.0, 29.0, 0.0),
+            Position::xyz(0.0, 21.0, 0.0),
+        ] {
+            assert!(rectangle.bind_result(ProbeResult::new(true, position)));
+        }
+        assert!(rectangle.on_job_completed());
+        let ProbeValue::RectangleCenter {
+            center,
+            width_mm,
+            height_mm,
+        } = &rectangle
+            .run()
+            .and_then(|run| run.outcome.as_ref())
+            .expect("outcome")
+            .value
+        else {
+            panic!("wrong value");
+        };
+        assert!((center.x_mm - 10.0).abs() < 1.0e-9, "{center:?}");
+        assert!((center.y_mm - 20.0).abs() < 1.0e-9, "{center:?}");
+        assert!((*width_mm - 20.0).abs() < 1.0e-9);
+        assert!((*height_mm - 10.0).abs() < 1.0e-9);
+        assert_eq!(
+            rectangle.apply_lines().expect("apply"),
+            vec!["G10 L2 P1 X9.000 Y18.000".to_string()]
+        );
+
+        let mut plate = model(ProbeCard::XyTouchPlate);
+        for (field, text) in [
+            (ProbeField::PlateX, "20.000"),
+            (ProbeField::PlateY, "30.000"),
+            (ProbeField::ProbingHeight, "0.000"),
+            (ProbeField::Diameter, "3.000"),
+        ] {
+            plate.set_field_text(field, text).expect("field");
+        }
+        plate.set_probe_offset(offset).expect("offset");
+        let zero_setup = {
+            let mut plain = plate.clone();
+            plain
+                .set_probe_offset(XyPoint::new(0.0, 0.0))
+                .expect("zero");
+            plain.prepare(&ctx).expect("zero plan")
+        };
+        let setup = plate.prepare(&ctx).expect("offset plan");
+        assert_eq!(setup.probe_offset, offset);
+        assert_shifted_plan(&zero_setup.plan, &setup.plan, offset);
+        plate.begin(setup);
+        assert!(plate.on_job_loaded("xy-touch-plate"));
+        assert!(plate.on_job_started());
+        assert!(plate.bind_result(ProbeResult::new(true, Position::xyz(8.5, 0.0, 0.0))));
+        assert!(plate.bind_result(ProbeResult::new(true, Position::xyz(0.0, 33.5, 0.0))));
+        assert!(plate.on_job_completed());
+        let ProbeValue::XyZero { zero, .. } = &plate
+            .run()
+            .and_then(|run| run.outcome.as_ref())
+            .expect("outcome")
+            .value
+        else {
+            panic!("wrong value");
+        };
+        assert!((zero.x_mm - 20.0).abs() < 1.0e-9, "{zero:?}");
+        assert!((zero.y_mm - 30.0).abs() < 1.0e-9, "{zero:?}");
+        assert_eq!(
+            plate.apply_lines().expect("apply"),
+            vec!["G10 L2 P1 X19.000 Y28.000".to_string()]
+        );
+    }
+
+    #[test]
+    fn result_binding_order_is_four_for_rectangles_and_two_for_plates() {
+        let ctx = context();
+        let mut rectangle = model(ProbeCard::CenterRectangle);
+        for (field, text) in [
+            (ProbeField::CenterX, "10.000"),
+            (ProbeField::CenterY, "20.000"),
+            (ProbeField::Diameter, "2.000"),
+            (ProbeField::RectangleWidth, "20.000"),
+            (ProbeField::RectangleHeight, "10.000"),
+        ] {
+            rectangle.set_field_text(field, text).expect("field");
+        }
+        let setup = rectangle.prepare(&ctx).expect("plan");
+        rectangle.begin(setup);
+        assert!(rectangle.on_job_loaded("center-rectangle-inside"));
+        assert!(rectangle.on_job_started());
+        for (index, position) in [
+            Position::xyz(19.0, 20.0, 0.0),
+            Position::xyz(1.0, 20.0, 0.0),
+            Position::xyz(10.0, 24.0, 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(rectangle.bind_result(ProbeResult::new(true, position)));
+            assert_eq!(rectangle.run().expect("run").bound(), index + 1);
+        }
+        assert!(rectangle.bind_result(ProbeResult::new(true, Position::xyz(10.0, 16.0, 0.0))));
+        assert!(rectangle.on_job_completed());
+        assert_eq!(rectangle.run().expect("run").bound(), 4);
+        assert!(
+            !rectangle.bind_result(ProbeResult::new(true, Position::xyz(0.0, 0.0, 0.0))),
+            "a completed run accepts no further result"
+        );
+
+        let mut plate = model(ProbeCard::XyTouchPlate);
+        let setup = plate.prepare(&ctx).expect("plan");
+        plate.begin(setup);
+        assert!(plate.on_job_loaded("xy-touch-plate"));
+        assert!(plate.on_job_started());
+        assert!(plate.bind_result(ProbeResult::new(true, Position::xyz(18.5, 0.0, 0.0))));
+        assert_eq!(plate.run().expect("run").bound(), 1);
+        assert!(plate.bind_result(ProbeResult::new(true, Position::xyz(0.0, 28.5, 0.0))));
+        assert_eq!(plate.run().expect("run").bound(), 2);
+        assert!(plate.on_job_completed());
+        assert!(
+            !plate.bind_result(ProbeResult::new(true, Position::xyz(0.0, 0.0, 0.0))),
+            "a completed plate run accepts no further result"
+        );
+    }
+
+    #[test]
+    fn zero_probe_offset_keeps_prior_new_cycle_behavior() {
+        let ctx = context();
+        for (card, positions) in [
+            (
+                ProbeCard::CenterRectangle,
+                vec![
+                    Position::xyz(28.5, 20.0, 0.0),
+                    Position::xyz(-28.5, 20.0, 0.0),
+                    Position::xyz(0.0, 18.5, 0.0),
+                    Position::xyz(0.0, -18.5, 0.0),
+                ],
+            ),
+            (
+                ProbeCard::XyTouchPlate,
+                vec![Position::xyz(18.5, 0.0, 0.0), Position::xyz(0.0, 18.5, 0.0)],
+            ),
+        ] {
+            let model = model(card);
+            let setup = model.prepare(&ctx).expect("plan");
+            let ProbeTarget::Cycle(cycle) = &setup.target else {
+                panic!("wrong target");
+            };
+            let cycle = *cycle;
+            assert_eq!(setup.probe_offset, XyPoint::new(0.0, 0.0));
+            assert_eq!(
+                setup.plan,
+                cycle.plan(&setup.params).expect("direct zero plan")
+            );
+            let direct = ProbeOutcome::from_results(
+                &cycle,
+                &setup.params,
+                &positions
+                    .iter()
+                    .map(|position| ProbeResult::new(true, *position))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("direct zero outcome");
+
+            let mut model = model;
+            model.begin(setup);
+            let name = cycle.name();
+            assert!(model.on_job_loaded(&name));
+            assert!(model.on_job_started());
+            for position in positions {
+                assert!(model.bind_result(ProbeResult::new(true, position)));
+            }
+            assert!(model.on_job_completed());
+            assert_eq!(
+                model.run().and_then(|run| run.outcome.clone()),
+                Some(direct)
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_new_cycle_result_or_alarm_stops_and_never_resumes() {
+        let ctx = context();
+        let mut rectangle = model(ProbeCard::CenterRectangle);
+        let setup = rectangle.prepare(&ctx).expect("plan");
+        rectangle.begin(setup);
+        assert!(rectangle.on_job_loaded("center-rectangle-inside"));
+        assert!(rectangle.on_job_started());
+        assert!(rectangle.bind_result(ProbeResult::new(true, Position::xyz(29.0, 0.0, 0.0))));
+        assert!(rectangle.on_alarm(5));
+        let run = rectangle.run().expect("run");
+        assert_eq!(run.phase, ProbePhase::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|text| text.contains("ALARM:5"))
+        );
+        assert!(!rectangle.needs_resume());
+        assert!(!rectangle.apply_supported());
+        assert!(rectangle.apply_lines().is_err());
+        assert!(
+            !rectangle.bind_result(ProbeResult::new(true, Position::xyz(0.0, 0.0, 0.0))),
+            "an alarmed run accepts no further result"
+        );
+
+        let mut plate = model(ProbeCard::XyTouchPlate);
+        let setup = plate.prepare(&ctx).expect("plan");
+        plate.begin(setup);
+        assert!(plate.on_job_loaded("xy-touch-plate"));
+        assert!(plate.on_job_started());
+        assert!(plate.bind_result(ProbeResult::new(true, Position::xyz(18.5, 0.0, 0.0))));
+        assert!(plate.bind_result(ProbeResult::new(false, Position::xyz(0.0, 5.0, 0.0))));
+        let run = plate.run().expect("run");
+        assert_eq!(run.phase, ProbePhase::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|text| text.contains("reported failure"))
+        );
+        assert!(plate.take_stop_request(), "the shell must stop the job");
+        assert!(
+            !plate.take_stop_request(),
+            "the stop request is consumed once"
+        );
+        assert!(!plate.needs_resume());
+        assert!(!plate.apply_supported());
+        assert!(
+            !plate.bind_result(ProbeResult::new(true, Position::xyz(0.0, 28.5, 0.0))),
+            "a failed plate run accepts no further result"
+        );
+    }
+
+    fn assert_shifted_plan(zero: &ProbePlan, shifted: &ProbePlan, offset: XyPoint) {
+        assert_eq!(zero.probes.len(), shifted.probes.len());
+        for (zero_probe, shifted_probe) in zero.probes.iter().zip(&shifted.probes) {
+            for (zero_position, shifted_position) in [
+                (zero_probe.from, shifted_probe.from),
+                (zero_probe.to, shifted_probe.to),
+            ] {
+                assert!(
+                    (shifted_position.get(CoreAxis::X)
+                        - (zero_position.get(CoreAxis::X) - offset.x_mm))
+                        .abs()
+                        < 1.0e-9
+                );
+                assert!(
+                    (shifted_position.get(CoreAxis::Y)
+                        - (zero_position.get(CoreAxis::Y) - offset.y_mm))
+                        .abs()
+                        < 1.0e-9
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_generated_plan_parses_in_the_engine_parser() {
         let ctx = context();
         for card in [
@@ -3495,7 +4258,9 @@ mod tests {
             ProbeCard::EdgeY,
             ProbeCard::Corner,
             ProbeCard::CenterCircle,
+            ProbeCard::CenterRectangle,
             ProbeCard::Rotation,
+            ProbeCard::XyTouchPlate,
             ProbeCard::ToolLength,
             ProbeCard::HeightMap,
         ] {
