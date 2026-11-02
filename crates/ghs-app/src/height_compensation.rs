@@ -116,6 +116,14 @@ impl OffsetFrame {
         }
     }
 
+    /// Total offset from work to machine coordinates: `WCS + G92 + TLO Z`.
+    #[must_use]
+    pub fn offset_mm(&self) -> Position {
+        let mut tlo = Position::zero();
+        tlo.set(CoreAxis::Z, self.tlo_z_mm);
+        self.wcs_value_mm + self.g92_mm + tlo
+    }
+
     /// Differences between the measured frame (`self`) and the live frame.
     ///
     /// Returns one explicit message per changed element, so the result sheet
@@ -132,21 +140,27 @@ impl OffsetFrame {
         }
         if !position_close(self.wcs_value_mm, live.wcs_value_mm) {
             messages.push(format!(
-                "the {} WCS offset changed from X{} Y{} to X{} Y{} mm since the grid was measured",
+                "the {} WCS offset changed from X{} Y{} Z{} to X{} Y{} Z{} mm since the \
+                 grid was measured",
                 self.wcs.as_str(),
                 format_mm(self.wcs_value_mm.get(CoreAxis::X)),
                 format_mm(self.wcs_value_mm.get(CoreAxis::Y)),
+                format_mm(self.wcs_value_mm.get(CoreAxis::Z)),
                 format_mm(live.wcs_value_mm.get(CoreAxis::X)),
                 format_mm(live.wcs_value_mm.get(CoreAxis::Y)),
+                format_mm(live.wcs_value_mm.get(CoreAxis::Z)),
             ));
         }
         if !position_close(self.g92_mm, live.g92_mm) {
             messages.push(format!(
-                "the G92 offset changed from X{} Y{} to X{} Y{} mm since the grid was measured",
+                "the G92 offset changed from X{} Y{} Z{} to X{} Y{} Z{} mm since the \
+                 grid was measured",
                 format_mm(self.g92_mm.get(CoreAxis::X)),
                 format_mm(self.g92_mm.get(CoreAxis::Y)),
+                format_mm(self.g92_mm.get(CoreAxis::Z)),
                 format_mm(live.g92_mm.get(CoreAxis::X)),
                 format_mm(live.g92_mm.get(CoreAxis::Y)),
+                format_mm(live.g92_mm.get(CoreAxis::Z)),
             ));
         }
         if (self.tlo_z_mm - live.tlo_z_mm).abs() > FRAME_TOLERANCE_MM {
@@ -438,6 +452,24 @@ impl HeightMapCompensation {
             self.original_wcs = selected_wcs(&source.source);
             self.original = Some(source);
         }
+    }
+
+    /// Adopt the loaded part program as the original for a saved-map Apply.
+    ///
+    /// Selecting a stored map only views it. This method is called by the
+    /// explicit Apply action (never by load) and records the current program
+    /// source so [`Self::request_apply`] can rewrite it. It clears no applied
+    /// state and keeps any pending preview untouched.
+    ///
+    /// Returns `true` when an original source is available afterwards.
+    pub fn adopt_current_program_for_map(&mut self) -> bool {
+        if self.original.is_none()
+            && let Some(source) = self.job_source.clone()
+        {
+            self.original_wcs = selected_wcs(&source.source);
+            self.original = Some(source);
+        }
+        self.original.is_some()
     }
 
     /// Original program kept for Revert.
@@ -1180,5 +1212,34 @@ M30
             );
             assert!(model.applied().is_none());
         }
+    }
+
+    #[test]
+    fn a_saved_map_can_use_the_same_gated_apply_after_adopting_the_program() {
+        let mut model = HeightMapCompensation::default();
+        model.remember_exact_source("part.nc", SOURCE);
+        let program: Program = ghs_gcode::parse_program(SOURCE).expect("source parses");
+        model.on_job_loaded("part.nc", &program, false);
+        assert!(model.original().is_none(), "no probe run has started yet");
+
+        assert!(model.adopt_current_program_for_map());
+        assert_eq!(
+            model.original().map(|source| source.name.as_str()),
+            Some("part.nc")
+        );
+        let snapshot = complete_map();
+        model
+            .request_apply(&snapshot, &gate())
+            .expect("the saved map applies through the same gates");
+        let preview = model.pending().expect("preview").clone();
+        assert_eq!(preview.program_name, "part.nc [height map]");
+        assert!(matches!(
+            preview.load().command(),
+            Command::LoadProgram { .. }
+        ));
+        assert!(
+            !matches!(preview.load().command(), Command::StartProgram { .. }),
+            "Apply never starts the job"
+        );
     }
 }

@@ -9,9 +9,11 @@
 //! touching this module's consumers.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ghs_config::HeightMapRecord;
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, ControllerInfo, EngineEvent, JobAbortReason, JobInfo, JobPauseReason,
@@ -21,6 +23,7 @@ use ghs_engine::{
 
 use crate::config::ConfigModel;
 use crate::height_compensation::HeightMapCompensation;
+use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_run};
 use crate::offsets::OffsetModel;
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
@@ -1010,6 +1013,8 @@ pub struct AppState {
     pub probe: ProbeModel,
     /// Original source and applied state for the explicit height-map workflow.
     pub height_map: HeightMapCompensation,
+    /// Saved per-controller maps and the current read-only selection.
+    pub height_map_library: HeightMapLibrary,
     /// Asserted `Pn` input bits from the last snapshot, for probe gating.
     pub signals_raw: CoreSignals,
     /// Application-owned tool table and its profile state.
@@ -1087,6 +1092,7 @@ impl AppState {
             offsets: OffsetModel::default(),
             probe: ProbeModel::default(),
             height_map: HeightMapCompensation::default(),
+            height_map_library: HeightMapLibrary::default(),
             signals_raw: CoreSignals::NONE,
             tools: ToolTableModel::new(),
             config,
@@ -1143,6 +1149,7 @@ impl AppState {
         self.tools = ToolTableModel::new();
         self.probe = ProbeModel::default();
         self.height_map.reset();
+        self.height_map_library.reset();
         self.config.begin_connection();
         self.push_console(ConsoleLevel::Info, message);
     }
@@ -1182,6 +1189,8 @@ impl AppState {
         );
         self.sync_offset_context();
         if let Some(load) = self.config.on_controller(info) {
+            // A newly loaded profile owns a different set of saved maps.
+            self.height_map_library.reset();
             let unverified = load.unverified;
             let corrupt = self.config.corrupt_profile();
             let status = if corrupt {
@@ -1472,6 +1481,87 @@ impl AppState {
         } else {
             live
         }
+    }
+
+    /// Maps stored in the active controller profile.
+    #[must_use]
+    pub fn saved_height_maps(&self) -> &[HeightMapRecord] {
+        self.config.height_maps()
+    }
+
+    /// Saved map currently shown read-only in the height-map workspace.
+    #[must_use]
+    pub fn selected_saved_map(&self) -> Option<&LoadedSavedMap> {
+        self.height_map_library.selected()
+    }
+
+    /// Select one saved map for display.
+    ///
+    /// The loaded map only builds a view model. It never applies compensation,
+    /// loads a program, or starts a job. The current part program is adopted as
+    /// the future Apply/Revert original, which is bookkeeping only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a probe run is active, the name is not stored, or
+    /// the record cannot be rebuilt.
+    pub fn select_saved_height_map(&mut self, name: &str) -> Result<(), String> {
+        if self.probe.is_running() {
+            return Err(
+                "a probe run is active; finish or stop it before opening a saved map".into(),
+            );
+        }
+        let record = self
+            .saved_height_maps()
+            .iter()
+            .find(|record| record.name == name)
+            .cloned()
+            .ok_or_else(|| format!("no saved map named '{name}'"))?;
+        self.height_map_library.select(record)?;
+        // A preview from the previous map must never survive the view change.
+        self.height_map.cancel_pending();
+        // Bookkeeping for a later explicit Apply. This does not apply or start.
+        self.height_map.adopt_current_program_for_map();
+        Ok(())
+    }
+
+    /// Clear the read-only saved-map selection.
+    pub fn clear_saved_map_selection(&mut self) {
+        // Leaving the browser also discards an unconfirmed rewrite.
+        self.height_map.cancel_pending();
+        self.height_map_library.clear_selection();
+    }
+
+    /// Save the current measured map into the active controller profile.
+    ///
+    /// The run may be complete or partial, but it must have at least one valid
+    /// cell. Nothing is sent to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no measured map, no valid cell, the
+    /// profile cannot be written, or the record is invalid.
+    pub fn save_current_height_map(
+        &mut self,
+        name: impl Into<String>,
+        created_at_unix_s: u64,
+    ) -> Result<PathBuf, String> {
+        let name = name.into();
+        let result = (|| {
+            let run = self
+                .probe
+                .run()
+                .ok_or_else(|| "no probe run to save".to_string())?;
+            let record = record_from_run(run, &name, Some(created_at_unix_s), self.tool)?;
+            self.config.save_height_map(record)
+        })();
+        match &result {
+            Ok(path) => self
+                .height_map_library
+                .mark_saved(name.trim().to_string(), path.clone()),
+            Err(message) => self.height_map_library.mark_error(message.clone()),
+        }
+        result
     }
 
     fn set_value(&mut self, axis: Axis, value: f64) {
@@ -1905,12 +1995,18 @@ fn seed_console() -> Vec<ConsoleLine> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use ghs_config::{ConfigStore, ControllerData, HeightMapFrame, HeightMapRecord, ProfileKey};
     use ghs_core::{
         FeedSpindle, MachineState, Overrides, Position, Signals, Wcs, parse_controller_info,
     };
     use ghs_engine::StatusReport;
 
     use super::*;
+    use crate::probe::ProbeContext;
 
     const FLEXIHAL: &[&str] = &[
         "[VER:1.1f.20240604:]",
@@ -1921,6 +2017,71 @@ mod tests {
         "[SIGNALS:HSDEP]",
         "[BOARD:FlexiHAL_20240604_210624]",
     ];
+
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "ghs-app-state-{label}-{}-{nanos}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn saved_record(name: &str, seed: f64) -> HeightMapRecord {
+        HeightMapRecord {
+            name: name.to_string(),
+            tool_number: Some(3),
+            created_at_unix_s: Some(1_700_000_000),
+            origin_x_mm: 0.0,
+            origin_y_mm: 0.0,
+            step_x_mm: 10.0,
+            step_y_mm: 10.0,
+            columns: 2,
+            rows: 2,
+            surface_z_mm: -1.0,
+            z_offset_mm: None,
+            samples: (0..4).map(|index| Some(seed + f64::from(index))).collect(),
+            frame: HeightMapFrame {
+                wcs: Wcs::G54,
+                wcs_offset: Position::xyz(1.0, 2.0, 3.0),
+                g92: Position::zero(),
+                tool_length_offset_z_mm: 0.0,
+            },
+        }
+    }
+
+    fn state_with_profile(label: &str) -> (AppState, TempRoot, ControllerInfo) {
+        let dir = TempRoot::new(label);
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut data = ControllerData::new();
+        data.height_maps = vec![saved_record("top", 1.0), saved_record("bottom", 2.0)];
+        store.save_controller_data(&key, &data).expect("profile");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store);
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+        (state, dir, info)
+    }
 
     #[test]
     fn units_round_trip_between_millimetres_and_inch() {
@@ -2136,5 +2297,201 @@ mod tests {
         assert!(job.tool_change.is_none(), "a running snapshot clears it");
         assert!(job.pause_reason.is_none());
         assert_eq!(job.fraction(), 0.75);
+    }
+
+    #[test]
+    fn profile_connect_surfaces_the_saved_maps_for_that_controller() {
+        let (state, _dir, _info) = state_with_profile("saved-maps");
+        let maps = state.saved_height_maps();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(
+            maps.iter().map(|map| map.name.as_str()).collect::<Vec<_>>(),
+            vec!["top", "bottom"]
+        );
+        assert!(state.selected_saved_map().is_none());
+    }
+
+    #[test]
+    fn selecting_a_saved_map_never_applies_compensation_or_starts_a_job() {
+        let (mut state, _dir, _info) = state_with_profile("saved-select");
+        let source = "G21 G90 G54\nG0 X0 Y0\nG1 Z-1 F200\nM30\n";
+        let program = Arc::new(ghs_gcode::parse_program(source).expect("program"));
+        state
+            .height_map
+            .remember_exact_source("part.nc", source.to_string());
+        state.height_map.on_job_loaded("part.nc", &program, false);
+        state.job.loaded("part.nc".into(), Arc::clone(&program), 4);
+
+        state
+            .select_saved_height_map("top")
+            .expect("saved map opens");
+        let selected = state.selected_saved_map().expect("selected");
+        assert_eq!(selected.record.name, "top");
+        assert!(selected.overlay.cells.len() == 4);
+
+        // Loading is a view action: no compensation is applied, no program is
+        // loaded, and the job runner stays exactly where it was.
+        assert!(state.height_map.applied().is_none());
+        assert!(state.height_map.pending().is_none());
+        assert!(state.height_map.last_error().is_none());
+        assert_eq!(state.job.state, JobState::Idle);
+        assert_eq!(state.job.name, "part.nc");
+        assert_eq!(state.job.current_line, 0);
+        assert!(state.probe.run().is_none());
+        assert!(
+            state.height_map.original().is_some(),
+            "the current program is recorded only for a later explicit Apply"
+        );
+
+        // The existing gated Apply can use the loaded record, but only builds a
+        // preview; it still produces no Start command.
+        let snapshot = selected.snapshot();
+        let frame = selected.frame;
+        let gate = crate::height_compensation::HeightApplyGate {
+            ready: true,
+            machine_state: MachineState::Idle,
+            job_active: false,
+            offsets_reported: true,
+            frame,
+        };
+        state
+            .height_map
+            .request_apply(&snapshot, &gate)
+            .expect("apply preview");
+        let preview = state.height_map.pending().expect("preview").clone();
+        assert_eq!(preview.program_name, "part.nc [height map]");
+        assert!(matches!(
+            preview.load().command(),
+            ghs_engine::Command::LoadProgram { .. }
+        ));
+        assert_eq!(state.job.state, JobState::Idle);
+
+        // Switching the viewed record discards the unconfirmed preview; it
+        // cannot survive into another map's confirmation step.
+        state
+            .select_saved_height_map("bottom")
+            .expect("second saved map opens");
+        assert!(state.height_map.pending().is_none());
+    }
+
+    #[test]
+    fn a_completed_probe_run_saves_into_the_active_profile() {
+        let (mut state, _dir, _info) = state_with_profile("saved-from-run");
+        let ctx = ProbeContext {
+            live: true,
+            ready: true,
+            machine_state: MachineState::Idle,
+            job_active: false,
+            machine_pos_mm: Position::xyz(0.0, 0.0, 5.0),
+            work_pos_mm: Position::zero(),
+            wcs: Wcs::G54,
+            wcs_value_mm: Position::xyz(1.0, 2.0, 3.0),
+            g92_mm: Position::zero(),
+            tlo_z_mm: 0.0,
+            spindle_on: false,
+            coolant_on: false,
+            has_probe: true,
+            has_probe_connected_signal: false,
+            probe_disconnected: false,
+            probe_triggered: false,
+            offsets_reported: true,
+            units: Units::Millimetre,
+        };
+        state
+            .probe
+            .select_card(crate::probe::ProbeCard::HeightMap, &ctx);
+        state.probe.probe_connected_confirmed = true;
+        let setup = state
+            .probe
+            .preflight(&ctx)
+            .setup
+            .expect("height-map preflight");
+        let name = setup.plan.name.clone();
+        let expected = setup.plan.expected_probes;
+        state.probe.begin(setup);
+        assert!(state.probe.on_job_loaded(&name));
+        assert!(state.probe.on_job_started());
+        for index in 0..expected {
+            let x = 10.0 + (index % 4) as f64 * 10.0;
+            let y = 20.0 + (index / 4) as f64 * 10.0;
+            assert!(state.probe.bind_result(ghs_engine::ProbeResult::new(
+                true,
+                Position::xyz(x, y, -1.0 - index as f64 * 0.01)
+            )));
+        }
+        assert!(state.probe.on_job_completed());
+        assert_eq!(
+            state.probe.run().map(|run| run.phase),
+            Some(crate::probe::ProbePhase::Complete)
+        );
+
+        let saved = state
+            .save_current_height_map("run result", 1_700_000_000)
+            .expect("save the measured map");
+        assert!(saved.exists());
+        let maps = state.saved_height_maps();
+        assert_eq!(maps.len(), 3, "two fixture maps plus the new one");
+        let record = maps.last().expect("record");
+        assert_eq!(record.name, "run result");
+        assert_eq!(record.created_at_unix_s, Some(1_700_000_000));
+        assert_eq!(record.columns, 4);
+        assert_eq!(record.rows, 4);
+        assert_eq!(record.samples.len(), expected);
+        assert_eq!(record.frame.wcs, Wcs::G54);
+        assert_eq!(record.frame.wcs_offset, Position::xyz(1.0, 2.0, 3.0));
+        assert_eq!(
+            state
+                .height_map_library
+                .last_saved()
+                .map(|notice| notice.name.as_str()),
+            Some("run result")
+        );
+        assert_eq!(state.job.state, JobState::Idle, "saving never starts a job");
+    }
+
+    #[test]
+    fn selecting_a_saved_map_is_refused_while_a_probe_run_is_active() {
+        let (mut state, _dir, _info) = state_with_profile("saved-running");
+        // A placeholder run is enough to prove the navigation gate; it is not
+        // started and never reaches the controller.
+        let program =
+            Arc::new(ghs_gcode::parse_program("G21\nG0 X0\nM30\n").expect("probe program"));
+        state.job.loaded("height-map".into(), program, 3);
+        let ctx = ProbeContext {
+            live: true,
+            ready: true,
+            machine_state: MachineState::Idle,
+            job_active: false,
+            machine_pos_mm: Position::zero(),
+            work_pos_mm: Position::zero(),
+            wcs: Wcs::G54,
+            wcs_value_mm: Position::zero(),
+            g92_mm: Position::zero(),
+            tlo_z_mm: 0.0,
+            spindle_on: false,
+            coolant_on: false,
+            has_probe: true,
+            has_probe_connected_signal: false,
+            probe_disconnected: false,
+            probe_triggered: false,
+            offsets_reported: true,
+            units: Units::Millimetre,
+        };
+        state
+            .probe
+            .select_card(crate::probe::ProbeCard::HeightMap, &ctx);
+        state.probe.probe_connected_confirmed = true;
+        let setup = state
+            .probe
+            .preflight(&ctx)
+            .setup
+            .expect("height-map preflight");
+        state.probe.begin(setup);
+
+        let error = state
+            .select_saved_height_map("top")
+            .expect_err("an active run blocks navigation");
+        assert!(error.contains("probe run is active"), "{error}");
+        assert!(state.selected_saved_map().is_none());
     }
 }

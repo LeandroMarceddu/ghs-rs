@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ghs_config::{
-    AppConfig, BackupBundle, ConfigStore, ControllerData, IdentityCheck, IdentityPolicy,
-    ImportOutcome, OffsetSnapshot, ProfileKey, ThemeMode, ToolTable,
+    AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
+    IdentityPolicy, ImportOutcome, MAX_HEIGHT_MAPS, OffsetSnapshot, ProfileKey, ThemeMode,
+    ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -247,6 +248,56 @@ impl ConfigModel {
     #[must_use]
     pub fn unverified_identity(&self) -> bool {
         self.unverified_identity
+    }
+
+    /// Persisted height maps for the current controller profile.
+    ///
+    /// The slice is empty before a profile loads or when the profile has none;
+    /// maps never cross a controller boundary.
+    #[must_use]
+    pub fn height_maps(&self) -> &[HeightMapRecord] {
+        &self.data.height_maps
+    }
+
+    /// Why a height map cannot be written to the current profile, if any.
+    ///
+    /// This mirrors the gate used by [`ConfigModel::save_height_map`] so the UI
+    /// can explain a refusal before the operator types a name.
+    #[must_use]
+    pub fn height_map_save_blocker(&self) -> Option<String> {
+        if self.store.is_none() {
+            return Some("no platform configuration directory".to_string());
+        }
+        if self.corrupt_profile {
+            return Some(
+                "the stored profile is corrupt; it was not overwritten. Repair or remove it first"
+                    .to_string(),
+            );
+        }
+        if self.pending_data.is_some() {
+            return Some(
+                "the controller profile is unverified; confirm or discard it in Utility first"
+                    .to_string(),
+            );
+        }
+        if self.unverified_identity {
+            return Some(
+                "the controller identity is not verified; height maps are saved only for a \
+                 known controller"
+                    .to_string(),
+            );
+        }
+        match self.key.as_ref() {
+            None => {
+                Some("no controller profile is active; connect and finish the handshake".into())
+            }
+            Some(key) if !key.is_identified() => Some(
+                "the controller identity is not verified; height maps are saved only for a \
+                 known controller"
+                    .to_string(),
+            ),
+            Some(_) => None,
+        }
     }
 
     /// Clear the per-session controller identity before a new connection.
@@ -517,6 +568,79 @@ impl ConfigModel {
         self.last_result = Some(ConfigStatus {
             ok: true,
             text: format!("Profile saved to {}", path.display()),
+        });
+        Ok(path)
+    }
+
+    /// Save one measured height map into the current controller profile.
+    ///
+    /// A record with the same name replaces the stored one in place. A new name
+    /// is refused at [`MAX_HEIGHT_MAPS`] instead of dropping an older map. The
+    /// write goes through the same atomic `ConfigStore` profile path as
+    /// [`ConfigModel::save_profile`] and never sends anything to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no verified profile is active, the profile file is
+    /// corrupt, the record fails validation, the profile is full, or writing
+    /// fails.
+    pub fn save_height_map(&mut self, record: HeightMapRecord) -> Result<PathBuf, String> {
+        if let Some(blocker) = self.height_map_save_blocker() {
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Height map not saved: {blocker}"),
+            });
+            return Err(blocker);
+        }
+        record
+            .validate()
+            .map_err(|error| format!("height map is invalid: {error}"))?;
+        let Some(key) = self.key.clone() else {
+            return Err("no controller profile is active".to_string());
+        };
+        let Some(store) = self.store.clone() else {
+            return Err("no platform configuration directory".to_string());
+        };
+
+        let mut data = self.data.clone();
+        if let Some(index) = data
+            .height_maps
+            .iter()
+            .position(|map| map.name == record.name)
+        {
+            data.height_maps[index] = record;
+        } else {
+            if data.height_maps.len() >= MAX_HEIGHT_MAPS {
+                let message = format!(
+                    "this controller profile already has {MAX_HEIGHT_MAPS} saved maps; \
+                     reuse a name to replace one"
+                );
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Height map not saved: {message}"),
+                });
+                return Err(message);
+            }
+            data.height_maps.push(record);
+        }
+        let path = store.profile_path(&key);
+        if let Err(error) = store.save_controller_data(&key, &data) {
+            let message = error.to_string();
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Height map save failed: {message}"),
+            });
+            return Err(message);
+        }
+        self.data = data;
+        self.profile_error = None;
+        self.last_result = Some(ConfigStatus {
+            ok: true,
+            text: format!(
+                "Height map saved to {} ({} stored)",
+                path.display(),
+                self.data.height_maps.len()
+            ),
         });
         Ok(path)
     }
@@ -930,5 +1054,190 @@ mod tests {
         assert!(imported.warning.is_some());
         assert!(imported.tools.is_none(), "other profile is not applied");
         assert!(reader.data().tools.is_empty());
+    }
+
+    fn saved_map(name: &str, seed: f64) -> HeightMapRecord {
+        HeightMapRecord {
+            name: name.to_string(),
+            tool_number: Some(3),
+            created_at_unix_s: Some(1_700_000_000),
+            origin_x_mm: 10.0,
+            origin_y_mm: 20.0,
+            step_x_mm: 5.0,
+            step_y_mm: 2.5,
+            columns: 3,
+            rows: 2,
+            surface_z_mm: -1.0,
+            z_offset_mm: None,
+            samples: (0..6).map(|index| Some(seed + f64::from(index))).collect(),
+            frame: ghs_config::HeightMapFrame {
+                wcs: Wcs::G55,
+                wcs_offset: Position::xyz(1.0, 2.0, 3.0),
+                g92: Position::xyz(0.1, 0.2, 0.3),
+                tool_length_offset_z_mm: -12.5,
+            },
+        }
+    }
+
+    #[test]
+    fn height_map_save_replaces_same_name_and_enforces_the_cap() {
+        let dir = TempDir::new("height-maps");
+        let store = ConfigStore::new(&dir.path);
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let mut model = ConfigModel::from_store(store.clone());
+        model.on_controller(&info).expect("profile");
+        assert!(model.height_map_save_blocker().is_none());
+
+        for index in 0..MAX_HEIGHT_MAPS {
+            let path = model
+                .save_height_map(saved_map(&format!("map-{index}"), index as f64))
+                .expect("save map");
+            assert!(path.exists());
+        }
+        assert_eq!(model.height_maps().len(), MAX_HEIGHT_MAPS);
+
+        let replacement = saved_map("map-5", 100.0);
+        model
+            .save_height_map(replacement.clone())
+            .expect("replace same name");
+        assert_eq!(model.height_maps().len(), MAX_HEIGHT_MAPS);
+        assert_eq!(
+            model.height_maps().get(5).map(|map| &map.samples),
+            Some(&replacement.samples),
+            "same name replaces in place"
+        );
+
+        let error = model
+            .save_height_map(saved_map("map-overflow", 0.0))
+            .expect_err("cap is enforced");
+        assert!(error.contains("16"), "{error}");
+        assert_eq!(model.height_maps().len(), MAX_HEIGHT_MAPS);
+
+        let stored = store
+            .load_controller_data(&key)
+            .expect("load")
+            .expect("profile");
+        assert_eq!(stored.height_maps.len(), MAX_HEIGHT_MAPS);
+        assert_eq!(stored.height_maps[5], replacement);
+    }
+
+    #[test]
+    fn height_map_save_is_refused_without_a_verified_profile_or_after_corruption() {
+        let dir = TempDir::new("height-map-gates");
+        let store = ConfigStore::new(&dir.path);
+
+        let mut no_profile = ConfigModel::from_store(store.clone());
+        let error = no_profile
+            .save_height_map(saved_map("first", 0.0))
+            .expect_err("no controller profile");
+        assert!(error.contains("no controller profile"), "{error}");
+
+        // Corrupt file: reported, never overwritten.
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let path = store.profile_path(&key);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let corrupt = b"{ not json";
+        fs::write(&path, corrupt).expect("write");
+        let mut corrupt_model = ConfigModel::from_store(store.clone());
+        let load = corrupt_model.on_controller(&info).expect("load notice");
+        assert!(load.notice.contains("corrupt"));
+        let error = corrupt_model
+            .save_height_map(saved_map("first", 0.0))
+            .expect_err("corrupt profile refused");
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(fs::read(&path).expect("read"), corrupt);
+
+        // Unverified identity: stored data waits for an explicit action.
+        let dir = TempDir::new("height-map-unverified");
+        let store = ConfigStore::new(&dir.path);
+        let mut anonymous = ControllerInfo::new();
+        anonymous.version = "1.1f".into();
+        let key = ProfileKey::from_controller(&anonymous);
+        assert!(!key.is_identified());
+        store
+            .save_controller_data(&key, &ControllerData::new())
+            .expect("save");
+        let mut unverified = ConfigModel::from_store(store);
+        assert!(
+            unverified
+                .on_controller(&anonymous)
+                .expect("notice")
+                .unverified
+        );
+        let error = unverified
+            .save_height_map(saved_map("first", 0.0))
+            .expect_err("unverified profile refused");
+        assert!(
+            error.contains("unverified") || error.contains("not verified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn saving_a_height_map_keeps_the_existing_profile_fields() {
+        let dir = TempDir::new("height-map-preserve");
+        let store = ConfigStore::new(&dir.path);
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let mut model = ConfigModel::from_store(store.clone());
+        model.on_controller(&info).expect("profile");
+        let mut table = ToolTable::new();
+        table.insert(tool(6, "Six"));
+        model
+            .save_profile(&table, &offsets(), BTreeMap::new())
+            .expect("profile save");
+        model
+            .save_height_map(saved_map("top", 1.0))
+            .expect("map save");
+
+        let stored = store
+            .load_controller_data(&key)
+            .expect("load")
+            .expect("data");
+        assert_eq!(stored.tools, table);
+        assert_eq!(stored.offsets, offsets());
+        assert_eq!(stored.height_maps.len(), 1);
+    }
+
+    #[test]
+    fn height_maps_never_cross_a_controller_profile() {
+        let dir = TempDir::new("height-map-profiles");
+        let store = ConfigStore::new(&dir.path);
+        let first = info();
+        let mut second = info();
+        second.board = Some("OtherBoard".into());
+
+        let mut writer = ConfigModel::from_store(store.clone());
+        writer.on_controller(&first).expect("first");
+        writer
+            .save_height_map(saved_map("first-only", 1.0))
+            .expect("save first");
+
+        let mut reader = ConfigModel::from_store(store.clone());
+        reader.on_controller(&second).expect("second");
+        assert!(
+            reader.height_maps().is_empty(),
+            "a different controller must not inherit maps"
+        );
+        reader
+            .save_height_map(saved_map("second-only", 2.0))
+            .expect("save second");
+
+        let first_key = ProfileKey::from_controller(&first);
+        let second_key = ProfileKey::from_controller(&second);
+        let first_data = store
+            .load_controller_data(&first_key)
+            .expect("first load")
+            .expect("first data");
+        let second_data = store
+            .load_controller_data(&second_key)
+            .expect("second load")
+            .expect("second data");
+        assert_eq!(first_data.height_maps.len(), 1);
+        assert_eq!(first_data.height_maps[0].name, "first-only");
+        assert_eq!(second_data.height_maps.len(), 1);
+        assert_eq!(second_data.height_maps[0].name, "second-only");
     }
 }

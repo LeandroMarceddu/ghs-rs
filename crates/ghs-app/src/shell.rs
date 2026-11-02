@@ -32,9 +32,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ghs_config::ToolRecord;
+use ghs_config::{MAX_HEIGHT_MAPS, ToolRecord};
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
     MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
@@ -59,6 +59,9 @@ use gpui_kit::{
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::height_compensation::{
     HeightApplyGate, HeightApplyPreview, HeightMapApplyStatus, HeightMapSnapshot,
+};
+use crate::height_map_library::{
+    LoadedSavedMap, SavedMapSummary, default_map_name, format_unix_utc,
 };
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
@@ -108,6 +111,8 @@ enum SettingsEntryPurpose {
     Text(u16),
     /// The name field of the open tool sheet.
     ToolName,
+    /// The name field for saving the measured height map.
+    HeightMapName,
 }
 
 /// One open settings text sheet.
@@ -232,6 +237,10 @@ pub struct Shell {
     demo_height_map_confirm_done: bool,
     demo_height_map_job: bool,
     demo_height_map_job_done: bool,
+    demo_height_map_save: bool,
+    demo_height_map_save_done: bool,
+    demo_height_map_open_saved: bool,
+    demo_height_map_open_saved_done: bool,
     /// Toolpath captured before a height-map probe replaced the job program.
     height_map_base_program: Option<Arc<ghs_gcode::Program>>,
     _poll_task: Option<Task<()>>,
@@ -360,6 +369,8 @@ impl Shell {
                 || arg == "--demo-height-map-revert"
                 || arg == "--demo-height-map-confirm"
                 || arg == "--demo-height-map-job"
+                || arg == "--demo-height-map-save"
+                || arg == "--demo-height-map-open-saved"
         });
         let demo_height_map_result = std::env::args().any(|arg| arg == "--demo-height-map-result");
         let demo_height_map_export = std::env::args().any(|arg| arg == "--demo-height-map-export");
@@ -367,6 +378,10 @@ impl Shell {
         let demo_height_map_confirm =
             std::env::args().any(|arg| arg == "--demo-height-map-confirm");
         let demo_height_map_job = std::env::args().any(|arg| arg == "--demo-height-map-job");
+        let demo_height_map_save = std::env::args().any(|arg| arg == "--demo-height-map-save");
+        let demo_height_map_open_saved =
+            std::env::args().any(|arg| arg == "--demo-height-map-open-saved");
+        let demo_height_map_save = demo_height_map_save || demo_height_map_open_saved;
         let demo_height_map_apply = demo_height_map_revert
             || demo_height_map_job
             || std::env::args().any(|arg| arg == "--demo-height-map-apply");
@@ -375,6 +390,7 @@ impl Shell {
         }
         let demo_probe_run = demo_probe_apply
             || demo_height_map_result
+            || demo_height_map_save
             || demo_height_map_confirm
             || demo_height_map_apply
             || std::env::args().any(|arg| arg == "--demo-probe-run");
@@ -429,6 +445,10 @@ impl Shell {
             demo_height_map_confirm_done: false,
             demo_height_map_job,
             demo_height_map_job_done: false,
+            demo_height_map_save,
+            demo_height_map_save_done: false,
+            demo_height_map_open_saved,
+            demo_height_map_open_saved_done: false,
             height_map_base_program: None,
             _poll_task: None,
             _subscriptions: subscriptions,
@@ -700,6 +720,36 @@ impl Shell {
             self.demo_height_map_export_done = true;
             self.export_height_map(cx);
             changed = true;
+        }
+        // Screenshot switch: save the completed demo map with the same action a
+        // tap uses, then optionally open it from the saved-map browser.
+        if self.demo_height_map_save && !self.demo_height_map_save_done {
+            let complete = self.state.probe.run().is_some_and(|run| {
+                run.phase == ProbePhase::Complete
+                    && run.map.as_ref().is_some_and(|map| map.valid_count() > 0)
+            });
+            if complete {
+                self.demo_height_map_save_done = true;
+                let name = default_map_name(now_unix_s());
+                let _ = self.save_height_map_named(name, cx);
+                changed = true;
+            }
+        }
+        if self.demo_height_map_open_saved
+            && self.demo_height_map_save_done
+            && !self.demo_height_map_open_saved_done
+        {
+            let saved = self
+                .state
+                .height_map_library
+                .last_saved()
+                .map(|notice| notice.name.clone());
+            if let Some(name) = saved
+                && self.state.select_saved_height_map(&name).is_ok()
+            {
+                self.demo_height_map_open_saved_done = true;
+                changed = true;
+            }
         }
         // Screenshot switch: open the same confirmation step without confirming.
         if self.demo_height_map_confirm && !self.demo_height_map_confirm_done {
@@ -1097,6 +1147,7 @@ impl Shell {
                 false,
                 None,
             ),
+            SettingsEntryPurpose::HeightMapName => (default_map_name(now_unix_s()), false, None),
         };
         let input = if let Some(entry) = self.settings_entry.as_ref() {
             entry
@@ -1142,6 +1193,29 @@ impl Shell {
                 editor.error = None;
             }
             self.settings_entry = None;
+            cx.notify();
+            return;
+        }
+        if purpose == SettingsEntryPurpose::HeightMapName {
+            let name = value.trim().to_string();
+            if name.is_empty() {
+                let message = "a map name is required".to_string();
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Height map: {message}"));
+                if let Some(entry) = self.settings_entry.as_mut() {
+                    entry.error = Some(message);
+                }
+                cx.notify();
+                return;
+            }
+            match self.save_height_map_named(name, cx) {
+                Ok(_) => self.settings_entry = None,
+                Err(message) => {
+                    if let Some(entry) = self.settings_entry.as_mut() {
+                        entry.error = Some(message);
+                    }
+                }
+            }
             cx.notify();
             return;
         }
@@ -1319,8 +1393,81 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the short-name sheet for saving the measured height map.
+    fn open_height_map_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_entry(SettingsEntryPurpose::HeightMapName, window, cx);
+    }
+
+    /// Save the measured map under `name` through the active profile.
+    fn save_height_map_named(
+        &mut self,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> Result<PathBuf, String> {
+        let result = self.state.save_current_height_map(name, now_unix_s());
+        match &result {
+            Ok(path) => self.state.push_console(
+                ConsoleLevel::Ok,
+                format!(
+                    "Height map saved: {} (profile {})",
+                    self.state
+                        .height_map_library
+                        .last_saved()
+                        .map_or("", |notice| notice.name.as_str()),
+                    path.display()
+                ),
+            ),
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Error,
+                format!("Height map not saved: {message}"),
+            ),
+        }
+        cx.notify();
+        result
+    }
+
+    /// Open one saved map read-only. Nothing is applied or started.
+    fn open_saved_height_map(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.state.select_saved_height_map(name) {
+            Ok(()) => {
+                let summary = self
+                    .state
+                    .height_map_library
+                    .selected()
+                    .map(|loaded| {
+                        format!(
+                            "{} | {} / {} cells | {}",
+                            loaded.record.name,
+                            loaded.summary.valid,
+                            loaded.summary.total,
+                            loaded.record.frame.wcs.as_str()
+                        )
+                    })
+                    .unwrap_or_default();
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "Saved height map opened read-only: {summary}; compensation is not applied"
+                    ),
+                );
+            }
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Saved map not opened: {message}"),
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Leave the saved-map browser and return to the live grid editor.
+    fn close_saved_height_map(&mut self, cx: &mut Context<Self>) {
+        self.state.clear_saved_map_selection();
+        cx.notify();
+    }
+
     fn use_pending_profile(&mut self, cx: &mut Context<Self>) {
         if let Some(tools) = self.state.config.use_pending_profile() {
+            self.state.clear_saved_map_selection();
             let path = self.state.config.profile_path();
             let count = tools.len();
             self.state
@@ -1412,6 +1559,7 @@ impl Shell {
         match self.state.config.import_backup(allow_warning) {
             Ok(import) => {
                 if let Some(tools) = import.tools {
+                    self.state.clear_saved_map_selection();
                     let count = tools.len();
                     let profile_path = self.state.config.profile_path();
                     self.state.tools.adopt(tools, profile_path, "IMPORTED");
@@ -1874,6 +2022,7 @@ impl Shell {
     fn select_probe_card(&mut self, card: ProbeCard, cx: &mut Context<Self>) {
         let ctx = self.probe_context();
         if self.state.probe.select_card(card, &ctx) {
+            self.state.clear_saved_map_selection();
             cx.notify();
         } else if self.state.probe.is_running() {
             self.state.push_console(
@@ -1886,6 +2035,7 @@ impl Shell {
 
     fn close_probe_card(&mut self, cx: &mut Context<Self>) {
         if self.state.probe.close_card() {
+            self.state.clear_saved_map_selection();
             cx.notify();
         } else {
             self.state.push_console(
@@ -1917,6 +2067,9 @@ impl Shell {
         };
         let name = setup.plan.name.clone();
         let source = setup.plan.program.clone();
+        // Starting a run always leaves the read-only saved-map browser and
+        // clears the previous run's save feedback.
+        self.state.height_map_library.reset();
         // Keep the work toolpath for the height-map overlay. A second run must
         // not capture its own probe program as the base path.
         if self.state.probe.card() == Some(ProbeCard::HeightMap)
@@ -2101,20 +2254,33 @@ impl Shell {
         cx.notify();
     }
 
+    /// Snapshot the map the operator is acting on: a read-only saved map when
+    /// one is open, otherwise the current measured run.
+    fn active_height_map_snapshot(&self) -> Option<HeightMapSnapshot> {
+        if let Some(saved) = self.state.selected_saved_map() {
+            Some(saved.snapshot())
+        } else {
+            self.state.probe.run().and_then(HeightMapSnapshot::from_run)
+        }
+    }
+
     /// Validate the map and prepare a compensated program for confirmation.
     ///
     /// Nothing is loaded and nothing starts: this only builds the preview the
     /// confirmation step shows.
     fn request_height_map_apply(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.state.probe.run().and_then(HeightMapSnapshot::from_run);
+        let snapshot = self.active_height_map_snapshot();
         let Some(snapshot) = snapshot else {
             self.state.push_console(
                 ConsoleLevel::Warn,
-                "Height map Apply refused: no measured map",
+                "Height map Apply refused: no measured or selected map",
             );
             cx.notify();
             return;
         };
+        // Applying a saved map rewrites the currently loaded part program. Adopt
+        // it as the Revert original only on this explicit action.
+        self.state.height_map.adopt_current_program_for_map();
         let gate = HeightApplyGate::from_context(&self.probe_context());
         match self.state.height_map.request_apply(&snapshot, &gate) {
             Ok(()) => {
@@ -2162,7 +2328,7 @@ impl Shell {
         };
         // Re-check the live gates: telemetry can change between the preview and
         // the operator's confirmation.
-        let snapshot = self.state.probe.run().and_then(HeightMapSnapshot::from_run);
+        let snapshot = self.active_height_map_snapshot();
         if let Some(snapshot) = snapshot {
             let gate = HeightApplyGate::from_context(&self.probe_context());
             let blockers = self.state.height_map.blockers(&snapshot, &gate);
@@ -3501,14 +3667,23 @@ impl Shell {
         let preflight = self.state.probe.preflight(ctx);
         let running = self.state.probe.is_running();
         let back_view = cx.entity();
-        let status = if let Some(run) = self.state.probe.run() {
+        let saved = if card == ProbeCard::HeightMap && !running {
+            self.state.selected_saved_map().cloned()
+        } else {
+            None
+        };
+        let status = if saved.is_some() {
+            "SAVED MAP"
+        } else if let Some(run) = self.state.probe.run() {
             run.phase.label()
         } else if preflight.setup.is_some() {
             "PREFLIGHT OK"
         } else {
             "SETUP"
         };
-        let status_color = if let Some(run) = self.state.probe.run() {
+        let status_color = if saved.is_some() {
+            p.info
+        } else if let Some(run) = self.state.probe.run() {
             match run.phase {
                 ProbePhase::Running => p.accent,
                 ProbePhase::Complete => p.success,
@@ -3520,9 +3695,15 @@ impl Shell {
             p.text_faint
         };
 
-        let body: AnyElement = if let Some(run) = self.state.probe.run() {
+        let body: AnyElement = if let Some(saved) = saved.as_ref() {
+            self.saved_height_map_detail(p, cx, saved)
+                .into_any_element()
+        } else if let Some(run) = self.state.probe.run() {
             let mut content = v_flex().gap_2().p_2();
             if run.map.is_some() {
+                if card == ProbeCard::HeightMap {
+                    content = content.child(self.height_map_library_panel(p, cx));
+                }
                 content = content.child(self.height_map_result_panel(p, cx, run));
             } else {
                 content = content.child(self.probe_run_panel(p, cx, run));
@@ -3566,6 +3747,9 @@ impl Shell {
                     v_flex()
                         .gap_2()
                         .p_2()
+                        .when(card == ProbeCard::HeightMap, |this| {
+                            this.child(self.height_map_library_panel(p, cx))
+                        })
                         .child(self.probe_preflight_panel(&preflight, p, cx)),
                 );
             h_flex()
@@ -3575,6 +3759,12 @@ impl Shell {
                 .child(form_pane)
                 .child(preflight_pane)
                 .into_any_element()
+        };
+
+        let footer = if let Some(saved) = saved.as_ref() {
+            self.saved_map_footer(p, cx, saved)
+        } else {
+            self.probe_footer(p, cx, &preflight, running)
         };
 
         v_flex()
@@ -3643,7 +3833,7 @@ impl Shell {
                     .child(chip(self.state.unit(), p)),
             )
             .child(body)
-            .child(self.probe_footer(p, cx, &preflight, running))
+            .child(footer)
     }
 
     fn probe_form(
@@ -4521,6 +4711,659 @@ impl Shell {
         panel
     }
 
+    /// Per-controller saved-map list and its profile status.
+    ///
+    /// Shown in the height-map workspace before and after a measurement; the
+    /// rows only select a read-only view.
+    fn height_map_library_panel(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let maps = self.state.saved_height_maps();
+        let selected = self
+            .state
+            .selected_saved_map()
+            .map(|saved| saved.record.name.clone());
+        let profile = self.state.config.profile_path();
+        let profile_text = profile.as_ref().map_or_else(
+            || "PROFILE: not active".to_string(),
+            |path| format!("PROFILE: {}", path.display()),
+        );
+        let blocker = self.state.config.height_map_save_blocker();
+        let mut panel = v_flex()
+            .w_full()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("SAVED MAPS", p))
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(18.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(p.info.opacity(0.14))
+                            .text_size(px(8.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.info)
+                            .child(format!("{} / {MAX_HEIGHT_MAPS}", maps.len())),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(p.text_faint)
+                            .child("per controller profile"),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(self.mono.clone())
+                    .text_size(px(7.5))
+                    .line_height(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(profile_text),
+            );
+        if let Some(blocker) = blocker {
+            panel = panel.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(10.5))
+                    .text_color(p.warning)
+                    .child(format!("SAVE BLOCKED: {blocker}")),
+            );
+        }
+        if let Some(notice) = self.state.height_map_library.last_saved() {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(self.mono.clone())
+                    .text_size(px(7.8))
+                    .line_height(px(10.0))
+                    .text_color(p.success)
+                    .child(format!(
+                        "SAVED: {} -> {}",
+                        notice.name,
+                        notice.path.display()
+                    )),
+            );
+        } else if let Some(error) = self.state.height_map_library.last_error() {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(self.mono.clone())
+                    .text_size(px(7.8))
+                    .line_height(px(10.0))
+                    .text_color(p.danger)
+                    .child(format!("SAVE FAILED: {error}")),
+            );
+        }
+
+        let mut rows = v_flex().gap_1();
+        if maps.is_empty() {
+            rows = rows.child(
+                div()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .text_size(px(9.5))
+                    .text_color(p.text_dim)
+                    .child("No saved maps for this controller profile yet."),
+            );
+        } else {
+            for (index, record) in maps.iter().enumerate() {
+                let summary = SavedMapSummary::from_record(record);
+                let is_selected = selected.as_deref() == Some(summary.name.as_str());
+                let view = cx.entity();
+                let name = summary.name.clone();
+                let date = summary
+                    .created_at_unix_s
+                    .map_or_else(|| "date unknown".to_string(), format_unix_utc);
+                let tool = summary
+                    .tool_number
+                    .map_or_else(|| "T?".to_string(), |tool| format!("T{tool}"));
+                let state_text = if summary.complete {
+                    "complete"
+                } else {
+                    "partial"
+                };
+                rows = rows.child(
+                    h_flex()
+                        .id(("saved-map-row", index))
+                        .h(px(48.0))
+                        .w_full()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(if is_selected { p.accent } else { p.border })
+                        .bg(if is_selected { p.accent_muted } else { p.panel })
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.open_saved_height_map(&name, cx);
+                            });
+                        })
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .gap_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(p.text)
+                                        .child(summary.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(7.8))
+                                        .line_height(px(10.0))
+                                        .text_color(p.text_dim)
+                                        .child(format!(
+                                            "{date} | {} cells | {} | {tool} | {state_text}",
+                                            summary.point_count,
+                                            summary.wcs.as_str()
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .h(px(18.0))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.0))
+                                .bg(if is_selected {
+                                    p.accent.opacity(0.18)
+                                } else {
+                                    p.panel_alt
+                                })
+                                .text_size(px(7.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if is_selected { p.accent } else { p.text_faint })
+                                .child(if is_selected { "OPEN" } else { "VIEW" }),
+                        ),
+                );
+            }
+        }
+        panel.child(
+            div()
+                .id("saved-map-list")
+                .w_full()
+                .max_h(px(104.0))
+                .overflow_y_scroll()
+                .child(rows),
+        )
+    }
+
+    /// Read-only detail for one saved map: list, summary, frame check, overlay.
+    fn saved_height_map_detail(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        saved: &LoadedSavedMap,
+    ) -> Div {
+        let summary = &saved.summary;
+        let live = self.probe_context();
+        let mismatches = saved.frame_mismatches(&live);
+        let frame_ok = mismatches.is_empty();
+        let frame_chip = if frame_ok {
+            "FRAME MATCH"
+        } else {
+            "FRAME MISMATCH"
+        };
+        let frame_color = if frame_ok { p.success } else { p.danger };
+        let created = saved
+            .record
+            .created_at_unix_s
+            .map_or_else(|| "date unknown".to_string(), format_unix_utc);
+        let tool = saved
+            .record
+            .tool_number
+            .map_or_else(|| "T?".to_string(), |tool| format!("T{tool}"));
+        let snapshot = saved.snapshot();
+        let program = self
+            .height_map_base_program
+            .clone()
+            .or_else(|| self.state.job.program().cloned());
+        let marker = viewer::marker_mm(self.state.profile.capabilities.units, &self.state.dro);
+
+        let min_z = summary.min_z_mm.map_or_else(|| "--".to_string(), format_mm);
+        let max_z = summary.max_z_mm.map_or_else(|| "--".to_string(), format_mm);
+        let compensation = match (summary.min_compensation_mm, summary.max_compensation_mm) {
+            (Some(low), Some(high)) => {
+                format!("{} .. {} mm", format_mm(low), format_mm(high))
+            }
+            _ => "--".to_string(),
+        };
+
+        let mut frame_rows = v_flex().gap_0();
+        for (label, recorded, current) in [
+            (
+                "WCS",
+                saved.frame.wcs.as_str().to_string(),
+                live.wcs.as_str().to_string(),
+            ),
+            (
+                "WCS OFFSET",
+                format!(
+                    "X{} Y{}",
+                    format_mm(saved.frame.wcs_value_mm.get(CoreAxis::X)),
+                    format_mm(saved.frame.wcs_value_mm.get(CoreAxis::Y))
+                ),
+                format!(
+                    "X{} Y{}",
+                    format_mm(live.wcs_value_mm.get(CoreAxis::X)),
+                    format_mm(live.wcs_value_mm.get(CoreAxis::Y))
+                ),
+            ),
+            (
+                "G92",
+                format!(
+                    "X{} Y{}",
+                    format_mm(saved.frame.g92_mm.get(CoreAxis::X)),
+                    format_mm(saved.frame.g92_mm.get(CoreAxis::Y))
+                ),
+                format!(
+                    "X{} Y{}",
+                    format_mm(live.g92_mm.get(CoreAxis::X)),
+                    format_mm(live.g92_mm.get(CoreAxis::Y))
+                ),
+            ),
+            (
+                "TLO Z",
+                format!("{} mm", format_mm(saved.frame.tlo_z_mm)),
+                format!("{} mm", format_mm(live.tlo_z_mm)),
+            ),
+        ] {
+            frame_rows = frame_rows.child(
+                h_flex()
+                    .h(px(24.0))
+                    .items_center()
+                    .gap_2()
+                    .font_family(self.mono.clone())
+                    .text_size(px(8.5))
+                    .child(
+                        div()
+                            .w(px(78.0))
+                            .flex_shrink_0()
+                            .text_color(p.text_faint)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(p.text_dim)
+                            .child(format!("rec {recorded}")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(if frame_ok { p.text_dim } else { p.warning })
+                            .child(format!("live {current}")),
+                    ),
+            );
+        }
+
+        let stats = v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(section_label("SAVED MAP", p))
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(18.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(frame_color.opacity(0.16))
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(frame_color)
+                            .child(frame_chip),
+                    ),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text)
+                    .child(saved.record.name.clone()),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(8.0))
+                    .line_height(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "{created} | {} | {}",
+                        saved.record.frame.wcs.as_str(),
+                        tool
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .line_height(px(11.0))
+                    .text_color(p.info)
+                    .child(
+                        "READ-ONLY: opening a saved map never applies compensation or \
+                         starts a job.",
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        height_map_detail_cell(
+                            "VALID",
+                            &format!("{} / {}", summary.valid, summary.total),
+                            p,
+                        )
+                        .w(px(96.0)),
+                    )
+                    .child(
+                        height_map_detail_cell("MISSING", &summary.missing.to_string(), p)
+                            .w(px(96.0)),
+                    )
+                    .child(height_map_detail_cell("MIN Z", &format!("{min_z} mm"), p).w(px(96.0)))
+                    .child(height_map_detail_cell("MAX Z", &format!("{max_z} mm"), p).w(px(96.0)))
+                    .child(height_map_detail_cell("COMP RANGE", &compensation, p).w(px(96.0)))
+                    .child(
+                        height_map_detail_cell(
+                            "SURFACE",
+                            &format!("{} mm", format_mm(summary.nominal_z_mm)),
+                            p,
+                        )
+                        .w(px(96.0)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label("MEASUREMENT FRAME", p))
+                            .child(
+                                div()
+                                    .text_size(px(8.0))
+                                    .text_color(p.text_faint)
+                                    .child("recorded vs live"),
+                            ),
+                    )
+                    .child(frame_rows)
+                    .when(!frame_ok, |this| {
+                        let mut warnings = v_flex().gap_1();
+                        warnings = warnings.child(
+                            div()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.danger)
+                                .child(
+                                    "FRAME MISMATCH: this map was measured in another \
+                                     WCS/G92/TLO frame. Apply is refused; re-probe in the \
+                                     live frame or restore the recorded offsets.",
+                                ),
+                        );
+                        for mismatch in &mismatches {
+                            warnings = warnings.child(
+                                div()
+                                    .text_size(px(8.5))
+                                    .line_height(px(10.5))
+                                    .text_color(p.warning)
+                                    .child(format!("- {mismatch}")),
+                            );
+                        }
+                        this.child(warnings)
+                    })
+                    .when(frame_ok, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(8.5))
+                                .line_height(px(10.5))
+                                .text_color(p.success)
+                                .child(
+                                    "The live WCS, G92, and TLO match the recorded frame. \
+                                     Apply still requires Idle, no active job, and a complete map.",
+                                ),
+                        )
+                    }),
+            )
+            .child(self.height_map_apply_section(p, cx, Some(&snapshot)));
+
+        h_flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
+            .child(
+                div()
+                    .id("saved-map-summary-scroll")
+                    .w(px(300.0))
+                    .flex_shrink_0()
+                    .h_full()
+                    .overflow_y_scrollbar()
+                    .child(div().w_full().pr_1().child(stats)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(220.0))
+                            .w_full()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(p.border)
+                            .overflow_hidden()
+                            .child(viewer::view(
+                                &self.viewer,
+                                p,
+                                program,
+                                marker,
+                                Some(saved.overlay.clone()),
+                                cx.entity(),
+                            )),
+                    )
+                    .child(height_map_overlay_legend(p)),
+            )
+    }
+
+    /// Footer for the saved-map browser; no RUN action is offered.
+    fn saved_map_footer(&self, p: Palette, cx: &mut Context<Self>, saved: &LoadedSavedMap) -> Div {
+        let close_view = cx.entity();
+        h_flex()
+            .h(px(68.0))
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_t_1()
+            .border_color(p.border)
+            .bg(p.panel)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.info)
+                            .child(format!("SAVED MAP: {}", saved.record.name)),
+                    )
+                    .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                        "Read-only view; opening does not apply compensation or start a job",
+                    )),
+            )
+            .child(
+                Button::new("saved-map-close")
+                    .label("CLOSE MAP")
+                    .secondary()
+                    .h(px(56.0))
+                    .w(px(150.0))
+                    .rounded_lg()
+                    .text_size(px(10.0))
+                    .on_click(move |_, _, cx| {
+                        close_view.update(cx, |this, cx| this.close_saved_height_map(cx));
+                    }),
+            )
+    }
+
+    /// SAVE MAP row for a measured height map.
+    ///
+    /// The button opens the short-name sheet; the profile path and the last
+    /// save result are shown beside it. It is disabled with an explicit reason
+    /// when the profile is corrupt/unverified/pending, no controller profile is
+    /// active, or the map has no valid cell.
+    fn height_map_save_section(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        valid_cells: usize,
+    ) -> Div {
+        let save_view = cx.entity();
+        let blocker = self.state.config.height_map_save_blocker();
+        let ready = valid_cells > 0 && blocker.is_none();
+        let last_saved = self.state.height_map_library.last_saved().cloned();
+        let last_error = self
+            .state
+            .height_map_library
+            .last_error()
+            .map(str::to_string);
+        let default_name = default_map_name(now_unix_s());
+        let profile = self.state.config.profile_path().map_or_else(
+            || "PROFILE NOT ACTIVE".to_string(),
+            |path| format!("PROFILE: {}", path.display()),
+        );
+        let mut section = v_flex()
+            .gap_1()
+            .pt_1()
+            .border_t_1()
+            .border_color(p.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("height-map-save")
+                            .label("SAVE MAP")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(130.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!ready)
+                            .on_click(move |_, window, cx| {
+                                save_view.update(cx, |this, cx| {
+                                    this.open_height_map_name(window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(self.mono.clone())
+                            .text_size(px(8.0))
+                            .line_height(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(profile),
+                    ),
+            );
+        if let Some(blocker) = blocker {
+            section = section.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(10.5))
+                    .text_color(p.warning)
+                    .child(format!("SAVE BLOCKED: {blocker}")),
+            );
+        } else if valid_cells == 0 {
+            section = section.child(
+                div()
+                    .text_size(px(8.5))
+                    .text_color(p.warning)
+                    .child("SAVE BLOCKED: the map has no valid cell"),
+            );
+        } else if let Some(notice) = last_saved {
+            section = section.child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(self.mono.clone())
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.success)
+                    .child(format!(
+                        "SAVED: {} -> {}",
+                        notice.name,
+                        notice.path.display()
+                    )),
+            );
+        } else {
+            section = section.child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(8.0))
+                    .line_height(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(format!("DEFAULT NAME: {default_name} (edit in the sheet)")),
+            );
+        }
+        if let Some(error) = last_error {
+            section = section.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(10.5))
+                    .text_color(p.danger)
+                    .child(format!("SAVE FAILED: {error}")),
+            );
+        }
+        section
+    }
+
     /// Result sheet and viewer overlay for a measured height map.
     fn height_map_result_panel(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
         let Some(map) = run.map.as_ref() else {
@@ -4638,6 +5481,7 @@ impl Shell {
                 )
             })
             .child(self.height_map_apply_section(p, cx, snapshot.as_ref()))
+            .child(self.height_map_save_section(p, cx, summary.valid))
             .child(
                 h_flex()
                     .flex_wrap()
@@ -6624,6 +7468,7 @@ impl Shell {
                 |row| format!("SETTING ${number} / {}", row.name),
             ),
             SettingsEntryPurpose::ToolName => "TOOL NAME".to_string(),
+            SettingsEntryPurpose::HeightMapName => "SAVE HEIGHT MAP".to_string(),
         };
         let hint = match entry.purpose {
             SettingsEntryPurpose::Search => {
@@ -6638,10 +7483,19 @@ impl Shell {
             SettingsEntryPurpose::ToolName => {
                 "Display name for the M6 sheet; 128 characters, no control characters.".to_string()
             }
+            SettingsEntryPurpose::HeightMapName => {
+                "Short label for this controller profile; the same name replaces that map."
+                    .to_string()
+            }
         };
         let masked = entry.masked;
         let error = entry.error.clone();
         let input = entry.input.clone();
+        let commit_label = match entry.purpose {
+            SettingsEntryPurpose::HeightMapName => "SAVE MAP",
+            _ if masked => "SET",
+            _ => "APPLY TEXT",
+        };
         let commit_view = view.clone();
         let cancel_view = view.clone();
         let scrim_view = view;
@@ -6730,7 +7584,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("settings-entry-commit")
-                                    .label(if masked { "SET" } else { "APPLY TEXT" })
+                                    .label(commit_label)
                                     .primary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -8919,6 +9773,17 @@ fn section_label(text: &'static str, p: Palette) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(p.text_dim)
         .child(text)
+}
+
+/// Wall-clock Unix seconds for a saved-map label.
+///
+/// The app has no clock service; a failed system-clock read maps to zero, which
+/// the UI renders as the epoch rather than inventing a time.
+fn now_unix_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn chip(text: &str, p: Palette) -> Div {

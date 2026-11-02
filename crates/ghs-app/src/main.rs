@@ -28,8 +28,11 @@
 //! `--demo-height-map-revert` press the same explicit height-map Apply/Confirm
 //! and Revert actions after the 4x4 demo map completes.
 //! `--demo-height-map-confirm` opens the confirmation step without confirming;
-//! `--demo-height-map-job` switches to the Job workspace marker. Normal startup
-//! never applies or starts anything. `--size WxH` (or `--size=WxH`)
+//! `--demo-height-map-job` switches to the Job workspace marker.
+//! `--demo-height-map-save` saves the completed demo map through the normal
+//! profile path, and `--demo-height-map-open-saved` then opens that record in
+//! the read-only saved-map browser. Normal startup never applies or starts
+//! anything. `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
 //!
@@ -42,6 +45,7 @@
 mod config;
 mod connection;
 mod height_compensation;
+mod height_map_library;
 mod keypad;
 mod live;
 mod offsets;
