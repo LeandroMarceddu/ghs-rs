@@ -18,7 +18,8 @@
 //! `--demo-settings-write` changes one safe integer through the normal
 //! pending/Apply/read-back path for the applied screenshot. `--offsets`,
 //! `--tools`, `--utility`, `--startup-lines`, and `--probe` open those
-//! workspaces directly. `--demo-tools` seeds the app-side tool table after the
+//! workspaces directly. `--keymap` opens the Utility workspace at the machine
+//! keymap section. `--demo-tools` seeds the app-side tool table after the
 //! controller profile loads. `--macros` opens the Utility workspace with the
 //! user-macro section, while `--demo-macros` seeds two profile macros through
 //! the normal save path; `--demo-macro-edit` then opens the macro editor and
@@ -76,6 +77,7 @@ mod console_log;
 mod file_browser;
 mod height_compensation;
 mod height_map_library;
+mod keymap;
 mod keypad;
 mod live;
 mod macros;

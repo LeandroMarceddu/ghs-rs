@@ -32,9 +32,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ghs_config::{MAX_HEIGHT_MAPS, Macro as ConfigMacro, ToolRecord};
+use ghs_config::{Keymap, MAX_HEIGHT_MAPS, Macro as ConfigMacro, ToolRecord};
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
     MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
@@ -47,13 +47,14 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Sizable as _, Size, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, UniformListScrollHandle, Window, div, px, uniform_list,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
+    ParentElement as _, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
+    Window, div, px, uniform_list,
 };
 
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
@@ -64,6 +65,12 @@ use crate::height_compensation::{
 };
 use crate::height_map_library::{
     LoadedSavedMap, SavedMapSummary, default_map_name, format_unix_utc,
+};
+use crate::keymap::{
+    BindingPlan, JogAxis, JogXMinus, JogXPlus, JogYMinus, JogYPlus, JogZMinus, JogZPlus,
+    KeyHoldGuard, KeyboardGate, KeymapModel, MachineAction, MachineIntent, MachinePause,
+    MachineResume, MachineStart, MachineStop, binding_for, note_key_down, pretty_keys, refusal,
+    unbind_for,
 };
 use crate::keypad;
 use crate::live::{DemoProgram, LinkMode, LiveLink};
@@ -99,6 +106,7 @@ const JOG_REPEAT: Duration = Duration::from_millis(120);
 /// One press-and-hold jog gesture.
 #[derive(Clone, Copy, Debug)]
 struct JogHold {
+    axis: Axis,
     sign: f64,
     continuous: bool,
     started: std::time::Instant,
@@ -144,6 +152,18 @@ struct SettingsEntry {
     input: Entity<InputState>,
     masked: bool,
     error: Option<String>,
+}
+
+/// One open keymap row editor.
+///
+/// The text field and the optional capture focus are local. Nothing is written
+/// to the profile until the section-level SAVE.
+struct KeymapEditor {
+    action: MachineAction,
+    input: Entity<InputState>,
+    error: Option<String>,
+    capturing: bool,
+    capture_focus: FocusHandle,
 }
 
 /// Text fields of one open tool add/edit sheet.
@@ -294,6 +314,15 @@ pub struct Shell {
     /// Screenshot switch: also select a line and open the run-to sheet.
     demo_run_to: bool,
     settings_entry: Option<SettingsEntry>,
+    /// Local keymap draft. It is local until the section SAVE succeeds.
+    keymap: KeymapModel,
+    /// Last profile keymap adopted by the shell.
+    keymap_source: Keymap,
+    /// Keys currently bound in GPUI, used to unbind changed rows.
+    active_bindings: Vec<(MachineAction, String)>,
+    /// Physical keys held since their action last dispatched.
+    held_machine_keys: KeyHoldGuard,
+    keymap_editor: Option<KeymapEditor>,
     tool_editor: Option<ToolEditor>,
     macro_editor: Option<MacroEditor>,
     macro_delete: Option<String>,
@@ -615,6 +644,12 @@ impl Shell {
             || demo_height_map_confirm
             || demo_height_map_apply
             || std::env::args().any(|arg| arg == "--demo-probe-run");
+        if std::env::args().any(|arg| arg == "--keymap" || arg == "--demo-keymap") {
+            state.mode = Mode::Utility;
+        }
+
+        let keymap = KeymapModel::default();
+        let keymap_source = Keymap::default();
 
         let mut shell = Self {
             state,
@@ -654,6 +689,11 @@ impl Shell {
             demo_breakpoints_done: false,
             demo_run_to,
             settings_entry: None,
+            keymap,
+            keymap_source,
+            active_bindings: Vec::new(),
+            held_machine_keys: KeyHoldGuard::default(),
+            keymap_editor: None,
             tool_editor: None,
             macro_editor: None,
             macro_delete: None,
@@ -706,6 +746,22 @@ impl Shell {
             _poll_task: None,
             _subscriptions: subscriptions,
         };
+        // Bind the documented defaults immediately. A profile keymap replaces
+        // them after the handshake; loading a keymap never dispatches an
+        // action, starts a job, or jogs an axis.
+        let defaults = shell.keymap.effective_bindings(cx.platform_info().os);
+        let plan = BindingPlan::between(&[], &defaults);
+        shell.apply_binding_plan(plan, cx);
+        shell.active_bindings = defaults;
+        // A key-up can be missed while the window is inactive. Release the
+        // repeat latch on every activation change so the first press after
+        // returning to the app is never swallowed.
+        shell
+            ._subscriptions
+            .push(cx.observe_window_activation(window, |this, _, cx| {
+                this.held_machine_keys.clear();
+                cx.notify();
+            }));
         if !mock {
             shell.connect_demo(cx);
         }
@@ -769,6 +825,10 @@ impl Shell {
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
         }
+        // Adopt a profile keymap after the handshake, a pending-profile
+        // confirmation, or a backup import. This only binds keys; it never
+        // dispatches an action.
+        changed |= self.sync_profile_keymap(cx);
         // A macro confirmation belongs to the link that produced it. Once the
         // link is no longer ready it can never be sent.
         if self.state.macro_run_pending().is_some() && !self.ready() {
@@ -2062,6 +2122,205 @@ impl Shell {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ keymap
+
+    /// Open one local keymap row editor. Nothing is stored until SAVE.
+    fn open_keymap_editor(
+        &mut self,
+        action: MachineAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_entry = None;
+        self.state.keypad = None;
+        let value = self.keymap.keys(action).to_string();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(value)
+                .placeholder("ctrl-shift-left or f5")
+                .clean_on_escape()
+        });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.keymap_editor = Some(KeymapEditor {
+            action,
+            input,
+            error: None,
+            capturing: false,
+            capture_focus: cx.focus_handle(),
+        });
+        cx.notify();
+    }
+
+    /// Close one row editor without changing the draft.
+    fn cancel_keymap_editor(&mut self, cx: &mut Context<Self>) {
+        self.keymap_editor = None;
+        cx.notify();
+    }
+
+    /// Commit one row editor into the local draft.
+    fn apply_keymap_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.keymap_editor.as_ref() else {
+            return;
+        };
+        let action = editor.action;
+        let value = editor.input.read(cx).value().to_string();
+        let os = cx.platform_info().os;
+        match self.keymap.try_set(action, &value, os) {
+            Ok(canonical) => {
+                self.keymap_editor = None;
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "Keymap draft: {} = {} (local; press SAVE to persist)",
+                        action.label(),
+                        pretty_keys(&canonical)
+                    ),
+                );
+            }
+            Err(message) => {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Keymap {}: {message}", action.label()),
+                );
+                if let Some(editor) = self.keymap_editor.as_mut() {
+                    editor.error = Some(message);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Capture a physical key press into the open row editor.
+    fn capture_keymap_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.keymap_editor.as_ref() else {
+            return;
+        };
+        if !editor.capturing {
+            return;
+        }
+        let action = editor.action;
+        let key = event.keystroke.key.trim().to_ascii_lowercase();
+        if key == "escape" {
+            if let Some(editor) = self.keymap_editor.as_mut() {
+                editor.capturing = false;
+                editor.error = None;
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key.is_empty()
+            || matches!(
+                key.as_str(),
+                "shift" | "control" | "ctrl" | "alt" | "platform" | "cmd" | "super" | "win" | "fn"
+            )
+        {
+            // Modifier-only events are part of the chord, not the key.
+            return;
+        }
+        let os = cx.platform_info().os;
+        let text = event.keystroke.unparse(os);
+        let outcome = self.keymap.try_set(action, &text, os);
+        let (value, error) = match outcome {
+            Ok(canonical) => (canonical, None),
+            Err(message) => (text, Some(message)),
+        };
+        if let Some(editor) = self.keymap_editor.as_mut() {
+            editor.capturing = false;
+            editor.error = error.clone();
+            let input = editor.input.clone();
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        if let Some(message) = error {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Keymap {}: {message}", action.label()),
+            );
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Focus the modal panel so the next key press can be captured.
+    fn start_keymap_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.keymap_editor.as_mut() else {
+            return;
+        };
+        editor.capturing = true;
+        editor.error = None;
+        let focus = editor.capture_focus.clone();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Load the documented defaults into the local draft.
+    fn reset_keymap_defaults(&mut self, cx: &mut Context<Self>) {
+        self.keymap.reset_defaults();
+        self.keymap_editor = None;
+        self.state.push_console(
+            ConsoleLevel::Info,
+            "Keymap defaults loaded locally; press SAVE to persist",
+        );
+        cx.notify();
+    }
+
+    /// Discard every local keymap edit. Sends and stores nothing.
+    fn cancel_keymap_draft(&mut self, cx: &mut Context<Self>) {
+        self.keymap = KeymapModel::from_keymap(&self.keymap_source);
+        self.keymap_editor = None;
+        self.state.push_console(
+            ConsoleLevel::Info,
+            "Keymap changes discarded; the profile was not written",
+        );
+        cx.notify();
+    }
+
+    /// Validate and persist the local keymap through the profile path.
+    fn save_keymap(&mut self, cx: &mut Context<Self>) {
+        let os = cx.platform_info().os;
+        let keymap = match self.keymap.to_keymap(os) {
+            Ok(keymap) => keymap,
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Keymap not saved: {message}"));
+                cx.notify();
+                return;
+            }
+        };
+        // Ask GPUI itself to build every binding before writing the profile, so
+        // a stored map can never contain a chord this build cannot install.
+        for (action, keys) in self.keymap.effective_bindings(os) {
+            if let Err(message) = binding_for(action, &keys, cx) {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Keymap not saved: {message}"));
+                cx.notify();
+                return;
+            }
+        }
+        match self.state.config.save_keymap(keymap.clone()) {
+            Ok(path) => {
+                self.keymap_source = keymap;
+                let desired = self.keymap.effective_bindings(os);
+                let plan = BindingPlan::between(&self.active_bindings, &desired);
+                self.apply_binding_plan(plan, cx);
+                self.active_bindings = desired;
+                self.state.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Keymap saved: {}", path.display()),
+                );
+            }
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Keymap save: {message}")),
+        }
+        cx.notify();
+    }
+
     // ------------------------------------------------------- startup lines
 
     /// Open the shared text sheet for one `$N0`/`$N1` draft.
@@ -2747,6 +3006,191 @@ impl Shell {
         )
     }
 
+    /// Snapshot the same gates the job/jog buttons use, for keyboard actions.
+    fn keyboard_gate(&self) -> KeyboardGate {
+        KeyboardGate {
+            live: self.state.live,
+            ready: self.ready(),
+            machine: self.machine(),
+            job: self.state.job.state,
+            program_loaded: self.job_loaded(),
+            probe_owns_program: self.state.probe.owns_program(&self.state.job.name),
+            tool_change_pending: self.state.job.tool_change_pending(),
+            watchdog_pause: self.state.job.pause_reason == Some(JobPauseReason::Watchdog),
+        }
+    }
+
+    /// Install the delta between the active and desired bindings.
+    ///
+    /// Changed keys get an `Unbind` marker before the replacement is added, so
+    /// an old key does not keep firing the same action after a profile change.
+    fn apply_binding_plan(&mut self, plan: BindingPlan, cx: &mut Context<Self>) {
+        if plan.is_empty() {
+            return;
+        }
+        let mut bindings = Vec::with_capacity(plan.unbinds.len() + plan.binds.len());
+        for (action, keys) in &plan.unbinds {
+            match unbind_for(*action, keys, cx) {
+                Ok(binding) => bindings.push(binding),
+                Err(message) => self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Keymap unbind skipped: {message}"),
+                ),
+            }
+        }
+        for (action, keys) in &plan.binds {
+            match binding_for(*action, keys, cx) {
+                Ok(binding) => bindings.push(binding),
+                Err(message) => self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Keymap binding skipped: {message}"),
+                ),
+            }
+        }
+        if !bindings.is_empty() {
+            cx.bind_keys(bindings);
+        }
+    }
+
+    /// Adopt the active profile's keymap without pressing anything.
+    ///
+    /// Returns `true` when the keymap changed. Invalid or duplicate stored
+    /// rows fall back to their defaults; the profile is not rewritten until
+    /// the operator presses SAVE.
+    fn sync_profile_keymap(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.state.config.key().is_none() {
+            return false;
+        }
+        let source = self.state.config.data().keymap.clone();
+        if source == self.keymap_source {
+            return false;
+        }
+        let os = cx.platform_info().os;
+        let model = KeymapModel::from_keymap(&source);
+        if model.to_keymap(os).is_err() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Profile keymap has an invalid or duplicate row; those actions use their \
+                 defaults until the keymap is saved again",
+            );
+        }
+        let desired = model.effective_bindings(os);
+        let plan = BindingPlan::between(&self.active_bindings, &desired);
+        self.apply_binding_plan(plan, cx);
+        self.active_bindings = desired;
+        self.keymap = model;
+        self.keymap_source = source;
+        self.keymap_editor = None;
+        self.held_machine_keys.clear();
+        true
+    }
+
+    /// Whether a non-text sheet currently owns operator attention.
+    ///
+    /// STOP remains available through an ordinary sheet. Every other machine
+    /// hotkey waits for the sheet to close.
+    fn keyboard_sheet_open(&self) -> bool {
+        self.settings_entry.is_some()
+            || self.tool_editor.is_some()
+            || self.macro_editor.is_some()
+            || self.macro_delete.is_some()
+            || self.startup_confirm.is_some()
+            || self.state.keypad.is_some()
+            || self.state.sleep_confirm_open
+            || self.state.macro_run_pending().is_some()
+            || self.state.run_options_open
+            || self.state.job.breakpoints.pending_run_to().is_some()
+            || self.state.job.tool_change.is_some()
+            || self.panel.open
+            || self.state.offsets_backup.preview().is_some()
+            || self.state.offsets.pending_action().is_some()
+            || self.file_browser.is_some()
+    }
+
+    /// Route one typed GPUI action through the guarded machine path.
+    ///
+    /// A text field or the keymap editor owns the key: the action is not
+    /// executed and propagation continues so typing and key capture still
+    /// work. The same is true for OS key repeat: the first press acts and the
+    /// latch releases on key-up.
+    fn keyboard_action(
+        &mut self,
+        action: MachineAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.keymap_editor.is_some() || window.has_focused_input(cx) {
+            cx.propagate();
+            return;
+        }
+        if self.keyboard_sheet_open() && !action.allowed_while_sheet_open() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!(
+                    "KEY {} ignored while a sheet is open; dismiss it or use F8 STOP",
+                    action.label()
+                ),
+            );
+            cx.notify();
+            cx.propagate();
+            return;
+        }
+        let now = Instant::now();
+        if self.held_machine_keys.is_held(action, now) {
+            cx.propagate();
+            return;
+        }
+        let intent = action.intent();
+        if let Some(reason) = refusal(intent, &self.keyboard_gate()) {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("KEY {} refused: {reason}", action.label()),
+            );
+        } else {
+            self.run_keyboard_intent(intent, cx);
+        }
+        cx.notify();
+        // Let the root key listener latch this physical key for repeat
+        // suppression even when the action itself was refused.
+        cx.propagate();
+    }
+
+    fn run_keyboard_intent(&mut self, intent: MachineIntent, cx: &mut Context<Self>) {
+        match intent {
+            MachineIntent::Jog { axis, sign } => {
+                let axis = match axis {
+                    JogAxis::X => Axis::X,
+                    JogAxis::Y => Axis::Y,
+                    JogAxis::Z => Axis::Z,
+                };
+                if self.jog_allowed() && self.state.live {
+                    // One step per press. CONT/hold-to-jog stays pointer-only
+                    // because a keyboard has no release event for the action.
+                    self.send_jog(axis, sign, false);
+                }
+            }
+            MachineIntent::Start => self.start_job(cx),
+            MachineIntent::Pause => self.pause_job(cx),
+            MachineIntent::Resume => self.resume_job(cx),
+            MachineIntent::Stop => self.stop_job(cx),
+        }
+    }
+
+    fn note_machine_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        note_key_down(
+            &mut self.held_machine_keys,
+            event,
+            &self.active_bindings,
+            cx.platform_info().os,
+            Instant::now(),
+        );
+    }
+
+    fn note_machine_key_up(&mut self, event: &KeyUpEvent) {
+        self.held_machine_keys
+            .end_key(&event.keystroke.key, &self.active_bindings);
+    }
+
     fn aux_allowed(&self) -> bool {
         self.ready() && (!self.state.live || !self.machine().is_locked())
     }
@@ -2857,13 +3301,15 @@ impl Shell {
         }
         self.jog_generation = self.jog_generation.wrapping_add(1);
         let generation = self.jog_generation;
+        let axis = self.state.jog_axis;
         let continuous = self.state.continuous;
         self.jog_hold = Some(JogHold {
+            axis,
             sign,
             continuous,
             started: std::time::Instant::now(),
         });
-        self.send_jog(sign, false);
+        self.send_jog(axis, sign, false);
         if continuous {
             self.spawn_jog_repeat(generation, cx);
         }
@@ -2889,8 +3335,7 @@ impl Shell {
     ///
     /// `quiet_busy` keeps the repeat loop from filling the console while the
     /// controller is still executing the previous step.
-    fn send_jog(&mut self, sign: f64, quiet_busy: bool) -> bool {
-        let axis = self.state.jog_axis;
+    fn send_jog(&mut self, axis: Axis, sign: f64, quiet_busy: bool) -> bool {
         let Some(core_axis) = CoreAxis::from_index(axis.index()) else {
             self.state
                 .push_console(ConsoleLevel::Warn, "Selected axis is not reported");
@@ -2940,7 +3385,7 @@ impl Shell {
                             shell.end_jog(cx);
                             return false;
                         }
-                        shell.send_jog(hold.sign, true);
+                        shell.send_jog(hold.axis, hold.sign, true);
                         true
                     })
                     .unwrap_or(false);
@@ -10880,6 +11325,180 @@ impl Shell {
             })
     }
 
+    fn keymap_card(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let blocker = self.state.config.keymap_save_blocker();
+        let saved = KeymapModel::from_keymap(&self.keymap_source);
+        let dirty = self.keymap.differs_from(&saved);
+        let os = cx.platform_info().os;
+        let validation = self.keymap.to_keymap(os).err();
+        let mut cells = Vec::with_capacity(self.keymap.rows().len());
+        for row in self.keymap.rows() {
+            let action = row.action;
+            let keys = row.keys.clone();
+            let text = pretty_keys(&keys);
+            let is_default = keys == action.default_keys();
+            let edit_view = view.clone();
+            let mono = self.mono.clone();
+            cells.push(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .items_center()
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .child(
+                        div()
+                            .w(px(58.0))
+                            .flex_shrink_0()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if is_default { p.accent } else { p.warning })
+                            .child(action.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(mono)
+                            .text_size(px(11.0))
+                            .text_color(p.text)
+                            .child(text),
+                    )
+                    .child(
+                        Button::new(format!("keymap-edit-{}", action.id()))
+                            .label("EDIT")
+                            .secondary()
+                            .h(px(40.0))
+                            .w(px(60.0))
+                            .rounded(px(6.0))
+                            .text_size(px(9.0))
+                            .on_click(move |_, window, cx| {
+                                edit_view.update(cx, |this, cx| {
+                                    this.open_keymap_editor(action, window, cx);
+                                });
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let mut cells = cells.into_iter();
+        let rows = h_flex()
+            .items_start()
+            .gap_1()
+            .child(v_flex().flex_1().gap_1().children(cells.by_ref().take(5)))
+            .child(v_flex().flex_1().gap_1().children(cells));
+
+        let reset_view = view.clone();
+        let cancel_view = view.clone();
+        let save_view = view;
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .items_center()
+                            .gap_2()
+                            .child(section_label("KEYMAP", p))
+                            .child(chip("PROFILE", p))
+                            .when(dirty, |this| this.child(chip("UNSAVED", p)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child("One step per press; off while typing. RESET DEFAULTS restores."),
+                            ),
+                    )
+                    .child(chip(
+                        if self.keymap.is_default() {
+                            "DEFAULTS"
+                        } else {
+                            "CUSTOM"
+                        },
+                        p,
+                    )),
+            )
+            .child(rows)
+            .when_some(validation.clone(), |this, message| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.danger)
+                        .child(format!("KEYMAP NOT VALID: {message}")),
+                )
+            })
+            .when_some(blocker.clone(), |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(format!("SAVE LOCKED: {}", reason.to_uppercase())),
+                )
+            })
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("keymap-reset")
+                            .label("RESET DEFAULTS")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(170.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                reset_view.update(cx, |this, cx| this.reset_keymap_defaults(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("keymap-cancel")
+                            .label("CANCEL")
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(110.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!dirty)
+                            .on_click(move |_, _, cx| {
+                                cancel_view.update(cx, |this, cx| this.cancel_keymap_draft(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("keymap-save")
+                            .label("SAVE")
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(120.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!dirty || blocker.is_some() || validation.is_some())
+                            .on_click(move |_, _, cx| {
+                                save_view.update(cx, |this, cx| this.save_keymap(cx));
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let config = &self.state.config;
@@ -11355,6 +11974,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.keymap_card(p, cx))
             .child(self.macro_card(p, cx))
             .child(startup_card)
             .child(sleep_card)
@@ -12117,6 +12737,195 @@ impl Shell {
     }
 
     /// Shared text sheet for search and text/password/IPv4 settings.
+    fn keymap_editor_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.keymap_editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let action = editor.action;
+        let input = editor.input.clone();
+        let error = editor.error.clone();
+        let capturing = editor.capturing;
+        let capture_focus = editor.capture_focus.clone();
+        let apply_view = view.clone();
+        let cancel_view = view.clone();
+        let scrim_view = view.clone();
+        let capture_view = view.clone();
+
+        let presets: [(&str, &str); 10] = [
+            ("F5", "f5"),
+            ("F6", "f6"),
+            ("F7", "f7"),
+            ("F8", "f8"),
+            ("C+S+LEFT", "ctrl-shift-left"),
+            ("C+S+RIGHT", "ctrl-shift-right"),
+            ("C+S+UP", "ctrl-shift-up"),
+            ("C+S+DOWN", "ctrl-shift-down"),
+            ("C+S+PGUP", "ctrl-shift-pageup"),
+            ("C+S+PGDN", "ctrl-shift-pagedown"),
+        ];
+        let mut preset_row = h_flex().flex_wrap().gap_1();
+        for (label, keys) in presets {
+            let preset_input = input.clone();
+            let preset_view = view.clone();
+            preset_row = preset_row.child(
+                Button::new(format!("keymap-preset-{keys}"))
+                    .label(label)
+                    .secondary()
+                    .h(px(44.0))
+                    .w(px(118.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.panel)
+                    .text_size(px(10.0))
+                    .on_click(move |_, window, cx| {
+                        preset_input.update(cx, |state, cx| {
+                            state.set_value(keys, window, cx);
+                        });
+                        preset_view.update(cx, |this, cx| {
+                            if let Some(editor) = this.keymap_editor.as_mut() {
+                                editor.error = None;
+                            }
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("keymap-editor-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_keymap_editor(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .track_focus(&capture_focus)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        this.capture_keymap_key(event, window, cx);
+                    }))
+                    .w(px(620.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(if capturing { p.accent } else { p.border_strong })
+                    .bg(p.raised)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(format!("KEYMAP / {}", action.label())),
+                    )
+                    .when(capturing, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.accent)
+                                .child("PRESS A KEY COMBINATION"),
+                        )
+                    })
+                    .child({
+                        let focus_input = input.clone();
+                        div()
+                            .h(px(48.0))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                focus_input.update(cx, |state, cx| state.focus(window, cx));
+                            })
+                            .child(
+                                Input::new(&input)
+                                    .with_size(Size::Large)
+                                    .w_full()
+                                    .text_size(px(16.0)),
+                            )
+                    })
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                        "Tap a preset, type a combination such as ctrl-shift-left, or \
+                                 press RECORD KEY. Ctrl, Alt, Fn, or F1-F24 are required so \
+                                 normal typing is not stolen. Esc, Cmd/Super/Win, and common text \
+                                 editing shortcuts are reserved.",
+                    ))
+                    .child(preset_row)
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    })
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Button::new("keymap-capture")
+                                    .label(if capturing {
+                                        "PRESS A KEY..."
+                                    } else {
+                                        "RECORD KEY"
+                                    })
+                                    .warning()
+                                    .h(px(48.0))
+                                    .w(px(150.0))
+                                    .rounded_lg()
+                                    .text_size(px(10.0))
+                                    .on_click(move |_, window, cx| {
+                                        capture_view.update(cx, |this, cx| {
+                                            this.start_keymap_capture(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("keymap-editor-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.cancel_keymap_editor(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("keymap-editor-apply")
+                                    .label("USE KEY")
+                                    .primary()
+                                    .h(px(48.0))
+                                    .w(px(140.0))
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        apply_view.update(cx, |this, cx| {
+                                            this.apply_keymap_editor(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn settings_entry_overlay(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(entry) = self.settings_entry.as_ref() else {
             return div().into_any_element();
@@ -14817,7 +15626,43 @@ impl Render for Shell {
             .text_color(p.text)
             .font_family("sans-serif")
             .child(self.top_bar(p, cx))
-            .child(content);
+            .child(content)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.note_machine_key_down(event, cx)
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
+                this.note_machine_key_up(event);
+            }))
+            .on_action(cx.listener(|this, _: &JogXMinus, window, cx| {
+                this.keyboard_action(MachineAction::JogXMinus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JogXPlus, window, cx| {
+                this.keyboard_action(MachineAction::JogXPlus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JogYMinus, window, cx| {
+                this.keyboard_action(MachineAction::JogYMinus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JogYPlus, window, cx| {
+                this.keyboard_action(MachineAction::JogYPlus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JogZMinus, window, cx| {
+                this.keyboard_action(MachineAction::JogZMinus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JogZPlus, window, cx| {
+                this.keyboard_action(MachineAction::JogZPlus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MachineStart, window, cx| {
+                this.keyboard_action(MachineAction::Start, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MachinePause, window, cx| {
+                this.keyboard_action(MachineAction::Pause, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MachineResume, window, cx| {
+                this.keyboard_action(MachineAction::Resume, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MachineStop, window, cx| {
+                this.keyboard_action(MachineAction::Stop, window, cx);
+            }));
 
         let keypad_state = self.state.keypad.clone();
         if self.tool_editor.is_some() {
@@ -14841,6 +15686,9 @@ impl Render for Shell {
         }
         if self.settings_entry.is_some() {
             root = root.child(self.settings_entry_overlay(p, cx));
+        }
+        if self.keymap_editor.is_some() {
+            root = root.child(self.keymap_editor_overlay(p, cx));
         }
         if self.startup_confirm.is_some() {
             root = root.child(self.startup_confirm_overlay(p, cx));

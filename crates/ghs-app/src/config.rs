@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use ghs_config::{
     AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
-    IdentityPolicy, ImportOutcome, MAX_HEIGHT_MAPS, Macro, OffsetSnapshot, ProbeOffsetRecord,
-    ProfileKey, ThemeMode, ToolTable,
+    IdentityPolicy, ImportOutcome, Keymap, MAX_HEIGHT_MAPS, Macro, OffsetSnapshot,
+    ProbeOffsetRecord, ProfileKey, ThemeMode, ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -303,6 +303,47 @@ impl ConfigModel {
             }
             Some(key) if !key.is_identified() => Some(
                 "the controller identity is not verified; macros are saved only for a known \
+                 controller"
+                    .to_string(),
+            ),
+            Some(_) => None,
+        }
+    }
+
+    /// Why the keymap cannot be written to the current profile, if any.
+    ///
+    /// This mirrors the gate used by [`ConfigModel::save_keymap`] so the
+    /// editor can explain a refusal before the operator presses SAVE.
+    #[must_use]
+    pub fn keymap_save_blocker(&self) -> Option<String> {
+        if self.store.is_none() {
+            return Some("no platform configuration directory".to_string());
+        }
+        if self.corrupt_profile {
+            return Some(
+                "the stored profile is corrupt; it was not overwritten. Repair or remove it first"
+                    .to_string(),
+            );
+        }
+        if self.pending_data.is_some() {
+            return Some(
+                "the controller profile is unverified; confirm or discard it in Utility first"
+                    .to_string(),
+            );
+        }
+        if self.unverified_identity {
+            return Some(
+                "the controller identity is not verified; the keymap is saved only for a known \
+                 controller"
+                    .to_string(),
+            );
+        }
+        match self.key.as_ref() {
+            None => {
+                Some("no controller profile is active; connect and finish the handshake".into())
+            }
+            Some(key) if !key.is_identified() => Some(
+                "the controller identity is not verified; the keymap is saved only for a known \
                  controller"
                     .to_string(),
             ),
@@ -832,6 +873,58 @@ impl ConfigModel {
         Ok(path)
     }
 
+    /// Save the bounded machine keymap into the current controller profile.
+    ///
+    /// The write goes through the same atomic `ConfigStore` profile path as
+    /// tools, macros, and maps. It never sends a command to the controller and
+    /// never starts a job or jogs an axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no verified profile is active, the profile file
+    /// is corrupt, the keymap fails record validation, or writing fails. A
+    /// refusal leaves the previous keymap in place.
+    pub fn save_keymap(&mut self, keymap: Keymap) -> Result<PathBuf, String> {
+        if let Some(blocker) = self.keymap_save_blocker() {
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Keymap not saved: {blocker}"),
+            });
+            return Err(blocker);
+        }
+        keymap
+            .validate()
+            .map_err(|error| format!("keymap is invalid: {error}"))?;
+        let Some(key) = self.key.clone() else {
+            return Err("no controller profile is active".to_string());
+        };
+        let Some(store) = self.store.clone() else {
+            return Err("no platform configuration directory".to_string());
+        };
+        let mut data = self.data.clone();
+        data.keymap = keymap;
+        let path = store.profile_path(&key);
+        if let Err(error) = store.save_controller_data(&key, &data) {
+            let message = error.to_string();
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Keymap save failed: {message}"),
+            });
+            return Err(message);
+        }
+        self.data = data;
+        self.profile_error = None;
+        self.last_result = Some(ConfigStatus {
+            ok: true,
+            text: format!(
+                "Keymap saved to {} ({} bindings)",
+                path.display(),
+                self.data.keymap.bindings.len()
+            ),
+        });
+        Ok(path)
+    }
+
     /// Export the current profile as a versioned backup bundle.
     ///
     /// The bundle is written under the configuration directory at
@@ -1024,7 +1117,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use ghs_config::ToolRecord;
+    use ghs_config::{KeyBinding, ToolRecord};
     use ghs_core::{Position, Wcs, parse_controller_info};
 
     use super::*;
@@ -1489,5 +1582,149 @@ mod tests {
         assert_eq!(first_data.height_maps[0].name, "first-only");
         assert_eq!(second_data.height_maps.len(), 1);
         assert_eq!(second_data.height_maps[0].name, "second-only");
+    }
+
+    fn test_keymap(stop: &str) -> Keymap {
+        let mut keymap = Keymap::new();
+        keymap.insert(KeyBinding::new("jog.x.minus", "ctrl-shift-left"));
+        keymap.insert(KeyBinding::new("run.stop", stop));
+        keymap
+    }
+
+    #[test]
+    fn keymap_round_trips_through_the_profile() {
+        let dir = TempDir::new("keymap");
+        let store = ConfigStore::new(&dir.path);
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let mut model = ConfigModel::from_store(store.clone());
+        model.on_controller(&info).expect("profile");
+        let keymap = test_keymap("f8");
+        let path = model.save_keymap(keymap.clone()).expect("save keymap");
+        assert!(path.exists());
+        assert_eq!(model.data().keymap, keymap);
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("data")
+                .keymap,
+            keymap
+        );
+
+        let mut reopened = ConfigModel::from_store(store);
+        reopened.on_controller(&info).expect("reload");
+        assert_eq!(reopened.data().keymap, keymap);
+    }
+
+    #[test]
+    fn keymaps_are_isolated_per_profile() {
+        let dir = TempDir::new("keymap-profiles");
+        let store = ConfigStore::new(&dir.path);
+        let first = info();
+        let mut second = info();
+        second.board = Some("OtherBoard".into());
+
+        let mut first_model = ConfigModel::from_store(store.clone());
+        first_model.on_controller(&first).expect("first");
+        let first_map = test_keymap("f8");
+        first_model
+            .save_keymap(first_map.clone())
+            .expect("first keymap");
+
+        let mut second_model = ConfigModel::from_store(store.clone());
+        second_model.on_controller(&second).expect("second");
+        assert!(
+            second_model.data().keymap.bindings.is_empty(),
+            "a new controller profile starts with no stored keymap"
+        );
+        let second_map = test_keymap("f12");
+        second_model
+            .save_keymap(second_map.clone())
+            .expect("second keymap");
+
+        let mut first_reopened = ConfigModel::from_store(store.clone());
+        first_reopened.on_controller(&first).expect("first reload");
+        assert_eq!(first_reopened.data().keymap, first_map);
+        let mut second_reopened = ConfigModel::from_store(store);
+        second_reopened
+            .on_controller(&second)
+            .expect("second reload");
+        assert_eq!(second_reopened.data().keymap, second_map);
+    }
+
+    #[test]
+    fn keymap_save_requires_a_verified_profile_and_never_overwrites_corruption() {
+        let dir = TempDir::new("keymap-gates");
+        let store = ConfigStore::new(&dir.path);
+
+        let mut no_profile = ConfigModel::from_store(store.clone());
+        let error = no_profile
+            .save_keymap(test_keymap("f8"))
+            .expect_err("no profile");
+        assert!(error.contains("no controller profile"), "{error}");
+        assert!(no_profile.keymap_save_blocker().is_some());
+
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let path = store.profile_path(&key);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let corrupt = b"{ not json";
+        fs::write(&path, corrupt).expect("write");
+        let mut corrupt_model = ConfigModel::from_store(store.clone());
+        corrupt_model.on_controller(&info).expect("notice");
+        let error = corrupt_model
+            .save_keymap(test_keymap("f8"))
+            .expect_err("corrupt profile refused");
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(fs::read(&path).expect("read"), corrupt);
+
+        let dir = TempDir::new("keymap-unverified");
+        let store = ConfigStore::new(&dir.path);
+        let mut anonymous = ControllerInfo::new();
+        anonymous.version = "1.1f".into();
+        let key = ProfileKey::from_controller(&anonymous);
+        assert!(!key.is_identified());
+        store
+            .save_controller_data(&key, &ControllerData::new())
+            .expect("save");
+        let mut unverified = ConfigModel::from_store(store);
+        assert!(
+            unverified
+                .on_controller(&anonymous)
+                .expect("notice")
+                .unverified
+        );
+        let error = unverified
+            .save_keymap(test_keymap("f8"))
+            .expect_err("unverified profile refused");
+        assert!(
+            error.contains("unverified") || error.contains("not verified"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn saving_a_keymap_preserves_tools_and_offsets() {
+        let dir = TempDir::new("keymap-preserve");
+        let store = ConfigStore::new(&dir.path);
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let mut model = ConfigModel::from_store(store.clone());
+        model.on_controller(&info).expect("profile");
+        let mut table = ToolTable::new();
+        table.insert(tool(7, "Seven"));
+        model
+            .save_profile(&table, &offsets(), BTreeMap::new())
+            .expect("profile save");
+        model.save_keymap(test_keymap("f10")).expect("keymap save");
+
+        let stored = store
+            .load_controller_data(&key)
+            .expect("load")
+            .expect("data");
+        assert_eq!(stored.tools, table);
+        assert_eq!(stored.offsets, offsets());
+        assert_eq!(stored.keymap, test_keymap("f10"));
     }
 }
