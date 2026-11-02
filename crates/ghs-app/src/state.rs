@@ -13,13 +13,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ghs_config::HeightMapRecord;
+use ghs_config::{HeightMapRecord, ProbeOffsetRecord};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, ControllerInfo, EngineEvent, JobAbortReason, JobInfo, JobPauseReason,
     JobState, MachineSnapshot, Offsets, Program, ProgramLine as EngineProgramLine, SettingValue,
     Signals as CoreSignals, StatusReport, Wcs,
 };
+use ghs_probe::XyPoint;
 
 use crate::config::ConfigModel;
 use crate::height_compensation::HeightMapCompensation;
@@ -1218,6 +1219,8 @@ impl AppState {
             {
                 self.push_console(ConsoleLevel::Warn, error.to_string());
             }
+            // The profile owns the physical mount offset.
+            self.load_probe_offset();
         }
     }
 
@@ -1481,6 +1484,33 @@ impl AppState {
         } else {
             live
         }
+    }
+
+    /// Copy the profile's probe mount offset into the editor fields.
+    ///
+    /// A missing profile or an old record loads as zero. This is setup data
+    /// only; nothing is sent to the controller.
+    pub fn load_probe_offset(&mut self) {
+        let offset = self.config.probe_offset();
+        let _ = self
+            .probe
+            .set_probe_offset(XyPoint::new(offset.x_mm, offset.y_mm));
+    }
+
+    /// Save the editor's probe mount offset into the active profile.
+    ///
+    /// The value is local setup data (`probe tip - controlled point`). This
+    /// never writes an offset, setting, or command to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the field/plan validation message or the profile save error.
+    pub fn save_probe_offset(&mut self) -> Result<PathBuf, String> {
+        let offset = self.probe.probe_offset()?;
+        self.config.save_probe_offset(ProbeOffsetRecord {
+            x_mm: offset.x_mm,
+            y_mm: offset.y_mm,
+        })
     }
 
     /// Maps stored in the active controller profile.
@@ -1999,7 +2029,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ghs_config::{ConfigStore, ControllerData, HeightMapFrame, HeightMapRecord, ProfileKey};
+    use ghs_config::{
+        ConfigStore, ControllerData, HeightMapFrame, HeightMapRecord, ProbeOffsetRecord, ProfileKey,
+    };
     use ghs_core::{
         FeedSpindle, MachineState, Overrides, Position, Signals, Wcs, parse_controller_info,
     };
@@ -2309,6 +2341,47 @@ mod tests {
             vec!["top", "bottom"]
         );
         assert!(state.selected_saved_map().is_none());
+    }
+
+    #[test]
+    fn profile_probe_offset_loads_on_connect_and_saves_without_controller_writes() {
+        let dir = TempRoot::new("probe-offset");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut data = ControllerData::new();
+        data.probe_offset = ProbeOffsetRecord {
+            x_mm: 4.5,
+            y_mm: -2.5,
+        };
+        store.save_controller_data(&key, &data).expect("profile");
+
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store.clone());
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+        assert_eq!(
+            state.probe.probe_offset().expect("loaded offset"),
+            XyPoint::new(4.5, -2.5)
+        );
+
+        state
+            .probe
+            .set_probe_offset(XyPoint::new(9.0, 1.25))
+            .expect("editor update");
+        let path = state.save_probe_offset().expect("save offset");
+        assert!(path.exists());
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("data")
+                .probe_offset,
+            ProbeOffsetRecord {
+                x_mm: 9.0,
+                y_mm: 1.25
+            }
+        );
     }
 
     #[test]

@@ -41,6 +41,8 @@ pub struct SavedMapSummary {
     pub wcs: Wcs,
     /// Tool number recorded with the map, when known.
     pub tool_number: Option<u32>,
+    /// Constant datum shift applied to every effective height, in millimetres.
+    pub z_offset_mm: f64,
 }
 
 impl SavedMapSummary {
@@ -58,6 +60,7 @@ impl SavedMapSummary {
             complete: valid == point_count,
             wcs: record.frame.wcs,
             tool_number: record.tool_number,
+            z_offset_mm: record.z_offset_mm.unwrap_or(0.0),
         }
     }
 }
@@ -96,9 +99,14 @@ impl LoadedSavedMap {
             rows: record.rows,
             surface_z_mm: record.surface_z_mm,
         };
-        let map = HeightMap::from_samples(grid, record.samples.clone()).map_err(|error| {
-            format!("saved map '{}' could not be rebuilt: {error}", record.name)
-        })?;
+        // Raw samples are persisted unchanged; the record's datum shift is
+        // applied to the rebuilt map so summary, overlay, CSV and Apply all
+        // report effective heights.
+        let map = HeightMap::from_samples(grid, record.samples.clone())
+            .and_then(|map| map.with_z_offset(record.z_offset_mm.unwrap_or(0.0)))
+            .map_err(|error| {
+                format!("saved map '{}' could not be rebuilt: {error}", record.name)
+            })?;
         let frame = OffsetFrame {
             wcs: record.frame.wcs,
             wcs_value_mm: record.frame.wcs_offset,
@@ -166,6 +174,7 @@ pub fn record_from_run(
     record_from_parts(
         grid,
         map.samples(),
+        map.z_offset_mm(),
         &run.setup,
         name,
         created_at_unix_s,
@@ -176,6 +185,7 @@ pub fn record_from_run(
 fn record_from_parts(
     grid: &HeightMapGrid,
     samples: &[Option<f64>],
+    map_z_offset_mm: f64,
     setup: &ProbeSetup,
     name: &str,
     created_at_unix_s: Option<u64>,
@@ -192,8 +202,9 @@ fn record_from_parts(
         columns: grid.columns,
         rows: grid.rows,
         surface_z_mm: grid.surface_z_mm,
-        // The probe workflow records no separate constant Z offset.
-        z_offset_mm: None,
+        // Persist the datum shift beside the raw samples so the saved map
+        // round-trips its effective heights.
+        z_offset_mm: Some(map_z_offset_mm),
         samples: samples.to_vec(),
         frame: HeightMapFrame {
             wcs: setup.params.wcs,
@@ -429,6 +440,8 @@ mod tests {
                 wcs_value_mm: frame.wcs_value_mm,
                 g92_mm: frame.g92_mm,
                 tlo_z_mm: frame.tlo_z_mm,
+                probe_offset: XyPoint::new(0.0, 0.0),
+                map_z_offset_mm: map.z_offset_mm(),
             },
             results: Vec::new(),
             raw: Vec::new(),
@@ -465,7 +478,7 @@ mod tests {
         assert_eq!(record.columns, 3);
         assert_eq!(record.rows, 2);
         assert_eq!(record.surface_z_mm, -1.0);
-        assert_eq!(record.z_offset_mm, None);
+        assert_eq!(record.z_offset_mm, Some(0.0));
         assert_eq!(
             record.samples,
             vec![
@@ -492,6 +505,47 @@ mod tests {
         assert!(!loaded.summary.complete);
         assert_eq!(loaded.overlay.cells.len(), 6);
         assert_eq!(LoadedSavedMap::from_record(record).unwrap().map, loaded.map);
+    }
+
+    #[test]
+    fn saved_record_round_trips_the_map_z_offset_and_rebuilds_effective_heights() {
+        let mut map = sample_map();
+        map.set_z_offset(1.25).expect("valid offset");
+        let record =
+            record_from_run(&sample_run(map, &frame()), "offset top", None, None).expect("record");
+        assert_eq!(record.z_offset_mm, Some(1.25));
+        // Raw samples never include the datum shift.
+        assert_eq!(record.samples[0], Some(-1.0));
+
+        let loaded = LoadedSavedMap::from_record(record.clone()).expect("rebuilt");
+        assert_eq!(loaded.map.z_offset_mm(), 1.25);
+        assert_eq!(loaded.map.samples(), record.samples.as_slice());
+        assert_eq!(loaded.map.z(0, 0), Some(0.25));
+        assert!(
+            (loaded.summary.min_z_mm.expect("min") - (-0.15)).abs() < 1.0e-9,
+            "{:?}",
+            loaded.summary.min_z_mm
+        );
+        assert_eq!(loaded.summary.max_z_mm, Some(0.25));
+        assert_eq!(loaded.summary.z_offset_mm, 1.25);
+        assert_eq!(loaded.overlay.cells[0].z_mm, Some(0.25));
+        assert_eq!(
+            loaded.map.compensation_at(10.0, 20.0),
+            Some(1.25),
+            "the saved datum shift participates in Apply"
+        );
+        assert!(
+            (loaded.summary.min_compensation_mm.expect("comp") - 0.85).abs() < 1.0e-9,
+            "{:?}",
+            loaded.summary.min_compensation_mm
+        );
+
+        // A record with no offset field (older profile) loads as zero.
+        let mut unshifted = record;
+        unshifted.z_offset_mm = None;
+        let loaded = LoadedSavedMap::from_record(unshifted).expect("zero default");
+        assert_eq!(loaded.map.z_offset_mm(), 0.0);
+        assert_eq!(loaded.map.z(0, 0), Some(-1.0));
     }
 
     #[test]

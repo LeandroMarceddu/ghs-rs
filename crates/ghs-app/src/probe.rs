@@ -33,10 +33,11 @@ use ghs_engine::{Axis as CoreAxis, MachineState, Position, ProbeResult, Wcs};
 use ghs_probe::{
     CornerProbe, EdgeMode, EdgeSpec, HeightMap, HeightMapEstimate, HeightMapGrid,
     MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM, MAX_HEIGHT_MAP_AXIS_POINTS,
-    MAX_HEIGHT_MAP_POINTS, MAX_PLATE_THICKNESS_MM, MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN,
-    MAX_RADIUS_MM, MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES,
-    ProbeAxis, ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue, RotationProbe, Sign,
-    XyPoint,
+    MAX_HEIGHT_MAP_POINTS, MAX_HEIGHT_MAP_Z_OFFSET_MM, MAX_PLATE_THICKNESS_MM,
+    MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN, MAX_PROBE_OFFSET_MM, MAX_RADIUS_MM,
+    MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES, ProbeAxis,
+    ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue, RotationProbe, Sign, XyPoint,
+    validate_probe_offset,
 };
 use ghs_viewer::Point2;
 
@@ -94,11 +95,17 @@ pub enum ProbeField {
     Rows,
     /// Lowest expected surface Z, in machine millimetres.
     SurfaceZ,
+    /// X component of `probe tip - controlled point`, in millimetres.
+    ProbeOffsetX,
+    /// Y component of `probe tip - controlled point`, in millimetres.
+    ProbeOffsetY,
+    /// Constant datum shift added to every measured height, in millimetres.
+    MapZOffset,
 }
 
 impl ProbeField {
     /// Number of editable fields.
-    pub const COUNT: usize = 24;
+    pub const COUNT: usize = 27;
 
     /// Every field, in edit order.
     pub const ALL: [ProbeField; ProbeField::COUNT] = [
@@ -126,6 +133,9 @@ impl ProbeField {
         ProbeField::Columns,
         ProbeField::Rows,
         ProbeField::SurfaceZ,
+        ProbeField::ProbeOffsetX,
+        ProbeField::ProbeOffsetY,
+        ProbeField::MapZOffset,
     ];
 
     /// Stable zero-based index for the input array.
@@ -155,6 +165,9 @@ impl ProbeField {
             ProbeField::Columns => 21,
             ProbeField::Rows => 22,
             ProbeField::SurfaceZ => 23,
+            ProbeField::ProbeOffsetX => 24,
+            ProbeField::ProbeOffsetY => 25,
+            ProbeField::MapZOffset => 26,
         }
     }
 
@@ -185,6 +198,9 @@ impl ProbeField {
             ProbeField::Columns => "COLUMNS",
             ProbeField::Rows => "ROWS",
             ProbeField::SurfaceZ => "SURFACE Z MACH",
+            ProbeField::ProbeOffsetX => "PROBE OFFSET X",
+            ProbeField::ProbeOffsetY => "PROBE OFFSET Y",
+            ProbeField::MapZOffset => "MAP Z OFFSET",
         }
     }
 
@@ -215,6 +231,9 @@ impl ProbeField {
             ProbeField::Columns => "columns",
             ProbeField::Rows => "rows",
             ProbeField::SurfaceZ => "surface-z",
+            ProbeField::ProbeOffsetX => "probe-offset-x",
+            ProbeField::ProbeOffsetY => "probe-offset-y",
+            ProbeField::MapZOffset => "map-z-offset",
         }
     }
 
@@ -253,6 +272,10 @@ impl ProbeField {
             ProbeField::Separation => (0.0, MAX_SEPARATION_MM),
             ProbeField::StepX | ProbeField::StepY => (0.0, MAX_COORDINATE_MM),
             ProbeField::Columns | ProbeField::Rows => (2.0, MAX_HEIGHT_MAP_AXIS_POINTS as f64),
+            ProbeField::ProbeOffsetX | ProbeField::ProbeOffsetY => {
+                (-MAX_PROBE_OFFSET_MM, MAX_PROBE_OFFSET_MM)
+            }
+            ProbeField::MapZOffset => (-MAX_HEIGHT_MAP_Z_OFFSET_MM, MAX_HEIGHT_MAP_Z_OFFSET_MM),
             _ => (-MAX_COORDINATE_MM, MAX_COORDINATE_MM),
         }
     }
@@ -284,6 +307,11 @@ impl ProbeField {
             ProbeField::Columns => "4".to_string(),
             ProbeField::Rows => "4".to_string(),
             ProbeField::SurfaceZ => "5.000".to_string(),
+            // A zero offset is the identity: the plan and result math are
+            // exactly the pre-offset workflow.
+            ProbeField::ProbeOffsetX | ProbeField::ProbeOffsetY | ProbeField::MapZOffset => {
+                "0.000".to_string()
+            }
         }
     }
 }
@@ -479,6 +507,9 @@ impl ProbeCard {
                 ProbeField::ReferenceZ,
             ],
             ProbeCard::HeightMap => &[
+                // The datum shift is the first card field so it is visible
+                // without scrolling past the whole grid editor.
+                ProbeField::MapZOffset,
                 ProbeField::OriginX,
                 ProbeField::OriginY,
                 ProbeField::StepX,
@@ -604,6 +635,16 @@ pub struct ProbeSetup {
     pub g92_mm: Position,
     /// TLO Z at preflight, in millimetres.
     pub tlo_z_mm: f64,
+    /// Physical probe mount offset, `probe tip - controlled point`, in
+    /// millimetres. The plan commands `feature - offset`; result math adds it
+    /// back before computing feature coordinates.
+    pub probe_offset: XyPoint,
+    /// Constant datum shift captured for a height map, in millimetres.
+    ///
+    /// It is applied only when the map is built from results. It never enters
+    /// the probe plan or the `surface_z_mm` search target and is zero for
+    /// standard cycles.
+    pub map_z_offset_mm: f64,
 }
 
 /// One cycle's optional anchor, centre and radius.
@@ -934,6 +975,58 @@ impl ProbeModel {
         }
     }
 
+    /// Validated probe mount offset, `probe tip - controlled point`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an empty/non-numeric field, a non-finite value,
+    /// or a component outside `+/- MAX_PROBE_OFFSET_MM`.
+    pub fn probe_offset(&self) -> Result<XyPoint, String> {
+        let offset = XyPoint::new(
+            self.field_value(ProbeField::ProbeOffsetX)?,
+            self.field_value(ProbeField::ProbeOffsetY)?,
+        );
+        validate_probe_offset(offset).map_err(|error| error.to_string())?;
+        Ok(offset)
+    }
+
+    /// Store a validated probe mount offset in the editor fields.
+    ///
+    /// Used when a controller profile loads. A bad value is refused before
+    /// either field changes, so the editor never holds half an offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `ghs-probe` validation message for a non-finite or
+    /// out-of-range component.
+    pub fn set_probe_offset(&mut self, offset: XyPoint) -> Result<(), String> {
+        validate_probe_offset(offset).map_err(|error| error.to_string())?;
+        self.set_field_text(ProbeField::ProbeOffsetX, format!("{:.3}", offset.x_mm))?;
+        self.set_field_text(ProbeField::ProbeOffsetY, format!("{:.3}", offset.y_mm))
+    }
+
+    /// Validated constant datum shift added to every measured height.
+    ///
+    /// This value is captured in [`ProbeSetup`] and applied to the map only;
+    /// it never changes the probing plan or `surface_z_mm`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an empty/non-numeric field, a non-finite value,
+    /// or a magnitude above [`MAX_HEIGHT_MAP_Z_OFFSET_MM`].
+    pub fn map_z_offset_mm(&self) -> Result<f64, String> {
+        let value = self.field_value(ProbeField::MapZOffset)?;
+        if value.abs() > MAX_HEIGHT_MAP_Z_OFFSET_MM {
+            return Err(format!(
+                "{} must be within -{:.3} ..= {:.3} mm",
+                ProbeField::MapZOffset.label(),
+                MAX_HEIGHT_MAP_Z_OFFSET_MM,
+                MAX_HEIGHT_MAP_Z_OFFSET_MM
+            ));
+        }
+        Ok(value)
+    }
+
     /// Reset the geometry defaults for the selected card from the live pose.
     ///
     /// Values the operator edits after this are not overwritten by snapshots.
@@ -1043,6 +1136,7 @@ impl ProbeModel {
         let retract_mm = self.field_value(ProbeField::Retract)?;
         let probe_diameter_mm = self.field_value(ProbeField::Diameter)?;
         let edge_offset_mm = self.field_value(ProbeField::EdgeOffset)?;
+        let probe_offset = self.probe_offset()?;
         let (position, center, radius_mm) = self.geometry(card, ctx)?;
         let params = ProbeParams {
             safe_z_mm,
@@ -1063,7 +1157,11 @@ impl ProbeModel {
         let cycle = self.cycle(card, ctx)?;
         // The plan is emitted verbatim: `ghs-probe` owns the G-code, and the
         // parser accepts its bare `G91` retract blocks after a modal `G38.2`.
-        let plan = cycle.plan(&params).map_err(|error| error.to_string())?;
+        // With a mount offset the cycle geometry stays in feature/tip
+        // coordinates and every commanded XY move is `feature - offset`.
+        let plan = cycle
+            .plan_with_offset(&params, probe_offset)
+            .map_err(|error| error.to_string())?;
         Ok(ProbeSetup {
             params,
             target: ProbeTarget::Cycle(cycle),
@@ -1072,6 +1170,8 @@ impl ProbeModel {
             wcs_value_mm: ctx.wcs_value_mm,
             g92_mm: ctx.g92_mm,
             tlo_z_mm: ctx.tlo_z_mm,
+            probe_offset,
+            map_z_offset_mm: 0.0,
         })
     }
 
@@ -1100,6 +1200,9 @@ impl ProbeModel {
         let columns = self.field_u16(ProbeField::Columns)?;
         let rows = self.field_u16(ProbeField::Rows)?;
         let surface_z_mm = self.field_value(ProbeField::SurfaceZ)?;
+        // The datum shift is validated with the grid editor but is applied
+        // only to the measured map; it never changes the plan or search target.
+        let _map_z_offset_mm = self.map_z_offset_mm()?;
         let offset = ctx.offset_mm();
         let grid = HeightMapGrid {
             origin_mm: XyPoint::new(
@@ -1240,9 +1343,11 @@ impl ProbeModel {
 
     fn prepare_height_map(&self, ctx: &ProbeContext) -> Result<ProbeSetup, String> {
         let draft = self.height_map_draft(ctx)?;
+        let probe_offset = self.probe_offset()?;
+        let map_z_offset_mm = self.map_z_offset_mm()?;
         let plan = draft
             .grid
-            .plan(&draft.params)
+            .plan_with_offset(&draft.params, probe_offset)
             .map_err(|error| error.to_string())?;
         Ok(ProbeSetup {
             params: draft.params,
@@ -1252,6 +1357,8 @@ impl ProbeModel {
             wcs_value_mm: ctx.wcs_value_mm,
             g92_mm: ctx.g92_mm,
             tlo_z_mm: ctx.tlo_z_mm,
+            probe_offset,
+            map_z_offset_mm,
         })
     }
 
@@ -1533,6 +1640,28 @@ impl ProbeModel {
             ),
             RowState::Info,
         );
+        match self.probe_offset() {
+            Ok(offset) => push(
+                "PROBE OFFSET",
+                format!(
+                    "X{} Y{} mm (probe tip - controlled point)",
+                    format_mm(offset.x_mm),
+                    format_mm(offset.y_mm)
+                ),
+                if offset.x_mm == 0.0 && offset.y_mm == 0.0 {
+                    RowState::Info
+                } else {
+                    RowState::Warn
+                },
+            ),
+            Err(error) => push("PROBE OFFSET", error, RowState::Bad),
+        }
+        push(
+            "COORDINATES",
+            "fields = feature/tip XY; plan/probes = controlled point = feature - offset"
+                .to_string(),
+            RowState::Info,
+        );
         push(
             "MACHINE XYZ",
             format!("{} mm", position_text(ctx.machine_pos_mm)),
@@ -1608,6 +1737,18 @@ impl ProbeModel {
                             "SURFACE Z",
                             format!("{:.3} mm machine", grid.surface_z_mm),
                             RowState::Info,
+                        );
+                        push(
+                            "MAP Z OFFSET",
+                            format!(
+                                "{:.3} mm effective only; plan/search unchanged",
+                                setup.map_z_offset_mm
+                            ),
+                            if setup.map_z_offset_mm == 0.0 {
+                                RowState::Info
+                            } else {
+                                RowState::Warn
+                            },
                         );
                         push(
                             "GRID ORIGIN",
@@ -1797,7 +1938,7 @@ impl ProbeModel {
             ));
             run.paused_after_probe = None;
             run.stop_requested = true;
-            run.map = partial_height_map(&run.setup.target, &run.results);
+            run.map = partial_height_map(&run.setup, &run.results);
         }
         true
     }
@@ -1825,7 +1966,12 @@ impl ProbeModel {
         }
         match &run.setup.target {
             ProbeTarget::Cycle(cycle) => {
-                match ProbeOutcome::from_results(cycle, &run.setup.params, &run.results) {
+                match ProbeOutcome::from_results_with_offset(
+                    cycle,
+                    &run.setup.params,
+                    &run.results,
+                    run.setup.probe_offset,
+                ) {
                     Ok(outcome) => {
                         run.outcome = Some(outcome);
                         run.phase = ProbePhase::Complete;
@@ -1837,7 +1983,9 @@ impl ProbeModel {
                 }
             }
             ProbeTarget::HeightMap(grid) => {
-                match HeightMap::from_results(grid.clone(), &run.results) {
+                match HeightMap::from_results(grid.clone(), &run.results)
+                    .and_then(|map| map.with_z_offset(run.setup.map_z_offset_mm))
+                {
                     Ok(map) => {
                         let complete = run.results.len() == run.setup.plan.expected_probes;
                         run.map = Some(map);
@@ -1877,7 +2025,7 @@ impl ProbeModel {
             return false;
         }
         if run.is_height_map() && run.map.is_none() {
-            run.map = partial_height_map(&run.setup.target, &run.results);
+            run.map = partial_height_map(&run.setup, &run.results);
         }
         run.phase = ProbePhase::Failed;
         run.error = Some(reason);
@@ -1984,11 +2132,16 @@ impl ProbeModel {
 }
 
 /// Build a partial height map from however many ordered results were bound.
-fn partial_height_map(target: &ProbeTarget, results: &[ProbeResult]) -> Option<HeightMap> {
-    let ProbeTarget::HeightMap(grid) = target else {
+///
+/// The captured datum shift is applied so a stopped run displays the same
+/// effective heights as a completed one; raw samples stay raw.
+fn partial_height_map(setup: &ProbeSetup, results: &[ProbeResult]) -> Option<HeightMap> {
+    let ProbeTarget::HeightMap(grid) = &setup.target else {
         return None;
     };
-    HeightMap::from_results(grid.clone(), results).ok()
+    HeightMap::from_results(grid.clone(), results)
+        .and_then(|map| map.with_z_offset(setup.map_z_offset_mm))
+        .ok()
 }
 
 /// Counts, ranges and compensation spread for a measured map.
@@ -2012,19 +2165,27 @@ pub struct HeightMapSummary {
     pub max_compensation_mm: Option<f64>,
     /// Nominal surface Z from the grid.
     pub nominal_z_mm: f64,
+    /// Constant datum shift included in every effective height, in
+    /// millimetres. Raw samples never include it.
+    pub z_offset_mm: f64,
 }
 
 /// Summarise a height map without filling any missing cell.
+///
+/// Every reported Z and compensation is effective: the raw sample plus the
+/// map's [`HeightMap::z_offset_mm`]. Raw samples remain available through
+/// [`HeightMap::samples`] for persistence.
 #[must_use]
 pub fn height_map_summary(map: &HeightMap) -> HeightMapSummary {
     let (min_z, max_z) = map
         .z_range()
         .map_or((None, None), |(low, high)| (Some(low), Some(high)));
     let nominal = map.grid().surface_z_mm;
+    let offset = map.z_offset_mm();
     let mut min_comp: Option<f64> = None;
     let mut max_comp: Option<f64> = None;
     for z in map.samples().iter().flatten() {
-        let compensation = z - nominal;
+        let compensation = (z + offset) - nominal;
         min_comp = Some(min_comp.map_or(compensation, |value| value.min(compensation)));
         max_comp = Some(max_comp.map_or(compensation, |value| value.max(compensation)));
     }
@@ -2038,6 +2199,7 @@ pub fn height_map_summary(map: &HeightMap) -> HeightMapSummary {
         min_compensation_mm: min_comp,
         max_compensation_mm: max_comp,
         nominal_z_mm: nominal,
+        z_offset_mm: offset,
     }
 }
 
@@ -2049,7 +2211,7 @@ pub fn height_map_summary(map: &HeightMap) -> HeightMapSummary {
 pub fn height_map_csv(map: &HeightMap) -> String {
     let grid = map.grid();
     let mut text = String::from(
-        "column,row,machine_x_mm,machine_y_mm,measured_machine_z_mm,compensation_mm,valid\n",
+        "column,row,machine_x_mm,machine_y_mm,effective_machine_z_mm,compensation_mm,valid\n",
     );
     for row in 0..grid.rows {
         for column in 0..grid.columns {
@@ -2519,6 +2681,212 @@ mod tests {
         assert!(model.select_card(card, &ctx));
         model.probe_connected_confirmed = true;
         model
+    }
+
+    #[test]
+    fn zero_probe_offset_keeps_the_previous_plan_and_result_exactly() {
+        let ctx = context();
+        let model = model(ProbeCard::ZTouchPlate);
+        let setup = model.prepare(&ctx).expect("plan");
+        assert_eq!(setup.probe_offset, XyPoint::new(0.0, 0.0));
+        assert_eq!(setup.map_z_offset_mm, 0.0);
+
+        let ProbeTarget::Cycle(cycle) = &setup.target else {
+            panic!("wrong target");
+        };
+        let direct = cycle.plan(&setup.params).expect("zero-offset plan");
+        assert_eq!(setup.plan.program, direct.program);
+        assert_eq!(setup.plan.probes, direct.probes);
+        assert_eq!(setup.plan.expected_probes, direct.expected_probes);
+
+        let contact = Position::xyz(6.0, 8.0, -11.0);
+        let direct_outcome =
+            ProbeOutcome::from_results(cycle, &setup.params, &[ProbeResult::new(true, contact)])
+                .expect("zero-offset result");
+        let mut run_model = model;
+        run_model.begin(setup);
+        assert!(run_model.on_job_loaded("z-touch-plate"));
+        assert!(run_model.on_job_started());
+        assert!(run_model.bind_result(ProbeResult::new(true, contact)));
+        assert!(run_model.on_job_completed());
+        assert_eq!(
+            run_model.run().and_then(|run| run.outcome.clone()),
+            Some(direct_outcome)
+        );
+    }
+
+    #[test]
+    fn nonzero_probe_offset_shifts_the_plan_and_binds_feature_coordinates() {
+        let ctx = context();
+        let mut model = model(ProbeCard::EdgeX);
+        model
+            .set_probe_offset(XyPoint::new(10.0, -5.0))
+            .expect("offset");
+        let setup = model.prepare(&ctx).expect("offset plan");
+        assert_eq!(setup.probe_offset, XyPoint::new(10.0, -5.0));
+        assert_eq!(setup.plan.expected_probes, 1);
+
+        // Expected feature edge 20 mm, radius 1.5, outside +X: feature hint
+        // 18.5, feature start 13.5. Controlled = feature - (10, -5).
+        let probe = &setup.plan.probes[0];
+        assert!((probe.from.get(CoreAxis::X) - 3.5).abs() < 1.0e-9);
+        // Feature Y is 20 mm; subtracting a -5 mm offset commands 25 mm.
+        assert!(
+            (probe.from.get(CoreAxis::Y) - 25.0).abs() < 1.0e-9,
+            "from {:?} to {:?}",
+            probe.from,
+            probe.to
+        );
+        assert!((probe.to.get(CoreAxis::X) - 8.5).abs() < 1.0e-9);
+        assert!((probe.to.get(CoreAxis::Y) - 25.0).abs() < 1.0e-9);
+        // The program is in work coordinates: controlled X 8.5 - WCS X 6.
+        assert!(
+            setup.plan.program.contains("G38.2 X2.500"),
+            "{}",
+            setup.plan.program
+        );
+
+        model.begin(setup);
+        assert!(model.on_job_loaded("edge-x-outside-positive"));
+        assert!(model.on_job_started());
+        // The raw PRB stays at the controlled point (8.5, 5). The outcome
+        // adds the offset back: feature contact X 18.5, edge 20.
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(8.5, 25.0, 0.0))));
+        assert!(model.on_job_completed());
+        let run = model.run().expect("run");
+        assert_eq!(run.results[0].position.get(CoreAxis::X), 8.5);
+        let ProbeValue::Edge {
+            edge_mm, zero_mm, ..
+        } = &run.outcome.as_ref().expect("outcome").value
+        else {
+            panic!("wrong value");
+        };
+        assert!((*edge_mm - 20.0).abs() < 1.0e-9, "{edge_mm}");
+        assert!((*zero_mm - 20.0).abs() < 1.0e-9, "{zero_mm}");
+    }
+
+    #[test]
+    fn invalid_probe_offset_is_refused_with_a_clear_error() {
+        let ctx = context();
+        let mut model = model(ProbeCard::ZTouchPlate);
+        let error = model
+            .set_field_text(ProbeField::ProbeOffsetX, "200.000")
+            .expect_err("out of range");
+        assert!(error.contains("PROBE OFFSET X"), "{error}");
+        assert!(error.contains("100.000"), "{error}");
+        assert_eq!(model.field_text(ProbeField::ProbeOffsetX), "0.000");
+        assert!(
+            model
+                .field_error(ProbeField::ProbeOffsetX)
+                .is_some_and(|text| text.contains("PROBE OFFSET X"))
+        );
+        assert!(
+            model.prepare(&ctx).is_ok(),
+            "the old zero offset still runs"
+        );
+
+        let error = model
+            .set_probe_offset(XyPoint::new(f64::NAN, 0.0))
+            .expect_err("non-finite");
+        assert!(error.to_lowercase().contains("finite"), "{error}");
+        assert_eq!(
+            model.probe_offset().expect("still zero"),
+            XyPoint::new(0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn map_z_offset_is_effective_in_summary_overlay_and_csv() {
+        let grid = HeightMapGrid {
+            origin_mm: XyPoint::new(10.0, 20.0),
+            step_x_mm: 4.0,
+            step_y_mm: 6.0,
+            columns: 2,
+            rows: 2,
+            surface_z_mm: 0.0,
+        };
+        let map = HeightMap::from_samples(grid, vec![Some(1.0), None, Some(3.0), Some(4.0)])
+            .expect("map")
+            .with_z_offset(0.75)
+            .expect("offset");
+        assert_eq!(map.samples()[0], Some(1.0), "raw samples stay raw");
+
+        let summary = height_map_summary(&map);
+        assert_eq!(summary.z_offset_mm, 0.75);
+        assert_eq!(summary.min_z_mm, Some(1.75));
+        assert_eq!(summary.max_z_mm, Some(4.75));
+        assert_eq!(summary.min_compensation_mm, Some(1.75));
+        assert_eq!(summary.max_compensation_mm, Some(4.75));
+
+        let overlay = height_map_overlay(&map, Position::xyz(5.0, 6.0, 3.0));
+        assert_eq!(overlay.cells[0].z_mm, Some(1.75));
+        assert_eq!(overlay.cells[1].z_mm, None);
+        assert_eq!(overlay.cells[3].z_mm, Some(4.75));
+
+        let csv = height_map_csv(&map);
+        assert!(csv.contains("0,0,10.000,20.000,1.750,1.750,true"), "{csv}");
+        assert!(csv.contains("1,1,14.000,26.000,4.750,4.750,true"), "{csv}");
+    }
+
+    #[test]
+    fn height_map_run_captures_the_z_offset_without_changing_the_plan() {
+        let ctx = context();
+        let mut shifted = model(ProbeCard::HeightMap);
+        set_height_grid(&mut shifted, 2, 2);
+        shifted
+            .set_field_text(ProbeField::MapZOffset, "1.250")
+            .expect("z offset");
+        let shifted_setup = shifted.prepare(&ctx).expect("shifted plan");
+
+        let mut plain = model(ProbeCard::HeightMap);
+        set_height_grid(&mut plain, 2, 2);
+        let plain_setup = plain.prepare(&ctx).expect("plain plan");
+        assert_eq!(
+            shifted_setup.plan.program, plain_setup.plan.program,
+            "the datum shift must not enter the plan"
+        );
+        assert_eq!(shifted_setup.plan.probes, plain_setup.plan.probes);
+        assert_eq!(shifted_setup.map_z_offset_mm, 1.25);
+
+        shifted.begin(shifted_setup);
+        assert!(shifted.on_job_loaded("height-map"));
+        assert!(shifted.on_job_started());
+        for (x, z) in [(6.0, 0.0), (16.0, -1.0), (6.0, -2.0), (16.0, -3.0)] {
+            let y = if x == 6.0 { 8.0 } else { 18.0 };
+            assert!(shifted.bind_result(ProbeResult::new(true, Position::xyz(x, y, z))));
+        }
+        assert!(shifted.on_job_completed());
+        let map = shifted.run().and_then(|run| run.map.as_ref()).expect("map");
+        assert_eq!(map.z_offset_mm(), 1.25);
+        assert_eq!(map.samples()[0], Some(0.0), "raw sample");
+        assert_eq!(map.z(0, 0), Some(1.25), "effective value");
+        assert_eq!(height_map_summary(map).min_z_mm, Some(-3.0 + 1.25));
+    }
+
+    #[test]
+    fn preflight_shows_the_probe_offset_and_coordinate_convention() {
+        let ctx = context();
+        let mut model = model(ProbeCard::ZTouchPlate);
+        model
+            .set_probe_offset(XyPoint::new(12.5, -8.0))
+            .expect("offset");
+        let sheet = model.preflight(&ctx);
+        assert!(sheet.blockers.is_empty(), "{:?}", sheet.blockers);
+        let offset = sheet
+            .rows
+            .iter()
+            .find(|row| row.label == "PROBE OFFSET")
+            .expect("offset row");
+        assert!(offset.value.contains("X12.500"), "{}", offset.value);
+        assert!(offset.value.contains("Y-8.000"), "{}", offset.value);
+        let coordinates = sheet
+            .rows
+            .iter()
+            .find(|row| row.label == "COORDINATES")
+            .expect("coordinate row");
+        assert!(coordinates.value.contains("feature"));
+        assert!(coordinates.value.contains("controlled point"));
+        assert!(coordinates.value.contains("feature - offset"));
     }
 
     #[test]
@@ -3025,7 +3393,7 @@ mod tests {
         assert_eq!(lines.len(), 5, "header plus one row per cell");
         assert_eq!(
             lines[0],
-            "column,row,machine_x_mm,machine_y_mm,measured_machine_z_mm,compensation_mm,valid"
+            "column,row,machine_x_mm,machine_y_mm,effective_machine_z_mm,compensation_mm,valid"
         );
         assert_eq!(lines[1], "0,0,10.000,20.000,1.500,1.500,true");
         assert_eq!(lines[2], "1,0,14.000,20.000,,,false");

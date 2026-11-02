@@ -670,6 +670,14 @@ impl Shell {
             if let Some(card) = parse_probe_card(&name) {
                 let ctx = self.probe_context();
                 self.state.probe.select_card(card, &ctx);
+                // Screenshot-only: show a nonzero mount offset so the
+                // controlled-vs-feature convention is visible in the capture.
+                if std::env::args().any(|arg| arg == "--demo-probe-offset") {
+                    let _ = self
+                        .state
+                        .probe
+                        .set_probe_offset(ghs_probe::XyPoint::new(12.5, -8.0));
+                }
             } else {
                 self.state.push_console(
                     ConsoleLevel::Warn,
@@ -1468,6 +1476,7 @@ impl Shell {
     fn use_pending_profile(&mut self, cx: &mut Context<Self>) {
         if let Some(tools) = self.state.config.use_pending_profile() {
             self.state.clear_saved_map_selection();
+            self.state.load_probe_offset();
             let path = self.state.config.profile_path();
             let count = tools.len();
             self.state
@@ -1560,6 +1569,7 @@ impl Shell {
             Ok(import) => {
                 if let Some(tools) = import.tools {
                     self.state.clear_saved_map_selection();
+                    self.state.load_probe_offset();
                     let count = tools.len();
                     let profile_path = self.state.config.profile_path();
                     self.state.tools.adopt(tools, profile_path, "IMPORTED");
@@ -2177,6 +2187,14 @@ impl Shell {
             (ProbeField::Feed, "100.000"),
             (ProbeField::Retract, "2.000"),
             (ProbeField::Diameter, "3.000"),
+            (
+                ProbeField::MapZOffset,
+                if std::env::args().any(|arg| arg == "--demo-height-map-z-offset") {
+                    "0.750"
+                } else {
+                    "0.000"
+                },
+            ),
         ] {
             if let Err(message) = self.state.probe.set_field_text(field, text) {
                 self.state
@@ -2745,9 +2763,26 @@ impl Shell {
                     }
                     // A settings value stays local until Apply; `AppState`
                     // already wrote it into the row draft.
-                    KeypadTarget::Setting(_)
-                    | KeypadTarget::Tool(_)
-                    | KeypadTarget::ProbeField(_) => {}
+                    KeypadTarget::Setting(_) | KeypadTarget::Tool(_) => {}
+                    KeypadTarget::ProbeField(field) => {
+                        // The mount offset is setup data owned by the profile.
+                        // A failed save never blocks the local value, but the
+                        // operator is told it will not survive reconnect.
+                        if matches!(field, ProbeField::ProbeOffsetX | ProbeField::ProbeOffsetY)
+                            && self.state.probe.field_error(field).is_none()
+                        {
+                            match self.state.save_probe_offset() {
+                                Ok(path) => self.state.push_console(
+                                    ConsoleLevel::Info,
+                                    format!("Probe offset saved to {}", path.display()),
+                                ),
+                                Err(message) => self.state.push_console(
+                                    ConsoleLevel::Warn,
+                                    format!("Probe offset not saved: {message}"),
+                                ),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3540,8 +3575,114 @@ impl Shell {
                     .child(chip(self.state.unit(), p))
                     .child(chip(if ctx.ready { "LIVE" } else { "OFFLINE" }, p)),
             )
+            .child(self.probe_offset_bar(p, cx))
             .child(banner)
             .child(grid)
+    }
+
+    /// Always-visible physical probe mount offset for the Probe workspace.
+    ///
+    /// The value is `probe tip - controlled point`, in millimetres. The cycle
+    /// fields stay in feature/tip coordinates; the generated plan commands the
+    /// controlled point (`feature - offset`).
+    fn probe_offset_bar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let x = self
+            .state
+            .probe
+            .field_text(ProbeField::ProbeOffsetX)
+            .to_string();
+        let y = self
+            .state
+            .probe
+            .field_text(ProbeField::ProbeOffsetY)
+            .to_string();
+        let nonzero = x.trim().parse::<f64>().unwrap_or(0.0) != 0.0
+            || y.trim().parse::<f64>().unwrap_or(0.0) != 0.0;
+        let error = self
+            .state
+            .probe
+            .field_error(ProbeField::ProbeOffsetX)
+            .or_else(|| self.state.probe.field_error(ProbeField::ProbeOffsetY))
+            .map(str::to_string);
+        let mut bar = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(if error.is_some() {
+                p.danger
+            } else if nonzero {
+                p.info.opacity(0.55)
+            } else {
+                p.border
+            })
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label("PROBE OFFSET X/Y", p))
+                    .child(self.probe_offset_button(ProbeField::ProbeOffsetX, "X", p, cx))
+                    .child(self.probe_offset_button(ProbeField::ProbeOffsetY, "Y", p, cx))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_dim)
+                            .child("mm | probe tip - controlled point | plan shifts controlled by -offset"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.text_faint)
+                    .child(
+                        "Entered positions, centres and grid origin are FEATURE (probe-tip) coordinates. \
+                         Preflight from/to and the program are CONTROLLED-POINT coordinates \
+                         (feature - offset). Stored per controller profile; never sent to the controller.",
+                    ),
+            );
+        if let Some(error) = error {
+            bar = bar.child(div().text_size(px(9.0)).text_color(p.danger).child(error));
+        }
+        bar
+    }
+
+    fn probe_offset_button(
+        &self,
+        field: ProbeField,
+        axis: &'static str,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let view = cx.entity();
+        let value = self.state.probe.field_text(field).to_string();
+        let invalid = self.state.probe.field_error(field).is_some();
+        Button::new(format!("probe-offset-{}", field.key()))
+            .label(format!("{axis} {value} mm"))
+            .h(px(48.0))
+            .w(px(150.0))
+            .flex_shrink_0()
+            .rounded_lg()
+            .text_size(px(12.0))
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(p.panel)
+                    .foreground(if invalid { p.danger } else { p.text })
+                    .hover(p.raised_hover)
+                    .active(p.accent_muted),
+            )
+            .border_1()
+            .border_color(if invalid { p.danger } else { p.border })
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.state.open_keypad(KeypadTarget::ProbeField(field));
+                    cx.notify();
+                });
+            })
     }
 
     fn probe_card_tile(
@@ -3701,10 +3842,13 @@ impl Shell {
         } else if let Some(run) = self.state.probe.run() {
             let mut content = v_flex().gap_2().p_2();
             if run.map.is_some() {
+                // The measured result and its effective summary come first so
+                // the Z offset and ranges are visible without scrolling past
+                // the saved-map browser. The browser remains below the result.
+                content = content.child(self.height_map_result_panel(p, cx, run));
                 if card == ProbeCard::HeightMap {
                     content = content.child(self.height_map_library_panel(p, cx));
                 }
-                content = content.child(self.height_map_result_panel(p, cx, run));
             } else {
                 content = content.child(self.probe_run_panel(p, cx, run));
             }
@@ -3832,6 +3976,7 @@ impl Shell {
                     .child(chip(self.state.wcs(), p))
                     .child(chip(self.state.unit(), p)),
             )
+            .child(self.probe_offset_bar(p, cx))
             .child(body)
             .child(footer)
     }
@@ -4004,6 +4149,18 @@ impl Shell {
                             format_mm(draft.grid.surface_z_mm),
                             format_mm(draft.params.safe_z_mm - draft.grid.surface_z_mm),
                             format_mm(draft.params.search_distance_mm),
+                        )),
+                );
+                let z_offset = self.state.probe.map_z_offset_mm().unwrap_or(0.0);
+                summary = summary.child(
+                    div()
+                        .text_size(px(8.5))
+                        .line_height(px(11.0))
+                        .text_color(p.info)
+                        .child(format!(
+                            "MAP Z OFFSET {} mm: datum shift added to every measured height for summary, \
+                             overlay, CSV and Apply. It does not change the grid, plan, or SURFACE Z search.",
+                            format_mm(z_offset)
                         )),
                 );
             }
@@ -4399,14 +4556,52 @@ impl Shell {
             .setup
             .as_ref()
             .is_some_and(|setup| matches!(setup.target, ProbeTarget::HeightMap(_)));
+        let (offset_x, offset_y) = preflight
+            .setup
+            .as_ref()
+            .map(|setup| (setup.probe_offset.x_mm, setup.probe_offset.y_mm))
+            .or_else(|| {
+                self.state
+                    .probe
+                    .probe_offset()
+                    .ok()
+                    .map(|offset| (offset.x_mm, offset.y_mm))
+            })
+            .unwrap_or((0.0, 0.0));
+        panel = panel.child(probe_notice(
+            "PROBE OFFSET X/Y",
+            &format!(
+                "X{} Y{} mm. Entered positions/centres/grid are FEATURE (probe-tip) coordinates; \
+                 plan FROM/TO are CONTROLLED-POINT coordinates (feature - offset).",
+                format_mm(offset_x),
+                format_mm(offset_y)
+            ),
+            p.info,
+            p,
+        ));
         if is_height_map {
-            panel = panel.child(probe_notice(
-                "SAFE Z",
-                "Safe Z must clear the highest point on the stock; every grid probe descends \
-                 from it. SEARCH must cover SAFE Z - SURFACE Z.",
-                p.warning,
-                p,
-            ));
+            let z_offset = preflight
+                .setup
+                .as_ref()
+                .map_or(0.0, |setup| setup.map_z_offset_mm);
+            panel = panel
+                .child(probe_notice(
+                    "SAFE Z",
+                    "Safe Z must clear the highest point on the stock; every grid probe descends \
+                     from it. SEARCH must cover SAFE Z - SURFACE Z.",
+                    p.warning,
+                    p,
+                ))
+                .child(probe_notice(
+                    "MAP Z OFFSET",
+                    &format!(
+                        "{} mm is added to every measured height for summary, overlay, CSV and \
+                         Apply. The plan and SURFACE Z search are unchanged.",
+                        format_mm(z_offset)
+                    ),
+                    p.info,
+                    p,
+                ));
         }
 
         if !preflight.blockers.is_empty() {
@@ -4487,8 +4682,9 @@ impl Shell {
             .child(
                 h_flex()
                     .items_center()
+                    .flex_wrap()
                     .gap_2()
-                    .child(section_label("SEARCH BOUND", p))
+                    .child(section_label("SEARCH BOUND (CONTROLLED-POINT XY)", p))
                     .child(
                         div()
                             .text_size(px(9.0))
@@ -4501,6 +4697,17 @@ impl Shell {
                                     .map(|probe| probe.travel_mm)
                                     .fold(0.0_f64, f64::max)
                             )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.info)
+                    .child(
+                        "FROM/TO are controlled-point machine coordinates. Entered positions, \
+                         centres and grid origin are feature/tip coordinates; \
+                         controlled = feature - probe offset.",
                     ),
             )
             .child(lines)
@@ -4877,9 +5084,11 @@ impl Shell {
                                         .line_height(px(10.0))
                                         .text_color(p.text_dim)
                                         .child(format!(
-                                            "{date} | {} cells | {} | {tool} | {state_text}",
+                                            "{date} | {} cells | {} | {tool} | {state_text} | \
+                                             Z offset {} mm",
                                             summary.point_count,
-                                            summary.wcs.as_str()
+                                            summary.wcs.as_str(),
+                                            format_mm(summary.z_offset_mm)
                                         )),
                                 ),
                         )
@@ -5065,9 +5274,10 @@ impl Shell {
                     .line_height(px(10.0))
                     .text_color(p.text_dim)
                     .child(format!(
-                        "{created} | {} | {}",
+                        "{created} | {} | {} | Z offset {} mm",
                         saved.record.frame.wcs.as_str(),
-                        tool
+                        tool,
+                        format_mm(summary.z_offset_mm)
                     )),
             )
             .child(
@@ -5103,6 +5313,14 @@ impl Shell {
                         height_map_detail_cell(
                             "SURFACE",
                             &format!("{} mm", format_mm(summary.nominal_z_mm)),
+                            p,
+                        )
+                        .w(px(96.0)),
+                    )
+                    .child(
+                        height_map_detail_cell(
+                            "Z OFFSET",
+                            &format!("{} mm", format_mm(summary.z_offset_mm)),
                             p,
                         )
                         .w(px(96.0)),
@@ -5480,8 +5698,6 @@ impl Shell {
                         .child(error),
                 )
             })
-            .child(self.height_map_apply_section(p, cx, snapshot.as_ref()))
-            .child(self.height_map_save_section(p, cx, summary.valid))
             .child(
                 h_flex()
                     .flex_wrap()
@@ -5505,6 +5721,14 @@ impl Shell {
                         height_map_detail_cell(
                             "SURFACE",
                             &format!("{} mm", format_mm(summary.nominal_z_mm)),
+                            p,
+                        )
+                        .w(px(96.0)),
+                    )
+                    .child(
+                        height_map_detail_cell(
+                            "Z OFFSET",
+                            &format!("{} mm", format_mm(summary.z_offset_mm)),
                             p,
                         )
                         .w(px(96.0)),
@@ -5535,6 +5759,8 @@ impl Shell {
                         }
                     }),
             )
+            .child(self.height_map_apply_section(p, cx, snapshot.as_ref()))
+            .child(self.height_map_save_section(p, cx, summary.valid))
             .child(
                 v_flex()
                     .gap_1()

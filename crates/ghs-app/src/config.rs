@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use ghs_config::{
     AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
-    IdentityPolicy, ImportOutcome, MAX_HEIGHT_MAPS, OffsetSnapshot, ProfileKey, ThemeMode,
-    ToolTable,
+    IdentityPolicy, ImportOutcome, MAX_HEIGHT_MAPS, OffsetSnapshot, ProbeOffsetRecord, ProfileKey,
+    ThemeMode, ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -512,6 +512,78 @@ impl ConfigModel {
         let _ = self.save_app();
     }
 
+    /// Persisted physical probe mount offset for the active profile.
+    #[must_use]
+    pub fn probe_offset(&self) -> ProbeOffsetRecord {
+        self.data.probe_offset
+    }
+
+    /// Save the probe mount offset into the current controller profile.
+    ///
+    /// The value is `probe tip - controlled point`, in millimetres. It is a
+    /// local setup value: this writes only the profile JSON and never sends a
+    /// command, offset, or setting to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no controller profile is active, the stored
+    /// profile is corrupt, the record is non-finite/out of range, or writing
+    /// fails. A refused record leaves the previous value in place.
+    pub fn save_probe_offset(&mut self, offset: ProbeOffsetRecord) -> Result<PathBuf, String> {
+        if self.corrupt_profile {
+            return Err(
+                "the stored profile is corrupt; it was not overwritten. Repair or remove it first"
+                    .to_string(),
+            );
+        }
+        if self.store.is_none() {
+            return Err("no platform configuration directory".to_string());
+        }
+        let Some(key) = self.key.clone() else {
+            return Err("connect a controller before saving the probe offset".to_string());
+        };
+        if !key.is_identified() {
+            return Err(
+                "the controller identity is not verified; the probe offset is saved only for a \
+                 known controller"
+                    .to_string(),
+            );
+        }
+        offset
+            .validate()
+            .map_err(|error| format!("probe offset is invalid: {error}"))?;
+        let mut data = self.data.clone();
+        data.probe_offset = offset;
+        let path = self
+            .store
+            .as_ref()
+            .map(|store| store.profile_path(&key))
+            .ok_or_else(|| "no platform configuration directory".to_string())?;
+        if let Err(error) = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "no platform configuration directory".to_string())
+            .and_then(|store| {
+                store
+                    .save_controller_data(&key, &data)
+                    .map_err(|error| error.to_string())
+            })
+        {
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Probe offset save failed: {error}"),
+            });
+            return Err(error);
+        }
+        self.data = data;
+        self.profile_error = None;
+        self.last_result = Some(ConfigStatus {
+            ok: true,
+            text: format!("Probe offset saved to {}", path.display()),
+        });
+        Ok(path)
+    }
+
     /// Save the current controller profile: tools, offsets, and a settings
     /// snapshot.
     ///
@@ -940,6 +1012,69 @@ mod tests {
         let load = reopened.on_controller(&info).expect("reload");
         assert_eq!(load.tools, Some(table));
         assert_eq!(reopened.data().offsets, offsets());
+    }
+
+    #[test]
+    fn probe_offset_round_trips_through_the_profile_and_rejects_bad_values() {
+        let dir = TempDir::new("probe-offset");
+        let store = ConfigStore::new(&dir.path);
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let mut model = ConfigModel::from_store(store.clone());
+        model.on_controller(&info).expect("profile");
+        assert_eq!(model.probe_offset(), ProbeOffsetRecord::default());
+
+        let offset = ProbeOffsetRecord {
+            x_mm: 12.5,
+            y_mm: -7.25,
+        };
+        let path = model.save_probe_offset(offset).expect("save offset");
+        assert!(path.exists());
+        assert_eq!(model.probe_offset(), offset);
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("data")
+                .probe_offset,
+            offset
+        );
+
+        let mut reopened = ConfigModel::from_store(store);
+        let load = reopened.on_controller(&info).expect("reload");
+        assert!(!load.unverified);
+        assert_eq!(reopened.probe_offset(), offset);
+
+        let error = reopened
+            .save_probe_offset(ProbeOffsetRecord {
+                x_mm: f64::NAN,
+                y_mm: 0.0,
+            })
+            .expect_err("non-finite offset is refused");
+        assert!(
+            error.contains("invalid") || error.contains("finite"),
+            "{error}"
+        );
+        assert_eq!(
+            reopened.probe_offset(),
+            offset,
+            "a refusal keeps the old value"
+        );
+    }
+
+    #[test]
+    fn probe_offset_save_needs_an_identified_profile() {
+        let dir = TempDir::new("probe-offset-gate");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store);
+        let error = model
+            .save_probe_offset(ProbeOffsetRecord {
+                x_mm: 1.0,
+                y_mm: 2.0,
+            })
+            .expect_err("no controller profile");
+        assert!(error.contains("connect a controller"), "{error}");
+        assert_eq!(model.probe_offset(), ProbeOffsetRecord::default());
     }
 
     #[test]
