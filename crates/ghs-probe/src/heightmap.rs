@@ -6,10 +6,19 @@ use ghs_viewer::{Bounds2, Point2, Point3, Segment, Toolpath};
 use crate::ProbePlan;
 use crate::error::{ProbeError, ValidationError};
 use crate::gcode::GcodeBuilder;
-use crate::params::{ProbeParams, XyPoint, check_coordinate, check_finite, check_range};
+use crate::params::{
+    ProbeParams, XyPoint, check_coordinate, check_finite, check_range, feature_to_controlled,
+    validate_probe_offset,
+};
 
 /// Largest number of height-map points in one grid.
 pub const MAX_HEIGHT_MAP_POINTS: usize = 4_096;
+
+/// Largest accepted absolute height-map Z offset, in millimetres.
+///
+/// The offset is a constant datum shift added to every measured sample when
+/// the map is used for display or compensation. The stored samples remain raw.
+pub const MAX_HEIGHT_MAP_Z_OFFSET_MM: f64 = 1_000.0;
 
 /// Largest number of columns or rows in a height map.
 pub const MAX_HEIGHT_MAP_AXIS_POINTS: u16 = 128;
@@ -38,9 +47,14 @@ pub const HEIGHT_MAP_POINT_OVERHEAD_SECONDS: f64 = 3.0;
 const MAX_STEP_MM: f64 = 1_000.0;
 
 /// A rectangular height-map grid.
+///
+/// Grid points are **feature / probe-tip** XY positions in machine
+/// millimetres. [`HeightMapGrid::plan_with_offset`] subtracts a probe-tip
+/// offset from every point to obtain the commanded controlled-point position;
+/// [`HeightMapGrid::plan`] uses a zero offset.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeightMapGrid {
-    /// First point, in machine millimetres.
+    /// First point, in machine millimetres, in feature/probe-tip coordinates.
     pub origin_mm: XyPoint,
     /// Column spacing, in millimetres.
     pub step_x_mm: f64,
@@ -194,15 +208,35 @@ impl HeightMapGrid {
             && y_mm <= max.y_mm
     }
 
-    /// Build the complete height-map probing program.
+    /// Build the complete height-map probing program with no probe-tip offset.
+    ///
+    /// This is [`HeightMapGrid::plan_with_offset`] with a zero offset.
+    pub fn plan(&self, params: &ProbeParams) -> Result<ProbePlan, ProbeError> {
+        self.plan_with_offset(params, XyPoint::new(0.0, 0.0))
+    }
+
+    /// Build the complete height-map probing program for a probe mounted away
+    /// from the controlled point.
+    ///
+    /// Grid points are **feature / probe-tip** positions; every emitted XY
+    /// rapid and `G38.2` target is the controlled point
+    /// (`controlled = feature - offset`). Z is unchanged. The returned
+    /// [`ProbePlan::probes`] positions are controlled-point machine
+    /// coordinates.
     ///
     /// Points are visited row by row, X fastest. Every point retracts to safe Z
     /// (the rapid plane above the whole grid), moves in XY at safe Z, probes
     /// down with `G38.2` to `surface_z_mm`, then retracts and returns to safe Z.
     /// No rapid descends toward the work, so a locally higher surface is met by
     /// the probe feed, not by a G0. A missed point raises a controller alarm
-    /// and stops the job, so later points never run on a bad probe.
-    pub fn plan(&self, params: &ProbeParams) -> Result<ProbePlan, ProbeError> {
+    /// and stops the job, so later points never run on a bad probe. The offset
+    /// must be finite and within [`crate::MAX_PROBE_OFFSET_MM`] on both axes.
+    pub fn plan_with_offset(
+        &self,
+        params: &ProbeParams,
+        offset: XyPoint,
+    ) -> Result<ProbePlan, ProbeError> {
+        validate_probe_offset(offset)?;
         self.validate_with_params(params)?;
         let mut builder = GcodeBuilder::new(params);
         for row in 0..self.rows {
@@ -210,9 +244,13 @@ impl HeightMapGrid {
                 let point = self
                     .point(column, row)
                     .ok_or(ProbeError::Degenerate("height-map grid point"))?;
-                builder.rapid_xy(point.x_mm, point.y_mm)?;
-                let from = Position::xyz(point.x_mm, point.y_mm, params.safe_z_mm);
-                let to = Position::xyz(point.x_mm, point.y_mm, self.surface_z_mm);
+                let controlled =
+                    feature_to_controlled(Position::xyz(point.x_mm, point.y_mm, 0.0), offset);
+                let x_mm = controlled.get(Axis::X);
+                let y_mm = controlled.get(Axis::Y);
+                builder.rapid_xy(x_mm, y_mm)?;
+                let from = Position::xyz(x_mm, y_mm, params.safe_z_mm);
+                let to = Position::xyz(x_mm, y_mm, self.surface_z_mm);
                 builder.probe(format!("p{row}-c{column}"), from, to)?;
                 builder.retract()?;
             }
@@ -263,26 +301,37 @@ pub struct HeightMapEstimate {
 
 /// Measured height grid with per-point validity.
 ///
-/// Heights are machine Z coordinates from `PRB`. `None` means the point was
-/// not probed, the probe failed, or the reported position was not finite.
+/// Raw heights are machine Z coordinates from `PRB`. `None` means the point
+/// was not probed, the probe failed, or the reported position was not finite.
 /// Bilinear interpolation never bridges a missing point: a cell with a missing
 /// corner returns `None`. The grid origin and the resulting bounds are also
 /// machine XY.
+///
+/// A map may carry a constant Z datum shift (`z_offset_mm`, default zero).
+/// [`HeightMap::samples`] and persistence keep the raw samples; display and
+/// compensation APIs (`z`, `height_at`, `valid_points`, `z_range`, `summary`,
+/// `csv`, `apply_to_z`, and `compensate_toolpath`) report
+/// `raw + z_offset_mm`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeightMap {
     grid: HeightMapGrid,
     samples: Vec<Option<f64>>,
+    z_offset_mm: f64,
 }
 
 impl HeightMap {
-    /// Build an empty, all-invalid map.
+    /// Build an empty, all-invalid map with a zero Z offset.
     pub fn new(grid: HeightMapGrid) -> Result<Self, ProbeError> {
         grid.validate()?;
         let samples = vec![None; grid.point_count()];
-        Ok(HeightMap { grid, samples })
+        Ok(HeightMap {
+            grid,
+            samples,
+            z_offset_mm: 0.0,
+        })
     }
 
-    /// Build a map from explicit samples.
+    /// Build a map from explicit raw samples with a zero Z offset.
     pub fn from_samples(
         grid: HeightMapGrid,
         samples: Vec<Option<f64>>,
@@ -297,7 +346,11 @@ impl HeightMap {
         for sample in samples.iter().flatten() {
             check_finite("height sample", *sample)?;
         }
-        Ok(HeightMap { grid, samples })
+        Ok(HeightMap {
+            grid,
+            samples,
+            z_offset_mm: 0.0,
+        })
     }
 
     /// Build a map from ordered probe results.
@@ -326,13 +379,48 @@ impl HeightMap {
         Ok(map)
     }
 
+    /// Set a constant Z datum offset, consuming and returning the map.
+    ///
+    /// The offset is added to every raw sample by display and compensation
+    /// APIs; [`HeightMap::samples`] keeps the raw values for persistence and
+    /// audit. It must be finite and within
+    /// `+/-` [`MAX_HEIGHT_MAP_Z_OFFSET_MM`].
+    pub fn with_z_offset(mut self, z_offset_mm: f64) -> Result<Self, ProbeError> {
+        self.set_z_offset(z_offset_mm)?;
+        Ok(self)
+    }
+
+    /// Set a constant Z datum offset in place.
+    ///
+    /// See [`HeightMap::with_z_offset`] for the effective/raw split.
+    pub fn set_z_offset(&mut self, z_offset_mm: f64) -> Result<(), ProbeError> {
+        check_range(
+            "z_offset_mm",
+            z_offset_mm,
+            -MAX_HEIGHT_MAP_Z_OFFSET_MM,
+            MAX_HEIGHT_MAP_Z_OFFSET_MM,
+        )?;
+        self.z_offset_mm = z_offset_mm;
+        Ok(())
+    }
+
+    /// Constant Z datum offset added to every raw sample, in millimetres.
+    #[must_use]
+    pub fn z_offset_mm(&self) -> f64 {
+        self.z_offset_mm
+    }
+
     /// Grid definition.
     #[must_use]
     pub fn grid(&self) -> &HeightMapGrid {
         &self.grid
     }
 
-    /// Every sample in row-major order; `None` is invalid.
+    /// Every raw sample in row-major order; `None` is invalid.
+    ///
+    /// These are the measured machine Z values before
+    /// [`HeightMap::z_offset_mm`]. Persist these values together with the
+    /// offset; the display/compensation APIs apply the offset.
     #[must_use]
     pub fn samples(&self) -> &[Option<f64>] {
         &self.samples
@@ -350,11 +438,30 @@ impl HeightMap {
         self.samples.is_empty()
     }
 
-    /// Sample at a grid point.
+    /// Effective sample at a grid point: raw sample plus
+    /// [`HeightMap::z_offset_mm`].
+    ///
+    /// Returns `None` for an invalid cell. Use [`HeightMap::samples`] for the
+    /// unchanged raw values.
     #[must_use]
     pub fn z(&self, column: u16, row: u16) -> Option<f64> {
+        self.raw_z(column, row)
+            .map(|raw| self.effective_height(raw))
+    }
+
+    /// Raw sample at a grid point, before the Z offset.
+    fn raw_z(&self, column: u16, row: u16) -> Option<f64> {
         let index = self.grid.index(column, row)?;
         self.samples.get(index).copied().flatten()
+    }
+
+    /// Apply the map's constant datum shift to one raw height.
+    fn effective_height(&self, raw_mm: f64) -> f64 {
+        if self.z_offset_mm == 0.0 {
+            raw_mm
+        } else {
+            raw_mm + self.z_offset_mm
+        }
     }
 
     /// Set or invalidate one cell.
@@ -405,12 +512,18 @@ impl HeightMap {
         self.grid.contains_xy(x_mm, y_mm)
     }
 
-    /// Bilinearly interpolated height.
+    /// Bilinearly interpolated effective height.
     ///
+    /// Returns the interpolated raw sample plus [`HeightMap::z_offset_mm`].
     /// Returns `None` outside the grid or when a required sample is invalid.
     /// On a grid line only the samples that actually contribute are required.
     #[must_use]
     pub fn height_at(&self, x_mm: f64, y_mm: f64) -> Option<f64> {
+        self.raw_height_at(x_mm, y_mm)
+            .map(|raw| self.effective_height(raw))
+    }
+
+    fn raw_height_at(&self, x_mm: f64, y_mm: f64) -> Option<f64> {
         if !self.grid.contains_xy(x_mm, y_mm) {
             return None;
         }
@@ -429,27 +542,31 @@ impl HeightMap {
         let ty = fy - f64::from(row0);
         let epsilon = 1e-12;
 
-        let z00 = self.z(column0, row0)?;
+        let z00 = self.raw_z(column0, row0)?;
         if tx.abs() <= epsilon && ty.abs() <= epsilon {
             return Some(z00);
         }
         if tx.abs() <= epsilon {
-            let z01 = self.z(column0, row1)?;
+            let z01 = self.raw_z(column0, row1)?;
             return Some(z00 * (1.0 - ty) + z01 * ty);
         }
         if ty.abs() <= epsilon {
-            let z10 = self.z(column1, row0)?;
+            let z10 = self.raw_z(column1, row0)?;
             return Some(z00 * (1.0 - tx) + z10 * tx);
         }
-        let z10 = self.z(column1, row0)?;
-        let z01 = self.z(column0, row1)?;
-        let z11 = self.z(column1, row1)?;
+        let z10 = self.raw_z(column1, row0)?;
+        let z01 = self.raw_z(column0, row1)?;
+        let z11 = self.raw_z(column1, row1)?;
         let bottom = z00 * (1.0 - tx) + z10 * tx;
         let top = z01 * (1.0 - tx) + z11 * tx;
         Some(bottom * (1.0 - ty) + top * ty)
     }
 
-    /// Z compensation at an XY point: measured surface minus nominal surface.
+    /// Z compensation at an XY point: effective measured surface minus the
+    /// nominal surface.
+    ///
+    /// The map's [`HeightMap::z_offset_mm`] is part of the effective height,
+    /// so it shifts compensation by exactly the offset.
     #[must_use]
     pub fn compensation_at(&self, x_mm: f64, y_mm: f64) -> Option<f64> {
         let height = self.height_at(x_mm, y_mm)?;
@@ -459,9 +576,10 @@ impl HeightMap {
     /// Apply height compensation to a nominal program Z.
     ///
     /// `x_mm` and `y_mm` are machine coordinates for the lookup. `z_mm` is the
-    /// nominal program Z; only the measured deviation is added, so its frame
-    /// cancels. This is the primitive for streamed compensation; a corrected
-    /// G-code export is a follow-up.
+    /// nominal program Z; only the effective measured deviation (including
+    /// [`HeightMap::z_offset_mm`]) is added, so its frame cancels. This is the
+    /// primitive for streamed compensation; a corrected G-code export is a
+    /// follow-up.
     #[must_use]
     pub fn apply_to_z(&self, x_mm: f64, y_mm: f64, z_mm: f64) -> Option<f64> {
         if !z_mm.is_finite() {
@@ -476,9 +594,9 @@ impl HeightMap {
     ///
     /// The toolpath is in **work coordinates**, in millimetres. Height lookups
     /// are machine XY, so every sample is converted with
-    /// `machine = work + work_offset`. Z needs no offset: the measured
-    /// deviation `measured Z - nominal surface Z` is frame-independent, so it
-    /// is added directly to the work Z.
+    /// `machine = work + work_offset`. Z needs no offset: the effective
+    /// deviation `(measured Z + z_offset) - nominal surface Z` is
+    /// frame-independent, so it is added directly to the work Z.
     ///
     /// # Subdivision
     ///
@@ -513,8 +631,10 @@ impl HeightMap {
     /// # Limitations
     ///
     /// Only an XY work offset is modelled. Work-plane rotation, axis scaling,
-    /// machine tilt, and a changed Z datum are **not** applied; feed them into
-    /// the toolpath before calling this method or compensate in a later layer.
+    /// and machine tilt are **not** applied; feed them into the toolpath
+    /// before calling this method or compensate in a later layer. The map's
+    /// own [`HeightMap::z_offset_mm`] **is** applied through
+    /// [`HeightMap::compensation_at`].
     ///
     /// All lengths are millimetres. The source toolpath is not modified.
     #[must_use]
@@ -758,7 +878,8 @@ impl HeightMap {
         }
     }
 
-    /// Valid samples as machine-XY viewer overlay points with their height.
+    /// Valid samples as machine-XY viewer overlay points with their effective
+    /// height (raw sample plus [`HeightMap::z_offset_mm`]).
     #[must_use]
     pub fn valid_points(&self) -> Vec<(Point2, f64)> {
         let mut points = Vec::with_capacity(self.valid_count());
@@ -776,20 +897,25 @@ impl HeightMap {
         points
     }
 
-    /// Lowest and highest valid height, if any.
+    /// Lowest and highest effective valid height, if any.
+    ///
+    /// The range includes [`HeightMap::z_offset_mm`].
     #[must_use]
     pub fn z_range(&self) -> Option<(f64, f64)> {
         let mut range: Option<(f64, f64)> = None;
         for height in self.samples.iter().flatten() {
+            let effective = self.effective_height(*height);
             range = Some(match range {
-                Some((low, high)) => (low.min(*height), high.max(*height)),
-                None => (*height, *height),
+                Some((low, high)) => (low.min(effective), high.max(effective)),
+                None => (effective, effective),
             });
         }
         range
     }
 
-    /// One row of samples.
+    /// One row of raw samples, before [`HeightMap::z_offset_mm`].
+    ///
+    /// Use [`HeightMap::z`] for an effective value.
     #[must_use]
     pub fn row(&self, row: u16) -> Option<&[Option<f64>]> {
         if row >= self.grid.rows {
@@ -804,7 +930,8 @@ impl HeightMap {
     ///
     /// The ranges are `None` when no cell is valid; an all-invalid map still
     /// reports its point count and missing count. Every value is in millimetres
-    /// and compensation is `measured Z - nominal surface Z`.
+    /// and compensation is `effective Z - nominal surface Z`, where the
+    /// effective Z includes [`HeightMap::z_offset_mm`].
     #[must_use]
     pub fn summary(&self) -> HeightMapSummary {
         let valid_points = self.valid_count();
@@ -814,9 +941,10 @@ impl HeightMap {
         let mut max_compensation_mm = f64::NEG_INFINITY;
 
         for height in self.samples.iter().flatten() {
-            let compensation_mm = height - self.grid.surface_z_mm;
-            min_z_mm = min_z_mm.min(*height);
-            max_z_mm = max_z_mm.max(*height);
+            let effective = self.effective_height(*height);
+            let compensation_mm = effective - self.grid.surface_z_mm;
+            min_z_mm = min_z_mm.min(effective);
+            max_z_mm = max_z_mm.max(effective);
             min_compensation_mm = min_compensation_mm.min(compensation_mm);
             max_compensation_mm = max_compensation_mm.max(compensation_mm);
         }
@@ -839,9 +967,12 @@ impl HeightMap {
     /// `column,row,x_mm,y_mm,z_mm,valid`, followed by exactly
     /// [`HeightMap::len`] rows in stable row-major order (row outer, column
     /// inner). `x_mm`, `y_mm`, and valid `z_mm` values use six decimal places.
-    /// An invalid cell leaves the `z_mm` field empty and writes `valid` as `0`;
-    /// valid cells write `valid` as `1`. The output ends with a newline and has
-    /// no quoting because every field is numeric. No file is written.
+    /// `z_mm` is the **effective** height: raw sample plus
+    /// [`HeightMap::z_offset_mm`]. An invalid cell leaves the `z_mm` field
+    /// empty and writes `valid` as `0`; valid cells write `valid` as `1`. The
+    /// output ends with a newline and has no quoting because every field is
+    /// numeric. No file is written; persist [`HeightMap::samples`] and the
+    /// offset separately to round-trip the raw data.
     #[must_use]
     pub fn csv(&self) -> String {
         use std::fmt::Write as _;
@@ -936,22 +1067,23 @@ impl CompensatedToolpath {
 
 /// Counts and ranges for a [`HeightMap`].
 ///
-/// A range is `None` only when the map contains no valid cell.
+/// A range is `None` only when the map contains no valid cell. Height ranges
+/// are effective values, including [`HeightMap::z_offset_mm`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct HeightMapSummary {
     /// Total number of grid points.
     pub points: usize,
-    /// Points with a measured height.
+    /// Points with an effective height.
     pub valid_points: usize,
     /// Points without a measured height.
     pub missing_points: usize,
-    /// Lowest valid measured Z, in machine millimetres.
+    /// Lowest valid effective Z, in machine millimetres.
     pub min_z_mm: Option<f64>,
-    /// Highest valid measured Z, in machine millimetres.
+    /// Highest valid effective Z, in machine millimetres.
     pub max_z_mm: Option<f64>,
-    /// Lowest valid compensation, in millimetres.
+    /// Lowest valid effective compensation, in millimetres.
     pub min_compensation_mm: Option<f64>,
-    /// Highest valid compensation, in millimetres.
+    /// Highest valid effective compensation, in millimetres.
     pub max_compensation_mm: Option<f64>,
 }
 

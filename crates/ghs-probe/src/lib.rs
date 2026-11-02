@@ -36,9 +36,21 @@
 //!   a cycle. See [`ProbeMoveCode`] for the full grblHAL family.
 //! - Plans contain `M5` and `M9` and never contain `M3`, `M4`, `M7` or `M8`.
 //!   They never contain a cycle-start character; the app starts the program.
-//! - Raw [`ghs_core::ProbeResult`] positions are machine coordinates. Result
-//!   math keeps that frame and reports machine coordinates for the app to
-//!   convert or to write with `G10 L2`/`G10 L20` after confirmation.
+//! - Raw [`ghs_core::ProbeResult`] positions are machine coordinates of the
+//!   **controlled point**. Result math keeps that frame and reports machine
+//!   coordinates for the app to convert or to write with `G10 L2`/`G10 L20`
+//!   after confirmation.
+//! - A probe may be mounted away from the controlled point. The optional
+//!   probe-tip offset is `offset = probe tip - controlled point`, in machine
+//!   or work XY. Cycle geometry in [`ProbeParams`] and
+//!   [`HeightMapGrid`] is **feature / probe-tip** coordinates; the plan emits
+//!   `controlled = feature - offset` for every XY move. Result math adds
+//!   `offset` back to raw `PRB` XY before computing edge/corner/circle/
+//!   rectangle/rotation/XY-plate values. Raw samples stay raw for audit.
+//!   [`ProbeCycle::plan_with_offset`],
+//!   [`HeightMapGrid::plan_with_offset`], and
+//!   [`ProbeOutcome::from_results_with_offset`] take the offset; the original
+//!   methods use zero.
 //!
 //! # Height map
 //!
@@ -56,14 +68,20 @@
 //! toolpath, subdividing long moves for sampling and reporting compensated
 //! and uncompensated length. It takes a caller-supplied work offset because
 //! lookups are machine XY; rotation and scaling are deliberately not modelled.
+//! A map may also carry a constant Z datum shift set with
+//! [`HeightMap::with_z_offset`] (or [`HeightMap::set_z_offset`]): raw
+//! [`HeightMap::samples`] stay unchanged for persistence, while `z`,
+//! `height_at`, `valid_points`, `z_range`, `summary`, `csv`, `apply_to_z`, and
+//! `compensate_toolpath` report effective heights including the offset.
 //! [`HeightMap::summary`] and [`HeightMap::csv`] are pure in-memory exports.
 //! Writing a corrected `.nc` file is deferred; the app should stream
 //! compensation or export in a later milestone.
 //!
 //! # Probe radius
 //!
-//! A touch is reported at the probe centre, so the contacted edge is on the
-//! leading side:
+//! A touch is reported at the controlled point; after adding any probe-tip
+//! offset it is the probe-tip centre. The contacted edge is on the leading
+//! side of that centre:
 //!
 //! `edge = contact + approach_sign * probe_radius`
 //!
@@ -119,7 +137,7 @@ pub use gcode::{PlannedProbe, ProbeMoveCode, ProbePlan, ProbePreconditions, Prob
 pub use heightmap::{
     CompensatedToolpath, HEIGHT_MAP_POINT_OVERHEAD_SECONDS, HeightMap, HeightMapEstimate,
     HeightMapGrid, HeightMapSummary, MAX_COMPENSATED_SEGMENTS, MAX_HEIGHT_MAP_AXIS_POINTS,
-    MAX_HEIGHT_MAP_POINTS,
+    MAX_HEIGHT_MAP_POINTS, MAX_HEIGHT_MAP_Z_OFFSET_MM,
 };
 pub use math::{
     CircleFit, RectangleFit, RotationAxis, RotationFit, circle_feature_radius, corner_work_zero,
@@ -129,9 +147,9 @@ pub use math::{
 };
 pub use params::{
     EdgeMode, MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM, MAX_PLATE_THICKNESS_MM,
-    MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN, MAX_RADIUS_MM, MAX_RECTANGLE_MM, MAX_RETRACT_MM,
-    MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES, ProbeAxis, ProbeParams, Sign,
-    XyPoint,
+    MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN, MAX_PROBE_OFFSET_MM, MAX_RADIUS_MM,
+    MAX_RECTANGLE_MM, MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM,
+    MIN_CIRCLE_TOUCHES, ProbeAxis, ProbeParams, Sign, XyPoint, validate_probe_offset,
 };
 pub use result::{CycleKind, ProbeOutcome, ProbeSample, ProbeValue};
 

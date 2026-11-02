@@ -104,9 +104,16 @@ pub struct PlannedProbe {
     pub label: String,
     /// Probe move code. Always [`ProbeMoveCode::G38_2`] today.
     pub code: ProbeMoveCode,
-    /// Machine position at the start of the search.
+    /// Controlled-point machine position at the start of the search.
+    ///
+    /// This is the commanded position, matching the emitted program after the
+    /// WCS offset. When a probe-tip offset is configured, the physical tip is
+    /// at `from + offset`; the offset is not applied to this field.
     pub from: Position,
-    /// Absolute machine target of the search.
+    /// Absolute controlled-point machine target of the search.
+    ///
+    /// As with [`PlannedProbe::from`], add the probe-tip offset to obtain the
+    /// feature/tip coordinate.
     pub to: Position,
     /// Unit direction from `from` to `to`.
     pub direction: ProbeVector,
@@ -167,9 +174,16 @@ pub struct ProbePlan {
     pub kind: CycleKind,
     /// Complete G-code program in [`ProbePlan::wcs`], newline separated with
     /// no trailing newline.
+    ///
+    /// All XY coordinates in the program are **controlled-point** positions;
+    /// a probe-tip offset was already subtracted from the feature geometry.
     pub program: String,
-    /// Every probe move, in execution order. Its `from`/`to` positions are
-    /// machine coordinates; the emitted `program` is in work coordinates.
+    /// Every probe move, in execution order.
+    ///
+    /// Its `from`/`to` positions are **controlled-point** machine coordinates
+    /// (the commanded position), not feature/tip coordinates. Add the
+    /// configured probe-tip offset to obtain the feature position. The emitted
+    /// `program` is in work coordinates.
     pub probes: Vec<PlannedProbe>,
     /// Number of `PRB` results the cycle expects; always `probes.len()`.
     pub expected_probes: usize,

@@ -1,6 +1,6 @@
 //! Cycle results and the correlation-friendly outcome type.
 
-use ghs_core::{Axis, ProbeResult, Units, Wcs};
+use ghs_core::{Axis, Position, ProbeResult, Units, Wcs};
 
 use crate::cycle::{CornerProbe, ProbeCycle, RotationProbe};
 use crate::error::ProbeError;
@@ -8,7 +8,9 @@ use crate::math::{
     RectangleFit, RotationAxis, RotationFit, circle_feature_radius, corner_work_zero,
     rectangle_center_from_edges, rotation_from_points, tool_length_offset, z_zero_from_contact,
 };
-use crate::params::{EdgeMode, ProbeAxis, ProbeParams, Sign, XyPoint};
+use crate::params::{
+    EdgeMode, ProbeAxis, ProbeParams, Sign, XyPoint, controlled_to_feature, validate_probe_offset,
+};
 
 /// Kind of a probe cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,15 +61,18 @@ pub struct ProbeSample {
     /// Stable label matching the plan's [`crate::PlannedProbe::label`] at the
     /// same index.
     pub label: String,
-    /// Raw controller result, in machine coordinates.
+    /// Raw controller result, in controlled-point machine coordinates. The
+    /// probe-tip offset is never applied here.
     pub result: ProbeResult,
 }
 
 /// Computed value of a probe cycle.
 ///
-/// Every position and zero is in machine coordinates, matching the raw `PRB`
-/// results. A delta such as the tool-length offset or a rotation angle is
-/// frame-independent.
+/// Every position and zero is in machine **feature/probe-tip** coordinates.
+/// With a zero probe-tip offset these equal the raw `PRB` positions; with a
+/// nonzero offset, [`ProbeOutcome::from_results_with_offset`] adds it before
+/// computing the value. A delta such as the tool-length offset or a rotation
+/// angle is frame-independent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProbeValue {
     /// Z work zero from a plate contact.
@@ -159,8 +164,9 @@ pub enum ProbeValue {
 
 /// Computed cycle result with every raw probe position.
 ///
-/// `samples` keeps the controller results in machine coordinates for audit;
-/// `value` is derived from them without changing the frame.
+/// `samples` keeps the raw controller results in controlled-point machine
+/// coordinates for audit; `value` is derived after the optional probe-tip
+/// offset correction and is expressed in machine feature coordinates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProbeOutcome {
     /// Cycle kind.
@@ -178,14 +184,37 @@ pub struct ProbeOutcome {
 impl ProbeOutcome {
     /// Correlate ordered `PRB` results with a cycle and compute its value.
     ///
-    /// The app binds the Nth [`ghs_core::ProbeResult`] from the engine to the
-    /// probe at index N in the plan. A failed or non-finite result is rejected
-    /// instead of producing a partial value.
+    /// This is [`ProbeOutcome::from_results_with_offset`] with a zero
+    /// probe-tip offset. The app binds the Nth [`ghs_core::ProbeResult`] from
+    /// the engine to the probe at index N in the plan. A failed or non-finite
+    /// result is rejected instead of producing a partial value.
     pub fn from_results(
         cycle: &ProbeCycle,
         params: &ProbeParams,
         results: &[ProbeResult],
     ) -> Result<Self, ProbeError> {
+        Self::from_results_with_offset(cycle, params, results, XyPoint::new(0.0, 0.0))
+    }
+
+    /// Correlate ordered `PRB` results and correct them for a probe-tip
+    /// offset.
+    ///
+    /// `offset` is `probe tip - controlled point` in machine/work XY
+    /// coordinates. Raw `PRB` positions are **controlled-point** coordinates;
+    /// every XY component is shifted by `+offset` before edge, corner, circle,
+    /// rectangle, rotation, and XY-plate math runs. Z-only values are
+    /// unchanged. [`ProbeOutcome::samples`] always keeps the raw,
+    /// unshifted results for audit.
+    ///
+    /// The offset must be finite and within
+    /// [`crate::MAX_PROBE_OFFSET_MM`] on both axes.
+    pub fn from_results_with_offset(
+        cycle: &ProbeCycle,
+        params: &ProbeParams,
+        results: &[ProbeResult],
+        offset: XyPoint,
+    ) -> Result<Self, ProbeError> {
+        validate_probe_offset(offset)?;
         cycle.validate(params)?;
         let expected = cycle.expected_probes();
         if results.len() != expected {
@@ -196,6 +225,7 @@ impl ProbeOutcome {
         }
         let labels = cycle.labels();
         let mut samples = Vec::with_capacity(expected);
+        let mut feature_positions = Vec::with_capacity(expected);
         for (index, result) in results.iter().enumerate() {
             if !result.success {
                 return Err(ProbeError::ProbeFailed { index });
@@ -211,8 +241,9 @@ impl ProbeOutcome {
                     .unwrap_or_else(|| format!("probe-{index}")),
                 result: *result,
             });
+            feature_positions.push(controlled_to_feature(result.position, offset));
         }
-        let value = compute_value(cycle, params, results)?;
+        let value = compute_value(cycle, params, &feature_positions)?;
         Ok(ProbeOutcome {
             cycle: cycle.kind(),
             wcs: params.wcs,
@@ -231,13 +262,13 @@ impl ProbeOutcome {
 fn compute_value(
     cycle: &ProbeCycle,
     params: &ProbeParams,
-    results: &[ProbeResult],
+    positions: &[Position],
 ) -> Result<ProbeValue, ProbeError> {
     match cycle {
         ProbeCycle::ZTouchPlate {
             plate_thickness_mm, ..
         } => {
-            let contact_z_mm = results[0].position.get(Axis::Z);
+            let contact_z_mm = positions[0].get(Axis::Z);
             let zero_z_mm = z_zero_from_contact(contact_z_mm, *plate_thickness_mm)?;
             Ok(ProbeValue::ZZero {
                 contact_z_mm,
@@ -246,7 +277,7 @@ fn compute_value(
             })
         }
         ProbeCycle::ToolLength { reference_z_mm } => {
-            let contact_z_mm = results[0].position.get(Axis::Z);
+            let contact_z_mm = positions[0].get(Axis::Z);
             let offset_mm = tool_length_offset(*reference_z_mm, contact_z_mm)?;
             Ok(ProbeValue::ToolLength {
                 reference_z_mm: *reference_z_mm,
@@ -255,7 +286,7 @@ fn compute_value(
             })
         }
         ProbeCycle::Edge(spec) => {
-            let contact_mm = spec.axis.component(results[0].position);
+            let contact_mm = spec.axis.component(positions[0]);
             let edge_mm = spec.edge_mm(params, contact_mm)?;
             let zero_mm = spec.zero_mm(params, contact_mm)?;
             Ok(ProbeValue::Edge {
@@ -266,7 +297,7 @@ fn compute_value(
             })
         }
         ProbeCycle::Corner(corner) => {
-            let (x_edge_mm, y_edge_mm, zero) = corner_values(corner, params, results)?;
+            let (x_edge_mm, y_edge_mm, zero) = corner_values(corner, params, positions)?;
             Ok(ProbeValue::Corner {
                 x_edge_mm,
                 y_edge_mm,
@@ -274,7 +305,7 @@ fn compute_value(
             })
         }
         ProbeCycle::XyTouchPlate(corner) => {
-            let (x_edge_mm, y_edge_mm, zero) = corner_values(corner, params, results)?;
+            let (x_edge_mm, y_edge_mm, zero) = corner_values(corner, params, positions)?;
             Ok(ProbeValue::XyZero {
                 x_edge_mm,
                 y_edge_mm,
@@ -282,9 +313,9 @@ fn compute_value(
             })
         }
         ProbeCycle::CenterCircle { mode, .. } => {
-            let points: Vec<XyPoint> = results
+            let points: Vec<XyPoint> = positions
                 .iter()
-                .map(|result| XyPoint::from_position(result.position))
+                .map(|position| XyPoint::from_position(*position))
                 .collect();
             let fit = crate::math::fit_circle(&points)?;
             let feature_radius_mm =
@@ -297,7 +328,7 @@ fn compute_value(
             })
         }
         ProbeCycle::CenterRectangle { mode, .. } => {
-            let fit = rectangle_values(*mode, params, results)?;
+            let fit = rectangle_values(*mode, params, positions)?;
             Ok(ProbeValue::RectangleCenter {
                 center: fit.center,
                 width_mm: fit.width_mm,
@@ -305,7 +336,7 @@ fn compute_value(
             })
         }
         ProbeCycle::Rotation(rotation) => {
-            let (fit, p1, p2) = rotation_values(rotation, params, results)?;
+            let (fit, p1, p2) = rotation_values(rotation, params, positions)?;
             Ok(ProbeValue::Rotation {
                 axis: fit.axis,
                 p1,
@@ -322,10 +353,10 @@ fn compute_value(
 fn corner_values(
     corner: &CornerProbe,
     params: &ProbeParams,
-    results: &[ProbeResult],
+    positions: &[Position],
 ) -> Result<(f64, f64, XyPoint), ProbeError> {
-    let x_contact = corner.x.axis.component(results[0].position);
-    let y_contact = corner.y.axis.component(results[1].position);
+    let x_contact = corner.x.axis.component(positions[0]);
+    let y_contact = corner.y.axis.component(positions[1]);
     let x_edge_mm = corner.x.edge_mm(params, x_contact)?;
     let y_edge_mm = corner.y.edge_mm(params, y_contact)?;
     let zero = corner_work_zero(
@@ -341,14 +372,14 @@ fn corner_values(
 fn rectangle_values(
     mode: EdgeMode,
     params: &ProbeParams,
-    results: &[ProbeResult],
+    positions: &[Position],
 ) -> Result<RectangleFit, ProbeError> {
     let radius = params.probe_radius_mm();
     let contacts = [
-        results[0].position.get(Axis::X),
-        results[1].position.get(Axis::X),
-        results[2].position.get(Axis::Y),
-        results[3].position.get(Axis::Y),
+        positions[0].get(Axis::X),
+        positions[1].get(Axis::X),
+        positions[2].get(Axis::Y),
+        positions[3].get(Axis::Y),
     ];
     let directions = rectangle_directions(mode);
     let edges = [
@@ -380,13 +411,13 @@ fn rectangle_directions(mode: EdgeMode) -> [Sign; 4] {
 fn rotation_values(
     rotation: &RotationProbe,
     params: &ProbeParams,
-    results: &[ProbeResult],
+    positions: &[Position],
 ) -> Result<(RotationFit, XyPoint, XyPoint), ProbeError> {
     let radius = params.probe_radius_mm();
     let sign = rotation.approach.as_f64();
     let normal = rotation.edge_axis.other();
-    let p1 = edge_point(results[0].position, normal, sign * radius);
-    let p2 = edge_point(results[1].position, normal, sign * radius);
+    let p1 = edge_point(positions[0], normal, sign * radius);
+    let p2 = edge_point(positions[1], normal, sign * radius);
     let fit = rotation_from_points(p1, p2, rotation.edge_axis)?;
     Ok((fit, p1, p2))
 }

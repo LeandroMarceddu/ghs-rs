@@ -8,8 +8,8 @@ use crate::error::{ProbeError, ValidationError};
 use crate::gcode::GcodeBuilder;
 use crate::params::{
     EdgeMode, MAX_CIRCLE_TOUCHES, MAX_PLATE_THICKNESS_MM, MAX_RADIUS_MM, MAX_RECTANGLE_MM,
-    MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES, ProbeAxis, ProbeParams, Sign, check_coordinate,
-    check_finite, check_range,
+    MAX_SEPARATION_MM, MIN_CIRCLE_TOUCHES, ProbeAxis, ProbeParams, Sign, XyPoint, check_coordinate,
+    check_finite, check_range, feature_to_controlled, validate_probe_offset,
 };
 use crate::result::CycleKind;
 
@@ -23,12 +23,14 @@ pub struct EdgeSpec {
     /// Search direction along `axis`.
     pub approach: Sign,
     /// Farthest expected edge coordinate along `axis`, in machine
-    /// millimetres.
+    /// millimetres, in **feature / probe-tip** coordinates.
     ///
     /// The search target is derived from this value minus the probe radius, so
     /// a missed probe stops one radius before this edge. Set this to the
     /// largest plausible coordinate in the approach direction; closer edges
-    /// trigger earlier.
+    /// trigger earlier. A probe-tip offset supplied to
+    /// [`ProbeCycle::plan_with_offset`] shifts only the commanded
+    /// controlled-point positions, never this expected feature edge.
     pub expected_edge_mm: f64,
 }
 
@@ -135,7 +137,7 @@ pub struct RotationProbe {
     /// Probing direction along the normal axis.
     pub approach: Sign,
     /// Farthest expected edge coordinate along the normal axis, in machine
-    /// millimetres.
+    /// millimetres, in **feature / probe-tip** coordinates.
     ///
     /// Both points use this value as the search target. For a nominally
     /// straight edge set it to the farthest plausible point in the approach
@@ -430,8 +432,33 @@ impl ProbeCycle {
         Ok(())
     }
 
-    /// Build the complete G-code plan.
+    /// Build the complete G-code plan with no probe-tip offset.
+    ///
+    /// This is [`ProbeCycle::plan_with_offset`] with a zero offset, so cycle
+    /// geometry is treated as the controlled-point position.
     pub fn plan(&self, params: &ProbeParams) -> Result<crate::ProbePlan, ProbeError> {
+        self.plan_with_offset(params, XyPoint::new(0.0, 0.0))
+    }
+
+    /// Build the complete G-code plan for a probe mounted away from the
+    /// controlled point.
+    ///
+    /// `offset` is `probe tip - controlled point` in machine/work XY
+    /// coordinates. Cycle geometry in `params` and the edge/rotation
+    /// expectations remain **feature / probe-tip** coordinates; every emitted
+    /// XY rapid and `G38.2` target is the controlled point
+    /// (`controlled = feature - offset`). Z is never shifted.
+    ///
+    /// The offset must be finite and within
+    /// [`crate::MAX_PROBE_OFFSET_MM`] on both axes. The returned
+    /// [`crate::ProbePlan::probes`] positions are controlled-point machine
+    /// coordinates, while the program is expressed in the plan's WCS.
+    pub fn plan_with_offset(
+        &self,
+        params: &ProbeParams,
+        offset: XyPoint,
+    ) -> Result<crate::ProbePlan, ProbeError> {
+        validate_probe_offset(offset)?;
         self.validate(params)?;
         match self {
             ProbeCycle::ZTouchPlate {
@@ -442,29 +469,35 @@ impl ProbeCycle {
                 *expected_plate_z_mm,
                 CycleKind::ZTouchPlate,
                 "z-touch-plate",
+                offset,
             ),
             ProbeCycle::ToolLength { reference_z_mm } => build_vertical(
                 params,
                 *reference_z_mm,
                 CycleKind::ToolLength,
                 "tool-length",
+                offset,
             ),
-            ProbeCycle::Edge(spec) => build_edge(params, spec),
+            ProbeCycle::Edge(spec) => build_edge(params, spec, offset),
             ProbeCycle::Corner(corner) => {
-                build_two_edges(params, corner, CycleKind::Corner, "corner")
+                build_two_edges(params, corner, CycleKind::Corner, "corner", offset)
             }
             ProbeCycle::CenterCircle { touch_count, mode } => {
-                build_circle(params, *touch_count, *mode)
+                build_circle(params, *touch_count, *mode, offset)
             }
             ProbeCycle::CenterRectangle {
                 width_mm,
                 height_mm,
                 mode,
-            } => build_rectangle(params, *width_mm, *height_mm, *mode),
-            ProbeCycle::Rotation(rotation) => build_rotation(params, rotation),
-            ProbeCycle::XyTouchPlate(corner) => {
-                build_two_edges(params, corner, CycleKind::XyTouchPlate, "xy-touch-plate")
-            }
+            } => build_rectangle(params, *width_mm, *height_mm, *mode, offset),
+            ProbeCycle::Rotation(rotation) => build_rotation(params, rotation, offset),
+            ProbeCycle::XyTouchPlate(corner) => build_two_edges(
+                params,
+                corner,
+                CycleKind::XyTouchPlate,
+                "xy-touch-plate",
+                offset,
+            ),
         }
     }
 }
@@ -531,13 +564,15 @@ fn build_vertical(
     expected_z_mm: f64,
     kind: CycleKind,
     name: &str,
+    offset: XyPoint,
 ) -> Result<crate::ProbePlan, ProbeError> {
     let start_z_mm = expected_z_mm + params.search_distance_mm;
     let mut builder = GcodeBuilder::new(params);
     let (from, to) = match params.position {
         Some(position) => {
-            let x = position.get(Axis::X);
-            let y = position.get(Axis::Y);
+            let controlled = feature_to_controlled(position, offset);
+            let x = controlled.get(Axis::X);
+            let y = controlled.get(Axis::Y);
             builder.rapid_xy(x, y)?;
             builder.rapid_z(start_z_mm)?;
             (
@@ -555,12 +590,18 @@ fn build_vertical(
     builder.finish(kind, name)
 }
 
-fn build_edge(params: &ProbeParams, spec: &EdgeSpec) -> Result<crate::ProbePlan, ProbeError> {
+fn build_edge(
+    params: &ProbeParams,
+    spec: &EdgeSpec,
+    offset: XyPoint,
+) -> Result<crate::ProbePlan, ProbeError> {
     let position = require_position(params)?;
     let hint = spec.contact_hint_mm(params)?;
     let start = spec.start_mm(params)?;
-    let from = spec.axis.replace(position, start);
-    let to = spec.axis.replace(position, hint);
+    let feature_from = spec.axis.replace(position, start);
+    let feature_to = spec.axis.replace(position, hint);
+    let from = feature_to_controlled(feature_from, offset);
+    let to = feature_to_controlled(feature_to, offset);
     let mut builder = GcodeBuilder::new(params);
     builder.rapid_xy(from.get(Axis::X), from.get(Axis::Y))?;
     builder.rapid_z(from.get(Axis::Z))?;
@@ -574,6 +615,7 @@ fn build_two_edges(
     corner: &CornerProbe,
     kind: CycleKind,
     name: &str,
+    offset: XyPoint,
 ) -> Result<crate::ProbePlan, ProbeError> {
     let base = require_position(params)?;
     let x_hint = corner.x.contact_hint_mm(params)?;
@@ -581,10 +623,14 @@ fn build_two_edges(
     let y_hint = corner.y.contact_hint_mm(params)?;
     let y_start = corner.y.start_mm(params)?;
     let z = base.get(Axis::Z);
-    let x_from = Position::xyz(x_start, base.get(Axis::Y), z);
-    let x_to = Position::xyz(x_hint, base.get(Axis::Y), z);
-    let y_from = Position::xyz(base.get(Axis::X), y_start, z);
-    let y_to = Position::xyz(base.get(Axis::X), y_hint, z);
+    let feature_x_from = Position::xyz(x_start, base.get(Axis::Y), z);
+    let feature_x_to = Position::xyz(x_hint, base.get(Axis::Y), z);
+    let feature_y_from = Position::xyz(base.get(Axis::X), y_start, z);
+    let feature_y_to = Position::xyz(base.get(Axis::X), y_hint, z);
+    let x_from = feature_to_controlled(feature_x_from, offset);
+    let x_to = feature_to_controlled(feature_x_to, offset);
+    let y_from = feature_to_controlled(feature_y_from, offset);
+    let y_to = feature_to_controlled(feature_y_to, offset);
 
     let mut builder = GcodeBuilder::new(params);
     builder.rapid_xy(x_from.get(Axis::X), x_from.get(Axis::Y))?;
@@ -602,6 +648,7 @@ fn build_circle(
     params: &ProbeParams,
     touch_count: u8,
     mode: EdgeMode,
+    offset: XyPoint,
 ) -> Result<crate::ProbePlan, ProbeError> {
     let center = require_center(params)?;
     let radius = params
@@ -627,12 +674,15 @@ fn build_circle(
             EdgeMode::Inside => (contact_radius - params.search_distance_mm).max(0.0),
             EdgeMode::Outside => contact_radius + params.search_distance_mm,
         };
-        let start = Position::xyz(cx + unit_x * start_radius, cy + unit_y * start_radius, cz);
-        let target = Position::xyz(
+        let feature_start =
+            Position::xyz(cx + unit_x * start_radius, cy + unit_y * start_radius, cz);
+        let feature_target = Position::xyz(
             cx + unit_x * contact_radius,
             cy + unit_y * contact_radius,
             cz,
         );
+        let start = feature_to_controlled(feature_start, offset);
+        let target = feature_to_controlled(feature_target, offset);
         builder.rapid_xy(start.get(Axis::X), start.get(Axis::Y))?;
         builder.rapid_z(cz)?;
         builder.probe(format!("touch-{index}"), start, target)?;
@@ -647,6 +697,7 @@ fn build_rectangle(
     width_mm: f64,
     height_mm: f64,
     mode: EdgeMode,
+    offset: XyPoint,
 ) -> Result<crate::ProbePlan, ProbeError> {
     let center = require_center(params)?;
     let cx = center.get(Axis::X);
@@ -662,7 +713,10 @@ fn build_rectangle(
     ];
     let mut builder = GcodeBuilder::new(params);
     for (axis, positive, wall, label) in sides {
-        let (from, to) = rectangle_side(params, mode, axis, positive, wall, cx, cy, cz)?;
+        let (feature_from, feature_to) =
+            rectangle_side(params, mode, axis, positive, wall, cx, cy, cz)?;
+        let from = feature_to_controlled(feature_from, offset);
+        let to = feature_to_controlled(feature_to, offset);
         builder.rapid_xy(from.get(Axis::X), from.get(Axis::Y))?;
         builder.rapid_z(cz)?;
         builder.probe(label, from, to)?;
@@ -714,27 +768,32 @@ fn rectangle_side(
 fn build_rotation(
     params: &ProbeParams,
     rotation: &RotationProbe,
+    offset: XyPoint,
 ) -> Result<crate::ProbePlan, ProbeError> {
     let base = require_position(params)?;
     let normal = rotation.normal_axis();
     let hint = rotation.contact_hint_mm(params);
     let start = rotation.start_mm(params);
     let z = base.get(Axis::Z);
-    let p1 = normal.replace(base, start);
-    let p1_target = normal.replace(base, hint);
-    let shifted = match rotation.edge_axis {
+    let feature_p1 = normal.replace(base, start);
+    let feature_p1_target = normal.replace(base, hint);
+    let feature_shifted = match rotation.edge_axis {
         ProbeAxis::X => {
-            let mut position = p1;
+            let mut position = feature_p1;
             position.set(Axis::X, base.get(Axis::X) + rotation.separation_mm);
             position
         }
         ProbeAxis::Y => {
-            let mut position = p1;
+            let mut position = feature_p1;
             position.set(Axis::Y, base.get(Axis::Y) + rotation.separation_mm);
             position
         }
     };
-    let p2_target = normal.replace(shifted, hint);
+    let feature_p2_target = normal.replace(feature_shifted, hint);
+    let p1 = feature_to_controlled(feature_p1, offset);
+    let p1_target = feature_to_controlled(feature_p1_target, offset);
+    let shifted = feature_to_controlled(feature_shifted, offset);
+    let p2_target = feature_to_controlled(feature_p2_target, offset);
 
     let mut builder = GcodeBuilder::new(params);
     builder.rapid_xy(p1.get(Axis::X), p1.get(Axis::Y))?;

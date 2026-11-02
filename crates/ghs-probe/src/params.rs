@@ -34,6 +34,13 @@ pub const MAX_SEPARATION_MM: f64 = 1_000.0;
 /// Largest accepted rectangle side, in millimetres.
 pub const MAX_RECTANGLE_MM: f64 = 10_000.0;
 
+/// Largest accepted absolute probe-tip offset, in millimetres.
+///
+/// The offset is the vector from the controlled point (spindle centre) to the
+/// probe tip, so each component is bounded to
+/// `-MAX_PROBE_OFFSET_MM..=MAX_PROBE_OFFSET_MM`.
+pub const MAX_PROBE_OFFSET_MM: f64 = 100.0;
+
 /// Smallest number of circle touches.
 pub const MIN_CIRCLE_TOUCHES: u8 = 3;
 
@@ -238,9 +245,16 @@ pub struct ProbeParams {
     /// cycles this is the XY position above the plate and is optional (the
     /// current XY is used). For edge, corner, rotation and XY-plate cycles it
     /// is required; its Z is the probing height.
+    ///
+    /// XY is a **feature / probe-tip** position. When a probe-tip offset is
+    /// supplied to [`crate::ProbeCycle::plan_with_offset`], the emitted
+    /// controlled point is `feature - offset` on X and Y.
     pub position: Option<Position>,
     /// Approximate centre for circle and rectangle cycles, in machine
     /// coordinates. Its Z is the probing height.
+    ///
+    /// XY is a **feature / probe-tip** position; see
+    /// [`ProbeParams::position`] for the offset convention.
     pub center: Option<Position>,
     /// Expected feature radius for a circle cycle, in millimetres.
     pub radius_mm: Option<f64>,
@@ -419,4 +433,58 @@ pub(crate) fn check_position(
         check_coordinate(field, value)?;
     }
     Ok(())
+}
+
+/// Validate an XY probe-tip offset.
+///
+/// The offset is `probe tip - controlled point`, expressed in the same machine
+/// or work axes as the cycle geometry. Both components must be finite and
+/// within `+/-` [`MAX_PROBE_OFFSET_MM`].
+pub fn validate_probe_offset(offset: XyPoint) -> Result<(), ValidationError> {
+    check_range(
+        "probe offset X",
+        offset.x_mm,
+        -MAX_PROBE_OFFSET_MM,
+        MAX_PROBE_OFFSET_MM,
+    )?;
+    check_range(
+        "probe offset Y",
+        offset.y_mm,
+        -MAX_PROBE_OFFSET_MM,
+        MAX_PROBE_OFFSET_MM,
+    )?;
+    Ok(())
+}
+
+/// Convert a feature/probe-tip position to the controlled-point position.
+///
+/// Only X and Y move: `controlled = feature - offset`. Axes absent from the
+/// input stay absent. A zero offset returns the input unchanged so existing
+/// zero-offset plans keep byte-identical coordinates.
+pub(crate) fn feature_to_controlled(position: Position, offset: XyPoint) -> Position {
+    shift_xy(position, -offset.x_mm, -offset.y_mm)
+}
+
+/// Convert a controlled-point position to the feature/probe-tip position.
+///
+/// Only X and Y move: `feature = controlled + offset`. Axes absent from the
+/// input stay absent. A zero offset returns the input unchanged so existing
+/// zero-offset results are bit-identical.
+pub(crate) fn controlled_to_feature(position: Position, offset: XyPoint) -> Position {
+    shift_xy(position, offset.x_mm, offset.y_mm)
+}
+
+fn shift_xy(position: Position, delta_x_mm: f64, delta_y_mm: f64) -> Position {
+    if delta_x_mm == 0.0 && delta_y_mm == 0.0 {
+        return position;
+    }
+    let axes = position.axes();
+    let mut shifted = position;
+    if axes.contains(Axis::X) {
+        shifted.set(Axis::X, position.get(Axis::X) + delta_x_mm);
+    }
+    if axes.contains(Axis::Y) {
+        shifted.set(Axis::Y, position.get(Axis::Y) + delta_y_mm);
+    }
+    shifted
 }
