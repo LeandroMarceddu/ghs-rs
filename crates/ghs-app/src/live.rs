@@ -16,7 +16,7 @@ use ghs_demo::{SimProfile, SimSession};
 use ghs_engine::{
     Command, ConnectTarget, ControllerInfo, Engine, EngineConfig, EngineError, EngineEvent,
     EngineHandle, JobAbortReason, JobPauseReason, LogLevel, MachineSnapshot, SerialConfig, Setting,
-    SettingDescription, SettingGroup, StatusReport,
+    SettingDescription, SettingGroup, StartupLine, StatusReport, SystemCommand, ToolEntry,
 };
 
 use crate::state::{
@@ -140,6 +140,10 @@ pub struct LiveLink {
     last_settings: Option<Arc<Vec<Setting>>>,
     last_descriptions: Option<Arc<Vec<SettingDescription>>>,
     last_groups: Option<Arc<Vec<SettingGroup>>>,
+    last_controller_tools: Option<Arc<Vec<ToolEntry>>>,
+    last_startup_lines: Option<Arc<Vec<StartupLine>>>,
+    /// `$N` was accepted once for this connection.
+    startup_requested: bool,
 }
 
 impl LiveLink {
@@ -172,6 +176,9 @@ impl LiveLink {
             last_settings: None,
             last_descriptions: None,
             last_groups: None,
+            last_controller_tools: None,
+            last_startup_lines: None,
+            startup_requested: false,
         };
         link.connect(mode)?;
         Ok(link)
@@ -390,6 +397,54 @@ impl LiveLink {
                 self.last_offsets = Some(offsets);
                 changed = true;
             }
+
+            // Controller-reported tool tables are read-only evidence; the
+            // accessor recovers a report whose event was drained before the UI
+            // existed and costs nothing while the Arc is unchanged.
+            let controller_tools = self.engine.controller_tools();
+            if option_arc_changed(
+                &self.last_controller_tools,
+                &Some(Arc::clone(&controller_tools)),
+            ) {
+                changed |= state.apply_controller_tools(&controller_tools);
+                self.last_controller_tools = Some(controller_tools);
+            }
+
+            // Startup lines are read once per connection. The request is
+            // read-only and retried while the streamer is busy.
+            if !self.startup_requested {
+                match self
+                    .engine
+                    .send(Command::System(SystemCommand::StartupLines))
+                {
+                    Ok(()) => self.startup_requested = true,
+                    Err(EngineError::Busy) => {}
+                    Err(error) => {
+                        self.startup_requested = true;
+                        state.push_console(
+                            ConsoleLevel::Warn,
+                            format!("Startup-line read failed: {error}"),
+                        );
+                        changed = true;
+                    }
+                }
+            }
+            let startup_lines = self.engine.startup_lines();
+            if option_arc_changed(&self.last_startup_lines, &Some(Arc::clone(&startup_lines))) {
+                changed |= state.apply_startup_lines(&startup_lines);
+                self.last_startup_lines = Some(startup_lines);
+            }
+        }
+
+        // A write/read-back result updates the row and the console once.
+        if let Some(notice) = state.startup_lines.take_notice() {
+            let level = if notice.ok {
+                ConsoleLevel::Ok
+            } else {
+                ConsoleLevel::Error
+            };
+            state.push_console(level, notice.text);
+            changed = true;
         }
 
         changed
@@ -414,6 +469,8 @@ impl LiveLink {
                 // Never leave a tool-change sheet behind a dead link.
                 state.job.interrupted();
                 state.settings.cancel_writes("disconnected");
+                state.startup_lines.on_disconnected();
+                self.startup_requested = false;
                 if state.offsets.status().is_pending() {
                     state.offsets.failed("disconnected");
                 }
@@ -439,6 +496,7 @@ impl LiveLink {
             EngineEvent::Alarm(code) => {
                 state.machine_state = "Alarm";
                 state.probe.on_alarm(code);
+                state.startup_lines.on_alarm(code);
                 if state.offsets.status().is_pending() {
                     state.offsets.failed(format!("ALARM:{code}"));
                 }
@@ -451,6 +509,7 @@ impl LiveLink {
                 true
             }
             EngineEvent::Error(code) => {
+                state.startup_lines.on_controller_error(code);
                 if state.offsets.status().is_pending() {
                     state.offsets.failed(format!("error:{code}"));
                 }
@@ -513,6 +572,14 @@ impl LiveLink {
                     );
                 }
                 true
+            }
+            EngineEvent::ControllerTools(tools) => {
+                self.last_controller_tools = Some(Arc::clone(&tools));
+                state.apply_controller_tools(&tools)
+            }
+            EngineEvent::StartupLines(lines) => {
+                self.last_startup_lines = Some(Arc::clone(&lines));
+                state.apply_startup_lines(&lines)
             }
             EngineEvent::CodeTables { .. } => false,
             EngineEvent::Probe(result) => {
@@ -632,6 +699,9 @@ impl LiveLink {
         self.last_settings = None;
         self.last_descriptions = None;
         self.last_groups = None;
+        self.last_controller_tools = None;
+        self.last_startup_lines = None;
+        self.startup_requested = false;
     }
 }
 
@@ -998,6 +1068,184 @@ mod tests {
             "the job did not continue after the tool change"
         );
         assert_eq!(state.job.fraction(), 1.0);
+        link.disconnect();
+    }
+
+    #[test]
+    fn controller_tool_and_startup_line_events_update_the_view_model() {
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state
+            .tools
+            .insert(ghs_config::ToolRecord {
+                number: 9,
+                name: "App tool".into(),
+                diameter_mm: 6.0,
+                length_mm: 30.0,
+                pocket: Some(9),
+            })
+            .expect("app tool");
+
+        let controller = Arc::new(vec![ToolEntry {
+            number: 4,
+            radius_mm: Some(2.0),
+            offset: ghs_engine::Position::xyz(1.0, 2.0, -3.0),
+            name: Some("Controller four".into()),
+            pocket: Some(4),
+        }]);
+        assert!(link.apply_event(
+            &mut state,
+            EngineEvent::ControllerTools(Arc::clone(&controller))
+        ));
+        assert_eq!(state.controller_tools.len(), 1);
+        assert_eq!(state.controller_tools.entries()[0].number, 4);
+        assert_eq!(state.tools.len(), 1, "the app table is untouched");
+
+        let lines = Arc::new(vec![
+            StartupLine {
+                index: 0,
+                line: "G21 G90".into(),
+            },
+            StartupLine {
+                index: 1,
+                line: "M3 S0".into(),
+            },
+        ]);
+        assert!(link.apply_event(&mut state, EngineEvent::StartupLines(Arc::clone(&lines))));
+        assert!(state.startup_lines.fully_reported());
+        assert_eq!(state.startup_lines.row(0).expect("row 0").stored, "G21 G90");
+        assert_eq!(state.startup_lines.row(1).expect("row 1").stored, "M3 S0");
+    }
+
+    #[test]
+    fn demo_link_reads_an_empty_controller_tool_table_and_keeps_the_app_table() {
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state
+            .tools
+            .insert(ghs_config::ToolRecord {
+                number: 1,
+                name: "App-only tool".into(),
+                diameter_mm: 6.0,
+                length_mm: 35.0,
+                pocket: Some(1),
+            })
+            .expect("app tool");
+
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.controller_tools.reported()
+                },
+                Duration::from_secs(10)
+            ),
+            "the controller tool accessor was not consumed after the handshake"
+        );
+        assert!(
+            state.controller_tools.is_empty(),
+            "the FlexiHAL profile reports no controller tool entries"
+        );
+        assert_eq!(state.tools.len(), 1);
+        assert_eq!(
+            state.tools.get(1).map(|tool| tool.name.as_str()),
+            Some("App-only tool"),
+            "an empty controller report must never clear the app table"
+        );
+        link.disconnect();
+    }
+
+    #[test]
+    fn demo_link_reads_and_verifies_a_startup_line_write() {
+        use crate::startup::{
+            StartupRequest, StartupStatus, StartupWrite, read_command, write_command,
+        };
+
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.startup_lines.fully_reported()
+                },
+                Duration::from_secs(10)
+            ),
+            "the startup lines were not read after the handshake: {:?}",
+            link.engine.startup_lines()
+        );
+        assert!(
+            state
+                .startup_lines
+                .rows()
+                .iter()
+                .all(|row| row.stored.is_empty()),
+            "the simulator starts with empty startup lines"
+        );
+
+        state
+            .startup_lines
+            .set_draft(0, "G21 G90")
+            .expect("local startup-line edit");
+        state
+            .startup_lines
+            .begin_apply(0, state.startup_write_gate())
+            .expect("idle startup-line write is allowed");
+        assert_eq!(
+            state.startup_lines.row(0).expect("row 0").status,
+            StartupStatus::Queued
+        );
+
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    if let Some(request) = state.startup_lines.next_request() {
+                        match request {
+                            StartupRequest::Write { index, line } => {
+                                let write = StartupWrite { index, line };
+                                match link.send(write_command(&write)) {
+                                    Ok(()) => {
+                                        state.startup_lines.write_sent(index);
+                                    }
+                                    Err(EngineError::Busy) => {}
+                                    Err(error) => panic!("startup write failed: {error}"),
+                                }
+                            }
+                            StartupRequest::Read { index } => {
+                                match link.send(read_command(index)) {
+                                    Ok(()) => {
+                                        state.startup_lines.read_sent(index);
+                                    }
+                                    Err(EngineError::Busy) => {}
+                                    Err(error) => panic!("startup read-back failed: {error}"),
+                                }
+                            }
+                        }
+                    }
+                    state
+                        .startup_lines
+                        .row(0)
+                        .is_some_and(|row| row.status == StartupStatus::Verified)
+                },
+                Duration::from_secs(10)
+            ),
+            "the startup-line write was not verified: {:?}",
+            link.engine.startup_lines()
+        );
+        assert_eq!(state.startup_lines.row(0).expect("row 0").stored, "G21 G90");
+        assert_eq!(link.engine.startup_lines()[0].line, "G21 G90");
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.text.contains("$N0 VERIFIED")),
+            "the verified read-back was not mapped to the console"
+        );
         link.disconnect();
     }
 }

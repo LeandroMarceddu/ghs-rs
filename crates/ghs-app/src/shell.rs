@@ -72,12 +72,13 @@ use crate::probe::{
     height_map_summary, outcome_summary,
 };
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
+use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
     Mode, ProgramKind, SignalState, format_elapsed, pause_reason_label,
 };
 use crate::theme::Palette;
-use crate::tools::{ToolField, ToolTableModel};
+use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::viewer;
 
 const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -109,10 +110,22 @@ enum SettingsEntryPurpose {
     Search,
     /// A `Text`, `Password`, or `IPv4` setting.
     Text(u16),
+    /// The local draft of one `$N0`/`$N1` startup line.
+    StartupLine(u8),
     /// The name field of the open tool sheet.
     ToolName,
     /// The name field for saving the measured height map.
     HeightMapName,
+}
+
+/// One open startup-line write confirmation.
+///
+/// The exact text is captured when APPLY opens the sheet, so the operator
+/// confirms what is shown instead of a value that a later edit could change.
+#[derive(Clone, Debug)]
+struct StartupConfirm {
+    index: u8,
+    text: String,
 }
 
 /// One open settings text sheet.
@@ -209,6 +222,7 @@ pub struct Shell {
     demo_start_sent: bool,
     settings_entry: Option<SettingsEntry>,
     tool_editor: Option<ToolEditor>,
+    startup_confirm: Option<StartupConfirm>,
     offset_refresh_sent: bool,
     backup_import_armed: bool,
     settings_demo_write: bool,
@@ -217,6 +231,8 @@ pub struct Shell {
     settings_demo_group_done: bool,
     demo_tools: bool,
     demo_tools_done: bool,
+    demo_startup_write: bool,
+    demo_startup_write_done: bool,
     demo_offsets_write: bool,
     demo_offsets_write_done: bool,
     demo_offsets_goto: bool,
@@ -353,7 +369,11 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--utility") {
             state.mode = Mode::Utility;
         }
+        if std::env::args().any(|arg| arg == "--startup-lines") {
+            state.mode = Mode::Utility;
+        }
         let demo_tools = std::env::args().any(|arg| arg == "--demo-tools");
+        let demo_startup_write = std::env::args().any(|arg| arg == "--demo-startup-write");
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
         let demo_offsets_goto = std::env::args().any(|arg| arg == "--demo-offsets-goto");
         let probe_card_demo = std::env::args().find_map(|arg| {
@@ -420,6 +440,7 @@ impl Shell {
             demo_start_sent: false,
             settings_entry: None,
             tool_editor: None,
+            startup_confirm: None,
             offset_refresh_sent: false,
             backup_import_armed: false,
             settings_demo_write,
@@ -428,6 +449,8 @@ impl Shell {
             settings_demo_group_done: false,
             demo_tools,
             demo_tools_done: false,
+            demo_startup_write,
+            demo_startup_write_done: false,
             demo_offsets_write,
             demo_offsets_write_done: false,
             demo_offsets_goto,
@@ -557,6 +580,9 @@ impl Shell {
         if !self.ready() && self.state.settings.cancel_writes("not connected") {
             changed = true;
         }
+        // Startup lines: one queued write, then a read-back retry while the
+        // engine is busy. Never update the row from the write itself.
+        changed |= self.pump_startup_writes();
         if let Some(name) = self.settings_demo_group.clone()
             && !self.settings_demo_group_done
         {
@@ -630,6 +656,29 @@ impl Shell {
             }
             self.state.tools.set_status("DEMO TABLE (UNSAVED)");
             changed = true;
+        }
+        // Screenshot switch: set one startup-line draft, open the real warning
+        // sheet, and confirm it through the same actions as a tap. Only runs in
+        // demo mode with the flag; normal startup never writes a startup line.
+        if self.demo_startup_write
+            && !self.demo_startup_write_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.startup_lines.fully_reported()
+            && self.state.startup_write_gate().blocked_reason().is_none()
+        {
+            self.demo_startup_write_done = true;
+            self.state.mode = Mode::Utility;
+            self.state.left_tab = LeftTab::Console;
+            self.state.console.clear();
+            self.state.push_console(
+                ConsoleLevel::Info,
+                "Demo: $N0 write through the normal APPLY / CONFIRM WRITE path",
+            );
+            if self.state.startup_lines.set_draft(0, "G21 G90").is_ok() {
+                self.request_startup_apply(0, cx);
+                self.confirm_startup_apply(cx);
+                changed = true;
+            }
         }
         // Screenshot switch: one real G10 write through the normal path.
         if self.demo_offsets_write
@@ -1173,6 +1222,14 @@ impl Shell {
                     None,
                 )
             }
+            SettingsEntryPurpose::StartupLine(index) => (
+                self.state
+                    .startup_lines
+                    .row(index)
+                    .map_or_else(String::new, |row| row.draft.clone()),
+                false,
+                None,
+            ),
             SettingsEntryPurpose::ToolName => (
                 self.tool_editor
                     .as_ref()
@@ -1230,6 +1287,22 @@ impl Shell {
             cx.notify();
             return;
         }
+        if let SettingsEntryPurpose::StartupLine(index) = purpose {
+            match self.state.startup_lines.set_draft(index, value) {
+                Ok(()) => self.settings_entry = None,
+                Err(message) => {
+                    self.state.push_console(
+                        ConsoleLevel::Warn,
+                        format!("Startup line $N{index}: {message}"),
+                    );
+                    if let Some(entry) = self.settings_entry.as_mut() {
+                        entry.error = Some(message);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         if purpose == SettingsEntryPurpose::HeightMapName {
             let name = value.trim().to_string();
             if name.is_empty() {
@@ -1276,6 +1349,141 @@ impl Shell {
     fn cancel_settings_entry(&mut self, cx: &mut Context<Self>) {
         self.settings_entry = None;
         cx.notify();
+    }
+
+    // ------------------------------------------------------- startup lines
+
+    /// Open the shared text sheet for one `$N0`/`$N1` draft.
+    fn open_startup_editor(&mut self, index: u8, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_entry(SettingsEntryPurpose::StartupLine(index), window, cx);
+    }
+
+    /// Validate a draft and open the motion warning without sending anything.
+    fn request_startup_apply(&mut self, index: u8, cx: &mut Context<Self>) {
+        let gate = self.state.startup_write_gate();
+        match self.state.startup_lines.preview_apply(index, gate) {
+            Ok(write) => {
+                self.state.keypad = None;
+                self.settings_entry = None;
+                self.startup_confirm = Some(StartupConfirm {
+                    index,
+                    text: write.line,
+                });
+            }
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Startup line $N{index}: {message}"),
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Close the warning sheet without sending.
+    fn cancel_startup_confirm(&mut self, cx: &mut Context<Self>) {
+        self.startup_confirm = None;
+        cx.notify();
+    }
+
+    /// Send the confirmed write through the guarded system-command path.
+    ///
+    /// The command is sent only when the captured text still matches the draft
+    /// and the connection/machine gate is still open. Nothing is marked applied:
+    /// the read-back decides VERIFIED, MISMATCH, or FAILED.
+    fn confirm_startup_apply(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.startup_confirm.take() else {
+            return;
+        };
+        let gate = self.state.startup_write_gate();
+        match self.state.startup_lines.preview_apply(confirm.index, gate) {
+            Ok(write) if write.line == confirm.text => {
+                if self
+                    .state
+                    .startup_lines
+                    .begin_apply(confirm.index, gate)
+                    .is_ok()
+                {
+                    match self.send_command_quiet(crate::startup::write_command(&write)) {
+                        Ok(()) => {
+                            self.state.startup_lines.write_sent(confirm.index);
+                        }
+                        Err(EngineError::Busy) => {
+                            // The streamer has a line in flight; the queued write
+                            // is retried by the poll without changing the value.
+                            self.state.startup_lines.write_busy(confirm.index);
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.state
+                                .startup_lines
+                                .failed(confirm.index, message.clone());
+                            self.state.push_console(
+                                ConsoleLevel::Error,
+                                format!("Startup line $N{}: {message}", confirm.index),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(_) => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!(
+                    "Startup line $N{} changed after APPLY; reopen the confirmation",
+                    confirm.index
+                ),
+            ),
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Startup line $N{}: {message}", confirm.index),
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Drive the startup-line write/read-back state machine.
+    ///
+    /// While the engine reports `Busy` the request stays where it is and is
+    /// retried on the next poll. A queued write is cancelled if the controller
+    /// leaves Idle; a read-back already in flight is left to finish.
+    fn pump_startup_writes(&mut self) -> bool {
+        let Some(request) = self.state.startup_lines.next_request() else {
+            return false;
+        };
+        match request {
+            StartupRequest::Write { index, line } => {
+                if let Some(reason) = self.state.startup_write_gate().blocked_reason() {
+                    return self.state.startup_lines.cancel_pending(reason);
+                }
+                let write = crate::startup::StartupWrite { index, line };
+                match self.send_command_quiet(crate::startup::write_command(&write)) {
+                    Ok(()) => self.state.startup_lines.write_sent(index),
+                    Err(EngineError::Busy) => false,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let changed = self.state.startup_lines.failed(index, message.clone());
+                        self.state.push_console(
+                            ConsoleLevel::Error,
+                            format!("Startup line $N{index}: {message}"),
+                        );
+                        changed
+                    }
+                }
+            }
+            StartupRequest::Read { index } => {
+                match self.send_command_quiet(crate::startup::read_command(index)) {
+                    Ok(()) => self.state.startup_lines.read_sent(index),
+                    Err(EngineError::Busy) => false,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let changed = self.state.startup_lines.failed(index, message.clone());
+                        self.state.push_console(
+                            ConsoleLevel::Error,
+                            format!("Startup line $N{index} read-back: {message}"),
+                        );
+                        changed
+                    }
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------- tools/profile
@@ -7388,6 +7596,236 @@ impl Shell {
         let corrupt = config.corrupt_profile();
         let import_armed = self.backup_import_armed;
 
+        let startup = &self.state.startup_lines;
+        let startup_lock = self.state.startup_write_gate().blocked_reason();
+        let startup_result = startup
+            .last_result()
+            .map(|text| (startup.last_result_ok(), text.to_string()));
+        let reload_view = cx.entity();
+        let mut startup_list = v_flex().gap_1();
+        for row in startup.rows() {
+            let index = row.index;
+            let edit_view = cx.entity();
+            let apply_view = cx.entity();
+            let busy = row.status.is_busy();
+            let reported = row.reported;
+            let current_text = if !reported {
+                "(not read yet)".to_string()
+            } else if row.stored.is_empty() {
+                "(empty)".to_string()
+            } else {
+                row.stored.clone()
+            };
+            let draft_text = if row.is_clear() {
+                "(empty; APPLY clears this line)".to_string()
+            } else {
+                row.draft.clone()
+            };
+            let status_label = row.status.label();
+            let status_color = match &row.status {
+                StartupStatus::Verified => p.success,
+                StartupStatus::Mismatch(_) | StartupStatus::Failed(_) => p.danger,
+                StartupStatus::Edited
+                | StartupStatus::Queued
+                | StartupStatus::Writing
+                | StartupStatus::Verifying => p.warning,
+                StartupStatus::Synced => p.text_faint,
+            };
+            let note = row.note.clone();
+            let has_edit = row.has_edit();
+            startup_list = startup_list.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_lg()
+                    .bg(p.panel)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(42.0))
+                                    .flex_shrink_0()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.accent)
+                                    .child(row.title()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(12.0))
+                                    .text_color(p.text)
+                                    .child(current_text),
+                            )
+                            .when(!status_label.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(status_color)
+                                        .child(status_label),
+                                )
+                            })
+                            .child(
+                                Button::new(format!("startup-edit-{index}"))
+                                    .label("EDIT")
+                                    .secondary()
+                                    .h(px(36.0))
+                                    .w(px(62.0))
+                                    .rounded(px(6.0))
+                                    .text_size(px(10.0))
+                                    .disabled(busy || !reported)
+                                    .on_click(move |_, window, cx| {
+                                        edit_view.update(cx, |this, cx| {
+                                            this.open_startup_editor(index, window, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .when(has_edit, |this| {
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(42.0))
+                                        .flex_shrink_0()
+                                        .text_size(px(9.0))
+                                        .text_color(p.text_faint)
+                                        .child("NEW"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(11.0))
+                                        .text_color(p.warning)
+                                        .child(draft_text),
+                                )
+                                .child(
+                                    Button::new(format!("startup-apply-{index}"))
+                                        .label("APPLY")
+                                        .warning()
+                                        .h(px(36.0))
+                                        .w(px(74.0))
+                                        .rounded(px(6.0))
+                                        .text_size(px(10.0))
+                                        .disabled(busy || startup_lock.is_some())
+                                        .on_click(move |_, _, cx| {
+                                            apply_view.update(cx, |this, cx| {
+                                                this.request_startup_apply(index, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                    })
+                    .when_some(note, |this, note| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(status_color)
+                                .child(note),
+                        )
+                    })
+                    .when(row.status.is_problem(), |this| {
+                        this.child(
+                            div()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.danger)
+                                .child("WRITE NOT APPLIED - THE PREVIOUS VALUE IS STILL ACTIVE"),
+                        )
+                    }),
+            );
+        }
+
+        let startup_card = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label("STARTUP LINES", p))
+                            .child(chip(
+                                if startup.reported() {
+                                    "$N0 / $N1"
+                                } else {
+                                    "NOT READ YET"
+                                },
+                                p,
+                            ))
+                            .when(startup.pending_count() > 0, |this| {
+                                this.child(chip(
+                                    &format!("{} PENDING", startup.pending_count()),
+                                    p,
+                                ))
+                            })
+                            .child(chip("RESET EXECUTION", p)),
+                    )
+                    .child(
+                        Button::new("startup-reload")
+                            .label("RELOAD")
+                            .secondary()
+                            .h(px(36.0))
+                            .w(px(88.0))
+                            .rounded(px(6.0))
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                reload_view.update(cx, |this, cx| {
+                                    if this
+                                        .send_command(Command::System(SystemCommand::StartupLines))
+                                    {
+                                        this.state.push_console(
+                                            ConsoleLevel::Info,
+                                            "Requested $N startup lines",
+                                        );
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(
+                "Startup lines execute automatically on every controller reset and can command \
+                 motion, spindle, or coolant. Writes are allowed only while the controller is Idle; \
+                 nothing is written until APPLY and CONFIRM WRITE.",
+            ))
+            .child(startup_list)
+            .when_some(startup_lock, |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(format!("STARTUP WRITES LOCKED: {}", reason.to_uppercase())),
+                )
+            })
+            .when_some(startup_result, |this, (ok, text)| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(if ok { p.success } else { p.danger })
+                        .child(text),
+                )
+            });
+
         let save_view = view.clone();
         let app_view = view.clone();
         let pending_view = view.clone();
@@ -7556,6 +7994,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(startup_card)
             .child(profile_card)
             .child(backup_card)
             .into_any_element()
@@ -7603,7 +8042,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .h(px(48.0))
+                    .h(px(40.0))
                     .px_2()
                     .rounded(px(6.0))
                     .bg(p.panel_alt)
@@ -7754,10 +8193,160 @@ impl Shell {
             })
             .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
                 "The app owns this table; it persists in the per-controller profile. \
-                         Controller [T:] entries stay read-only in the console and are never \
-                         merged silently.",
+                         Controller [T:] entries stay read-only and are never merged silently.",
             ))
             .child(list)
+            .child({
+                let controller = &self.state.controller_tools;
+                let mut panel = v_flex()
+                    .id("controller-tool-table")
+                    .gap_1()
+                    .p_2()
+                    .rounded_lg()
+                    .bg(p.panel_alt)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(section_label("CONTROLLER TOOLS", p))
+                                    .child(chip("READ-ONLY", p)),
+                            )
+                            .child(chip(&format!("{} ENTRIES", controller.len()), p)),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                        "Reported by the controller through [T:...]; this panel never writes, \
+                         overwrites, or merges into the app table above.",
+                    ));
+                if !controller.reported() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .py(px(5.0))
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .text_size(px(11.0))
+                            .text_color(p.text_dim)
+                            .child("No controller tool table has been reported yet."),
+                    );
+                } else if controller.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .py(px(5.0))
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .text_size(px(11.0))
+                            .text_color(p.text_dim)
+                            .child("The controller reports an empty tool table (0 entries)."),
+                    );
+                } else {
+                    panel = panel.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_faint)
+                            .child(div().w(px(40.0)).child("TOOL"))
+                            .child(div().flex_1().child("NAME"))
+                            .child(div().w(px(68.0)).child("X"))
+                            .child(div().w(px(68.0)).child("Y"))
+                            .child(div().w(px(68.0)).child("Z"))
+                            .child(div().w(px(58.0)).child("RADIUS"))
+                            .child(div().w(px(46.0)).child("POCKET")),
+                    );
+                    for entry in controller.entries() {
+                        panel = panel.child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .h(px(34.0))
+                                .px_2()
+                                .rounded(px(6.0))
+                                .bg(p.panel)
+                                .child(
+                                    div()
+                                        .w(px(40.0))
+                                        .flex_shrink_0()
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(p.accent)
+                                        .child(format!("T{}", entry.number)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(p.text)
+                                        .child(ControllerToolTable::display_name(entry)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(68.0))
+                                        .flex_shrink_0()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_dim)
+                                        .child(ControllerToolTable::offset_text(
+                                            entry,
+                                            CoreAxis::X,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(68.0))
+                                        .flex_shrink_0()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_dim)
+                                        .child(ControllerToolTable::offset_text(
+                                            entry,
+                                            CoreAxis::Y,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(68.0))
+                                        .flex_shrink_0()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_dim)
+                                        .child(ControllerToolTable::offset_text(
+                                            entry,
+                                            CoreAxis::Z,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(58.0))
+                                        .flex_shrink_0()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_dim)
+                                        .child(ControllerToolTable::radius_text(entry)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(46.0))
+                                        .flex_shrink_0()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_dim)
+                                        .child(ControllerToolTable::pocket_text(entry)),
+                                ),
+                        );
+                    }
+                }
+                panel
+            })
             .into_any_element()
     }
 
@@ -8176,6 +8765,7 @@ impl Shell {
                 || format!("SETTING ${number}"),
                 |row| format!("SETTING ${number} / {}", row.name),
             ),
+            SettingsEntryPurpose::StartupLine(index) => format!("STARTUP LINE $N{index}"),
             SettingsEntryPurpose::ToolName => "TOOL NAME".to_string(),
             SettingsEntryPurpose::HeightMapName => "SAVE HEIGHT MAP".to_string(),
         };
@@ -8189,6 +8779,12 @@ impl Shell {
                 .row(number)
                 .map(|row| row.meta_line())
                 .unwrap_or_default(),
+            SettingsEntryPurpose::StartupLine(index) => format!(
+                "$N{index} executes on every controller reset and can command motion or the \
+                 spindle. Empty text clears the line. Up to {} ASCII bytes; the draft is local \
+                 until APPLY and CONFIRM WRITE.",
+                crate::startup::MAX_STARTUP_TEXT
+            ),
             SettingsEntryPurpose::ToolName => {
                 "Display name for the M6 sheet; 128 characters, no control characters.".to_string()
             }
@@ -8202,6 +8798,7 @@ impl Shell {
         let input = entry.input.clone();
         let commit_label = match entry.purpose {
             SettingsEntryPurpose::HeightMapName => "SAVE MAP",
+            SettingsEntryPurpose::StartupLine(_) => "KEEP DRAFT",
             _ if masked => "SET",
             _ => "APPLY TEXT",
         };
@@ -8302,6 +8899,158 @@ impl Shell {
                                     .on_click(move |_, _, cx| {
                                         commit_view.update(cx, |shell, cx| {
                                             shell.commit_settings_entry(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Warning sheet for one confirmed `$N<n>=<line>` write.
+    ///
+    /// The exact text and the previous controller value are both visible; the
+    /// command is not sent until CONFIRM WRITE.
+    fn startup_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(confirm) = self.startup_confirm.as_ref() else {
+            return div().into_any_element();
+        };
+        let index = confirm.index;
+        let text = confirm.text.clone();
+        let previous = self
+            .state
+            .startup_lines
+            .row(index)
+            .map(|row| {
+                if row.stored.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    row.stored.clone()
+                }
+            })
+            .unwrap_or_else(|| "(not read)".to_string());
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let scrim_view = view;
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("startup-confirm-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_startup_confirm(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(560.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(format!("WRITE $N{index}")),
+                            )
+                            .child(chip("RESET EXECUTION", p)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(p.warning)
+                            .child(
+                                "This startup line executes automatically on every controller \
+                                 reset. It can command motion, spindle, or coolant.",
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child("EXACT TEXT TO STORE"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(14.0))
+                                    .text_color(p.text)
+                                    .child(if text.is_empty() {
+                                        "(empty line: clears the startup line)".to_string()
+                                    } else {
+                                        text.clone()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(format!("Previous controller value   {previous}")),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_dim).child(format!(
+                        "CONFIRM WRITE sends $N{index}=<text> with exactly this text. The app does \
+                         not update the row itself: it reads the line back and shows VERIFIED, \
+                         MISMATCH, or FAILED."
+                    )))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("startup-confirm-cancel")
+                                    .label("CANCEL")
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_startup_confirm(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("startup-confirm-write")
+                                    .label("CONFIRM WRITE")
+                                    .warning()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |shell, cx| {
+                                            shell.confirm_startup_apply(cx);
                                         });
                                     }),
                             ),
@@ -10049,6 +10798,9 @@ impl Render for Shell {
         }
         if self.settings_entry.is_some() {
             root = root.child(self.settings_entry_overlay(p, cx));
+        }
+        if self.startup_confirm.is_some() {
+            root = root.child(self.startup_confirm_overlay(p, cx));
         }
         if self.state.job.tool_change.is_some() {
             root = root.child(self.tool_change_overlay(p, cx));

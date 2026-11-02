@@ -16,9 +16,12 @@
 //! `--settings-group=NAME` selects a reported group in that workspace;
 //! `--demo-settings-write` changes one safe integer through the normal
 //! pending/Apply/read-back path for the applied screenshot. `--offsets`,
-//! `--tools`, `--utility`, and `--probe` open those workspaces directly.
-//! `--demo-tools` seeds the app-side tool table after the controller profile
-//! loads. `--demo-offsets-write` sends one real `G10 L20` through MDI and
+//! `--tools`, `--utility`, `--startup-lines`, and `--probe` open those
+//! workspaces directly. `--demo-tools` seeds the app-side tool table after the
+//! controller profile loads. `--demo-startup-write` edits `$N0` and presses the
+//! same APPLY / CONFIRM WRITE actions as a tap, then waits for the read-back so
+//! the VERIFIED state can be captured; normal startup never writes a startup
+//! line. `--demo-offsets-write` sends one real `G10 L20` through MDI and
 //! refreshes `$#` for the applied-offsets screenshot. `--demo-offsets-goto`
 //! opens the G28 confirmation sheet through the normal request action without
 //! confirming it. `--probe-card=z|edge-x|
@@ -54,6 +57,7 @@ mod offsets;
 mod probe;
 mod settings;
 mod shell;
+mod startup;
 mod state;
 mod theme;
 mod tools;

@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use ghs_config::{ToolRecord, ToolTable, ValidationError};
+use ghs_engine::{Axis, ToolEntry};
 
 /// One editable numeric field in the tool sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +254,100 @@ impl ToolTableModel {
     }
 }
 
+/// Read-only mirror of the controller-reported `[T:...]` tool table.
+///
+/// This is deliberately separate from [`ToolTableModel`]: the app table is
+/// editable and persisted in the controller profile, while this table is only
+/// what the controller reported through `$#`/`[T:...]`. Nothing here writes,
+/// merges, or overwrites the application table, and an empty report is kept as
+/// a reported empty table rather than treated as "no data".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ControllerToolTable {
+    entries: Vec<ToolEntry>,
+    reported: bool,
+}
+
+impl ControllerToolTable {
+    /// No controller report has arrived yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the mirror with one controller report.
+    ///
+    /// An empty slice is a valid report: it proves the controller answered and
+    /// has no entries. Returns `true` when the visible table changed.
+    pub fn apply(&mut self, entries: &[ToolEntry]) -> bool {
+        let changed = !self.reported || self.entries != entries;
+        self.entries.clear();
+        self.entries.extend_from_slice(entries);
+        self.reported = true;
+        changed
+    }
+
+    /// Whether the controller has answered a tool-table report.
+    #[must_use]
+    pub fn reported(&self) -> bool {
+        self.reported
+    }
+
+    /// Reported entries, sorted by tool number by the engine.
+    #[must_use]
+    pub fn entries(&self) -> &[ToolEntry] {
+        &self.entries
+    }
+
+    /// Number of reported entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the last report had no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Display name, falling back to `T<number>` and stripping control
+    /// characters from controller text.
+    #[must_use]
+    pub fn display_name(entry: &ToolEntry) -> String {
+        let name = entry.name.as_deref().map(str::trim).unwrap_or("");
+        if name.is_empty() {
+            format!("T{}", entry.number)
+        } else {
+            name.chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(64)
+                .collect()
+        }
+    }
+
+    /// One offset axis in millimetres, formatted for the read-only panel.
+    #[must_use]
+    pub fn offset_text(entry: &ToolEntry, axis: Axis) -> String {
+        format!("{:.3}", entry.offset.get(axis))
+    }
+
+    /// Radius in millimetres, or `--` when the controller did not report one.
+    #[must_use]
+    pub fn radius_text(entry: &ToolEntry) -> String {
+        entry
+            .radius_mm
+            .map_or_else(|| "--".to_string(), |radius| format!("{radius:.3}"))
+    }
+
+    /// Pocket number, or `--` when the controller did not report one.
+    #[must_use]
+    pub fn pocket_text(entry: &ToolEntry) -> String {
+        entry
+            .pocket
+            .map_or_else(|| "--".to_string(), |pocket| pocket.to_string())
+    }
+}
+
 fn parse_u32(text: &str, field: &str) -> Result<u32, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -391,5 +486,51 @@ mod tests {
         assert!(!model.dirty());
         assert_eq!(model.file.status, "1 TOOLS, SAVED");
         assert_eq!(model.path(), Some(Path::new("/tmp/profile.json")));
+    }
+
+    #[test]
+    fn controller_tools_are_read_only_and_separate_from_the_app_table() {
+        let mut app = ToolTableModel::new();
+        app.insert(record(1, "App tool", 6.0)).expect("app tool");
+        let app_before = app.table().clone();
+
+        let mut controller = ControllerToolTable::new();
+        assert!(!controller.reported());
+        assert!(controller.is_empty());
+
+        let entry = ToolEntry {
+            number: 7,
+            radius_mm: Some(3.0),
+            offset: ghs_engine::Position::xyz(1.5, -2.0, -30.0),
+            name: Some("Probe\nT7".into()),
+            pocket: Some(4),
+        };
+        assert!(controller.apply(std::slice::from_ref(&entry)));
+        assert!(controller.reported());
+        assert_eq!(controller.len(), 1);
+        assert_eq!(controller.entries()[0].number, 7);
+        assert_eq!(
+            ControllerToolTable::display_name(&entry),
+            "Probe T7",
+            "controller names are display-only and control characters are stripped"
+        );
+        assert_eq!(ControllerToolTable::offset_text(&entry, Axis::Z), "-30.000");
+        assert_eq!(ControllerToolTable::radius_text(&entry), "3.000");
+        assert_eq!(ControllerToolTable::pocket_text(&entry), "4");
+
+        // Applying a controller report never changes the app-owned table.
+        assert_eq!(app.table(), &app_before);
+        assert_eq!(app.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_controller_report_is_explicitly_reported() {
+        let mut controller = ControllerToolTable::new();
+        assert!(controller.apply(&[]));
+        assert!(controller.reported());
+        assert!(controller.is_empty());
+        assert_eq!(controller.len(), 0);
+        // The same empty report is not a visible change.
+        assert!(!controller.apply(&[]));
     }
 }

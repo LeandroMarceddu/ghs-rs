@@ -18,7 +18,7 @@ use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, ControllerInfo, EngineEvent, JobAbortReason, JobInfo, JobPauseReason,
     JobState, MachineSnapshot, Offsets, Program, ProgramLine as EngineProgramLine, SettingValue,
-    Signals as CoreSignals, StatusReport, Wcs,
+    Signals as CoreSignals, StartupLine, StatusReport, ToolEntry, Wcs,
 };
 use ghs_probe::XyPoint;
 
@@ -28,7 +28,8 @@ use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_ru
 use crate::offsets::OffsetModel;
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
-use crate::tools::{ToolField, ToolTableModel};
+use crate::startup::{StartupLinesModel, StartupWriteGate};
+use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 
 /// Connection state shown in the top-bar status pill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1020,6 +1021,10 @@ pub struct AppState {
     pub signals_raw: CoreSignals,
     /// Application-owned tool table and its profile state.
     pub tools: ToolTableModel,
+    /// Read-only controller `[T:...]` report; never merged into `tools`.
+    pub controller_tools: ControllerToolTable,
+    /// `$N0`/`$N1` read state and the local edit/confirmation model.
+    pub startup_lines: StartupLinesModel,
     /// Local app preferences, controller profile, and backup helpers.
     pub config: ConfigModel,
 }
@@ -1096,6 +1101,8 @@ impl AppState {
             height_map_library: HeightMapLibrary::default(),
             signals_raw: CoreSignals::NONE,
             tools: ToolTableModel::new(),
+            controller_tools: ControllerToolTable::new(),
+            startup_lines: StartupLinesModel::new(),
             config,
         };
         state.sync_offset_context();
@@ -1148,6 +1155,9 @@ impl AppState {
         self.offsets = OffsetModel::default();
         self.sync_offset_context();
         self.tools = ToolTableModel::new();
+        // Controller-reported data belongs to this session only.
+        self.controller_tools = ControllerToolTable::new();
+        self.startup_lines.reset();
         self.probe = ProbeModel::default();
         self.height_map.reset();
         self.height_map_library.reset();
@@ -1430,6 +1440,34 @@ impl AppState {
     pub fn apply_offsets(&mut self, offsets: &Offsets) {
         self.sync_offset_context();
         self.offsets.apply_engine(offsets);
+    }
+
+    /// Install the controller-reported, read-only `[T:...]` tool table.
+    ///
+    /// This never touches [`AppState::tools`]; the app table is editable and
+    /// persisted, the controller table is evidence.
+    pub fn apply_controller_tools(&mut self, entries: &[ToolEntry]) -> bool {
+        self.controller_tools.apply(entries)
+    }
+
+    /// Install the controller startup lines from `$N`/`$N<n>`.
+    ///
+    /// A report for an index with a write in flight is treated as the read-back
+    /// and compared with the requested text.
+    pub fn apply_startup_lines(&mut self, lines: &[StartupLine]) -> bool {
+        self.startup_lines.apply_reported(lines)
+    }
+
+    /// Machine/connection gate for a `$N<n>` write.
+    #[must_use]
+    pub fn startup_write_gate(&self) -> StartupWriteGate {
+        StartupWriteGate {
+            live: self.live,
+            ready: self.connection.is_ready_like(),
+            idle: self.machine_state == "Idle",
+            alarm_or_door: matches!(self.machine_state, "Alarm" | "Door"),
+            job_active: self.job.is_active(),
+        }
     }
 
     /// Update the active WCS used by the offsets workspace.
@@ -2566,5 +2604,126 @@ mod tests {
             .expect_err("an active run blocks navigation");
         assert!(error.contains("probe run is active"), "{error}");
         assert!(state.selected_saved_map().is_none());
+    }
+
+    fn controller_tool(number: u32, name: &str) -> ToolEntry {
+        ToolEntry {
+            number,
+            radius_mm: Some(3.0),
+            offset: Position::xyz(f64::from(number), -2.0, -30.0),
+            name: Some(name.to_string()),
+            pocket: Some(number),
+        }
+    }
+
+    #[test]
+    fn controller_tools_stay_separate_from_the_app_table() {
+        let mut state = AppState::new();
+        assert!(!state.controller_tools.reported());
+        assert!(state.controller_tools.is_empty());
+
+        state
+            .tools
+            .insert(ghs_config::ToolRecord {
+                number: 1,
+                name: "App tool".into(),
+                diameter_mm: 6.0,
+                length_mm: 35.0,
+                pocket: Some(1),
+            })
+            .expect("app tool");
+        let app_before = state.tools.table().clone();
+
+        assert!(state.apply_controller_tools(&[
+            controller_tool(3, "Controller three"),
+            controller_tool(7, "Controller seven"),
+        ]));
+        assert!(state.controller_tools.reported());
+        assert_eq!(state.controller_tools.len(), 2);
+        assert_eq!(state.controller_tools.entries()[0].number, 3);
+        assert_eq!(state.tools.table(), &app_before);
+
+        // A later empty controller report is still a report, and still does not
+        // touch the app table.
+        assert!(state.apply_controller_tools(&[]));
+        assert!(state.controller_tools.reported());
+        assert!(state.controller_tools.is_empty());
+        assert_eq!(state.tools.table(), &app_before);
+    }
+
+    #[test]
+    fn startup_lines_load_from_a_controller_report_and_survive_a_reconnect_reset() {
+        let mut state = AppState::new();
+        assert!(!state.startup_lines.reported());
+        assert_eq!(state.startup_lines.rows().len(), 2);
+
+        let lines = [
+            StartupLine {
+                index: 0,
+                line: "G21 G90".into(),
+            },
+            StartupLine {
+                index: 1,
+                line: "M3 S0".into(),
+            },
+        ];
+        assert!(state.apply_startup_lines(&lines));
+        assert!(state.startup_lines.fully_reported());
+        assert_eq!(state.startup_lines.row(0).expect("row 0").stored, "G21 G90");
+        assert_eq!(state.startup_lines.row(1).expect("row 1").stored, "M3 S0");
+
+        // A new session never shows the previous controller's startup lines.
+        state.begin_live("test transport");
+        assert!(!state.startup_lines.reported());
+        assert!(
+            state
+                .startup_lines
+                .rows()
+                .iter()
+                .all(|row| row.stored.is_empty())
+        );
+    }
+
+    #[test]
+    fn startup_write_gate_mirrors_connection_machine_and_job_state() {
+        let mut state = AppState::new();
+        // `AppState::new` starts in mock mode.
+        assert_eq!(
+            state.startup_write_gate().blocked_reason(),
+            Some("mock mode: no controller")
+        );
+
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Connecting;
+        assert_eq!(
+            state.startup_write_gate().blocked_reason(),
+            Some("not connected")
+        );
+
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Alarm";
+        assert_eq!(
+            state.startup_write_gate().blocked_reason(),
+            Some("alarm or door")
+        );
+
+        state.machine_state = "Idle";
+        let program = Arc::new(ghs_gcode::parse_program("G21\nM30\n").expect("program"));
+        state.job.loaded("job.nc".into(), program, 2);
+        state.job.started(1, 2);
+        assert_eq!(
+            state.startup_write_gate().blocked_reason(),
+            Some("job active")
+        );
+
+        state.job.completed(Duration::from_secs(1));
+        state.machine_state = "Run";
+        assert_eq!(
+            state.startup_write_gate().blocked_reason(),
+            Some("controller not Idle")
+        );
+
+        state.machine_state = "Idle";
+        assert_eq!(state.startup_write_gate().blocked_reason(), None);
     }
 }
