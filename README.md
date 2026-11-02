@@ -35,8 +35,9 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 - **Connection and protocol** — serial port picker, in-process FlexiHAL
   simulator, capability-driven `$I+` handshake, live status, realtime commands,
   alarm/error tables, parser state, and runtime enumeration.
-- **Manual control** — live DRO, hold-to-jog, MDI, feed/spindle/rapid
-  overrides, spindle and coolant controls, reset/stop, and a console.
+- **Manual control** — live DRO, hold-to-jog, MDI with history, feed/spindle/
+  rapid overrides with fine/reset actions, spindle and coolant controls,
+  reset/stop/sleep, and a console.
 - **Jobs** — in-app program file browser and loading, streaming, pause/resume/
   stop, tool-change sheet, optional-stop/single-block/block-delete run options,
   breakpoints and run-to-line, progress, ETA and current line, a real parsed

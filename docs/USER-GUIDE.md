@@ -226,9 +226,14 @@ Type a line in the `MDI` field and press `SEND`. The engine logs the command
 and the controller's `ok` or `error` in the Console. MDI is enabled only when
 the link is ready and the machine is `Idle`.
 
+The card keeps the last 10 accepted commands for the session. `UP`/`DN` recall
+an entry into the field; recall never sends. Empty and consecutive duplicate
+entries are ignored, and the history is not persisted.
+
 ### Overrides
 
-- **Feed override:** 10–200%, slider plus `-10`/`+10`.
+- **Feed override:** 10–200%, slider plus `-10`/`+10`, fine `-1`/`+1`, and a
+  primary `RESET 100%` action.
 - **Spindle override:** 50–200%, slider in the Spindle card.
 - **Rapid override:** the `RAPID 100%` chip in the viewer header cycles
   `100% -> 50% -> 25% -> 100%`. It shows the value reported by the controller;
@@ -247,6 +252,14 @@ reports. The right-rail `M8/M9` quick action toggles flood.
   job toolbar's `STOP`, which aborts the job and sends a reset to discard
   buffered motion.
 - The job toolbar also has `START`, `PAUSE`, `RESUME`, and `STOP`.
+
+### Controller sleep
+
+**Utility** → `CONTROLLER SLEEP` opens a confirmation sheet. Confirming sends
+`$SLP` only when the link is ready, the machine is `Idle`, and no job is active.
+Sleep stops status polling and freezes the DRO, signals, and job state; the app
+does not wake the controller automatically. Use the top-bar `RESET` (or a
+status wake that the controller supports) to recover. CANCEL sends nothing.
 
 ## 6. Jobs
 

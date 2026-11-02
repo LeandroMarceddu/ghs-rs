@@ -77,14 +77,14 @@ implemented before its UI or hardware validation row is complete.
 | CTL-01 | DRO for all axes and work coordinate systems | M2 | todo | X/Y/Z first, 9-axis capable |
 | CTL-02 | Zero axes and set position | M2 | todo | Per axis and all |
 | CTL-03 | Goto and park | M2 | todo | Confirmation for Goto |
-| CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | todo | Jog cancel on release |
-| CTL-05 | Jog cancel and pendant-safe behavior | M2 | todo | `0x85` |
-| CTL-06 | Feed override, fine and coarse, reset | M2 | todo | Slider plus buttons |
+| CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | partial | No keyboard jog; jog feed follows global feed |
+| CTL-05 | Jog cancel and pendant-safe behavior | M2 | done | `0x85` |
+| CTL-06 | Feed override, fine and coarse, reset | M2 | done | Slider, ±1/±10, reset |
 | CTL-07 | Rapid override | M2 | done | 100/50/25 compact chip |
-| CTL-08 | Spindle control and override | M2 | todo | On/off, CW/CCW, RPM, stop |
-| CTL-09 | Coolant mist, flood, fan | M2 | todo | Capability-gated |
-| CTL-10 | MDI with history | M2 | todo | Multi-line support |
-| CTL-11 | Home, unlock, reset, sleep | M2 | todo | State-aware |
+| CTL-08 | Spindle control and override | M2 | done | On/off, CW/CCW, RPM, stop |
+| CTL-09 | Coolant mist, flood, fan | M2 | done | Capability-gated |
+| CTL-10 | MDI with history | M2 | done | 10-entry session history |
+| CTL-11 | Home, unlock, reset, sleep | M2 | done | Confirmed sleep |
 | CTL-12 | Signals, pins, and AUX IO display | M2 | todo | HSDEP plus 4/4 AUX |
 | CTL-13 | Macros with parameters and special words | M5 | partial | Single-line MDI editor/run; params/system/multi-line deferred |
 | CTL-14 | Startup lines | M5 | done | Read, edit, read-back verify |
