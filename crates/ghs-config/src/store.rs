@@ -631,7 +631,10 @@ mod tests {
 
     use super::*;
     use crate::backup::IdentityPolicy;
-    use crate::controller::{ControllerData, HeightMapFrame, HeightMapRecord, ToolRecord};
+    use crate::controller::{
+        ControllerData, HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, ProbeOffsetRecord,
+        ToolRecord,
+    };
     use crate::error::ValidationError;
 
     const FLEXIHAL: &[&str] = &[
@@ -710,6 +713,10 @@ mod tests {
         data.keymap
             .insert(crate::controller::KeyBinding::new("run.pause", "Space"));
         data.height_maps = vec![sample_height_map()];
+        data.probe_offset = ProbeOffsetRecord {
+            x_mm: 4.0,
+            y_mm: -2.5,
+        };
         data
     }
 
@@ -952,6 +959,37 @@ mod tests {
                 field: "columns",
                 ..
             }))
+        ));
+        assert!(!store.profile_path(&key).exists());
+        assert_no_temp_files(dir.path());
+    }
+
+    #[test]
+    fn invalid_probe_offset_in_a_backup_is_rejected_before_writing() {
+        let (dir, store) = store("backup-invalid-probe-offset");
+        let info = info();
+        let key = ProfileKey::from_controller(&info);
+        let bundle = BackupBundle::new(AppConfig::default(), &info, sample_data());
+        let path = dir.path().join("probe-offset.json");
+        store.export_backup(&path, &bundle).expect("export");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        value["data"]["probe_offset"]["x_mm"] = serde_json::json!(MAX_PROBE_OFFSET_MM + 1.0);
+        let text = serde_json::to_string(&value).expect("json");
+        fs::write(&path, text).expect("write");
+
+        assert!(matches!(
+            store.load_backup(&path),
+            Err(ConfigError::Validation(
+                ValidationError::ProbeOffsetOutOfRange { axis: "x_mm", .. }
+            ))
+        ));
+        assert!(matches!(
+            store.import_backup(&path, Some(&info), IdentityPolicy::Reject),
+            Err(ConfigError::Validation(
+                ValidationError::ProbeOffsetOutOfRange { .. }
+            ))
         ));
         assert!(!store.profile_path(&key).exists());
         assert_no_temp_files(dir.path());

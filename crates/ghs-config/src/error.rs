@@ -82,6 +82,26 @@ pub enum ValidationError {
         /// Offset name, for example `"G54"` or `"G28"`.
         field: &'static str,
     },
+    /// A probe mount offset component is NaN or infinite.
+    #[error("probe offset {axis} must be finite (got {value})")]
+    NonFiniteProbeOffset {
+        /// Component name, `"x_mm"` or `"y_mm"`.
+        axis: &'static str,
+        /// Rejected value.
+        value: f64,
+    },
+    /// A probe mount offset component is outside the accepted range.
+    #[error("probe offset {axis} must be between {min} and {max} millimetres (got {value})")]
+    ProbeOffsetOutOfRange {
+        /// Component name, `"x_mm"` or `"y_mm"`.
+        axis: &'static str,
+        /// Rejected value.
+        value: f64,
+        /// Smallest accepted value.
+        min: f64,
+        /// Largest accepted value.
+        max: f64,
+    },
     /// A setting value is NaN, infinite, or structurally invalid.
     #[error("setting ${number} is invalid: {reason}")]
     InvalidSetting {

@@ -252,7 +252,9 @@ mod tests {
     use ghs_core::{Position, Wcs, parse_controller_info};
 
     use super::*;
-    use crate::controller::{HeightMapFrame, HeightMapRecord, Macro, ToolRecord};
+    use crate::controller::{
+        HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, Macro, ProbeOffsetRecord, ToolRecord,
+    };
 
     const FLEXIHAL: &[&str] = &[
         "[VER:1.1f.20240604:]",
@@ -303,6 +305,10 @@ mod tests {
         });
         data.macros = vec![Macro::new("Safe Z", "G0 Z5")];
         data.height_maps = vec![height_map()];
+        data.probe_offset = ProbeOffsetRecord {
+            x_mm: 3.5,
+            y_mm: -1.25,
+        };
         data
     }
 
@@ -317,7 +323,44 @@ mod tests {
         let decoded = BackupBundle::from_json_str(&json).expect("decode");
         assert_eq!(decoded, original);
         assert_eq!(decoded.data.height_maps, original.data.height_maps);
+        assert_eq!(decoded.data.probe_offset, original.data.probe_offset);
+        assert!(json.contains("\"probe_offset\""));
         decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn bundle_rejects_an_invalid_probe_offset() {
+        let mut out_of_range = bundle();
+        out_of_range.data.probe_offset = ProbeOffsetRecord {
+            x_mm: MAX_PROBE_OFFSET_MM + 1.0,
+            y_mm: 0.0,
+        };
+        assert!(matches!(
+            out_of_range.validate(),
+            Err(ValidationError::ProbeOffsetOutOfRange { axis: "x_mm", .. })
+        ));
+        assert!(matches!(
+            out_of_range.to_json_string(),
+            Err(ConfigError::Validation(
+                ValidationError::ProbeOffsetOutOfRange { .. }
+            ))
+        ));
+
+        let mut non_finite = bundle();
+        non_finite.data.probe_offset = ProbeOffsetRecord {
+            x_mm: 0.0,
+            y_mm: f64::NAN,
+        };
+        assert!(matches!(
+            non_finite.validate(),
+            Err(ValidationError::NonFiniteProbeOffset { axis: "y_mm", .. })
+        ));
+        assert!(matches!(
+            non_finite.to_json_string(),
+            Err(ConfigError::Validation(
+                ValidationError::NonFiniteProbeOffset { .. }
+            ))
+        ));
     }
 
     #[test]

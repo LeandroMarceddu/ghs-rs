@@ -38,6 +38,14 @@ pub const MAX_HEIGHT_MAP_COORDINATE_MM: f64 = 100_000.0;
 /// Maximum length of a height-map label in characters.
 const MAX_HEIGHT_MAP_NAME: usize = 128;
 
+/// Maximum absolute X or Y probe mount offset, in millimetres.
+///
+/// The offset is `probe tip - controlled point`, so each component is bounded
+/// to `-MAX_PROBE_OFFSET_MM..=MAX_PROBE_OFFSET_MM`. This matches the bound in
+/// the probe crate; `ghs-config` does not depend on that crate, so the value is
+/// repeated here and must stay in sync.
+pub const MAX_PROBE_OFFSET_MM: f64 = 100.0;
+
 /// Maximum length of a tool name in characters.
 const MAX_TOOL_NAME: usize = 128;
 /// Maximum length of a macro name in characters.
@@ -551,6 +559,56 @@ impl OffsetSnapshot {
     }
 }
 
+/// Physical XY mount offset of the probe tip for one controller.
+///
+/// The value is `probe tip - controlled point`, in millimetres, along the
+/// machine/work X and Y axes. It is a property of the physical mount, not a
+/// work offset: to convert a feature (probe-tip) position to the controlled
+/// point, subtract the offset. Loading a profile never applies it to the
+/// controller.
+///
+/// Both components are finite and within `+/-`[`MAX_PROBE_OFFSET_MM`]. A
+/// profile that predates this record loads with a zero offset, which is also
+/// the default.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ProbeOffsetRecord {
+    /// X component of `probe tip - controlled point`, in millimetres.
+    #[serde(default)]
+    pub x_mm: f64,
+    /// Y component of `probe tip - controlled point`, in millimetres.
+    #[serde(default)]
+    pub y_mm: f64,
+}
+
+impl ProbeOffsetRecord {
+    /// Validate both components.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::NonFiniteProbeOffset`] when a component is
+    /// NaN or infinite, and [`ValidationError::ProbeOffsetOutOfRange`] when it
+    /// is outside `+/-`[`MAX_PROBE_OFFSET_MM`].
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_probe_offset_axis("x_mm", self.x_mm)?;
+        validate_probe_offset_axis("y_mm", self.y_mm)
+    }
+}
+
+fn validate_probe_offset_axis(axis: &'static str, value: f64) -> Result<(), ValidationError> {
+    if !value.is_finite() {
+        return Err(ValidationError::NonFiniteProbeOffset { axis, value });
+    }
+    if value.abs() > MAX_PROBE_OFFSET_MM {
+        return Err(ValidationError::ProbeOffsetOutOfRange {
+            axis,
+            value,
+            min: -MAX_PROBE_OFFSET_MM,
+            max: MAX_PROBE_OFFSET_MM,
+        });
+    }
+    Ok(())
+}
+
 /// Measurement frame a height map was captured in.
 ///
 /// The frame is stored beside the map so it is not reused after a work-offset
@@ -845,6 +903,12 @@ pub struct ControllerData {
     /// Work, home, and tool offsets.
     #[serde(default)]
     pub offsets: OffsetSnapshot,
+    /// Physical XY mount offset of the probe tip, `probe tip - controlled
+    /// point`, in machine/work axes.
+    ///
+    /// Profiles written before this field existed load with a zero offset.
+    #[serde(default)]
+    pub probe_offset: ProbeOffsetRecord,
     /// Application-owned tool table.
     #[serde(default)]
     pub tools: ToolTable,
@@ -871,6 +935,7 @@ impl Default for ControllerData {
             schema_version: CONTROLLER_SCHEMA_VERSION,
             settings: BTreeMap::new(),
             offsets: OffsetSnapshot::default(),
+            probe_offset: ProbeOffsetRecord::default(),
             tools: ToolTable::default(),
             macros: Vec::new(),
             startup_lines: StartupLines::default(),
@@ -887,8 +952,8 @@ impl ControllerData {
         Self::default()
     }
 
-    /// Validate the schema, settings, offsets, tools, macros, startup lines,
-    /// keymap, and height maps.
+    /// Validate the schema, settings, offsets, probe offset, tools, macros,
+    /// startup lines, keymap, and height maps.
     ///
     /// # Errors
     ///
@@ -905,6 +970,7 @@ impl ControllerData {
             validate_setting(*number, value)?;
         }
         self.offsets.validate()?;
+        self.probe_offset.validate()?;
         self.tools.validate()?;
 
         let mut names = HashSet::with_capacity(self.macros.len());
@@ -1034,6 +1100,10 @@ mod tests {
         offsets.tool_radius = Some(Position::xyz(3.0, 0.0, 0.0));
         offsets.scaling = Some(vec![1.0, 1.0, 0.5]);
         data.offsets = offsets;
+        data.probe_offset = ProbeOffsetRecord {
+            x_mm: -12.5,
+            y_mm: 7.25,
+        };
 
         data.tools = sample_tools();
         data.macros = vec![
@@ -1063,7 +1133,9 @@ mod tests {
         assert!(json.contains("\"G54\""));
         assert!(json.contains("\"G59.3\""));
         assert!(json.contains("\"height_maps\""));
+        assert!(json.contains("\"probe_offset\""));
         assert_eq!(decoded.height_maps, data.height_maps);
+        assert_eq!(decoded.probe_offset, data.probe_offset);
     }
 
     #[test]
@@ -1223,14 +1295,124 @@ mod tests {
         let data: ControllerData =
             serde_json::from_str(r#"{"schema_version":1}"#).expect("old profile");
         assert!(data.height_maps.is_empty());
+        assert_eq!(data.probe_offset, ProbeOffsetRecord::default());
         data.validate().expect("valid");
         assert_eq!(data, ControllerData::default());
 
         let mut value = serde_json::to_value(sample_data()).expect("json");
-        value.as_object_mut().expect("object").remove("height_maps");
+        let object = value.as_object_mut().expect("object");
+        object.remove("height_maps");
+        object.remove("probe_offset");
         let decoded: ControllerData = serde_json::from_value(value).expect("decode");
         assert!(decoded.height_maps.is_empty());
+        assert_eq!(decoded.probe_offset, ProbeOffsetRecord::default());
         decoded.validate().expect("valid");
+        assert_eq!(decoded, {
+            let mut expected = sample_data();
+            expected.height_maps.clear();
+            expected.probe_offset = ProbeOffsetRecord::default();
+            expected
+        });
+    }
+
+    #[test]
+    fn probe_offset_round_trips_and_defaults_to_zero() {
+        let default = ControllerData::new();
+        assert_eq!(default.probe_offset, ProbeOffsetRecord::default());
+        assert_eq!(default.probe_offset.x_mm, 0.0);
+        assert_eq!(default.probe_offset.y_mm, 0.0);
+        default.validate().expect("default profile is valid");
+
+        let data = sample_data();
+        assert_eq!(
+            data.probe_offset,
+            ProbeOffsetRecord {
+                x_mm: -12.5,
+                y_mm: 7.25,
+            }
+        );
+        let json = serde_json::to_string_pretty(&data).expect("serialize");
+        let decoded: ControllerData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, data);
+        assert_eq!(decoded.probe_offset.x_mm, -12.5);
+        assert_eq!(decoded.probe_offset.y_mm, 7.25);
+        decoded.validate().expect("valid after round trip");
+
+        let partial: ProbeOffsetRecord =
+            serde_json::from_str(r#"{"x_mm":1.5}"#).expect("partial record");
+        assert_eq!(
+            partial,
+            ProbeOffsetRecord {
+                x_mm: 1.5,
+                y_mm: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn probe_offset_rejects_non_finite_and_out_of_range_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (axis, offset) in [
+                (
+                    "x_mm",
+                    ProbeOffsetRecord {
+                        x_mm: value,
+                        y_mm: 0.0,
+                    },
+                ),
+                (
+                    "y_mm",
+                    ProbeOffsetRecord {
+                        x_mm: 0.0,
+                        y_mm: value,
+                    },
+                ),
+            ] {
+                let mut data = ControllerData::new();
+                data.probe_offset = offset;
+                assert!(matches!(
+                    data.validate(),
+                    Err(ValidationError::NonFiniteProbeOffset { axis: found, .. })
+                        if found == axis
+                ));
+            }
+        }
+
+        for value in [MAX_PROBE_OFFSET_MM + 0.001, -MAX_PROBE_OFFSET_MM - 0.001] {
+            for (axis, offset) in [
+                (
+                    "x_mm",
+                    ProbeOffsetRecord {
+                        x_mm: value,
+                        y_mm: 0.0,
+                    },
+                ),
+                (
+                    "y_mm",
+                    ProbeOffsetRecord {
+                        x_mm: 0.0,
+                        y_mm: value,
+                    },
+                ),
+            ] {
+                let mut data = ControllerData::new();
+                data.probe_offset = offset;
+                assert!(matches!(
+                    data.validate(),
+                    Err(ValidationError::ProbeOffsetOutOfRange { axis: found, .. })
+                        if found == axis
+                ));
+            }
+        }
+
+        for value in [MAX_PROBE_OFFSET_MM, -MAX_PROBE_OFFSET_MM, 0.0] {
+            let mut data = ControllerData::new();
+            data.probe_offset = ProbeOffsetRecord {
+                x_mm: value,
+                y_mm: value,
+            };
+            data.validate().expect("bound is inclusive");
+        }
     }
 
     #[test]
