@@ -11,6 +11,7 @@ members = [
   "crates/ghs-demo",
   "crates/ghs-config",
   "crates/ghs-probe",
+  "crates/ghs-i18n",
   "crates/ghs-app",
 ]
 default-members = ["crates/ghs-app"]
@@ -33,6 +34,7 @@ ghs-viewer = { path = "crates/ghs-viewer" }
 ghs-gcode = { path = "crates/ghs-gcode" }
 ghs-demo = { path = "crates/ghs-demo" }
 ghs-config = { path = "crates/ghs-config" }
+ghs-i18n = { path = "crates/ghs-i18n" }
 ghs-probe = { path = "crates/ghs-probe" }
 
 serde = { version = "1", features = ["derive"] }
