@@ -53,7 +53,7 @@ pub use handle::{Engine, EngineHandle};
 // can construct commands without depending on every crate directly.
 pub use ghs_core::{
     AlarmCode, Axes, Axis, ControllerInfo, FeedSpindle, JobInfo, JobState, MachineSnapshot,
-    MachineState, Overrides, Position, ProbeResult, Setting, SettingValue, Signals, Wcs,
+    MachineState, Overrides, Position, ProbeResult, Setting, SettingValue, Signals, ToolEntry, Wcs,
 };
 pub use ghs_gcode::{Program, ProgramLine};
 pub use ghs_proto::{

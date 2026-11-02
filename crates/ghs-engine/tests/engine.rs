@@ -80,6 +80,31 @@ fn standard_script_with_status(control: &Control, status: &str) {
 }
 
 fn standard_script_with_options(control: &Control, opt: &str, newopt: &str, status: &str) {
+    standard_script_with_offsets(
+        control,
+        opt,
+        newopt,
+        status,
+        &[
+            "[G54:10.000,20.000,30.000]",
+            "[G55:0.000,0.000,0.000]",
+            "[G28:0.000,0.000,0.000]",
+            "[G30:0.000,0.000,0.000]",
+            "[G92:0.000,0.000,0.000]",
+            "[TLO:0.000,0.000,0.000]",
+            "[TLR:0.000]",
+            "ok",
+        ],
+    );
+}
+
+fn standard_script_with_offsets(
+    control: &Control,
+    opt: &str,
+    newopt: &str,
+    status: &str,
+    offsets: &[&str],
+) {
     control.set_status(status);
     control.expect_line(
         "$I+",
@@ -105,19 +130,7 @@ fn standard_script_with_options(control: &Control, opt: &str, newopt: &str, stat
         "$$",
         &["$0=10", "$22=1", "$100=250.000", "$110=8000.000", "ok"],
     );
-    control.expect_line(
-        "$#",
-        &[
-            "[G54:10.000,20.000,30.000]",
-            "[G55:0.000,0.000,0.000]",
-            "[G28:0.000,0.000,0.000]",
-            "[G30:0.000,0.000,0.000]",
-            "[G92:0.000,0.000,0.000]",
-            "[TLO:0.000,0.000,0.000]",
-            "[TLR:0.000]",
-            "ok",
-        ],
-    );
+    control.expect_line("$#", offsets);
     control.expect_line("$G", &["[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]", "ok"]);
     if newopt.contains("ENUMS") {
         control.expect_line(
@@ -138,6 +151,32 @@ fn standard_script_with_options(control: &Control, opt: &str, newopt: &str, stat
         );
         control.expect_line("$EG", &["[SETTINGGROUP:1|N/A|Axes]", "ok"]);
     }
+}
+
+/// Queue discovery whose `$#` response also carries controller tool entries.
+fn tool_script(control: &Control, tools: &[&str]) {
+    let mut lines: Vec<String> = [
+        "[G54:10.000,20.000,30.000]",
+        "[G55:0.000,0.000,0.000]",
+        "[G28:0.000,0.000,0.000]",
+        "[G30:0.000,0.000,0.000]",
+        "[G92:0.000,0.000,0.000]",
+        "[TLO:0.000,0.000,0.000]",
+        "[TLR:0.000]",
+    ]
+    .iter()
+    .map(|line| (*line).to_string())
+    .collect();
+    lines.extend(tools.iter().map(|line| (*line).to_string()));
+    lines.push("ok".to_string());
+    let offsets: Vec<&str> = lines.iter().map(String::as_str).collect();
+    standard_script_with_offsets(
+        control,
+        "[OPT:VNMSL+2,64,1024,3,0]",
+        "[NEWOPT:ENUMS,RT+,HOME,ES,EXPR,TC,SED]",
+        IDLE_STATUS,
+        &offsets,
+    );
 }
 
 fn connected_engine_with(
@@ -920,6 +959,243 @@ fn destructive_offset_resets_clear_the_cached_probe_result() {
             "{line} must drop the cached probe result"
         );
     }
+    handle.shutdown();
+}
+
+#[test]
+fn controller_tool_table_is_sorted_and_published_as_an_event() {
+    let (handle, _control) = connected_engine(|control| {
+        tool_script(
+            control,
+            &[
+                "[T:7|0.000,0.000,-12.000|1.500|6,0,0|End mill|4]",
+                "[T:2|10.000,20.000,-5.000|3.175]",
+                "[T:5|0.000,0.000,-8.000|2.000|3,0,0|Spot drill|1]",
+            ],
+        );
+    });
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || handle.controller_tools().len() == 3,
+            Duration::from_secs(1)
+        ),
+        "controller tools were not collected: {:?}",
+        handle.controller_tools()
+    );
+
+    let table = handle.controller_tools();
+    assert_eq!(
+        table.iter().map(|tool| tool.number).collect::<Vec<_>>(),
+        vec![2, 5, 7]
+    );
+    assert_eq!(table[0].offset, Position::xyz(10.0, 20.0, -5.0));
+    assert_eq!(table[0].radius_mm, Some(3.175));
+    assert_eq!(table[1].name.as_deref(), Some("Spot drill"));
+    assert_eq!(table[2].pocket, Some(4));
+
+    let event = wait_event(
+        &handle,
+        Duration::from_secs(1),
+        |event| matches!(event, EngineEvent::ControllerTools(tools) if tools.as_slice() == table.as_slice()),
+    );
+    match event {
+        EngineEvent::ControllerTools(tools) => assert_eq!(*tools, *table),
+        other => panic!("expected controller tools, got {other:?}"),
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn duplicate_controller_tool_numbers_replace_the_previous_entry() {
+    let (handle, _control) = connected_engine(|control| {
+        tool_script(
+            control,
+            &[
+                "[T:3|0.000,0.000,-1.000|1.000]",
+                "[T:3|0.000,0.000,-2.000|2.000]",
+            ],
+        );
+    });
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || {
+                handle
+                    .controller_tools()
+                    .iter()
+                    .any(|tool| tool.number == 3 && tool.radius_mm == Some(2.0))
+            },
+            Duration::from_secs(1)
+        ),
+        "the second T3 entry must replace the first: {:?}",
+        handle.controller_tools()
+    );
+
+    let table = handle.controller_tools();
+    assert_eq!(table.len(), 1);
+    assert_eq!(table[0].number, 3);
+    assert_eq!(table[0].offset, Position::xyz(0.0, 0.0, -2.0));
+    assert_eq!(table[0].radius_mm, Some(2.0));
+    handle.shutdown();
+}
+
+#[test]
+fn malformed_and_oversized_controller_tool_tables_are_bounded() {
+    const BOUND: usize = 256;
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("[T:not-a-number|0,0,0|1.0]".to_string());
+    lines.push("[T:1|0,0,0]".to_string());
+    for number in 0..(BOUND + 32) {
+        lines.push(format!("[T:{number}|0.000,0.000,0.000|1.000]"));
+    }
+    let tools: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+    let (handle, _control) = connected_engine(|control| tool_script(control, &tools));
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || handle.controller_tools().len() == BOUND,
+            Duration::from_secs(2)
+        ),
+        "expected {BOUND} bounded entries, got {}",
+        handle.controller_tools().len()
+    );
+
+    let table = handle.controller_tools();
+    assert_eq!(table.len(), BOUND);
+    assert_eq!(table.first().map(|tool| tool.number), Some(0));
+    assert_eq!(
+        table.last().map(|tool| tool.number),
+        Some((BOUND - 1) as u32)
+    );
+    assert!(table.windows(2).all(|pair| pair[0].number < pair[1].number));
+    handle.shutdown();
+}
+
+#[test]
+fn manual_tool_table_refresh_replaces_the_previous_report() {
+    let (handle, control) = connected_engine(|control| {
+        tool_script(control, &["[T:1|0.000,0.000,-1.000|1.000]"]);
+    });
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || handle.controller_tools().len() == 1,
+            Duration::from_secs(1)
+        ),
+        "the initial tool table was not collected"
+    );
+
+    control.expect_line("$#", &["[T:5|0.000,0.000,-5.000|2.500]", "ok"]);
+    send_retry(&handle, Command::System(SystemCommand::Offsets)).expect("refresh offsets");
+    assert!(
+        wait_until(
+            || {
+                let table = handle.controller_tools();
+                table.len() == 1 && table[0].number == 5
+            },
+            Duration::from_secs(1)
+        ),
+        "a fresh $# must replace the cached controller table: {:?}",
+        handle.controller_tools()
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn controller_tool_table_reset_rules_are_explicit() {
+    let (handle, control) = connected_engine(|control| {
+        tool_script(control, &["[T:1|0.000,0.000,-1.000|1.000]"]);
+        control.expect_byte(0x18, &[]);
+        control.expect_line("$RST=#", &["ok"]);
+    });
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || handle.controller_tools().len() == 1,
+            Duration::from_secs(1)
+        ),
+        "the initial tool table was not collected"
+    );
+
+    // A soft reset keeps the controller's stored tool table.
+    handle.send(Command::Reset).expect("soft reset");
+    assert_sent_byte(&control, 0x18);
+    assert_eq!(handle.controller_tools().len(), 1);
+
+    // Resetting the stored offsets drops the local copy; only a later `$#`
+    // can repopulate it from the controller.
+    send_retry(
+        &handle,
+        Command::System(SystemCommand::Reset(ghs_proto::ResetTarget::Offsets)),
+    )
+    .expect("reset offsets");
+    assert_sent_line(&control, "$RST=#");
+    assert!(
+        wait_until(
+            || handle.controller_tools().is_empty(),
+            Duration::from_secs(1)
+        ),
+        "$RST=# must clear the cached controller tool table"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn reconnect_replaces_the_controller_tool_table() {
+    let (handle, _control) = connected_engine(|control| {
+        tool_script(control, &["[T:4|0.000,0.000,-4.000|2.000]"]);
+    });
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || {
+                let table = handle.controller_tools();
+                table.len() == 1 && table[0].number == 4
+            },
+            Duration::from_secs(1)
+        ),
+        "the initial tool table was not collected"
+    );
+
+    handle.disconnect();
+    wait_event(&handle, Duration::from_secs(1), |event| {
+        matches!(event, EngineEvent::Disconnected)
+    });
+    // The cache survives a disconnect like the other discovery data; the next
+    // session start clears it before the controller re-reports.
+    assert_eq!(handle.controller_tools().len(), 1);
+
+    let (transport, control2) = ScriptedTransport::new();
+    tool_script(
+        &control2,
+        &[
+            "[T:9|0.000,0.000,-9.000|3.000]",
+            "[T:10|0.000,0.000,-10.000|4.000]",
+        ],
+    );
+    handle
+        .connect(ConnectTarget::Transport(Box::new(transport)))
+        .expect("reconnect");
+    wait_ready(&handle);
+    assert!(
+        wait_until(
+            || {
+                let table = handle.controller_tools();
+                table.len() == 2 && table[0].number == 9 && table[1].number == 10
+            },
+            Duration::from_secs(1)
+        ),
+        "reconnect must replace the controller table: {:?}",
+        handle.controller_tools()
+    );
+    assert!(
+        !handle
+            .controller_tools()
+            .iter()
+            .any(|tool| tool.number == 4)
+    );
     handle.shutdown();
 }
 

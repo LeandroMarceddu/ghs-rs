@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use ghs_core::{ControllerInfo, MachineSnapshot, Setting};
+use ghs_core::{ControllerInfo, MachineSnapshot, Setting, ToolEntry};
 use ghs_proto::{
     CodeTable as ProtoCodeTable, Offsets, ParserState, SettingDescription, SettingGroup,
     StatusReport, Streamer, StreamerConfig,
@@ -27,6 +27,7 @@ pub(crate) struct Telemetry {
     pub(crate) settings: Arc<Vec<Setting>>,
     pub(crate) setting_descriptions: Arc<Vec<SettingDescription>>,
     pub(crate) setting_groups: Arc<Vec<SettingGroup>>,
+    pub(crate) controller_tools: Arc<Vec<ToolEntry>>,
     pub(crate) offsets: Arc<Offsets>,
     pub(crate) parser_state: Option<Arc<ParserState>>,
     pub(crate) alarm_codes: Arc<ProtoCodeTable>,
@@ -82,6 +83,14 @@ impl SharedState {
         let mut telemetry = self.telemetry();
         telemetry.setting_descriptions = descriptions;
         telemetry.setting_groups = groups;
+    }
+
+    pub(crate) fn controller_tools(&self) -> Arc<Vec<ToolEntry>> {
+        Arc::clone(&self.telemetry().controller_tools)
+    }
+
+    pub(crate) fn set_controller_tools(&self, tools: Arc<Vec<ToolEntry>>) {
+        self.telemetry().controller_tools = tools;
     }
 
     pub(crate) fn offsets(&self) -> Arc<Offsets> {
@@ -306,6 +315,17 @@ impl EngineHandle {
     #[must_use]
     pub fn setting_groups(&self) -> Arc<Vec<SettingGroup>> {
         self.shared.setting_groups()
+    }
+
+    /// Controller-reported `[T:...]` tool table from `$#`.
+    ///
+    /// Entries are sorted by tool number and are read-only: the application
+    /// owns its own editable table and must not merge the two. The list is
+    /// replaced by each controller report and cleared at the start of a new
+    /// discovery; it never contains entries the controller did not send.
+    #[must_use]
+    pub fn controller_tools(&self) -> Arc<Vec<ToolEntry>> {
+        self.shared.controller_tools()
     }
 
     /// Latest `$#` offsets.

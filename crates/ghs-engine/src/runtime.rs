@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ghs_core::{
     AlarmCode, ControllerInfo, JobState, MachineSnapshot, MachineState, Setting, SettingValue,
+    ToolEntry,
 };
 use ghs_proto::{
     CodeTable, ExtendedCommand, JogCommand, Offsets, ParserState, RealtimeCommand, ResetTarget,
@@ -32,6 +33,12 @@ const MAX_MDI_LINES: usize = 1_024;
 const MAX_MDI_BYTES: usize = 64 * 1_024;
 /// Longest console text kept in one event.
 const MAX_LOG_TEXT: usize = 512;
+/// Maximum number of controller-reported `[T:...]` entries retained.
+///
+/// A grblHAL tool table is small (the reference build has none). The bound
+/// protects the session from a malformed or hostile `$#` response that keeps
+/// reporting new tool numbers.
+const MAX_CONTROLLER_TOOLS: usize = 256;
 /// Upper bound on a controller-reported serial receive buffer, in bytes.
 ///
 /// A grblHAL controller reports a few hundred bytes to a few kilobytes. A
@@ -188,6 +195,7 @@ pub(crate) struct EngineRuntime {
     settings: BTreeMap<u16, SettingValue>,
     setting_descriptions: BTreeMap<u16, SettingDescription>,
     setting_groups: BTreeMap<u16, SettingGroup>,
+    controller_tools: BTreeMap<u32, ToolEntry>,
     alarm_codes: CodeTable,
     error_codes: CodeTable,
     offsets: Offsets,
@@ -243,6 +251,7 @@ impl EngineRuntime {
             settings: BTreeMap::new(),
             setting_descriptions: BTreeMap::new(),
             setting_groups: BTreeMap::new(),
+            controller_tools: BTreeMap::new(),
             alarm_codes: CodeTable::new(),
             error_codes: CodeTable::new(),
             offsets: Offsets::default(),
@@ -413,6 +422,10 @@ impl EngineRuntime {
         self.streamer.clear();
         self.streamer.resume();
         self.current_purpose = None;
+        if step == DiscoveryStep::Offsets {
+            // A timed-out `$#` may have delivered only part of the table.
+            self.clear_controller_tools();
+        }
         self.advance_discovery(step, now);
     }
 
@@ -618,6 +631,7 @@ impl EngineRuntime {
         self.settings.clear();
         self.setting_descriptions.clear();
         self.setting_groups.clear();
+        self.controller_tools.clear();
         self.alarm_codes = CodeTable::new();
         self.error_codes = CodeTable::new();
         self.offsets = Offsets::default();
@@ -855,6 +869,7 @@ impl EngineRuntime {
             SystemCommand::Settings | SystemCommand::SettingsExtended
         );
         let is_sleep = matches!(command, SystemCommand::Sleep);
+        let is_offsets_dump = matches!(command, SystemCommand::Offsets);
         let line = command.encode()?;
         if is_dump {
             self.settings_dump_pending = true;
@@ -864,6 +879,10 @@ impl EngineRuntime {
                 if is_sleep {
                     self.sleep_on_ack = true;
                 }
+                if is_offsets_dump {
+                    // A manual `$#` refresh replaces the controller table.
+                    self.clear_controller_tools();
+                }
                 if matches!(
                     &command,
                     SystemCommand::Reset(ResetTarget::Offsets | ResetTarget::All)
@@ -872,6 +891,10 @@ impl EngineRuntime {
                     // the offsets; drop the cached copy as soon as the command
                     // is accepted.
                     self.invalidate_probe_result();
+                    // The controller's stored tool table belongs to the same
+                    // non-volatile offset data; do not keep showing it after a
+                    // reset. A later `$#` repopulates it from the controller.
+                    self.clear_controller_tools();
                 }
                 Ok(())
             }
@@ -1873,7 +1896,7 @@ impl EngineRuntime {
                 self.publish_parser_state();
             }
             Response::Probe(result) => self.on_probe(result),
-            Response::ToolEntry(entry) => self.log_info(format!("$# {entry}")),
+            Response::ToolEntry(entry) => self.on_controller_tool(entry),
             Response::Help(text) => self.log_info(format!("[HLP:{text}]")),
             Response::Echo(text) => self.log_info(format!("[echo:{text}]")),
             Response::StartupLine(line) => {
@@ -2041,6 +2064,7 @@ impl EngineRuntime {
                     self.streamer.resume();
                     self.current_purpose = None;
                     self.discovery = None;
+                    self.clear_controller_tools();
                     self.phase = Phase::MpgPassive {
                         next_poll_at: deadline(now, self.config.status_poll_idle),
                     };
@@ -2127,7 +2151,14 @@ impl EngineRuntime {
         self.error_latched = true;
 
         match purpose {
-            Some(LinePurpose::Discovery(_)) => self.advance_after_clear = true,
+            Some(LinePurpose::Discovery(step)) => {
+                if step == DiscoveryStep::Offsets {
+                    // The controller rejected `$#`; any entries already parsed
+                    // belong to an incomplete report.
+                    self.clear_controller_tools();
+                }
+                self.advance_after_clear = true;
+            }
             Some(LinePurpose::MdiLine) => {
                 let dropped = self.mdi_queue.len();
                 self.mdi_queue.clear();
@@ -2193,6 +2224,30 @@ impl EngineRuntime {
         self.publish_snapshot();
         self.emit(EngineEvent::Probe(result));
         self.log_info(format!("Probe: {result}"));
+    }
+
+    /// Record one controller-reported `[T:...]` entry.
+    ///
+    /// The controller table is read-only and separate from the application's
+    /// table. A repeated tool number replaces the earlier entry, and new
+    /// numbers beyond [`MAX_CONTROLLER_TOOLS`] are ignored so a malformed
+    /// response cannot grow memory without bound.
+    fn on_controller_tool(&mut self, entry: ToolEntry) {
+        self.log_info(format!("$# {entry}"));
+        let number = entry.number;
+        if self.controller_tools.get(&number) == Some(&entry) {
+            return;
+        }
+        if !self.controller_tools.contains_key(&number)
+            && self.controller_tools.len() >= MAX_CONTROLLER_TOOLS
+        {
+            self.log_warn(format!(
+                "Ignoring controller tool T{number}: at most {MAX_CONTROLLER_TOOLS} entries are kept"
+            ));
+            return;
+        }
+        self.controller_tools.insert(number, entry);
+        self.publish_controller_tools();
     }
 
     /// Forget the cached `PRB` result after the controller invalidates it.
@@ -2323,6 +2378,7 @@ impl EngineRuntime {
         self.settings.clear();
         self.setting_descriptions.clear();
         self.setting_groups.clear();
+        self.clear_controller_tools();
         self.alarm_codes = CodeTable::new();
         self.error_codes = CodeTable::new();
         self.offsets = Offsets::default();
@@ -2376,6 +2432,12 @@ impl EngineRuntime {
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.current = next;
             discovery.deadline = deadline(now, self.config.discovery_timeout);
+        }
+
+        if next == DiscoveryStep::Offsets {
+            // Each `$#` is a complete controller report: rebuild the tool
+            // table instead of keeping entries the controller no longer sends.
+            self.clear_controller_tools();
         }
 
         if let Err(error) = self.enqueue_line(next.command(), LinePurpose::Discovery(next)) {
@@ -2513,6 +2575,26 @@ impl EngineRuntime {
 
     fn publish_offsets(&mut self) {
         self.shared.set_offsets(Arc::new(self.offsets.clone()));
+    }
+
+    fn publish_controller_tools(&mut self) {
+        let tools = Arc::new(self.controller_tools.values().cloned().collect::<Vec<_>>());
+        self.shared.set_controller_tools(Arc::clone(&tools));
+        self.emit(EngineEvent::ControllerTools(tools));
+    }
+
+    /// Drop the cached controller tool table.
+    ///
+    /// Called before a fresh `$#` report and when a session or discovery
+    /// restarts. A soft reset is deliberately not included: the controller
+    /// keeps its stored tool table across `0x18`.
+    fn clear_controller_tools(&mut self) {
+        if self.controller_tools.is_empty() {
+            self.shared.set_controller_tools(Arc::new(Vec::new()));
+            return;
+        }
+        self.controller_tools.clear();
+        self.publish_controller_tools();
     }
 
     fn publish_parser_state(&mut self) {

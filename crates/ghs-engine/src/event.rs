@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ghs_core::{ControllerInfo, ProbeResult, Setting, SettingValue};
+use ghs_core::{ControllerInfo, ProbeResult, Setting, SettingValue, ToolEntry};
 use ghs_gcode::Program;
 use ghs_proto::{CodeTable, SettingDescription, SettingGroup};
 
@@ -120,6 +120,14 @@ pub enum EngineEvent {
         /// Error code descriptions.
         errors: Arc<CodeTable>,
     },
+
+    /// The controller-reported `[T:...]` tool table changed.
+    ///
+    /// Entries are sorted by tool number and are read-only. The same list is
+    /// available from [`crate::EngineHandle::controller_tools`]; the event
+    /// avoids polling and never mixes these entries with the application's own
+    /// editable tool table.
+    ControllerTools(Arc<Vec<ToolEntry>>),
 
     /// A probe result from `[PRB:...]` or the status `PRB:` field.
     Probe(ProbeResult),
