@@ -67,13 +67,26 @@ Generate the form; do not hardcode setting numbers. Map types:
 - Keymap and app settings are local; JSON/TOML with atomic writes and rolling
   backups.
 
+## Height maps
+
+- A completed map is saved in the controller profile
+  (`ControllerData.height_maps`) with its grid, row-major samples,
+  WCS/G92/TLO frame, tool number, and timestamp. A profile keeps at most 16
+  maps; loading a profile starts with its own maps only.
+- A saved map opens read-only. Loading never applies compensation or starts a
+  job; Apply is a separate, gated action.
+- A saved map whose WCS/G92/TLO frame differs from the live machine is flagged
+  and refused for Apply. Incomplete maps and programs that leave the mapped
+  area are refused rather than extrapolated or run uncompensated.
+
 ## Profiles and backup
 
 - Profile keyed by `$I+` identity: firmware, board, driver, serial number when
   available. A reconnect with a different controller must not silently apply
   another machine's offsets/tools.
 - Backup bundle: app settings, controller settings snapshot, offsets, tool
-  table, macros, keymap. Versioned schema; import validates before writing.
+  table, macros, keymap, and saved height maps. Versioned schema; import
+  validates before writing.
 - Atomic writes: temp file → fsync → rename; keep the last N backups.
 - No telemetry; exports are user-initiated.
 

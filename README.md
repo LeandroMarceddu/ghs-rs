@@ -11,10 +11,11 @@ macOS, and Linux.
 
 > **Status: pre-alpha, M6.** Protocol, simulator, serial, job streaming, the
 > real 2D viewer, generated settings, live offsets, the tool table, profiles,
-> backups, the probe workspace, and the height-map measurement and explicit
-> Apply/Revert workflow are implemented. The reference FlexiHAL is not yet
-> available for hardware validation, so all evidence so far is simulator and
-> unit-test based. See [docs/PLAN.md](docs/PLAN.md).
+> backups, the probe workspace, and the height-map measurement, explicit
+> Apply/Revert, and per-profile map save/load workflow are implemented. The
+> reference FlexiHAL is not yet available for hardware validation, so all
+> evidence so far is simulator and unit-test based. See
+> [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
 
@@ -57,7 +58,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
   partial-map invalidation, 2D overlay, and CSV export. Explicit Apply rewrites
   the loaded program with bilinear compensation, keeps the original for Revert,
-  and labels the compensated job.
+  and labels the compensated job. Maps are saved per controller profile and
+  reloaded with a WCS/G92/TLO frame check.
 - **Touch shell** — approved C1/C2/C3 layout, 48 px primary controls,
   dark/light themes, and a resizable desktop layout from 1024×600 up.
 

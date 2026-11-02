@@ -101,7 +101,9 @@ safe Z, spindle off) and a retract. Do not hand the app raw prelude text.
   contours are M7.
 - Re-probe invalid points; do not interpolate across a failed corner blindly.
 - A height map is per workpiece/setup; do not silently reuse it after a WCS or
-  tool change.
+  tool change. Save it in the controller profile with its grid, samples, and
+  WCS/G92/TLO frame; loading is read-only and Apply remains an explicit,
+  gated action.
 
 ## UI
 
