@@ -799,7 +799,6 @@ pub enum MacroAction {
     SafeZ,
     Home,
     Unlock,
-    Park,
     ProbeZ,
     Coolant,
 }
@@ -1390,7 +1389,6 @@ impl AppState {
                 mac("Safe Z", MacroAction::SafeZ),
                 mac("Home", MacroAction::Home),
                 mac("Unlock", MacroAction::Unlock),
-                mac("Park", MacroAction::Park),
                 mac("Probe Z", MacroAction::ProbeZ),
                 mac("M8/M9", MacroAction::Coolant),
             ],
@@ -2285,17 +2283,11 @@ impl AppState {
                 self.machine_state = "Idle";
                 self.push_console(ConsoleLevel::Ok, "ok (unlock is visual only)");
             }
-            MacroAction::Park => {
-                self.set_value(Axis::X, -1043.33);
-                self.set_value(Axis::Y, -801.0);
-                self.set_value(Axis::Z, -2.0);
-                self.machine_state = "Idle";
-            }
             MacroAction::ProbeZ => {
-                self.machine_state = "Probe";
+                self.mode = Mode::Probe;
                 self.push_console(
-                    ConsoleLevel::Warn,
-                    "probe cycle is not wired in the M0 shell",
+                    ConsoleLevel::Info,
+                    "Opened Probe > Z touch plate (mock; no probe starts)",
                 );
             }
             MacroAction::Coolant => {

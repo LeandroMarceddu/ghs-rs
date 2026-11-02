@@ -413,7 +413,7 @@ impl ProbeCard {
             }
             ProbeCard::HeightMap => {
                 "Row-major grid of Z touches with a retract between points. Missing cells stay \
-                 invalid; this build measures and exports the map but does not compensate the job."
+                 invalid; Apply rewrites the loaded program and keeps the original for Revert."
             }
         }
     }

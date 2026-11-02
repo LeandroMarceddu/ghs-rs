@@ -2370,7 +2370,7 @@ impl Shell {
     fn macro_allowed(&self, action: crate::state::MacroAction) -> bool {
         use crate::state::MacroAction;
         match action {
-            MacroAction::Unlock | MacroAction::Home | MacroAction::Park => self.ready(),
+            MacroAction::Unlock | MacroAction::Home => self.ready(),
             MacroAction::ProbeZ => self.ready(),
             MacroAction::ZeroXy | MacroAction::ZeroZ | MacroAction::SafeZ => self.mdi_allowed(),
             MacroAction::Coolant => self.aux_allowed(),
@@ -3596,17 +3596,20 @@ impl Shell {
             MacroAction::Unlock => {
                 self.send_command(Command::Unlock);
             }
-            MacroAction::Park => {
-                self.state.push_console(
-                    ConsoleLevel::Warn,
-                    "Park needs a machine-specific position; not sent (M7)",
-                );
-            }
             MacroAction::ProbeZ => {
-                self.state.push_console(
-                    ConsoleLevel::Warn,
-                    "Probe cycles are not wired until M6; not sent",
-                );
+                self.state.mode = Mode::Probe;
+                let ctx = self.probe_context();
+                if self.state.probe.select_card(ProbeCard::ZTouchPlate, &ctx) {
+                    self.state.push_console(
+                        ConsoleLevel::Info,
+                        "Opened Probe > Z touch plate; press RUN to start",
+                    );
+                } else {
+                    self.state.push_console(
+                        ConsoleLevel::Warn,
+                        "Finish or stop the active probe before opening another cycle",
+                    );
+                }
             }
             MacroAction::Coolant => {
                 if self.send_command(Command::Realtime(RealtimeCommand::FloodToggle))
