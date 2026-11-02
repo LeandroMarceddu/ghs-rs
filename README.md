@@ -75,8 +75,7 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 ## In progress
 
 - Keymap editing.
-- Start-from-line/check mode, i18n, packaging, and the post-v1.0 SD/ATC/MPG
-  surfaces.
+- Start-from-line/check mode, i18n, and the post-v1.0 SD/ATC/MPG surfaces.
 - Hardware validation on the reference FlexiHAL.
 
 ## Build
@@ -115,9 +114,11 @@ open the connection panel to select a real serial port.
 - [docs/architecture.md](docs/architecture.md) — crates, threading, safety
 - [docs/protocol.md](docs/protocol.md) — grblHAL protocol surface
 - [docs/parity.md](docs/parity.md) — ioSender feature checklist
+- [docs/app-viewer.md](docs/app-viewer.md) — 2D/3D viewer and program list
 - [docs/settings.md](docs/settings.md) — settings, offsets, tools, backups
 - [docs/probing.md](docs/probing.md) — probing and height-map contract
 - [docs/app-engine.md](docs/app-engine.md) — app/engine boundary
+- [docs/RELEASE.md](docs/RELEASE.md) — release checklist and artifacts
 - [docs/SAFETY.md](docs/SAFETY.md) — non-negotiable motion rules
 
 ## License

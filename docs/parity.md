@@ -199,15 +199,15 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| REL-01 | CI on Linux, macOS, Windows | M0 | wip | Workflow being added |
-| REL-02 | Unit, golden, and property tests | M1 | todo | Per crate |
-| REL-03 | Simulator scenario suite | M1 | todo | Alarms, tool change, probing, reconnect |
+| REL-01 | CI on Linux, macOS, Windows | M0 | done | fmt, clippy, tests, 3-OS build |
+| REL-02 | Unit, golden, and property tests | M1 | done | Per crate |
+| REL-03 | Simulator scenario suite | M1 | partial | Alarm/tool/probe/reconnect coverage |
 | REL-04 | Hardware-in-the-loop checklist | M2 | todo | FlexiHAL |
-| REL-05 | Windows, macOS, Linux packaging | M7 | todo | MSI, DMG, AppImage/deb |
+| REL-05 | Windows, macOS, Linux packaging | M7 | partial | Draft archives; signed installers open |
 | REL-06 | Code signing and notarization | M7 | todo | Best effort |
 | REL-07 | User manual and troubleshooting guide | M7 | todo | Docs site or mdBook |
 | REL-08 | Versioning and changelog | M7 | todo | Semver |
-| REL-09 | License and attribution review | M0 | todo | MIT/Apache plus NOTICE |
+| REL-09 | License and attribution review | M0 | done | MIT/Apache plus NOTICE |
 | REL-10 | Performance benchmarks in CI | M4 | todo | Thresholds |
 
 ## Explicitly not applicable

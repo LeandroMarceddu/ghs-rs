@@ -1,6 +1,6 @@
 # ghs-rs — implementation plan
 
-**Status:** M5 closeout (macros/keymap/offset backup); M6 hardware validation pending
+**Status:** M7 — 3D viewer and release packaging done; i18n/keymap/hardware pending
 **Updated:** 2026-11-02
 **Reference hardware:** FlexiHAL / STM32F446, grblHAL `1.1f.20240604`
 
@@ -20,9 +20,10 @@ offset and height-map Z offset are implemented and persisted per profile.
 Startup-line read/edit/verify and the read-only controller tool table are also
 implemented. The remaining M5 work is keymap persistence; basic single-line
 user macros and the WCS-only offsets backup/restore are implemented, with
-advanced macro forms deferred. The M7 3D toolpath viewer is implemented;
-i18n, stock meshes, packaging, and release validation remain. Hardware
-validation remains the M6 gate before the M7 release pass.
+advanced macro forms deferred. The M7 3D toolpath viewer, release workflow,
+Linux desktop entry, and release checklist are implemented. Remaining M7 work is
+i18n, stock meshes, keymap persistence, signed/installer packaging, and the full
+release QA pass. Hardware validation remains the M6 gate before publishing.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
 it parses every status field, real-time command, system command, and runtime
