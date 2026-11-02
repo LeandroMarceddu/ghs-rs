@@ -230,8 +230,9 @@ the link is ready and the machine is `Idle`.
 
 - **Feed override:** 10–200%, slider plus `-10`/`+10`.
 - **Spindle override:** 50–200%, slider in the Spindle card.
-- **Rapid override:** the state tracks it, but this build has no rapid
-  override control in the UI. Do not expect a rapid-override button.
+- **Rapid override:** the `RAPID 100%` chip in the viewer header cycles
+  `100% -> 50% -> 25% -> 100%`. It shows the value reported by the controller;
+  a tap never changes the label until the next snapshot confirms it.
 
 ### Spindle and coolant
 
@@ -277,7 +278,8 @@ loader.
 
 Open the left **Program** tab to see the parsed line list. The current line is
 highlighted as the job runs. The footer shows total lines and
-`line N | P%`. The viewer header shows the same percentage and line count.
+`line N | P%`. The viewer header shows the same percentage, line count, and an
+`ETA MM:SS` estimate while a job is running or paused with usable progress.
 Search supports `FILTER` and `HIGHLIGHT`, with `PREV`, `NEXT`, and `JUMP`.
 
 ### Start, pause, resume, stop
@@ -762,8 +764,6 @@ Exports are user-initiated. There is no telemetry and no network transport.
   support exists; the shell does not expose the toggles.
 - **No drag-and-drop or recent-files list.** The in-app browser lists one
   directory at a time and remembers the last folder only for the session.
-- **No rapid-override control.** Feed and spindle overrides are exposed; rapid
-  override is tracked but has no UI.
 - **Advanced macros are absent.** User macros are single-line MDI commands;
   no parameters, special words, multi-line bodies, or `$` system commands.
 - **Probe Apply is partial.** Rotation and tool-length report values; work

@@ -80,7 +80,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | todo | Jog cancel on release |
 | CTL-05 | Jog cancel and pendant-safe behavior | M2 | todo | `0x85` |
 | CTL-06 | Feed override, fine and coarse, reset | M2 | todo | Slider plus buttons |
-| CTL-07 | Rapid override | M2 | todo | Low, medium, reset |
+| CTL-07 | Rapid override | M2 | done | 100/50/25 compact chip |
 | CTL-08 | Spindle control and override | M2 | todo | On/off, CW/CCW, RPM, stop |
 | CTL-09 | Coolant mist, flood, fan | M2 | todo | Capability-gated |
 | CTL-10 | MDI with history | M2 | todo | Multi-line support |
@@ -105,7 +105,7 @@ implemented before its UI or hardware validation row is complete.
 | JOB-05 | Manual tool change prompt and resume | M3 | done | `TC`, persistent tool plugin |
 | JOB-06 | Optional stop, single block, block delete | M3 | todo | Realtime toggles |
 | JOB-07 | Start-from-line, run-to-line, breakpoints | M3 | todo | Confirmations |
-| JOB-08 | Progress, elapsed time, ETA | M3 | partial | Progress/time; ETA open |
+| JOB-08 | Progress, elapsed time, ETA | M3 | done | Progress/time and ETA |
 | JOB-09 | Console with filtering and file log | M3 | partial | Bounded console; file log open |
 | JOB-10 | Dry run and check mode | M3 | todo | Never moves |
 | JOB-11 | Defined reconnect and interruption policy | M3 | todo | No silent resume |

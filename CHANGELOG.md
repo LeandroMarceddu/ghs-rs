@@ -28,13 +28,14 @@ section exists to diff against.
   thread with synchronized writes, hotplug watching, and a connection panel.
   Line settings are 8N1 with a selectable baud rate.
 - **Engine and manual control** — a dedicated engine session with live DRO,
-  hold-to-jog, MDI, feed and spindle overrides, spindle and coolant controls,
-  reset/stop, and a console. All commands pass through one safety gateway.
+  hold-to-jog, MDI, feed, spindle, and rapid overrides, spindle and coolant
+  controls, reset/stop, and a console. All commands pass through one safety
+  gateway.
 - **Jobs** — in-app program file browser and loading with a 20 MiB UTF-8
   bound; character-counting streaming against the reported receive buffer;
-  pause, resume, and stop; a tool-change sheet; progress and current-line
-  display; a parsed program list with text/line-number search, filter,
-  highlight, previous/next, and jump. Job recovery never auto-resumes.
+  pause, resume, and stop; a tool-change sheet; progress, elapsed time, and an
+  ETA; a parsed program list with text/line-number search, filter, highlight,
+  previous/next, and jump. Job recovery never auto-resumes.
 - **Viewer** — parsed toolpath in 2D top view or 3D orbit view, with fit, pan,
   zoom, pinch, ground grid, work envelope, motion-style paths, a live tool
   marker, and height-map cells projected in both views.
