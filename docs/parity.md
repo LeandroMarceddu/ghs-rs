@@ -77,7 +77,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-01 | DRO for all axes and work coordinate systems | M2 | todo | X/Y/Z first, 9-axis capable |
 | CTL-02 | Zero axes and set position | M2 | todo | Per axis and all |
 | CTL-03 | Goto and park | M2 | todo | Confirmation for Goto |
-| CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | partial | No keyboard jog; jog feed follows global feed |
+| CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | partial | Keyboard one-step; hold pointer-only; jog feed global |
 | CTL-05 | Jog cancel and pendant-safe behavior | M2 | done | `0x85` |
 | CTL-06 | Feed override, fine and coarse, reset | M2 | done | Slider, ±1/±10, reset |
 | CTL-07 | Rapid override | M2 | done | 100/50/25 compact chip |
@@ -88,7 +88,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-12 | Signals, pins, and AUX IO display | M2 | todo | HSDEP plus 4/4 AUX |
 | CTL-13 | Macros with parameters and special words | M5 | partial | Single-line MDI editor/run; params/system/multi-line deferred |
 | CTL-14 | Startup lines | M5 | done | Read, edit, read-back verify |
-| CTL-15 | Keymap editor | M5 | todo | Keyboard and gamepad later |
+| CTL-15 | Keymap editor | M5 | done | Ten machine actions, runtime rebind |
 | CTL-16 | Work offsets editor, G54–G59.3, G10 | M5 | done | Edit, zero, goto, G92 clear |
 | CTL-17 | App-side tool table and manual M6 workflow | M5 | done | Controller table read-only |
 | CTL-18 | Metric and imperial units | M2 | todo | mm canonical |
@@ -139,7 +139,7 @@ implemented before its UI or hardware validation row is complete.
 | SETUP-05 | App settings and controller profiles | M5 | done | Keyed by `$I` identity |
 | SETUP-06 | Import and export settings, offsets, tools | M5 | partial | Backup bundle; offsets `.nc` open |
 | SETUP-07 | Controller reset (`$RST`) with backup prompt | M5 | todo | Destructive, confirmed |
-| SETUP-08 | Keymap persistence | M5 | todo | Includes jog keys |
+| SETUP-08 | Keymap persistence | M5 | done | Machine actions; gamepad later |
 | SETUP-09 | Startup line persistence | M5 | done | `$N` read/edit/verify |
 | SETUP-10 | Tool table persistence | M5 | done | App-side |
 | SETUP-11 | Offsets backup and restore | M5 | done | WCS-only `offsets.nc`; load-as-program |
@@ -152,9 +152,9 @@ implemented before its UI or hardware validation row is complete.
 | PROBE-02 | Tool length probing | M6 | partial | Reports delta; TLO apply deferred |
 | PROBE-03 | Edge finder X/Y, inside and outside | M6 | done | Edge offset |
 | PROBE-04 | Corner finder | M6 | done | XY touch plate |
-| PROBE-05 | Center finder, circle and rectangle | M6 | partial | Circle UI; rectangle helper only |
+| PROBE-05 | Center finder, circle and rectangle | M6 | done | Circle and rectangle UI |
 | PROBE-06 | Rotation and straightness | M6 | partial | Reports angle; work rotation apply deferred |
-| PROBE-07 | XY touch plate offsets | M6 | todo | Single probe input |
+| PROBE-07 | XY touch plate offsets | M6 | done | Outside-edge plate workflow |
 | PROBE-08 | Probe verify and connected flow | M6 | done | No `PC` signal on this build |
 | PROBE-09 | Pre and post probe macros | M6 | todo | Bounded |
 | PROBE-10 | Height map probing | M6 | done | Grid, feeds, safe Z, overlay, CSV |
@@ -188,7 +188,7 @@ implemented before its UI or hardware validation row is complete.
 | UX-05 | 48 px targets, no hover-only actions | M2 | todo | Touch audit |
 | UX-06 | Dockable Workbench layout | M7 | todo | Optional mode |
 | UX-07 | Dark, light, high-contrast themes | M5 | todo | Shop-floor default |
-| UX-08 | Keyboard navigation and accessibility | M7 | todo | AccessKit |
+| UX-08 | Keyboard navigation and accessibility | M7 | partial | Machine keymap; full navigation/AccessKit open |
 | UX-09 | Localization, starting with en, pt-BR, de | M7 | todo | Runtime switch |
 | UX-10 | First-run safety onboarding | M7 | todo | Checklist |
 | UX-11 | Error dialogs and notifications | M2 | todo | Actionable |

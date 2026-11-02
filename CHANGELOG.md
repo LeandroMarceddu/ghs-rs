@@ -29,9 +29,9 @@ section exists to diff against.
   Line settings are 8N1 with a selectable baud rate.
 - **Engine and manual control** — a dedicated engine session with live DRO,
   hold-to-jog, MDI with session history, feed, spindle, and rapid overrides
-  (including fine/reset), spindle and coolant controls, reset/stop/sleep, and a
-  filterable console with a bounded log snapshot. All commands pass through one
-  safety gateway.
+  (including fine/reset), spindle and coolant controls, reset/stop/sleep, a
+  filterable console with a bounded log snapshot, and a per-profile machine
+  keymap. All commands pass through one safety gateway.
 - **Jobs** — in-app program file browser and loading with a 20 MiB UTF-8
   bound; character-counting streaming against the reported receive buffer;
   pause, resume, and stop; a tool-change sheet; optional-stop, single-block, and
@@ -50,9 +50,10 @@ section exists to diff against.
   `G28`/`G30` goto and explicit `G92.1` clear; a WCS-only `offsets.nc` export
   with validated load-as-program restore; an app-side persisted tool table
   used by the M6 sheet; and a read-only controller tool table.
-- **Probing** — Z touch plate, edge X/Y, corner, and center-circle cycles, plus
-  rotation-angle and tool-length delta reporting. Every run uses a mandatory
-  preflight, ordered `PRB` binding, and a confirmed `G10 L2` apply.
+- **Probing** — Z touch plate, edge X/Y, corner, center-circle, center-rectangle,
+  XY touch-plate, plus rotation-angle and tool-length delta reporting. Every run
+  uses a mandatory preflight, ordered `PRB` binding, and a confirmed `G10 L2`
+  apply.
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
   partial-map invalidation, 2D/3D cell overlay, and CSV export. A constant map
   Z offset shifts effective heights without re-probing. Explicit Apply rewrites
@@ -148,8 +149,9 @@ section exists to diff against.
   not code-signed or notarized and have no `.app` bundle. Only per-file
   Gatekeeper/SmartScreen overrides are appropriate, and downloads should be
   checked against `SHA256SUMS.txt`.
-- **No keymap editor.** Keyboard jog, gamepad mapping, and keymap persistence
-  are not implemented; the app ships no configurable keymap.
+- **Machine keymap only.** Keyboard jog/start/pause/resume/stop are configurable;
+  full keyboard navigation, screen-reader labels, and gamepad mapping are not
+  implemented. Keyboard jog is one step per press; hold-to-jog is pointer-only.
 - **No start-from-line or check mode.** The UI has no start-from-line or
   dry-run/check workflow, and the engine only accepts a start at line 1 because
   it cannot synthesize a modal preamble for a later line.

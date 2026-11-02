@@ -479,8 +479,10 @@ bar, then the cycle cards:
 - Edge Y
 - Corner
 - Center circle
+- Center rectangle
 - Rotation
 - Tool length
+- XY touch plate
 - Height map
 
 Select a card (or press its `CONFIGURE`) to open the detail sheet.
@@ -634,6 +636,25 @@ the Probe workspace's Z touch-plate card; it does **not** start a probe.
   ACTIVE`.
 - Startup lines execute automatically on every controller reset and can
   command motion, spindle, or coolant. Edit them with the machine clear.
+
+### Keymap
+
+**Utility** → `KEYMAP` lists ten machine actions: jog X−/X+, Y−/Y+, Z−/Z+,
+`START`, `PAUSE`, `RESUME`, and `STOP`.
+
+- Defaults are modifier-heavy so typing is not stolen:
+  `Ctrl+Shift+arrows` for X/Y, `Ctrl+Shift+PgUp/PgDn` for Z, and `F5`–`F8` for
+  start/pause/resume/stop.
+- `EDIT` opens a capture sheet; `RESET DEFAULTS` restores the defaults.
+  Changes stay local until `SAVE`, which writes the per-profile keymap.
+- Rebinding is applied at runtime after profile load or SAVE; no restart is
+  required.
+- A focused text field or the key-capture editor suppresses machine actions.
+  `STOP` remains available while non-text sheets are open.
+- Keyboard jog is one step per press; hold-to-jog remains pointer-only.
+- Refusals follow the same gates as the buttons: mock, not ready, Alarm/Door,
+  active job, no program, probe program, no paused/running job, pending tool
+  change, or watchdog pause.
 
 ## 13. Profiles and backups
 
@@ -803,8 +824,9 @@ Exports are user-initiated. There is no telemetry and no network transport.
 - **Builds are unsigned and pre-alpha.** Linux archives have no signature,
   macOS builds are not signed/notarized, and Windows builds have no
   Authenticode signature. See [RELEASE.md](RELEASE.md).
-- **No keymap editor.** The keymap record exists in the profile/backup format,
-  but the editor is not implemented.
+- **Machine keymap only.** The editor covers jog/start/pause/resume/stop; full
+  keyboard navigation, screen-reader labels, and gamepad mapping are not
+  implemented.
 - **No start-from-line or check mode.** The job toolbar can set breakpoints and
   run to a line from the beginning, but it cannot start mid-program; the engine
   rejects `from_line > 1` because it cannot synthesize a modal preamble.

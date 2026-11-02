@@ -37,7 +37,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   alarm/error tables, parser state, and runtime enumeration.
 - **Manual control** — live DRO, hold-to-jog, MDI with history, feed/spindle/
   rapid overrides with fine/reset actions, spindle and coolant controls,
-  reset/stop/sleep, and a filterable console with a saved log.
+  reset/stop/sleep, a filterable console with a saved log, and a per-profile
+  machine keymap.
 - **Jobs** — in-app program file browser and loading, streaming, pause/resume/
   stop, tool-change sheet, optional-stop/single-block/block-delete run options,
   breakpoints and run-to-line, progress, ETA and current line, a real parsed
@@ -60,12 +61,13 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 - **Profiles and backups** — identity-keyed controller profiles, app config,
   atomic saves, rolling backups, export/validate/import, and identity-mismatch
   confirmation.
-- **Probing** — Z touch plate, edge X/Y, corner, and center-circle cycles, plus
-  rotation and tool-length reporting. Every run has a mandatory preflight
-  (link, Idle, spindle/coolant off, probe signal or explicit confirmation, and
-  loaded offsets), ordered `PRB` binding, and a confirmed `G10 L2` apply. The
-  probe mount XY offset is persisted per profile; entered positions are
-  feature/probe-tip coordinates and plans shift the controlled point.
+- **Probing** — Z touch plate, edge X/Y, corner, center circle, center
+  rectangle, XY touch plate, plus rotation and tool-length reporting. Every run
+  has a mandatory preflight (link, Idle, spindle/coolant off, probe signal or
+  explicit confirmation, and loaded offsets), ordered `PRB` binding, and a
+  confirmed `G10 L2` apply. The probe mount XY offset is persisted per profile;
+  entered positions are feature/probe-tip coordinates and plans shift the
+  controlled point.
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
   partial-map invalidation, 2D overlay, and CSV export. A constant map Z offset
   shifts effective heights without re-probing. Explicit Apply rewrites the
@@ -77,8 +79,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 
 ## In progress
 
-- Keymap editing.
-- Start-from-line/check mode, i18n, and the post-v1.0 SD/ATC/MPG surfaces.
+- Start-from-line/check mode, i18n, utilities/calibration, and signed
+  installers.
 - Hardware validation on the reference FlexiHAL.
 
 ## Build

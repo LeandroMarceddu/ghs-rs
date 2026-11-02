@@ -74,6 +74,9 @@ Generate the form; do not hardcode setting numbers. Map types:
 - Startup lines `$N0`/`$N1` are read/written through the engine; never edit
   while a job is active. A write is explicit, idle-only, and read back to
   verify the stored text; it is never optimistically reflected in the UI.
+- The keymap editor covers ten machine actions and persists per profile.
+  Bindings apply at runtime after profile load or save. Keyboard jog is one
+  step per press; text fields suppress machine actions.
 - Keymap and app settings are local; JSON/TOML with atomic writes and rolling
   backups.
 
