@@ -9,12 +9,12 @@ The goal is a touch-first CNC sender with the ergonomics of
 feature set of [ioSender](https://github.com/terjeio/ioSender) — on Windows,
 macOS, and Linux.
 
-> **Status: pre-alpha, M6.** Protocol, simulator, serial, job streaming, the
-> real 2D viewer, generated settings, live offsets, the tool table, profiles,
-> backups, the probe workspace, and the height-map measurement, explicit
-> Apply/Revert, and per-profile map save/load workflow are implemented. The
-> reference FlexiHAL is not yet available for hardware validation, so all
-> evidence so far is simulator and unit-test based. See
+> **Status: pre-alpha, M6 complete except hardware.** Protocol, simulator,
+> serial, job streaming, the real 2D viewer, generated settings, live offsets,
+> the tool table, profiles, backups, the probe workspace, and the height-map
+> measurement, explicit Apply/Revert, and per-profile map save/load workflow are
+> implemented. The reference FlexiHAL is not yet available for hardware
+> validation, so all evidence so far is simulator and unit-test based. See
 > [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
@@ -54,11 +54,14 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 - **Probing** — Z touch plate, edge X/Y, corner, and center-circle cycles, plus
   rotation and tool-length reporting. Every run has a mandatory preflight
   (link, Idle, spindle/coolant off, probe signal or explicit confirmation, and
-  loaded offsets), ordered `PRB` binding, and a confirmed `G10 L2` apply.
+  loaded offsets), ordered `PRB` binding, and a confirmed `G10 L2` apply. The
+  probe mount XY offset is persisted per profile; entered positions are
+  feature/probe-tip coordinates and plans shift the controlled point.
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
-  partial-map invalidation, 2D overlay, and CSV export. Explicit Apply rewrites
-  the loaded program with bilinear compensation, keeps the original for Revert,
-  and labels the compensated job. Maps are saved per controller profile and
+  partial-map invalidation, 2D overlay, and CSV export. A constant map Z offset
+  shifts effective heights without re-probing. Explicit Apply rewrites the
+  loaded program with bilinear compensation, keeps the original for Revert, and
+  labels the compensated job. Maps are saved per controller profile and
   reloaded with a WCS/G92/TLO frame check.
 - **Touch shell** — approved C1/C2/C3 layout, 48 px primary controls,
   dark/light themes, and a resizable desktop layout from 1024×600 up.

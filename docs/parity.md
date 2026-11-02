@@ -148,20 +148,22 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| PROBE-01 | Z touch plate | M6 | todo | Safe Z, retries |
-| PROBE-02 | Tool length probing | M6 | todo | Update TLO |
-| PROBE-03 | Edge finder X/Y, inside and outside | M6 | todo | Edge offset |
-| PROBE-04 | Corner finder | M6 | todo | XY touch plate |
-| PROBE-05 | Center finder, circle and rectangle | M6 | todo | Multi-pass |
-| PROBE-06 | Rotation and straightness | M6 | todo | Two-point and multi-point |
+| PROBE-01 | Z touch plate | M6 | done | Safe Z, retries |
+| PROBE-02 | Tool length probing | M6 | partial | Reports delta; TLO apply deferred |
+| PROBE-03 | Edge finder X/Y, inside and outside | M6 | done | Edge offset |
+| PROBE-04 | Corner finder | M6 | done | XY touch plate |
+| PROBE-05 | Center finder, circle and rectangle | M6 | partial | Circle UI; rectangle helper only |
+| PROBE-06 | Rotation and straightness | M6 | partial | Reports angle; work rotation apply deferred |
 | PROBE-07 | XY touch plate offsets | M6 | todo | Single probe input |
-| PROBE-08 | Probe verify and connected flow | M6 | todo | No `PC` signal on this build |
+| PROBE-08 | Probe verify and connected flow | M6 | done | No `PC` signal on this build |
 | PROBE-09 | Pre and post probe macros | M6 | todo | Bounded |
 | PROBE-10 | Height map probing | M6 | done | Grid, feeds, safe Z, overlay, CSV |
 | PROBE-11 | Height map compensation and export | M6 | done | Explicit Apply rewrite, original preserved |
-| PROBE-12 | Probe-safe interlocks | M6 | todo | Mandatory |
-| PROBE-13 | Probe feed, step, and retry settings | M6 | todo | Persisted |
-| PROBE-14 | Probe results display and log | M6 | todo | PRB history |
+| PROBE-12 | Probe-safe interlocks | M6 | done | Mandatory preflight |
+| PROBE-13 | Probe feed, step, and retry settings | M6 | partial | Offset persisted; feed/search per run |
+| PROBE-14 | Probe results display and log | M6 | done | PRB history |
+| PROBE-15 | Probe mount XY offset | M6 | done | Persisted per profile; feature vs controlled point |
+| PROBE-16 | Height-map Z offset | M6 | done | Effective map; raw samples retained |
 
 ## Utilities and wizards
 

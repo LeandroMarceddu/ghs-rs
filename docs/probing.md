@@ -15,6 +15,20 @@ explicit preflight.
 - Spindle must be off; the workflow refuses to start with `M3`/`M4` active.
 - Work offset and current WCS are known and displayed before the run.
 
+## Coordinate frames
+
+- Operator-entered positions, centres, and height-map grid origins are
+  **feature/probe-tip** coordinates.
+- The probe mount offset is `probe tip - controlled point`, in millimetres. It
+  is stored per controller profile and is never sent to the controller.
+- Generated plan `from`/`to` values are **controlled-point** coordinates:
+  `controlled = feature - probe_offset`. `PRB` positions are controlled-point;
+  result math adds the offset back before computing an edge, centre, or angle.
+- The height-map Z offset is a constant datum shift added to every measured
+  height. Raw samples and the offset are persisted; summaries, the overlay,
+  CSV, and compensation use the effective height. It never changes the probing
+  plan or the surface-Z search target.
+
 ## Safety contract
 
 A probe run is refused unless:
