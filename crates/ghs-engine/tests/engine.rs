@@ -833,6 +833,97 @@ fn probe_results_update_the_snapshot_and_offsets() {
 }
 
 #[test]
+fn soft_reset_clears_the_cached_probe_result() {
+    let (handle, control) = connected_engine(standard_script);
+    wait_ready(&handle);
+
+    control.push_line("[PRB:1.000,2.000,-3.000:1]");
+    wait_event(&handle, Duration::from_secs(1), |event| {
+        matches!(event, EngineEvent::Probe(_))
+    });
+    assert_eq!(
+        handle.offsets().probe.map(|probe| probe.position),
+        Some(Position::xyz(1.0, 2.0, -3.0))
+    );
+    assert!(handle.snapshot().probe.is_some());
+
+    handle.send(Command::Reset).expect("soft reset");
+    assert_sent_byte(&control, 0x18);
+
+    assert!(
+        wait_until(
+            || handle.offsets().probe.is_none() && handle.snapshot().probe.is_none(),
+            Duration::from_secs(1)
+        ),
+        "a soft reset must drop the cached probe result: offsets={:?}, snapshot={:?}",
+        handle.offsets().probe,
+        handle.snapshot().probe
+    );
+
+    // Only the probe result expires: the work offsets stay cached until the
+    // controller repopulates them after the reset.
+    let offsets = handle.offsets();
+    assert_eq!(offsets.wcs(Wcs::G54), Some(Position::xyz(10.0, 20.0, 30.0)));
+    assert_eq!(offsets.g92, Some(Position::xyz(0.0, 0.0, 0.0)));
+    assert!(offsets.tlo.is_some());
+
+    // A fresh probe after the reset must still replace the cleared result.
+    control.push_line("[PRB:4.000,5.000,-6.000:1]");
+    let probe = wait_event(
+        &handle,
+        Duration::from_secs(1),
+        |event| matches!(event, EngineEvent::Probe(result) if result.success),
+    );
+    match probe {
+        EngineEvent::Probe(result) => {
+            assert_eq!(result.position, Position::xyz(4.0, 5.0, -6.0));
+        }
+        other => panic!("expected probe, got {other:?}"),
+    }
+    assert_eq!(
+        handle.offsets().probe.map(|probe| probe.position),
+        Some(Position::xyz(4.0, 5.0, -6.0))
+    );
+    assert_eq!(
+        handle.snapshot().probe.map(|probe| probe.position),
+        Some(Position::xyz(4.0, 5.0, -6.0))
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn destructive_offset_resets_clear_the_cached_probe_result() {
+    let (handle, control) = connected_engine(|control| {
+        standard_script(control);
+        control.expect_line("$RST=#", &["ok"]);
+        control.expect_line("$RST=*", &["ok"]);
+    });
+    wait_ready(&handle);
+
+    for (target, line) in [
+        (ghs_proto::ResetTarget::Offsets, "$RST=#"),
+        (ghs_proto::ResetTarget::All, "$RST=*"),
+    ] {
+        control.push_line("[PRB:1.000,2.000,-3.000:1]");
+        wait_event(&handle, Duration::from_secs(1), |event| {
+            matches!(event, EngineEvent::Probe(_))
+        });
+        assert!(handle.offsets().probe.is_some());
+
+        send_retry(&handle, Command::System(SystemCommand::Reset(target))).expect("reset command");
+        assert_sent_line(&control, line);
+        assert!(
+            wait_until(
+                || handle.offsets().probe.is_none() && handle.snapshot().probe.is_none(),
+                Duration::from_secs(1)
+            ),
+            "{line} must drop the cached probe result"
+        );
+    }
+    handle.shutdown();
+}
+
+#[test]
 fn disconnect_then_reconnect_works_on_the_same_engine() {
     let (handle, control) = connected_engine(standard_script);
     wait_ready(&handle);

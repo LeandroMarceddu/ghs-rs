@@ -11,9 +11,9 @@ use ghs_core::{
     AlarmCode, ControllerInfo, JobState, MachineSnapshot, MachineState, Setting, SettingValue,
 };
 use ghs_proto::{
-    CodeTable, ExtendedCommand, JogCommand, Offsets, ParserState, RealtimeCommand, Response,
-    ResponseParser, SettingDescription, SettingGroup, StatusReport, Streamer, StreamerError,
-    SystemCommand, validate_line,
+    CodeTable, ExtendedCommand, JogCommand, Offsets, ParserState, RealtimeCommand, ResetTarget,
+    Response, ResponseParser, SettingDescription, SettingGroup, StatusReport, Streamer,
+    StreamerError, SystemCommand, validate_line,
 };
 use ghs_serial::{SerialTransport, Transport, TransportError, TransportEvent};
 
@@ -864,6 +864,15 @@ impl EngineRuntime {
                 if is_sleep {
                     self.sleep_on_ack = true;
                 }
+                if matches!(
+                    &command,
+                    SystemCommand::Reset(ResetTarget::Offsets | ResetTarget::All)
+                ) {
+                    // `$RST=#` and `$RST=*` wipe the stored probe result with
+                    // the offsets; drop the cached copy as soon as the command
+                    // is accepted.
+                    self.invalidate_probe_result();
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1578,6 +1587,9 @@ impl EngineRuntime {
         self.watchdog_paused = false;
         self.write_bytes(&[0x18])?;
         self.log_command("0x18 soft reset");
+        // The controller drops its stored probe result on a soft reset; the
+        // cached copy must not survive and show a stale `PRB`.
+        self.invalidate_probe_result();
         let now = Instant::now();
         self.next_poll_at = deadline(now, self.config.status_poll_idle);
         if self.sleeping {
@@ -2181,6 +2193,40 @@ impl EngineRuntime {
         self.publish_snapshot();
         self.emit(EngineEvent::Probe(result));
         self.log_info(format!("Probe: {result}"));
+    }
+
+    /// Forget the cached `PRB` result after the controller invalidates it.
+    ///
+    /// A soft reset and `$RST=#`/`$RST=*` clear the controller's stored probe
+    /// result. The engine's copy must go too, or the offsets and probe panels
+    /// keep showing a `PRB` the controller no longer has. Work offsets, `G92`,
+    /// TLO, tool data, settings and code tables stay cached: only the probe
+    /// result expires.
+    fn invalidate_probe_result(&mut self) {
+        let had_result = self.offsets.probe.is_some()
+            || self.snapshot.probe.is_some()
+            || self
+                .last_status
+                .as_ref()
+                .is_some_and(|status| status.probe.is_some());
+        self.offsets.probe = None;
+        self.publish_offsets();
+
+        let mut next = (*self.snapshot).clone();
+        next.probe = None;
+        self.snapshot = Arc::new(next);
+        // `last_status` is republished alongside the snapshot; drop the stale
+        // field there too so re-reading the pair cannot restore the result.
+        if let Some(status) = self.last_status.take() {
+            let mut status = (*status).clone();
+            status.probe = None;
+            self.last_status = Some(Arc::new(status));
+        }
+        self.publish_snapshot();
+
+        if had_result {
+            tracing::debug!("cleared the cached probe result after a controller reset");
+        }
     }
 
     fn on_setting(&mut self, number: u16, value: SettingValue) {
