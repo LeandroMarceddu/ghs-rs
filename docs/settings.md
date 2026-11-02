@@ -44,8 +44,12 @@ Generate the form; do not hardcode setting numbers. Map types:
   non-persistent and clearly labeled.
 - "Set current position as zero" and "Goto origin" go through MDI with
   confirmation; do not move silently.
-- Backup offsets as JSON/NC (`offsets.nc` equivalent); restore requires an
-  explicit run and read-back.
+- Backup work offsets as a WCS-only `offsets.nc`: a `G21` preamble plus one
+  `G10 L2 P<n>` line per reported G54–G59.3. G92, G28/G30, HOME, TLO/TLR, G51,
+  and PRB are deliberately omitted and the file says so.
+- Restore is a validated preview followed by an explicit **Load as program**;
+  the file is loaded but never started. Running it overwrites the stored WCS
+  offsets and requires the usual Idle/ready gate.
 
 ## Tool table and manual M6
 

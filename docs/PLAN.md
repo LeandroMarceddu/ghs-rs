@@ -18,10 +18,10 @@ measurement and explicit Apply/Revert workflow are implemented, including the
 sender-side G-code rewrite and compensated-job labelling. The probe mount XY
 offset and height-map Z offset are implemented and persisted per profile.
 Startup-line read/edit/verify and the read-only controller tool table are also
-implemented. The remaining M5 work is keymap persistence and offset
-backup/restore; basic single-line user macros are implemented, with parameters,
-multi-line forms, and system commands deferred. Hardware validation remains the
-M6 gate before the M7 release pass.
+implemented. The remaining M5 work is keymap persistence; basic single-line
+user macros and the WCS-only offsets backup/restore are implemented, with
+advanced macro forms deferred. Hardware validation remains the M6 gate before
+the M7 release pass.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
 it parses every status field, real-time command, system command, and runtime

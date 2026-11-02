@@ -48,9 +48,9 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   editing with read-back verification.
 - **Offsets and tools** — live `$#` values for G54–G59.3, G28/G30, G92, HOME,
   TLO, TLR, G51 and PRB; large `G10 L20` zero controls with `$#` refresh;
-  confirmed `G28`/`G30` goto and `G92.1` clear; a persisted app-side tool table
-  used by the M6 tool-change sheet; and a separate read-only controller tool
-  table.
+  confirmed `G28`/`G30` goto and `G92.1` clear; a WCS-only `offsets.nc` export
+  with validated load-as-program restore; a persisted app-side tool table used
+  by the M6 tool-change sheet; and a separate read-only controller tool table.
 - **Macros** — per-profile single-line MDI macros with explicit RUN and
   confirmation; no macro runs on load, connect, or profile import.
 - **Profiles and backups** — identity-keyed controller profiles, app config,
@@ -73,7 +73,7 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 
 ## In progress
 
-- Keymap editing and offsets backup/restore.
+- Keymap editing.
 - Start-from-line/check mode, 3D view, i18n, packaging, and the post-v1.0
   SD/ATC/MPG surfaces.
 - Hardware validation on the reference FlexiHAL.

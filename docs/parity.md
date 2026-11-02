@@ -142,7 +142,7 @@ implemented before its UI or hardware validation row is complete.
 | SETUP-08 | Keymap persistence | M5 | todo | Includes jog keys |
 | SETUP-09 | Startup line persistence | M5 | done | `$N` read/edit/verify |
 | SETUP-10 | Tool table persistence | M5 | done | App-side |
-| SETUP-11 | Offsets backup and restore | M5 | partial | `offsets.nc` equivalent open |
+| SETUP-11 | Offsets backup and restore | M5 | done | WCS-only `offsets.nc`; load-as-program |
 
 ## Probing
 
