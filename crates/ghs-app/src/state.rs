@@ -27,6 +27,7 @@ use crate::height_compensation::HeightMapCompensation;
 use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_run};
 use crate::macros::{MacroModel, MacroRunGate, MacroRunRequest};
 use crate::offsets::OffsetModel;
+use crate::offsets_export::{OffsetsBackupModel, OffsetsExport};
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
@@ -1012,6 +1013,8 @@ pub struct AppState {
     pub settings: SettingsModel,
     /// Live `$#` offsets, formatted for the offsets workspace.
     pub offsets: OffsetModel,
+    /// Local `offsets.nc` export result and the validated restore preview.
+    pub offsets_backup: OffsetsBackupModel,
     /// Probe preflight, run binding and apply model.
     pub probe: ProbeModel,
     /// Original source and applied state for the explicit height-map workflow.
@@ -1102,6 +1105,7 @@ impl AppState {
             feed_rate: 1200,
             settings: SettingsModel::default(),
             offsets: OffsetModel::default(),
+            offsets_backup: OffsetsBackupModel::default(),
             probe: ProbeModel::default(),
             height_map: HeightMapCompensation::default(),
             height_map_library: HeightMapLibrary::default(),
@@ -1160,6 +1164,7 @@ impl AppState {
         // Offsets and the tool table are reloaded after `$I+`; never show the
         // previous machine's data as if it belonged to this one.
         self.offsets = OffsetModel::default();
+        self.offsets_backup.close_preview();
         self.sync_offset_context();
         self.tools = ToolTableModel::new();
         // Controller-reported data belongs to this session only.
@@ -1662,6 +1667,51 @@ impl AppState {
         } else {
             self.config.data().offsets.clone()
         }
+    }
+
+    /// Write the fixed `exports/offsets.nc` from the live `$#` snapshot.
+    ///
+    /// Local only: this never sends a command and never starts a job. A missing
+    /// configuration root, a missing `$#` report, or an invalid value is
+    /// refused by [`OffsetsBackupModel::export`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation, directory, or write message.
+    pub fn export_offsets_nc(&mut self) -> Result<OffsetsExport, String> {
+        let root = self.config.store_root().map(std::path::Path::to_path_buf);
+        self.offsets_backup.export(&self.offsets, root.as_deref())
+    }
+
+    /// Validate the fixed offsets file and open the preview sheet.
+    ///
+    /// Nothing is loaded, sent, or started. The file content is held for the
+    /// explicit `LOAD AS PROGRAM` action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-qualified I/O or validation message.
+    pub fn open_offsets_preview(&mut self) -> Result<(), String> {
+        let root = self.config.store_root().map(std::path::Path::to_path_buf);
+        self.offsets_backup.open_preview(root.as_deref())
+    }
+
+    /// Close the offsets preview after CANCEL. Nothing is loaded or sent.
+    pub fn cancel_offsets_preview(&mut self) {
+        self.offsets_backup.cancel();
+    }
+
+    /// Re-validate the previewed file and return the one load command.
+    ///
+    /// The command is always `Command::LoadProgram`; it never starts the job.
+    /// The shell sends it only after the operator pressed `LOAD AS PROGRAM`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no preview is open or the file is no longer
+    /// valid.
+    pub fn take_offsets_program(&mut self) -> Result<Command, String> {
+        self.offsets_backup.load_program()
     }
 
     /// Settings for a local save or backup.
@@ -2584,6 +2634,43 @@ mod tests {
                 y_mm: 1.25
             }
         );
+    }
+
+    #[test]
+    fn offsets_nc_export_and_preview_use_the_config_export_dir() {
+        let (mut state, dir, _info) = state_with_profile("offsets-nc");
+        let mut offsets = Offsets::default();
+        offsets.wcs[Wcs::G54.index()] = Some(Position::xyz(1.0, 2.0, 3.0));
+        offsets.g92 = Some(Position::xyz(9.0, 9.0, 9.0));
+        state.apply_offsets(&offsets);
+
+        let export = state.export_offsets_nc().expect("export offsets");
+        assert_eq!(export.path, dir.path.join("exports").join("offsets.nc"));
+        assert_eq!(export.wcs_lines, 1);
+        let text = fs::read_to_string(&export.path).expect("read export");
+        assert!(text.contains("G10 L2 P1 X1.000 Y2.000 Z3.000"), "{text}");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("G92")),
+            "{text}"
+        );
+
+        state.open_offsets_preview().expect("open preview");
+        assert_eq!(
+            state
+                .offsets_backup
+                .preview()
+                .expect("preview")
+                .lines()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            state.take_offsets_program().expect("load program"),
+            Command::LoadProgram { .. }
+        ));
+        assert!(state.offsets_backup.preview().is_none());
     }
 
     #[test]

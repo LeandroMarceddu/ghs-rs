@@ -286,6 +286,10 @@ pub struct Shell {
     demo_offsets_write_done: bool,
     demo_offsets_goto: bool,
     demo_offsets_goto_done: bool,
+    demo_offsets_export: bool,
+    demo_offsets_export_done: bool,
+    demo_offsets_restore: bool,
+    demo_offsets_restore_done: bool,
     probe_card_demo: Option<String>,
     probe_card_demo_done: bool,
     demo_probe_run: bool,
@@ -433,6 +437,9 @@ impl Shell {
         let demo_startup_write = std::env::args().any(|arg| arg == "--demo-startup-write");
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
         let demo_offsets_goto = std::env::args().any(|arg| arg == "--demo-offsets-goto");
+        let demo_offsets_restore = std::env::args().any(|arg| arg == "--demo-offsets-restore");
+        let demo_offsets_export =
+            demo_offsets_restore || std::env::args().any(|arg| arg == "--demo-offsets-export");
         let probe_card_demo = std::env::args().find_map(|arg| {
             arg.strip_prefix("--probe-card=")
                 .map(std::string::ToString::to_string)
@@ -518,6 +525,10 @@ impl Shell {
             demo_offsets_write_done: false,
             demo_offsets_goto,
             demo_offsets_goto_done: false,
+            demo_offsets_export,
+            demo_offsets_export_done: false,
+            demo_offsets_restore,
+            demo_offsets_restore_done: false,
             probe_card_demo,
             probe_card_demo_done: false,
             demo_probe_run,
@@ -815,6 +826,41 @@ impl Shell {
                 "Demo: G28 confirmation sheet; nothing has been sent",
             );
             self.request_offset_action(OffsetAction::GotoG28, cx);
+            changed = true;
+        }
+        // Screenshot switch: write the local offsets.nc through the normal
+        // export action. Nothing is sent to the controller.
+        if self.demo_offsets_export
+            && !self.demo_offsets_export_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.offsets.reported()
+            && self.state.job.has_program()
+        {
+            self.demo_offsets_export_done = true;
+            self.state.mode = Mode::Offset;
+            self.state.left_tab = LeftTab::Console;
+            self.state.console.clear();
+            self.state.push_console(
+                ConsoleLevel::Info,
+                "Demo: local offsets.nc export through the normal action; no command is sent",
+            );
+            self.export_offsets(cx);
+            changed = true;
+        }
+        // Screenshot switch: validate the exported file and open the preview
+        // sheet. It is never loaded or started by this switch.
+        if self.demo_offsets_restore
+            && !self.demo_offsets_restore_done
+            && self.demo_offsets_export_done
+        {
+            self.demo_offsets_restore_done = true;
+            self.state.mode = Mode::Offset;
+            self.state.left_tab = LeftTab::Console;
+            self.state.push_console(
+                ConsoleLevel::Info,
+                "Demo: offsets restore preview; nothing is loaded or started",
+            );
+            self.open_offsets_restore(cx);
             changed = true;
         }
         // Screenshot switch: open one probe card once live telemetry and `$#`
@@ -1132,6 +1178,7 @@ impl Shell {
         }
         // A confirmation captured on this link must not survive it.
         self.state.offsets.cancel_action();
+        self.state.offsets_backup.close_preview();
         self.state.cancel_macro_run();
         self.state.connection = ConnectionState::Disconnected;
         self.state.push_console(
@@ -2567,6 +2614,117 @@ impl Shell {
             self.state.push_console(
                 ConsoleLevel::Error,
                 format!("Offset: the engine rejected {line}; nothing changed"),
+            );
+        }
+        cx.notify();
+    }
+
+    /// Fixed `exports/offsets.nc` path for the current configuration root.
+    fn offsets_export_path(&self) -> Option<PathBuf> {
+        self.state
+            .config
+            .store_root()
+            .map(crate::offsets_export::offsets_export_path)
+    }
+
+    /// Write the local work-offset backup through the app model.
+    ///
+    /// Export is local only: no command is sent and no job is loaded. The full
+    /// path and the line count are shown in the panel and the console.
+    fn export_offsets(&mut self, cx: &mut Context<Self>) {
+        match self.state.export_offsets_nc() {
+            Ok(export) => {
+                let text = self.state.offsets_backup.status().map_or_else(
+                    || format!("Offsets exported to {}", export.path.display()),
+                    |status| status.text.clone(),
+                );
+                self.state.push_console(ConsoleLevel::Ok, text);
+            }
+            Err(message) => {
+                let text = self.state.offsets_backup.status().map_or_else(
+                    || format!("Offsets export refused: {message}"),
+                    |status| status.text.clone(),
+                );
+                self.state.push_console(ConsoleLevel::Error, text);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Validate the fixed offsets file and open the restore preview sheet.
+    ///
+    /// Validation is local. Nothing is loaded, sent, or started here.
+    fn open_offsets_restore(&mut self, cx: &mut Context<Self>) {
+        match self.state.open_offsets_preview() {
+            Ok(()) => {
+                if let Some(status) = self.state.offsets_backup.status() {
+                    self.state
+                        .push_console(ConsoleLevel::Info, status.text.clone());
+                }
+            }
+            Err(message) => {
+                let text = self.state.offsets_backup.status().map_or_else(
+                    || format!("Offsets file not loaded: {message}"),
+                    |status| status.text.clone(),
+                );
+                self.state.push_console(ConsoleLevel::Warn, text);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Close the restore preview. Nothing is loaded or sent.
+    fn cancel_offsets_restore(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_offsets_preview();
+        if let Some(status) = self.state.offsets_backup.status() {
+            self.state
+                .push_console(ConsoleLevel::Info, status.text.clone());
+        }
+        cx.notify();
+    }
+
+    /// Load the re-validated offsets file as a program. Never starts it.
+    ///
+    /// The engine remains the final authority. The operator has to review the
+    /// loaded program in Job and press Start only when Idle and ready.
+    fn load_offsets_program(&mut self, cx: &mut Context<Self>) {
+        if self.state.job.is_active() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "Offsets restore: a job is active; stop it before loading a program",
+            );
+            cx.notify();
+            return;
+        }
+        let command = match self.state.take_offsets_program() {
+            Ok(command) => command,
+            Err(message) => {
+                let text = self.state.offsets_backup.status().map_or_else(
+                    || format!("Offsets program not loaded: {message}"),
+                    |status| status.text.clone(),
+                );
+                self.state.push_console(ConsoleLevel::Warn, text);
+                cx.notify();
+                return;
+            }
+        };
+        let status = self
+            .state
+            .offsets_backup
+            .status()
+            .map(|status| status.text.clone())
+            .unwrap_or_else(|| "Offsets program loaded; not started".to_string());
+        if self.send_command(command) {
+            self.state.push_console(ConsoleLevel::Ok, status);
+            self.state.mode = Mode::Job;
+            self.state.left_tab = LeftTab::Program;
+        } else {
+            self.state
+                .offsets_backup
+                .load_failed("the engine rejected the load; nothing was loaded or started");
+            self.state.push_console(
+                ConsoleLevel::Error,
+                "Offsets program was not accepted by the engine; nothing was loaded",
             );
         }
         cx.notify();
@@ -7556,6 +7714,94 @@ impl Shell {
                 ),
             );
 
+        let export_path = self.offsets_export_path().map_or_else(
+            || "No app configuration directory".to_string(),
+            |path| path.display().to_string(),
+        );
+        let export_view = view.clone();
+        let load_file_view = view.clone();
+        let mut backup = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("offset-export")
+                            .label("EXPORT OFFSETS")
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(p.panel)
+                                    .foreground(p.text)
+                                    .hover(p.raised_hover)
+                                    .active(p.accent_muted),
+                            )
+                            .border_1()
+                            .border_color(p.border)
+                            .on_click(move |_, _, cx| {
+                                export_view.update(cx, |this, cx| {
+                                    this.export_offsets(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("offset-load-file")
+                            .label("LOAD OFFSETS FILE")
+                            .h(px(48.0))
+                            .w(px(180.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(p.panel)
+                                    .foreground(p.text)
+                                    .hover(p.raised_hover)
+                                    .active(p.accent_muted),
+                            )
+                            .border_1()
+                            .border_color(p.border)
+                            .on_click(move |_, _, cx| {
+                                load_file_view.update(cx, |this, cx| {
+                                    this.open_offsets_restore(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .font_family(self.mono.clone())
+                                    .text_color(p.text_dim)
+                                    .child(format!("FILE: {export_path}")),
+                            )
+                            .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                                "Local, no command sent. Work offsets only; G92, G28/G30, HOME, \
+                                 TLO, TLR, G51 and PRB are omitted.",
+                            )),
+                    ),
+            );
+        if let Some(status) = self.state.offsets_backup.status() {
+            backup = backup.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(if status.ok { p.success } else { p.danger })
+                    .child(status.text.clone()),
+            );
+        }
+
         let table = v_flex()
             .flex_1()
             .min_w(px(300.0))
@@ -7636,6 +7882,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(backup)
             .child(
                 h_flex()
                     .items_start()
@@ -7880,6 +8127,204 @@ impl Shell {
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         scrim_view.update(cx, |this, cx| {
                             this.cancel_offset_action(cx);
+                        });
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
+    /// Preview of the validated `offsets.nc` file.
+    ///
+    /// The sheet lists the full path and every accepted `G10 L2` line. CANCEL
+    /// sends nothing. `LOAD AS PROGRAM` re-validates the file and loads it into
+    /// the engine for review; it never starts the job. Running it later
+    /// overwrites the stored WCS offsets listed here and needs the usual
+    /// Idle/ready gate, with the engine as the final authority.
+    fn offsets_restore_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(preview) = self.state.offsets_backup.preview() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let load_view = view;
+        let mono = self.mono.clone();
+        let path = preview.path().display().to_string();
+        let line_count = preview.lines().len();
+        let wcs_count = preview.wcs().len();
+        let job_active = self.state.job.is_active();
+
+        let mut lines = v_flex()
+            .id("offsets-restore-lines")
+            .gap_1()
+            .max_h(px(264.0))
+            .overflow_y_scrollbar();
+        for line in preview.lines() {
+            lines = lines.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(22.0))
+                    .px_1()
+                    .rounded(px(4.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .w(px(52.0))
+                            .flex_shrink_0()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_faint)
+                            .child(line.wcs.as_str()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .font_family(mono.clone())
+                            .text_size(px(10.0))
+                            .text_color(p.text)
+                            .child(line.text.clone()),
+                    ),
+            );
+        }
+
+        let sheet = v_flex()
+            .w(px(640.0))
+            .max_w_full()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.warning.opacity(0.6))
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.warning)
+                            .child("RESTORE WORK OFFSETS - PREVIEW"),
+                    )
+                    .child(chip("NOT LOADED", p)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child("VALIDATED FILE"),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(p.text)
+                            .child(path),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(format!(
+                                "{line_count} G10 L2 lines | {wcs_count} work coordinate systems | \
+                                 normalized preview"
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child("G10 L2 LINES IN THIS FILE (VALUES IN MILLIMETRES)"),
+            )
+            .child(lines)
+            .child(div().text_size(px(11.0)).text_color(p.text_dim).child(
+                "LOAD AS PROGRAM validates this file again and loads it into the Job \
+                         workspace. It does not start. The file begins with G21, so every \
+                         value is interpreted in millimetres. Running it overwrites the \
+                         stored WCS offsets listed above and requires Idle with a ready \
+                         controller. The engine safety gateway remains the final authority.",
+            ))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.warning)
+                    .child("THE FILE BEGINS WITH G21: EVERY VALUE IS INTERPRETED IN MILLIMETRES."),
+            )
+            .when(job_active, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.danger)
+                        .child("LOCKED: A JOB IS ACTIVE; STOP IT BEFORE LOADING A PROGRAM"),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("offsets-restore-cancel")
+                            .label("CANCEL")
+                            .secondary()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                cancel_view.update(cx, |this, cx| {
+                                    this.cancel_offsets_restore(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("offsets-restore-load")
+                            .label("LOAD AS PROGRAM")
+                            .primary()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(job_active || !self.state.live)
+                            .on_click(move |_, _, cx| {
+                                load_view.update(cx, |this, cx| {
+                                    this.load_offsets_program(cx);
+                                });
+                            }),
+                    ),
+            );
+
+        let scrim_view = cx.entity();
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("offsets-restore-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| {
+                            this.cancel_offsets_restore(cx);
                         });
                     }),
             )
@@ -11785,6 +12230,9 @@ impl Render for Shell {
         }
         if self.panel.open {
             root = root.child(self.connection_overlay(p, cx));
+        }
+        if self.state.offsets_backup.preview().is_some() {
+            root = root.child(self.offsets_restore_overlay(p, cx));
         }
         if self.state.offsets.pending_action().is_some() {
             root = root.child(self.offset_confirm_overlay(p, cx));

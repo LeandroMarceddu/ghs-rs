@@ -28,7 +28,10 @@
 //! line. `--demo-offsets-write` sends one real `G10 L20` through MDI and
 //! refreshes `$#` for the applied-offsets screenshot. `--demo-offsets-goto`
 //! opens the G28 confirmation sheet through the normal request action without
-//! confirming it. `--probe-card=z|edge-x|
+//! confirming it. `--demo-offsets-export` writes the fixed
+//! `exports/offsets.nc` from live `$#` values through the same export action;
+//! `--demo-offsets-restore` then validates it and opens the preview sheet
+//! without loading it. `--probe-card=z|edge-x|
 //! edge-y|corner|circle|rotation|tool|height` opens one probe cycle once live
 //! telemetry and `$#` are available; `--demo-probe-check` stands in for the
 //! operator's "probe connected" confirmation on a board without `PC`;
@@ -59,6 +62,7 @@ mod keypad;
 mod live;
 mod macros;
 mod offsets;
+mod offsets_export;
 mod probe;
 mod settings;
 mod shell;
