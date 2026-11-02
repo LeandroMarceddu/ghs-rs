@@ -329,6 +329,38 @@ mod tests {
     }
 
     #[test]
+    fn bundle_round_trips_the_app_locale() {
+        let app = AppConfig {
+            locale: "pt-BR".into(),
+            ..AppConfig::default()
+        };
+        let original = BackupBundle::new(app, &info(), data()).with_created_at(1_700_000_000);
+        let json = original.to_json_string().expect("encode");
+        assert!(json.contains("\"locale\": \"pt-BR\""));
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.app.locale, "pt-BR");
+    }
+
+    #[test]
+    fn old_bundle_without_locale_uses_english() {
+        let app = AppConfig {
+            locale: "pt-BR".into(),
+            ..AppConfig::default()
+        };
+        let original = BackupBundle::new(app, &info(), data()).with_created_at(1_700_000_000);
+        let json = original.to_json_string().expect("encode");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        value["app"]
+            .as_object_mut()
+            .expect("app object")
+            .remove("locale");
+        let text = serde_json::to_string(&value).expect("json");
+        let decoded = BackupBundle::from_json_str(&text).expect("decode");
+        assert_eq!(decoded.app.locale, "en");
+    }
+
+    #[test]
     fn bundle_rejects_an_invalid_probe_offset() {
         let mut out_of_range = bundle();
         out_of_range.data.probe_offset = ProbeOffsetRecord {

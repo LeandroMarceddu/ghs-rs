@@ -175,6 +175,14 @@ pub enum ValidationError {
     /// A profile display name is not valid.
     #[error("profile display name {0:?} is not valid")]
     InvalidProfileName(String),
+    /// A stored UI locale tag is malformed.
+    #[error("locale {locale:?} is invalid: {reason}")]
+    InvalidLocale {
+        /// Rejected locale tag.
+        locale: String,
+        /// Human-readable reason.
+        reason: &'static str,
+    },
     /// The bundle's stored key does not match its embedded controller info.
     #[error("profile key {stored:?} does not match the embedded controller identity {computed:?}")]
     ProfileIdentityMismatch {

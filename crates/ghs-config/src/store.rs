@@ -792,6 +792,7 @@ mod tests {
         let config = AppConfig {
             theme: crate::app::ThemeMode::Light,
             units: ghs_core::Units::Inch,
+            locale: "pt-BR".into(),
             last_profile: Some(ProfileKey::from_controller(&info())),
             window: crate::app::WindowLayout {
                 width: 1920,
