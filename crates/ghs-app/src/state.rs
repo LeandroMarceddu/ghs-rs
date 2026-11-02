@@ -501,6 +501,297 @@ pub struct ProgramLine {
     pub kind: ProgramKind,
 }
 
+/// Program-tab search mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProgramSearchMode {
+    /// Show only matching lines, keeping their original line numbers.
+    #[default]
+    Filter,
+    /// Show every line and mark the matching ones.
+    Highlight,
+}
+
+impl ProgramSearchMode {
+    /// Short label for the mode toggle.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProgramSearchMode::Filter => "FILTER",
+            ProgramSearchMode::Highlight => "HIGHLIGHT",
+        }
+    }
+}
+
+/// Source lines scanned by [`ProgramSearch`].
+///
+/// Kept as a trait so the search stays independent of the engine and can be
+/// exercised against the mock design-review program in tests.
+pub(crate) trait ProgramLineSource {
+    fn line_count(&self) -> usize;
+    fn line_number(&self, index: usize) -> u32;
+    fn line_text(&self, index: usize) -> &str;
+}
+
+impl ProgramLineSource for Program {
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn line_number(&self, index: usize) -> u32 {
+        self.lines
+            .get(index)
+            .map_or(0, |line| u32::try_from(line.line).unwrap_or(u32::MAX))
+    }
+
+    fn line_text(&self, index: usize) -> &str {
+        self.lines
+            .get(index)
+            .map_or("", |line| line.source.as_str())
+    }
+}
+
+impl ProgramLineSource for [ProgramLine] {
+    fn line_count(&self) -> usize {
+        self.len()
+    }
+
+    fn line_number(&self, index: usize) -> u32 {
+        self.get(index)
+            .map_or(0, |line| u32::try_from(line.number).unwrap_or(u32::MAX))
+    }
+
+    fn line_text(&self, index: usize) -> &str {
+        self.get(index).map_or("", |line| line.text)
+    }
+}
+
+/// Local search state for the Program tab.
+///
+/// The model stores only a sorted list of matching source indices; it never
+/// copies or rebuilds the parsed program. Filter mode maps a visible list index
+/// through those matches, while highlight mode keeps the identity mapping and
+/// marks matches inside the lazily rendered rows.
+#[derive(Clone, Debug, Default)]
+pub struct ProgramSearch {
+    query: String,
+    mode: ProgramSearchMode,
+    /// Zero-based indices into the program's source lines, ascending.
+    matches: Arc<[usize]>,
+    /// Index into `matches`, not into the program.
+    current: Option<usize>,
+    /// What the current match list was compiled from.
+    compiled_query: Option<String>,
+    compiled_key: Option<usize>,
+}
+
+impl ProgramSearch {
+    /// Search text as typed by the operator.
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Active display mode.
+    pub fn mode(&self) -> ProgramSearchMode {
+        self.mode
+    }
+
+    /// Set the display mode. Matches are unaffected.
+    pub fn set_mode(&mut self, mode: ProgramSearchMode) {
+        self.mode = mode;
+    }
+
+    /// Replace the search text. A blank query is the cleared state.
+    ///
+    /// The caller must refresh the model (normally through
+    /// [`AppState::set_program_search_query`]) before reading the match count.
+    pub fn set_query(&mut self, query: impl Into<String>) {
+        let query = query.into();
+        if query != self.query {
+            self.query = query;
+            self.current = None;
+        }
+    }
+
+    /// Clear the search and every cached match.
+    pub fn clear(&mut self) {
+        self.query.clear();
+        self.matches = Arc::from(Vec::new());
+        self.current = None;
+        self.compiled_query = None;
+        self.compiled_key = None;
+    }
+
+    /// Whether a non-blank query is active.
+    pub fn is_active(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    /// Number of matching source lines.
+    pub fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    /// One-based current match position, when any line matches.
+    pub fn current_position(&self) -> Option<usize> {
+        self.current.map(|index| index + 1)
+    }
+
+    /// Zero-based source index of the current match.
+    pub fn current_source_index(&self) -> Option<usize> {
+        self.current
+            .and_then(|index| self.matches.get(index).copied())
+    }
+
+    /// Whether one source index is a match.
+    pub fn is_match(&self, source_index: usize) -> bool {
+        self.matches.binary_search(&source_index).is_ok()
+    }
+
+    /// Advance to the next match, wrapping to the first.
+    ///
+    /// Returns `false` when the query has no matches.
+    pub fn next_match(&mut self) -> bool {
+        let count = self.matches.len();
+        if count == 0 {
+            self.current = None;
+            return false;
+        }
+        let next = self.current.map_or(0, |current| (current + 1) % count);
+        self.current = Some(next);
+        true
+    }
+
+    /// Move to the previous match, wrapping to the last.
+    ///
+    /// Returns `false` when the query has no matches.
+    pub fn previous_match(&mut self) -> bool {
+        let count = self.matches.len();
+        if count == 0 {
+            self.current = None;
+            return false;
+        }
+        let previous = self
+            .current
+            .map_or(count - 1, |current| (current + count - 1) % count);
+        self.current = Some(previous);
+        true
+    }
+
+    /// Number of rows the Program tab should render.
+    ///
+    /// Filter mode renders only the matches; highlight mode, and the cleared
+    /// state, render every source line.
+    pub fn visible_count(&self, line_count: usize) -> usize {
+        if self.is_active() && self.mode == ProgramSearchMode::Filter {
+            self.matches.len()
+        } else {
+            line_count
+        }
+    }
+
+    /// Map one visible row to its source index.
+    pub fn visible_source_index(&self, visible: usize, line_count: usize) -> Option<usize> {
+        if self.is_active() && self.mode == ProgramSearchMode::Filter {
+            self.matches.get(visible).copied()
+        } else if visible < line_count {
+            Some(visible)
+        } else {
+            None
+        }
+    }
+
+    /// Map one source index to its visible row.
+    pub fn source_visible_index(&self, source: usize, line_count: usize) -> Option<usize> {
+        if self.is_active() && self.mode == ProgramSearchMode::Filter {
+            self.matches.binary_search(&source).ok()
+        } else if source < line_count {
+            Some(source)
+        } else {
+            None
+        }
+    }
+
+    /// Visible row for the current match, used by the scroll handle.
+    pub fn current_visible_index(&self, line_count: usize) -> Option<usize> {
+        let source = self.current_source_index()?;
+        self.source_visible_index(source, line_count)
+    }
+
+    /// Whether the cached matches were built for this query and program.
+    pub(crate) fn needs_refresh(&self, program_key: usize) -> bool {
+        self.compiled_key != Some(program_key)
+            || self.compiled_query.as_deref() != Some(self.query.as_str())
+    }
+
+    /// Recompute the match list for one program.
+    ///
+    /// Called only when the query or program identity changes, so typing does
+    /// not repeatedly scan a large program and rendering never does.
+    pub(crate) fn refresh(
+        &mut self,
+        source: &(impl ProgramLineSource + ?Sized),
+        program_key: usize,
+    ) {
+        let raw_query = self.query.clone();
+        let query = raw_query.trim();
+        let reset = self.compiled_query.as_deref() != Some(raw_query.as_str());
+        let mut matches = Vec::new();
+        if !query.is_empty() {
+            if let Some(line_number) = program_line_query(query) {
+                for index in 0..source.line_count() {
+                    if source.line_number(index) == line_number {
+                        matches.push(index);
+                    }
+                }
+            } else {
+                let needle = query.to_ascii_lowercase();
+                for index in 0..source.line_count() {
+                    if contains_ignore_ascii_case(source.line_text(index), &needle) {
+                        matches.push(index);
+                    }
+                }
+            }
+        }
+        self.matches = Arc::from(matches);
+        self.compiled_query = Some(raw_query);
+        self.compiled_key = Some(program_key);
+        let count = self.matches.len();
+        if count == 0 {
+            self.current = None;
+        } else if reset || self.current.is_none() {
+            self.current = Some(0);
+        } else {
+            let current = self.current.map_or(0, |index| index.min(count - 1));
+            self.current = Some(current);
+        }
+    }
+}
+
+/// Parse `120` or `N120` as an exact source line number.
+///
+/// Any other query is text. Zero is not a valid source line.
+fn program_line_query(query: &str) -> Option<u32> {
+    let digits = query
+        .strip_prefix('N')
+        .or_else(|| query.strip_prefix('n'))
+        .unwrap_or(query);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|line| *line > 0)
+}
+
+/// ASCII case-insensitive substring test without allocating per line.
+fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
+    let needle = needle_lower.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MacroAction {
     ZeroXy,
@@ -1003,6 +1294,8 @@ pub struct AppState {
     pub program: Vec<ProgramLine>,
     pub active_line: usize,
     pub progress: f32,
+    /// Program-tab search/filter and jump state.
+    pub program_search: ProgramSearch,
     pub keypad: Option<KeypadState>,
     pub mdi: String,
     pub macros: Vec<Macro>,
@@ -1088,6 +1381,7 @@ impl AppState {
                 .collect(),
             active_line: 13,
             progress: 0.42,
+            program_search: ProgramSearch::default(),
             keypad: None,
             mdi: "G0 X10 Y10".to_string(),
             macros: vec![
@@ -1396,6 +1690,73 @@ impl AppState {
         } else {
             self.progress
         }
+    }
+
+    // ------------------------------------------------------- program search
+
+    /// Replace the Program-tab search text and rebuild its match list.
+    ///
+    /// A numeric query (`120` or `N120`) matches that exact source line; any
+    /// other query is a case-insensitive substring of the source text.
+    pub fn set_program_search_query(&mut self, query: impl Into<String>) {
+        self.program_search.set_query(query);
+        self.sync_program_search();
+    }
+
+    /// Switch between filtered and highlighted Program-tab results.
+    pub fn set_program_search_mode(&mut self, mode: ProgramSearchMode) {
+        self.program_search.set_mode(mode);
+        self.sync_program_search();
+    }
+
+    /// Clear the search, restoring the full program list.
+    pub fn clear_program_search(&mut self) {
+        self.program_search.clear();
+        self.sync_program_search();
+    }
+
+    /// Rebuild the search matches when the query or program changed.
+    ///
+    /// This is deliberately cheap when nothing changed: it only compares the
+    /// query and the program identity. The parsed program is never re-parsed.
+    ///
+    /// Returns `true` when the match list was recomputed.
+    pub fn sync_program_search(&mut self) -> bool {
+        if let Some(program) = self.job.program() {
+            let key = Arc::as_ptr(program) as usize;
+            if !self.program_search.needs_refresh(key) {
+                return false;
+            }
+            self.program_search.refresh(program.as_ref(), key);
+            return true;
+        }
+        if self.live {
+            let key = 0;
+            if !self.program_search.needs_refresh(key) {
+                return false;
+            }
+            let empty: &[ProgramLine] = &[];
+            self.program_search.refresh(empty, key);
+            return true;
+        }
+        let key = 1;
+        if !self.program_search.needs_refresh(key) {
+            return false;
+        }
+        self.program_search.refresh(&self.program[..], key);
+        true
+    }
+
+    /// Rows the Program tab should render for the current search.
+    pub fn program_search_visible_count(&self) -> usize {
+        self.program_search
+            .visible_count(self.display_program_lines())
+    }
+
+    /// Visible row of the current match, for the list's scroll handle.
+    pub fn program_search_scroll_index(&self) -> Option<usize> {
+        self.program_search
+            .current_visible_index(self.display_program_lines())
     }
 
     /// Job status label, including the mock program's "loaded" state.
@@ -3337,5 +3698,207 @@ mod tests {
         );
         assert!(state.confirm_macro_run().is_err());
         assert!(state.macro_run_pending().is_none());
+    }
+
+    // ------------------------------------------------------- program search
+
+    fn search_program(lines: &[&str]) -> Arc<Program> {
+        let source: String = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        Arc::new(ghs_gcode::parse_program(&source).expect("search program parses"))
+    }
+
+    fn compiled_search(query: &str, program: &Program, mode: ProgramSearchMode) -> ProgramSearch {
+        let mut search = ProgramSearch::default();
+        search.set_mode(mode);
+        search.set_query(query);
+        search.refresh(program, 0x5eed);
+        search
+    }
+
+    #[test]
+    fn program_search_matches_source_text_case_insensitively() {
+        let program = search_program(&["G21", "G0 X10 Y20", "G1 X30 F800", "(X10 comment)"]);
+
+        let lower = compiled_search("x10", &program, ProgramSearchMode::Filter);
+        assert_eq!(lower.match_count(), 2);
+        assert_eq!(lower.current_source_index(), Some(1));
+        assert!(lower.is_match(1));
+        assert!(lower.is_match(3));
+
+        let upper = compiled_search("G0 X10", &program, ProgramSearchMode::Filter);
+        assert_eq!(upper.match_count(), 1);
+        assert_eq!(upper.current_source_index(), Some(1));
+        assert_eq!(
+            compiled_search("missing", &program, ProgramSearchMode::Filter).match_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn program_search_accepts_plain_and_n_prefixed_line_numbers() {
+        let lines: Vec<String> = (1..=130).map(|line| format!("G1 X{line} F800")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let program = search_program(&refs);
+
+        for query in ["120", "N120", "n120"] {
+            let search = compiled_search(query, &program, ProgramSearchMode::Filter);
+            assert_eq!(search.match_count(), 1, "{query}");
+            assert_eq!(search.current_source_index(), Some(119), "{query}");
+            assert_eq!(program.lines[119].line, 120);
+        }
+
+        assert_eq!(
+            compiled_search("N999", &program, ProgramSearchMode::Filter).match_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn program_search_filter_maps_visible_rows_to_original_lines() {
+        let program = search_program(&["G21", "G0 X1", "G1 Y1 F800", "G0 X2"]);
+        let search = compiled_search("G0", &program, ProgramSearchMode::Filter);
+
+        assert_eq!(search.visible_count(4), 2);
+        let visible: Vec<usize> = (0..search.visible_count(4))
+            .filter_map(|row| search.visible_source_index(row, 4))
+            .collect();
+        assert_eq!(visible, vec![1, 3]);
+        assert_eq!(program.lines[visible[0]].line, 2);
+        assert_eq!(program.lines[visible[1]].line, 4);
+        assert_eq!(search.source_visible_index(3, 4), Some(1));
+        assert_eq!(search.source_visible_index(2, 4), None);
+    }
+
+    #[test]
+    fn program_search_highlight_keeps_every_line() {
+        let program = search_program(&["G21", "G0 X1", "G1 Y1 F800", "G0 X2"]);
+        let search = compiled_search("G0", &program, ProgramSearchMode::Highlight);
+
+        assert_eq!(search.visible_count(4), 4);
+        assert_eq!(search.match_count(), 2);
+        assert!(search.is_match(1));
+        assert!(!search.is_match(2));
+        for row in 0..4 {
+            assert_eq!(search.visible_source_index(row, 4), Some(row));
+        }
+    }
+
+    #[test]
+    fn program_search_next_and_previous_wrap() {
+        let program = search_program(&["G0 X0", "G1 X1 F800", "G0 X2", "G1 X3 F800", "G0 X4"]);
+        let mut search = compiled_search("G0", &program, ProgramSearchMode::Filter);
+        assert_eq!(search.current_position(), Some(1));
+        assert_eq!(search.current_source_index(), Some(0));
+
+        assert!(search.next_match());
+        assert_eq!(search.current_source_index(), Some(2));
+        assert!(search.next_match());
+        assert_eq!(search.current_source_index(), Some(4));
+        assert!(search.next_match());
+        assert_eq!(search.current_source_index(), Some(0), "next wraps");
+
+        assert!(search.previous_match());
+        assert_eq!(search.current_source_index(), Some(4), "previous wraps");
+        assert!(search.previous_match());
+        assert_eq!(search.current_source_index(), Some(2));
+        assert_eq!(search.current_position(), Some(2));
+    }
+
+    #[test]
+    fn program_search_keeps_the_streaming_line_and_never_moves_the_job() {
+        let program = search_program(&["G21", "G0 X10", "G1 X20 F800", "G0 X30"]);
+        let mut state = AppState::new();
+        state
+            .job
+            .loaded("search.nc".into(), Arc::clone(&program), 4);
+        state.job.progress(3, 2, 4, Duration::ZERO);
+
+        state.set_program_search_query("G1");
+        assert!(state.program_search.is_active());
+        assert_eq!(state.display_line(), 3);
+        assert_eq!(state.program_search_visible_count(), 1);
+        // The current streaming line is the only match, and it stays active.
+        assert_eq!(state.program_search_scroll_index(), Some(0));
+        assert_eq!(state.program_search.visible_source_index(0, 4), Some(2));
+        assert_eq!(program.lines[2].line, 3);
+
+        assert!(state.program_search.next_match());
+        assert_eq!(state.display_line(), 3);
+        assert_eq!(state.job.current_line, 3);
+    }
+
+    #[test]
+    fn program_search_jump_line_does_not_change_the_loaded_program() {
+        let lines: Vec<String> = (1..=130).map(|line| format!("G1 X{line} F800")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let program = search_program(&refs);
+        let mut state = AppState::new();
+        state
+            .job
+            .loaded("jump.nc".into(), Arc::clone(&program), 130);
+        state.job.progress(7, 6, 130, Duration::ZERO);
+
+        state.set_program_search_query("N120");
+        assert_eq!(state.program_search.current_source_index(), Some(119));
+        assert_eq!(state.program_search_scroll_index(), Some(0));
+        assert_eq!(state.display_line(), 7);
+        assert_eq!(state.job.line_count(), 130);
+        assert!(Arc::ptr_eq(
+            state.job.program().expect("program remains loaded"),
+            &program
+        ));
+    }
+
+    #[test]
+    fn program_search_clear_restores_all_lines_and_the_current_line() {
+        let program = search_program(&["G21", "G0 X1", "G1 Y1 F800", "G0 X2"]);
+        let mut state = AppState::new();
+        state.job.loaded("clear.nc".into(), Arc::clone(&program), 4);
+        state.job.progress(3, 2, 4, Duration::ZERO);
+        state.set_program_search_query("G0");
+        assert_eq!(state.program_search_visible_count(), 2);
+
+        state.clear_program_search();
+        assert!(!state.program_search.is_active());
+        assert_eq!(state.program_search.match_count(), 0);
+        assert_eq!(state.program_search.current_position(), None);
+        assert_eq!(state.program_search_visible_count(), 4);
+        assert_eq!(state.display_line(), 3);
+        assert_eq!(state.program_search.visible_source_index(3, 4), Some(3));
+    }
+
+    #[test]
+    fn program_search_scans_the_mock_program_without_a_job() {
+        let mut state = AppState::new();
+        assert!(!state.job.has_program());
+        assert_eq!(state.display_program_lines(), 30);
+
+        state.set_program_search_query("G1");
+        assert!(state.program_search.match_count() > 0);
+        assert!(state.program_search_visible_count() < 30);
+
+        state.set_program_search_mode(ProgramSearchMode::Highlight);
+        assert_eq!(state.program_search_visible_count(), 30);
+        assert_eq!(state.display_line(), 13);
+    }
+
+    #[test]
+    fn program_search_handles_a_missing_program() {
+        let mut state = AppState::new();
+        state.begin_live("no program");
+        state.set_program_search_query("G1");
+
+        assert_eq!(state.display_program_lines(), 0);
+        assert_eq!(state.display_line(), 0);
+        assert!(state.program_search.is_active());
+        assert_eq!(state.program_search.match_count(), 0);
+        assert_eq!(state.program_search_visible_count(), 0);
+        assert_eq!(state.program_search_scroll_index(), None);
+
+        state.set_program_search_mode(ProgramSearchMode::Highlight);
+        assert_eq!(state.program_search_visible_count(), 0);
     }
 }

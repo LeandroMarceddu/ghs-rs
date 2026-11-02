@@ -42,7 +42,7 @@ use ghs_engine::{
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
@@ -76,7 +76,8 @@ use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScop
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
     AppState, Axis, ConnectionState, ConsoleLevel, JobView, KeypadAction, KeypadTarget, LeftTab,
-    Mode, ProgramKind, SignalState, format_elapsed, pause_reason_label,
+    Mode, ProgramKind, ProgramSearch, ProgramSearchMode, SignalState, format_elapsed,
+    pause_reason_label,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -258,6 +259,7 @@ pub struct Shell {
     spindle_slider_active: bool,
     console_scroll: ScrollHandle,
     program_scroll: UniformListScrollHandle,
+    program_search_input: Entity<InputState>,
     viewer: viewer::ViewerHandle,
     last_job_line: u32,
     demo_program: DemoProgram,
@@ -319,7 +321,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let feed_slider = cx.new(|_| {
             SliderState::new()
                 .min(10.0)
@@ -397,6 +399,51 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--settings") {
             state.mode = Mode::Settings;
         }
+        // Screenshot switch: open the Program tab with a search already
+        // applied. Normal startup always starts with Console and no query.
+        if let Some(query) = program_search_arg() {
+            state.program_search.set_query(query);
+            state.left_tab = LeftTab::Program;
+        }
+        if std::env::args().any(|arg| arg == "--program-highlight") {
+            state.program_search.set_mode(ProgramSearchMode::Highlight);
+        }
+        let program_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(state.program_search.query().to_string())
+                .placeholder("Line 120, N120, or text")
+                .clean_on_escape()
+                .submit_on_enter(true)
+        });
+        subscriptions.push(
+            cx.subscribe(&program_search_input, |this, input, event, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let was_active = this.state.program_search.is_active();
+                        let query = input.read(cx).value().to_string();
+                        if query.is_empty() {
+                            this.state.clear_program_search();
+                        } else {
+                            this.state.set_program_search_query(query);
+                        }
+                        // Clearing the field restores the full list and follows
+                        // the streaming line again; typing does not move the list.
+                        if was_active && !this.state.program_search.is_active() {
+                            this.follow_current_program_line();
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { shift, .. } => {
+                        if *shift {
+                            this.previous_program_match(cx);
+                        } else {
+                            this.next_program_match(cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }),
+        );
 
         // Screenshot/demo switches. They only select a bundled demo source or
         // press the same Start action a tap would; normal startup ignores them.
@@ -497,6 +544,7 @@ impl Shell {
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
             program_scroll: UniformListScrollHandle::new(),
+            program_search_input,
             viewer: viewer::ViewerHandle::new(),
             last_job_line: 0,
             demo_program,
@@ -1048,14 +1096,20 @@ impl Shell {
                 changed = true;
             }
         }
+        // Recompute the Program-tab matches only when the query or the loaded
+        // program changed. This never re-parses the program.
+        changed |= self.state.sync_program_search();
         // Follow the current line in the Program tab. Only a changed line
-        // scrolls, so manual scrolling is not fought every poll.
+        // scrolls, so manual scrolling is not fought every poll. A search owns
+        // navigation until it is cleared.
         let line = self.state.display_line();
         if self.state.job.has_program() && line != self.last_job_line {
             self.last_job_line = line;
-            if line > 0 {
-                self.program_scroll
-                    .scroll_to_item(line as usize - 1, ScrollStrategy::Center);
+            if line > 0
+                && !self.state.program_search.is_active()
+                && let Ok(index) = usize::try_from(line)
+            {
+                self.scroll_program_to_visible(index.saturating_sub(1));
             }
         }
         if changed {
@@ -1064,6 +1118,62 @@ impl Shell {
             }
             cx.notify();
         }
+    }
+
+    // ------------------------------------------------------- program search
+
+    /// Scroll the virtualized Program list to one visible row.
+    fn scroll_program_to_visible(&self, visible: usize) {
+        self.program_scroll
+            .scroll_to_item(visible, ScrollStrategy::Center);
+    }
+
+    /// Follow the streaming line when no search is active.
+    fn follow_current_program_line(&self) {
+        if self.state.program_search.is_active() {
+            return;
+        }
+        let line = self.state.display_line();
+        let count = self.state.display_program_lines();
+        let index = usize::try_from(line)
+            .ok()
+            .and_then(|line| line.checked_sub(1));
+        if let Some(index) = index
+            && index < count
+        {
+            self.scroll_program_to_visible(index);
+        }
+    }
+
+    /// Scroll to the current search match.
+    fn jump_to_program_match(&mut self, cx: &mut Context<Self>) {
+        self.state.sync_program_search();
+        if let Some(index) = self.state.program_search_scroll_index() {
+            self.scroll_program_to_visible(index);
+        }
+        cx.notify();
+    }
+
+    /// Advance to the next search match and reveal it.
+    fn next_program_match(&mut self, cx: &mut Context<Self>) {
+        self.state.sync_program_search();
+        if self.state.program_search.next_match()
+            && let Some(index) = self.state.program_search_scroll_index()
+        {
+            self.scroll_program_to_visible(index);
+        }
+        cx.notify();
+    }
+
+    /// Move to the previous search match and reveal it.
+    fn previous_program_match(&mut self, cx: &mut Context<Self>) {
+        self.state.sync_program_search();
+        if self.state.program_search.previous_match()
+            && let Some(index) = self.state.program_search_scroll_index()
+        {
+            self.scroll_program_to_visible(index);
+        }
+        cx.notify();
     }
 
     // ------------------------------------------------------- connection/link
@@ -3803,7 +3913,7 @@ impl Shell {
 
         let body = match self.state.left_tab {
             LeftTab::Console => self.console(p).into_any_element(),
-            LeftTab::Program => self.program(p).into_any_element(),
+            LeftTab::Program => self.program(p, cx).into_any_element(),
         };
 
         div()
@@ -3890,7 +4000,130 @@ impl Shell {
             }))
     }
 
-    fn program(&self, p: Palette) -> AnyElement {
+    /// Program-tab search toolbar: query field, mode toggle, match count, and
+    /// previous/next/jump actions. All controls are 48 px high.
+    fn program_search_toolbar(&self, p: Palette, line_count: usize, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let search = &self.state.program_search;
+        let active = search.is_active();
+        let match_count = search.match_count();
+        let has_matches = active && match_count > 0;
+        let status = if !active {
+            format!("{line_count} LINES")
+        } else if match_count == 0 {
+            "NO MATCH".to_string()
+        } else {
+            format!(
+                "{} / {} MATCH",
+                search.current_position().unwrap_or(0),
+                match_count
+            )
+        };
+        let filter_selected = search.mode() == ProgramSearchMode::Filter;
+        let highlight_selected = search.mode() == ProgramSearchMode::Highlight;
+
+        let focus_input = self.program_search_input.clone();
+        let search_field = div()
+            .h(px(48.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                focus_input.update(cx, |state, cx| state.focus(window, cx));
+            })
+            .child(
+                Input::new(&self.program_search_input)
+                    .with_size(Size::Large)
+                    .cleanable(true)
+                    .min_w(px(0.0))
+                    .text_size(px(12.0)),
+            );
+
+        v_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .p_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                h_flex()
+                    .h(px(48.0))
+                    .items_center()
+                    .gap_2()
+                    .child(search_field)
+                    .child(program_search_button(
+                        "program-search-prev",
+                        "PREV",
+                        has_matches,
+                        p,
+                        view.clone(),
+                        |shell, cx| shell.previous_program_match(cx),
+                    ))
+                    .child(program_search_button(
+                        "program-search-next",
+                        "NEXT",
+                        has_matches,
+                        p,
+                        view.clone(),
+                        |shell, cx| shell.next_program_match(cx),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .h(px(48.0))
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .h(px(48.0))
+                            .w(px(164.0))
+                            .flex_shrink_0()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(p.border)
+                            .overflow_hidden()
+                            .child(program_mode_segment(
+                                ProgramSearchMode::Filter,
+                                filter_selected,
+                                p,
+                                view.clone(),
+                            ))
+                            .child(program_mode_segment(
+                                ProgramSearchMode::Highlight,
+                                highlight_selected,
+                                p,
+                                view.clone(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if has_matches {
+                                p.accent
+                            } else if active {
+                                p.warning
+                            } else {
+                                p.text_faint
+                            })
+                            .child(status),
+                    )
+                    .child(program_search_button(
+                        "program-search-jump",
+                        "JUMP",
+                        has_matches,
+                        p,
+                        view,
+                        |shell, cx| shell.jump_to_program_match(cx),
+                    )),
+            )
+    }
+
+    fn program(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let source = if let Some(program) = self.state.job.program() {
             ProgramSource::Engine(Arc::clone(program))
         } else if self.state.live {
@@ -3898,18 +4131,47 @@ impl Shell {
         } else {
             ProgramSource::Mock(self.state.program.clone())
         };
-        let count = source.len();
-        let active_line = self.state.display_line();
-        uniform_list("program-list", count, move |range, _, _| {
-            range
-                .filter_map(|index| source.row(index, active_line))
-                .map(|row| program_row(row, p))
-                .collect::<Vec<_>>()
-        })
-        .flex_1()
-        .min_h(px(0.0))
-        .track_scroll(&self.program_scroll)
-        .into_any_element()
+        let line_count = source.len();
+        if line_count == 0 {
+            return if self.state.job.has_program() {
+                empty_program_lines_notice(p).into_any_element()
+            } else {
+                empty_program_notice(p).into_any_element()
+            };
+        }
+        let toolbar = self.program_search_toolbar(p, line_count, cx);
+        let search = self.state.program_search.clone();
+        let visible_count = self.state.program_search_visible_count();
+        let no_matches =
+            search.is_active() && search.mode() == ProgramSearchMode::Filter && visible_count == 0;
+        let body = if no_matches {
+            no_program_matches_notice(p, search.query()).into_any_element()
+        } else {
+            let active_line = self.state.display_line();
+            // The uniform list still owns virtualization: filter mode maps a
+            // visible row through the match index, highlight mode uses the
+            // identity mapping, and only the visible range becomes widgets.
+            uniform_list("program-list", visible_count, move |range, _, _| {
+                range
+                    .filter_map(|visible| {
+                        let index = search.visible_source_index(visible, line_count)?;
+                        source
+                            .row(index, active_line, &search)
+                            .map(|row| program_row(row, p))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flex_1()
+            .min_h(px(0.0))
+            .track_scroll(&self.program_scroll)
+            .into_any_element()
+        };
+        v_flex()
+            .size_full()
+            .min_h(px(0.0))
+            .child(toolbar)
+            .child(body)
+            .into_any_element()
     }
 
     /// Viewer card: fills the centre column's first row.
@@ -12284,7 +12546,7 @@ impl ProgramSource {
         }
     }
 
-    fn row(&self, index: usize, active_line: u32) -> Option<ProgramRow> {
+    fn row(&self, index: usize, active_line: u32, search: &ProgramSearch) -> Option<ProgramRow> {
         match self {
             ProgramSource::Engine(program) => {
                 let line = program.lines.get(index)?;
@@ -12296,6 +12558,8 @@ impl ProgramSource {
                     comment: trimmed.starts_with('(') || trimmed.starts_with(';'),
                     kind: None,
                     active: active_line != 0 && number == active_line,
+                    matched: search.is_match(index),
+                    current_match: search.current_source_index() == Some(index),
                 })
             }
             ProgramSource::Mock(lines) => {
@@ -12307,6 +12571,8 @@ impl ProgramSource {
                     comment: line.kind == ProgramKind::Comment,
                     kind: Some(line.kind),
                     active: active_line != 0 && number == active_line,
+                    matched: search.is_match(index),
+                    current_match: search.current_source_index() == Some(index),
                 })
             }
         }
@@ -12320,11 +12586,15 @@ struct ProgramRow {
     comment: bool,
     kind: Option<ProgramKind>,
     active: bool,
+    /// The row matches the active search.
+    matched: bool,
+    /// The row is the current search match.
+    current_match: bool,
 }
 
 fn program_row(row: ProgramRow, p: Palette) -> Div {
     let active = row.active;
-    let text_color = if active {
+    let text_color = if active || row.current_match || row.matched {
         p.accent
     } else if row.comment {
         p.text_faint
@@ -12338,20 +12608,40 @@ fn program_row(row: ProgramRow, p: Palette) -> Div {
             None => p.text_dim,
         }
     };
+    let background = if row.current_match {
+        p.accent.opacity(0.22)
+    } else if active {
+        p.accent_muted
+    } else if row.matched {
+        p.accent.opacity(0.08)
+    } else {
+        p.panel
+    };
+    let border_color = if active || row.current_match {
+        p.accent
+    } else if row.matched {
+        p.accent.opacity(0.55)
+    } else {
+        p.panel
+    };
     h_flex()
         .items_center()
         .gap_2()
         .h(px(23.0))
         .px_2()
-        .bg(if active { p.accent_muted } else { p.panel })
+        .bg(background)
         .border_l(px(3.0))
-        .border_color(if active { p.accent } else { p.panel })
+        .border_color(border_color)
         .child(
             div()
                 .w(px(44.0))
                 .flex_shrink_0()
                 .text_size(px(10.0))
-                .text_color(if active { p.accent } else { p.text_faint })
+                .text_color(if active || row.current_match || row.matched {
+                    p.accent
+                } else {
+                    p.text_faint
+                })
                 .child(row.number.to_string()),
         )
         .child(
@@ -12386,6 +12676,58 @@ fn empty_program_notice(p: Palette) -> Div {
         )
 }
 
+fn empty_program_lines_notice(p: Palette) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .p_3()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(p.text_dim)
+                .child("Program has no lines"),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child("Load a non-empty source file to search it."),
+        )
+}
+
+fn no_program_matches_notice(p: Palette, query: &str) -> Div {
+    let query = query.trim().to_string();
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .p_3()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(p.text_dim)
+                .child("No matching lines"),
+        )
+        .child(
+            div()
+                .max_w(px(260.0))
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child(format!("Nothing matches '{query}'.")),
+        )
+        .child(
+            div()
+                .max_w(px(260.0))
+                .text_size(px(10.0))
+                .text_color(p.text_faint)
+                .child("Switch to HIGHLIGHT or clear the field to restore the full list."),
+        )
+}
+
 fn job_status_color(job: &JobView, p: Palette) -> Hsla {
     if job.tool_change.is_some() {
         return p.warning;
@@ -12413,6 +12755,14 @@ fn connection_panel_arg() -> Option<String> {
         }
     }
     None
+}
+
+/// Read the screenshot-only `--program-search=TEXT` switch.
+fn program_search_arg() -> Option<String> {
+    std::env::args().find_map(|arg| {
+        arg.strip_prefix("--program-search=")
+            .map(std::string::ToString::to_string)
+    })
 }
 
 fn mode_variant(cx: &App, p: Palette, active: bool) -> ButtonCustomVariant {
@@ -12790,6 +13140,86 @@ fn chip_button(
         .hover(|style| style.bg(p.raised_hover).text_color(p.text))
         .on_click(move |_, window, cx| on_click(window, cx))
         .child(text.to_string())
+}
+
+/// One 48 px Program-tab search action. Disabled actions stay visible so the
+/// toolbar geometry never shifts.
+fn program_search_button(
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    p: Palette,
+    view: Entity<Shell>,
+    action: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+) -> AnyElement {
+    let button = div()
+        .id(id)
+        .h(px(48.0))
+        .min_w(px(52.0))
+        .flex_shrink_0()
+        .px_2()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .border_1()
+        .border_color(p.border)
+        .bg(p.panel_alt)
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
+        .text_color(p.text_dim);
+    if enabled {
+        button
+            .cursor_pointer()
+            .hover(|style| style.bg(p.raised_hover).text_color(p.text))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |shell, cx| action(shell, cx));
+            })
+            .child(label)
+            .into_any_element()
+    } else {
+        button.opacity(0.45).child(label).into_any_element()
+    }
+}
+
+/// One half of the FILTER / HIGHLIGHT segmented toggle.
+fn program_mode_segment(
+    mode: ProgramSearchMode,
+    selected: bool,
+    p: Palette,
+    view: Entity<Shell>,
+) -> impl IntoElement {
+    let id = match mode {
+        ProgramSearchMode::Filter => "program-search-filter",
+        ProgramSearchMode::Highlight => "program-search-highlight",
+    };
+    div()
+        .id(id)
+        .flex_1()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(if selected {
+            p.accent_muted
+        } else {
+            p.panel_alt
+        })
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
+        .text_color(if selected { p.accent } else { p.text_dim })
+        .cursor_pointer()
+        .hover(|style| style.bg(p.raised_hover).text_color(p.text))
+        .on_click(move |_, _, cx| {
+            view.update(cx, |shell, cx| {
+                shell.state.set_program_search_mode(mode);
+                if let Some(index) = shell.state.program_search_scroll_index() {
+                    shell.scroll_program_to_visible(index);
+                }
+                cx.notify();
+            });
+        })
+        .child(mode.label())
 }
 
 /// Compact "the numbers below are not live" marker for the DRO header.
@@ -13591,6 +14021,7 @@ mod tests {
 
     #[test]
     fn program_rows_map_source_numbers_and_current_line() {
+        let search = ProgramSearch::default();
         let mock = ProgramSource::Mock(vec![
             crate::state::ProgramLine {
                 number: 1,
@@ -13603,24 +14034,24 @@ mod tests {
                 kind: ProgramKind::Setup,
             },
         ]);
-        let row = mock.row(1, 2).expect("second mock row");
+        let row = mock.row(1, 2, &search).expect("second mock row");
         assert_eq!(row.number, 2);
         assert_eq!(row.text, "M30");
         assert!(row.active);
         assert!(!row.comment);
-        assert!(mock.row(2, 2).is_none());
+        assert!(mock.row(2, 2, &search).is_none());
 
         let program = Arc::new(
             ghs_gcode::parse_program("G21\n(Groove)\nM30\n").expect("sample program parses"),
         );
         let live = ProgramSource::Engine(program);
         assert_eq!(live.len(), 3);
-        assert_eq!(live.row(0, 3).map(|row| row.number), Some(1));
-        let comment = live.row(1, 3).expect("comment row");
+        assert_eq!(live.row(0, 3, &search).map(|row| row.number), Some(1));
+        let comment = live.row(1, 3, &search).expect("comment row");
         assert!(comment.comment);
         assert!(!comment.active);
         assert_eq!(comment.text, "(Groove)");
-        let current = live.row(2, 3).expect("current row");
+        let current = live.row(2, 3, &search).expect("current row");
         assert!(current.active);
         assert!(!current.comment);
     }

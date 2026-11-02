@@ -112,7 +112,9 @@ fn main() {
             ..Default::default()
         };
 
-        if let Err(err) = open_window(options, cx, |_, cx| cx.new(shell::Shell::new)) {
+        if let Err(err) = open_window(options, cx, |window, cx| {
+            cx.new(|cx| shell::Shell::new(window, cx))
+        }) {
             eprintln!("failed to open ghs-rs window: {err}");
             cx.quit();
         }
