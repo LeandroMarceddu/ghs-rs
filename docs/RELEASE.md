@@ -38,8 +38,10 @@ whether to publish.
 
 ## 2. Changelog and release notes
 
-- [ ] There is no `CHANGELOG.md` yet. The workflow asks GitHub to generate
-      release notes from commits and merged pull requests; edit that draft.
+- [ ] Update `CHANGELOG.md`: move the relevant `Unreleased` entries under the
+      new version and date, then review the notes for accuracy. The workflow
+      also asks GitHub to generate release notes from commits and merged pull
+      requests; edit that draft.
 - [ ] Group the notes under Added, Changed, Fixed, and Safety.
 - [ ] Call out protocol surface changes, simulator profile changes, config or
       backup format changes, and known limitations.
