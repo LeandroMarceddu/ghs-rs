@@ -60,7 +60,7 @@ implemented before its UI or hardware validation row is complete.
 | COM-19 | Runtime alarm/error code sets (`$EA`, `$EE`) | M1 | todo | Fallback tables only when unavailable |
 | COM-20 | Runtime settings and groups (`$ES`, `$EG`) | M1 | todo | Data types, formats, min/max, reboot flags |
 | COM-21 | Parser state report (`$G`, `0x83`) | M1 | todo | All grblHAL codes |
-| COM-22 | Pins, limit state, last events (`$PINS`, `$PINSTATE`, `$LIM`, `$LEV`) | M1 | todo | Signals/AUX panel |
+| COM-22 | Pins, limit state, last events (`$PINS`, `$PINSTATE`, `$LIM`, `$LEV`) | M1 | done | Reference pipe forms; upstream comma forms open |
 | COM-23 | Spindle and port enumeration (`$SPINDLES`, `$SPINDLESH`, `$PORTS`) | M1 | todo | Multi-spindle capable |
 | COM-24 | Manual tool change protocol (`Tool` state, `0xA3`) | M1 | todo | Jog and offsets while pending |
 | COM-25 | MPG takeover (`|MPG:1/0`) | M1 | todo | Pause UI, keep telemetry |
@@ -85,7 +85,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-09 | Coolant mist, flood, fan | M2 | done | Capability-gated |
 | CTL-10 | MDI with history | M2 | done | 10-entry session history |
 | CTL-11 | Home, unlock, reset, sleep | M2 | done | Confirmed sleep |
-| CTL-12 | Signals, pins, and AUX IO display | M2 | todo | HSDEP plus 4/4 AUX |
+| CTL-12 | Signals, pins, and AUX IO display | M2 | done | Pn plus diagnostics panel |
 | CTL-13 | Macros with parameters and special words | M5 | partial | Single-line MDI editor/run; params/system/multi-line deferred |
 | CTL-14 | Startup lines | M5 | done | Read, edit, read-back verify |
 | CTL-15 | Keymap editor | M5 | done | Ten machine actions, runtime rebind |

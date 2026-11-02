@@ -186,6 +186,10 @@ The shell has a fixed three-column layout at 1280×800 and wider. Below
 - `COOLANT`: Mist/Flood/Fan buttons for the channels the controller reports.
 - `MACROS`: eight quick-action buttons. These are separate from user macros.
 - `SIGNALS`: limit/probe/E-stop/door rows plus the reported `Pn` capabilities.
+- `CONTROLLER DIAGNOSTICS` (Utility) opens a read-only snapshot of the `$PINS`
+  pin map, `$PINSTATE` input/output bits, `$LIM` per-axis limits, and `$LEV`
+  last events. `REFRESH` sends only those four read-only reports; there is no
+  automatic refresh.
 - `WORK`: current origin values, feed, WCS, and `G20`/`G21`, `G90`, `G17`
   chips.
 - `SPINDLE`: on/off switch, RPM field, `CW`/`CCW`, and the override slider.
