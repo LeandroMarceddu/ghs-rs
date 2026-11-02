@@ -17,6 +17,7 @@ ghs-serial.workspace = true
 ghs-gcode.workspace = true
 ghs-viewer.workspace = true
 ghs-config.workspace = true
+ghs-i18n.workspace = true
 ghs-probe.workspace = true
 
 # Pinned by the workspace. Keep GPUI behind this facade so a future `ghs-ui`

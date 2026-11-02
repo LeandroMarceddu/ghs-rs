@@ -595,6 +595,22 @@ impl ConfigModel {
         let _ = self.save_app();
     }
 
+    /// Persist the UI locale for the next session.
+    ///
+    /// The global catalog is applied by the caller (see
+    /// [`crate::i18n::choose_locale`]); this method only writes
+    /// [`AppConfig::locale`] through [`Self::save_app`]. The selector applies
+    /// the new locale even when this write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::save_app`] error when no store is available or the
+    /// existing app file is corrupt.
+    pub fn set_locale(&mut self, locale: ghs_i18n::Locale) -> Result<PathBuf, String> {
+        self.app.locale = locale.code().to_string();
+        self.save_app()
+    }
+
     /// Persist the parser's unit mode for the next session.
     pub fn set_units(&mut self, units: CoreUnits) {
         if self.app.units == units {

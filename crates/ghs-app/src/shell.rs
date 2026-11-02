@@ -40,6 +40,7 @@ use ghs_engine::{
     MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
     SystemCommand, Wcs,
 };
+use ghs_i18n::{Locale, t};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -435,6 +436,9 @@ impl Shell {
 
         let mono = cx.theme().mono_font_family.clone();
         let mut state = AppState::new();
+        // Apply the persisted locale before the first frame. Unknown but
+        // well-formed tags stay in AppConfig and display English.
+        crate::i18n::apply_startup_locale(state.config.app());
         // Demo-only switches used for screenshots and manual reviews. They do
         // not affect normal startup and never touch the controller.
         let forced_light = std::env::args().any(|arg| arg == "--light");
@@ -2753,6 +2757,21 @@ impl Shell {
         cx.notify();
     }
 
+    /// Apply and persist a language-selector choice.
+    ///
+    /// The global locale changes immediately so the next frame uses the new
+    /// catalog, even if the app config cannot be written. Selecting a language
+    /// never sends a controller command.
+    fn select_language(&mut self, locale: Locale, cx: &mut Context<Self>) {
+        if let Err(message) = crate::i18n::choose_locale(&mut self.state.config, locale) {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Locale selection was not saved: {message}"),
+            );
+        }
+        cx.notify();
+    }
+
     fn save_app_config(&mut self, cx: &mut Context<Self>) {
         match self.state.config.save_app() {
             Ok(path) => self.state.push_console(
@@ -4859,7 +4878,7 @@ impl Shell {
             let view = view.clone();
             let variant = mode_variant(cx, p, active);
             Button::new(format!("mode-{index}"))
-                .label(mode.label())
+                .label(t(mode.label()))
                 .h(px(48.0))
                 .px_3()
                 .rounded_lg()
@@ -4891,7 +4910,7 @@ impl Shell {
         // point, so tapping it opens the transport picker.
         let status_text = format!(
             "{} | {} axes | {}",
-            link_label,
+            t(link_label),
             self.state.profile.capabilities.axes.len(),
             self.state.machine_state
         );
@@ -4899,9 +4918,9 @@ impl Shell {
             self.state.connection,
             ConnectionState::Connecting | ConnectionState::Ready
         ) {
-            "DISCONNECT"
+            t("DISCONNECT")
         } else {
-            "CONNECT"
+            t("CONNECT")
         };
 
         div()
@@ -4962,7 +4981,7 @@ impl Shell {
             .child(
                 Switch::new("theme-toggle")
                     .checked(!self.state.dark)
-                    .label("Light")
+                    .label(t("Light"))
                     .text_size(px(12.0))
                     .on_change(move |checked, _, cx| {
                         let dark = !*checked;
@@ -4979,7 +4998,7 @@ impl Shell {
                     .label(link_text)
                     .secondary()
                     .h(px(48.0))
-                    .w(px(96.0))
+                    .w(px(120.0))
                     .rounded_lg()
                     .text_size(px(12.0))
                     .on_click(move |_, _, cx| {
@@ -4997,7 +5016,7 @@ impl Shell {
             )
             .child(
                 Button::new("reset")
-                    .label("RESET")
+                    .label(t("RESET"))
                     .danger()
                     .h(px(48.0))
                     .w(px(84.0))
@@ -5009,7 +5028,7 @@ impl Shell {
             )
             .child(
                 Button::new("stop")
-                    .label("STOP")
+                    .label(t("STOP"))
                     .warning()
                     .h(px(48.0))
                     .w(px(84.0))
@@ -5074,7 +5093,7 @@ impl Shell {
             view.clone(),
         );
         let save_log = Button::new("console-save-log")
-            .label("SAVE LOG")
+            .label(t("SAVE LOG"))
             .secondary()
             .h(px(48.0))
             .w(px(84.0))
@@ -5260,7 +5279,7 @@ impl Shell {
         let status = if !active {
             format!("{line_count} LINES")
         } else if match_count == 0 {
-            "NO MATCH".to_string()
+            t("NO MATCH").to_string()
         } else {
             format!(
                 "{} / {} MATCH",
@@ -5303,7 +5322,7 @@ impl Shell {
                     .child(search_field)
                     .child(program_search_button(
                         "program-search-prev",
-                        "PREV",
+                        t("PREV"),
                         has_matches,
                         p,
                         view.clone(),
@@ -5311,7 +5330,7 @@ impl Shell {
                     ))
                     .child(program_search_button(
                         "program-search-next",
-                        "NEXT",
+                        t("NEXT"),
                         has_matches,
                         p,
                         view.clone(),
@@ -5400,7 +5419,7 @@ impl Shell {
                 } else if has_breakpoint {
                     format!("BREAKPOINT ON | {count} TOTAL")
                 } else if active {
-                    format!("JOB ACTIVE: RUN TO SETS BP ONLY | {count} TOTAL")
+                    format!("{}: RUN TO SETS BP ONLY | {count} TOTAL", t("JOB ACTIVE"))
                 } else {
                     format!("NO BREAKPOINT | {count} TOTAL")
                 };
@@ -5416,7 +5435,7 @@ impl Shell {
             None => {
                 let detail = gate
                     .map(|refusal| refusal.message().to_string())
-                    .unwrap_or_else(|| "TAP A LINE TO SELECT".to_string());
+                    .unwrap_or_else(|| t("TAP A LINE TO SELECT").to_string());
                 (String::from("NO LINE SELECTED"), detail, p.text_faint)
             }
         };
@@ -5456,7 +5475,7 @@ impl Shell {
             )
             .child(
                 Button::new("program-toggle-breakpoint")
-                    .label("BP")
+                    .label(t("BP"))
                     .secondary()
                     .h(px(48.0))
                     .w(px(58.0))
@@ -5474,10 +5493,10 @@ impl Shell {
             )
             .child(
                 Button::new("program-run-to")
-                    .label("RUN TO")
+                    .label(t("RUN TO"))
                     .primary()
                     .h(px(48.0))
-                    .w(px(88.0))
+                    .w(px(116.0))
                     .rounded_lg()
                     .text_size(px(10.0))
                     .disabled(!run_ok)
@@ -5580,7 +5599,7 @@ impl Shell {
                     .text_size(px(9.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(p.text_faint)
-                    .child("PROGRAM"),
+                    .child(t("PROGRAM")),
             )
             .child(
                 div()
@@ -5637,7 +5656,7 @@ impl Shell {
                             .text_size(px(12.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text)
-                            .child("NO PROGRAM LOADED"),
+                            .child(t("NO PROGRAM LOADED")),
                     )
                     .child(
                         div()
@@ -5659,7 +5678,7 @@ impl Shell {
                     })
                     .child(
                         Button::new(id)
-                            .label("LOAD PROGRAM")
+                            .label(t("LOAD PROGRAM"))
                             .primary()
                             .h(px(48.0))
                             .w_full()
@@ -5700,7 +5719,7 @@ impl Shell {
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text_dim)
-                            .child(self.state.mode.title()),
+                            .child(t(self.state.mode.title())),
                     )
                     .child(
                         div()
@@ -5835,7 +5854,7 @@ impl Shell {
         h_flex()
             .id("run-options")
             .h(px(48.0))
-            .w(px(104.0))
+            .w(px(150.0))
             .flex_shrink_0()
             .items_center()
             .justify_center()
@@ -5854,7 +5873,7 @@ impl Shell {
                     .text_size(px(9.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(p.text_faint)
-                    .child("RUN OPTIONS"),
+                    .child(t("RUN OPTIONS")),
             )
             .child(
                 div()
@@ -5863,9 +5882,9 @@ impl Shell {
                     .font_weight(FontWeight::BOLD)
                     .text_color(color)
                     .child(if any {
-                        format!("{count} ON")
+                        format!("{count} {}", t("ON"))
                     } else {
-                        "OFF".to_string()
+                        t("OFF").to_string()
                     }),
             )
     }
@@ -5918,7 +5937,7 @@ impl Shell {
                     .text_size(px(9.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(p.text_faint)
-                    .child("RAPID"),
+                    .child(t("RAPID")),
             )
             .child(
                 div()
@@ -5978,7 +5997,7 @@ impl Shell {
         let confirm_label = if will_start {
             "SET BP + START"
         } else {
-            "SET BREAKPOINT"
+            t("SET BREAKPOINT")
         };
 
         div()
@@ -6027,7 +6046,7 @@ impl Shell {
                                     .text_color(p.warning)
                                     .child(format!("RUN TO LINE {line}")),
                             )
-                            .child(chip("CONFIRM REQUIRED", p)),
+                            .child(chip(t("CONFIRM REQUIRED"), p)),
                     )
                     .child(
                         h_flex()
@@ -6127,7 +6146,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("run-to-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -6245,7 +6264,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(if value { p.on_accent } else { p.text_dim })
-                        .child(if value { "ON" } else { "OFF" }),
+                        .child(if value { t("ON") } else { t("OFF") }),
                 )
         });
         let error = self.state.run_options_error.clone();
@@ -6292,7 +6311,7 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child("RUN OPTIONS"),
+                                    .child(t("RUN OPTIONS")),
                             )
                             .child(chip("CONTROLLER STATE", p)),
                     )
@@ -6358,7 +6377,7 @@ impl Shell {
                                             shell.close_run_options(cx);
                                         });
                                     })
-                                    .child("CLOSE"),
+                                    .child(t("CLOSE")),
                             ),
                     ),
             )
@@ -6410,7 +6429,7 @@ impl Shell {
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(color)
-                            .child(status),
+                            .child(t(status)),
                     )
                     .when_some(detail, |this, detail| {
                         this.child(
@@ -6437,7 +6456,7 @@ impl Shell {
                                 .text_size(px(9.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(p.accent)
-                                .child("HEIGHT MAP / COMPENSATED"),
+                                .child(t("HEIGHT MAP / COMPENSATED")),
                         )
                     })
                     .child(
@@ -6446,7 +6465,7 @@ impl Shell {
                             .font_family(self.mono.clone())
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child(format!("TIME {elapsed}")),
+                            .child(format!("{} {elapsed}", t("TIME"))),
                     ),
             )
             .child(
@@ -6456,10 +6475,10 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("job-load")
-                            .label("LOAD PROGRAM")
+                            .label(t("LOAD PROGRAM"))
                             .secondary()
                             .h(px(48.0))
-                            .w(px(132.0))
+                            .w(px(156.0))
                             .rounded_lg()
                             .text_size(px(10.0))
                             .on_click(move |_, window, cx| {
@@ -6470,7 +6489,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("job-start")
-                            .label("START")
+                            .label(t("START"))
                             .primary()
                             .h(px(48.0))
                             .w(px(78.0))
@@ -6483,7 +6502,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("job-pause")
-                            .label("PAUSE")
+                            .label(t("PAUSE"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(78.0))
@@ -6496,10 +6515,10 @@ impl Shell {
                     )
                     .child(
                         Button::new("job-resume")
-                            .label("RESUME")
+                            .label(t("RESUME"))
                             .primary()
                             .h(px(48.0))
-                            .w(px(88.0))
+                            .w(px(104.0))
                             .rounded_lg()
                             .text_size(px(11.0))
                             .disabled(!resume_ok)
@@ -6509,10 +6528,10 @@ impl Shell {
                     )
                     .child(
                         Button::new("job-stop")
-                            .label("STOP")
+                            .label(t("STOP"))
                             .warning()
                             .h(px(48.0))
-                            .w(px(68.0))
+                            .w(px(84.0))
                             .rounded_lg()
                             .text_size(px(11.0))
                             .disabled(!stop_ok)
@@ -6529,8 +6548,8 @@ impl Shell {
         // Real geometry comes from `JobLoaded`; the synthetic sketch remains
         // only for `--mock` and for a live session with nothing loaded.
         let path_label = match (&program, self.state.live) {
-            (Some(_), _) => "TOOLPATH",
-            (None, true) => "NO PROGRAM",
+            (Some(_), _) => t("TOOLPATH"),
+            (None, true) => t("NO PROGRAM"),
             (None, false) => "SYNTHETIC",
         };
         let segments = program
@@ -6541,7 +6560,7 @@ impl Shell {
         let mode = self.viewer.mode();
 
         let fit_view = cx.entity();
-        let fit = chip_button("viewer-fit", "FIT", p, move |_, cx| {
+        let fit = chip_button("viewer-fit", t("FIT"), p, move |_, cx| {
             fit_view.update(cx, |this, cx| {
                 this.viewer.fit();
                 cx.notify();
@@ -6608,9 +6627,9 @@ impl Shell {
                     .bg(p.panel.opacity(0.9))
                     .border_1()
                     .border_color(p.border)
-                    .child(legend(p.path_cut, "Cut", p))
-                    .child(legend(p.path_rapid, "Rapid", p))
-                    .child(legend(p.path_plunge, "Plunge", p))
+                    .child(legend(p.path_cut, t("Cut"), p))
+                    .child(legend(p.path_rapid, t("Rapid"), p))
+                    .child(legend(p.path_plunge, t("Plunge"), p))
                     .when(mode.is_three_d(), |this| {
                         this.child(
                             div()
@@ -6638,7 +6657,8 @@ impl Shell {
                     .text_color(p.text_dim)
                     .child(if self.state.live {
                         format!(
-                            "TOOL {} | S{}",
+                            "{} {} | S{}",
+                            t("TOOL"),
                             self.state
                                 .tool
                                 .map_or_else(|| "--".to_string(), |tool| tool.to_string()),
@@ -6686,14 +6706,14 @@ impl Shell {
             .count();
         let file_count = browser.file_count();
         let folder_label = if folder_count == 1 {
-            "FOLDER"
+            t("FOLDER")
         } else {
             "FOLDERS"
         };
         let file_label = if file_count == 1 {
-            "PROGRAM"
+            t("PROGRAM")
         } else {
-            "PROGRAMS"
+            t("PROGRAMS")
         };
         let error = browser.error().map(str::to_string);
         let refusal = self.state.program_load_refusal();
@@ -6701,11 +6721,11 @@ impl Shell {
         let (link_label, link_color) = match refusal {
             Some(ProgramLoadRefusal::Mock) => ("MOCK / BROWSE ONLY", p.warning),
             Some(ProgramLoadRefusal::NotReady) => ("LINK NOT READY", p.warning),
-            Some(ProgramLoadRefusal::JobActive) => ("JOB ACTIVE", p.warning),
+            Some(ProgramLoadRefusal::JobActive) => (t("JOB ACTIVE"), p.warning),
             None => ("LIVE / READY", p.success),
         };
         let selected_name = selected.as_ref().map_or_else(
-            || "No file selected".to_string(),
+            || t("No file selected").to_string(),
             |entry| entry.name.clone(),
         );
         let selected_meta = match (&selected, refusal) {
@@ -6803,7 +6823,7 @@ impl Shell {
                                     .text_size(px(14.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child("LOAD PROGRAM"),
+                                    .child(t("LOAD PROGRAM")),
                             )
                             .child(
                                 div()
@@ -6828,7 +6848,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("file-browser-close")
-                            .label("CLOSE")
+                            .label(t("CLOSE"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(88.0))
@@ -6851,7 +6871,7 @@ impl Shell {
                             .text_size(px(9.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text_faint)
-                            .child("CURRENT"),
+                            .child(t("CURRENT")),
                     )
                     .child(
                         div()
@@ -6882,7 +6902,7 @@ impl Shell {
                     .child(path_field)
                     .child(
                         Button::new("file-browser-up")
-                            .label("UP")
+                            .label(t("UP"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(64.0))
@@ -6894,7 +6914,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("file-browser-go")
-                            .label("GO")
+                            .label(t("GO"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(64.0))
@@ -6976,7 +6996,7 @@ impl Shell {
                 )
                 .child(
                     Button::new("file-browser-cancel")
-                        .label("CANCEL")
+                        .label(t("CANCEL"))
                         .secondary()
                         .h(px(48.0))
                         .w(px(96.0))
@@ -6991,7 +7011,7 @@ impl Shell {
                 )
                 .child(
                     Button::new("file-browser-load")
-                        .label("LOAD PROGRAM")
+                        .label(t("LOAD PROGRAM"))
                         .primary()
                         .h(px(48.0))
                         .w(px(150.0))
@@ -7164,7 +7184,7 @@ impl Shell {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(section_label("PROBE OFFSET X/Y", p))
+                    .child(section_label(t("PROBE OFFSET X/Y"), p))
                     .child(self.probe_offset_button(ProbeField::ProbeOffsetX, "X", p, cx))
                     .child(self.probe_offset_button(ProbeField::ProbeOffsetY, "Y", p, cx))
                     .child(
@@ -7237,9 +7257,9 @@ impl Shell {
         let status = if partial {
             "APPLY DEFERRED"
         } else if ctx.ready && ctx.has_probe {
-            "READY"
+            t("READY")
         } else {
-            "SETUP"
+            t("SETUP")
         };
         let status_color = if partial {
             p.info
@@ -7293,7 +7313,7 @@ impl Shell {
                                     .text_size(px(15.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child(card.title()),
+                                    .child(t(card.title())),
                             )
                             .child(
                                 div()
@@ -7324,7 +7344,7 @@ impl Shell {
                     "probe-configure-{}",
                     card.title().to_lowercase().replace(' ', "-")
                 ))
-                .label("CONFIGURE")
+                .label(t("CONFIGURE"))
                 .secondary()
                 .h(px(48.0))
                 .w_full()
@@ -7354,13 +7374,13 @@ impl Shell {
             None
         };
         let status = if saved.is_some() {
-            "SAVED MAP"
+            t("SAVED MAP")
         } else if let Some(run) = self.state.probe.run() {
-            run.phase.label()
+            t(run.phase.label())
         } else if preflight.setup.is_some() {
             "PREFLIGHT OK"
         } else {
-            "SETUP"
+            t("SETUP")
         };
         let status_color = if saved.is_some() {
             p.info
@@ -7464,7 +7484,7 @@ impl Shell {
                     .border_color(p.border)
                     .child(
                         Button::new("probe-back")
-                            .label("CYCLES")
+                            .label(t("CYCLES"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(84.0))
@@ -7489,7 +7509,7 @@ impl Shell {
                                             .text_size(px(15.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(p.text)
-                                            .child(card.title()),
+                                            .child(t(card.title())),
                                     )
                                     .child(
                                         div()
@@ -7550,7 +7570,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(section_label("CYCLE PARAMETERS", p))
+                    .child(section_label(t("CYCLE PARAMETERS"), p))
                     .child(
                         div()
                             .text_size(px(9.0))
@@ -7575,9 +7595,9 @@ impl Shell {
         let view = cx.entity();
         let unit = field.unit();
         let label = if unit.is_empty() {
-            field.label().to_string()
+            t(field.label()).to_string()
         } else {
-            format!("{} ({})", field.label(), unit)
+            format!("{} ({})", t(field.label()), unit)
         };
         let value = self.state.probe.field_text(field).to_string();
         let mut cell = v_flex()
@@ -7652,7 +7672,7 @@ impl Shell {
                         .flex_wrap()
                         .items_center()
                         .gap_2()
-                        .child(section_label("GRID SUMMARY", p))
+                        .child(section_label(t("GRID SUMMARY"), p))
                         .child(
                             div()
                                 .text_size(px(11.0))
@@ -7733,7 +7753,7 @@ impl Shell {
                 .child(
                     Switch::new("probe-connected")
                         .checked(self.state.probe.probe_connected_confirmed)
-                        .label("Probe connected")
+                        .label(t("Probe connected"))
                         .text_size(px(11.0))
                         .on_change(move |checked, _, cx| {
                             connected_view.update(cx, |this, cx| {
@@ -7912,7 +7932,7 @@ impl Shell {
                 cx,
                 p,
                 format!("probe-mode-{label}-in"),
-                "POCKET",
+                t("POCKET"),
                 !outside,
                 move |_, cx| {
                     in_view.update(cx, |this, cx| {
@@ -7979,7 +7999,7 @@ impl Shell {
                 .text_size(px(9.0))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("TOUCHES"),
+                .child(t("TOUCHES")),
         );
         for count in [3_u8, 4, 6, 8] {
             let view = cx.entity();
@@ -8192,7 +8212,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(section_label("PREFLIGHT", p))
+                    .child(section_label(t("PREFLIGHT"), p))
                     .child(
                         div()
                             .px_2()
@@ -8208,7 +8228,7 @@ impl Shell {
                             .text_size(px(9.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(if ok { p.success } else { p.danger })
-                            .child(if ok { "READY" } else { "REFUSED" }),
+                            .child(if ok { t("READY") } else { "REFUSED" }),
                     )
                     .child(div().flex_1())
                     .child(
@@ -8236,7 +8256,7 @@ impl Shell {
             })
             .unwrap_or((0.0, 0.0));
         panel = panel.child(probe_notice(
-            "PROBE OFFSET X/Y",
+            t("PROBE OFFSET X/Y"),
             &format!(
                 "X{} Y{} mm. Entered positions/centres/grid are FEATURE (probe-tip) coordinates; \
                  plan FROM/TO are CONTROLLED-POINT coordinates (feature - offset).",
@@ -8253,14 +8273,14 @@ impl Shell {
                 .map_or(0.0, |setup| setup.map_z_offset_mm);
             panel = panel
                 .child(probe_notice(
-                    "SAFE Z",
+                    t("SAFE Z"),
                     "Safe Z must clear the highest point on the stock; every grid probe descends \
                      from it. SEARCH must cover SAFE Z - SURFACE Z.",
                     p.warning,
                     p,
                 ))
                 .child(probe_notice(
-                    "MAP Z OFFSET",
+                    t("MAP Z OFFSET"),
                     &format!(
                         "{} mm is added to every measured height for summary, overlay, CSV and \
                          Apply. The plan and SURFACE Z search are unchanged.",
@@ -8397,7 +8417,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(section_label("PROBE RUN", p))
+                    .child(section_label(t("PROBE RUN"), p))
                     .child(
                         div()
                             .px_2()
@@ -8409,7 +8429,7 @@ impl Shell {
                             .text_size(px(9.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(phase_color)
-                            .child(run.phase.label()),
+                            .child(t(run.phase.label())),
                     )
                     .child(
                         div()
@@ -8428,7 +8448,7 @@ impl Shell {
                         let attack_view = cx.entity();
                         this.child(
                             Button::new("probe-abort")
-                                .label("ABORT")
+                                .label(t("ABORT"))
                                 .warning()
                                 .h(px(48.0))
                                 .w(px(92.0))
@@ -8542,7 +8562,7 @@ impl Shell {
                         .bg(p.panel)
                         .border_1()
                         .border_color(p.border)
-                        .child(section_label("RAW PRB (machine mm)", p))
+                        .child(section_label(t("RAW PRB (machine mm)"), p))
                         .child(
                             div()
                                 .id("probe-raw-scroll")
@@ -8566,7 +8586,7 @@ impl Shell {
                     .items_center()
                     .child(
                         Button::new("probe-retry")
-                            .label("RETRY PREFLIGHT")
+                            .label(t("RETRY PREFLIGHT"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(150.0))
@@ -8613,7 +8633,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(section_label("SAVED MAPS", p))
+                    .child(section_label(t("SAVED MAPS"), p))
                     .child(
                         div()
                             .px_2()
@@ -8775,7 +8795,7 @@ impl Shell {
                                 .text_size(px(7.5))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(if is_selected { p.accent } else { p.text_faint })
-                                .child(if is_selected { "OPEN" } else { "VIEW" }),
+                                .child(if is_selected { t("OPEN") } else { t("VIEW") }),
                         ),
                 );
             }
@@ -8839,7 +8859,7 @@ impl Shell {
                 live.wcs.as_str().to_string(),
             ),
             (
-                "WCS OFFSET",
+                t("WCS OFFSET"),
                 format!(
                     "X{} Y{}",
                     format_mm(saved.frame.wcs_value_mm.get(CoreAxis::X)),
@@ -8910,7 +8930,7 @@ impl Shell {
                     .items_center()
                     .flex_wrap()
                     .gap_2()
-                    .child(section_label("SAVED MAP", p))
+                    .child(section_label(t("SAVED MAP"), p))
                     .child(
                         div()
                             .px_2()
@@ -8963,14 +8983,14 @@ impl Shell {
                     .gap_1()
                     .child(
                         height_map_detail_cell(
-                            "VALID",
+                            t("VALID"),
                             &format!("{} / {}", summary.valid, summary.total),
                             p,
                         )
                         .w(px(96.0)),
                     )
                     .child(
-                        height_map_detail_cell("MISSING", &summary.missing.to_string(), p)
+                        height_map_detail_cell(t("MISSING"), &summary.missing.to_string(), p)
                             .w(px(96.0)),
                     )
                     .child(height_map_detail_cell("MIN Z", &format!("{min_z} mm"), p).w(px(96.0)))
@@ -8978,7 +8998,7 @@ impl Shell {
                     .child(height_map_detail_cell("COMP RANGE", &compensation, p).w(px(96.0)))
                     .child(
                         height_map_detail_cell(
-                            "SURFACE",
+                            t("SURFACE"),
                             &format!("{} mm", format_mm(summary.nominal_z_mm)),
                             p,
                         )
@@ -9003,7 +9023,7 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(section_label("MEASUREMENT FRAME", p))
+                            .child(section_label(t("MEASUREMENT FRAME"), p))
                             .child(
                                 div()
                                     .text_size(px(8.0))
@@ -9123,7 +9143,7 @@ impl Shell {
             )
             .child(
                 Button::new("saved-map-close")
-                    .label("CLOSE MAP")
+                    .label(t("CLOSE MAP"))
                     .secondary()
                     .h(px(56.0))
                     .w(px(150.0))
@@ -9172,7 +9192,7 @@ impl Shell {
                     .items_center()
                     .child(
                         Button::new("height-map-save")
-                            .label("SAVE MAP")
+                            .label(t("SAVE MAP"))
                             .primary()
                             .h(px(48.0))
                             .w(px(130.0))
@@ -9259,13 +9279,15 @@ impl Shell {
         let status = self.state.height_map.status(snapshot.as_ref());
         let (status_text, status_color) = match status {
             HeightMapApplyStatus::MeasurementOnly => {
-                (HeightMapApplyStatus::MeasurementOnly.label(), p.warning)
+                (t(HeightMapApplyStatus::MeasurementOnly.label()), p.warning)
             }
             HeightMapApplyStatus::ReadyToApply => {
-                (HeightMapApplyStatus::ReadyToApply.label(), p.accent)
+                (t(HeightMapApplyStatus::ReadyToApply.label()), p.accent)
             }
-            HeightMapApplyStatus::Applied => (HeightMapApplyStatus::Applied.label(), p.success),
-            HeightMapApplyStatus::Reverted => (HeightMapApplyStatus::Reverted.label(), p.text_dim),
+            HeightMapApplyStatus::Applied => (t(HeightMapApplyStatus::Applied.label()), p.success),
+            HeightMapApplyStatus::Reverted => {
+                (t(HeightMapApplyStatus::Reverted.label()), p.text_dim)
+            }
         };
         let last_error = self.state.height_map.last_error().map(str::to_string);
         let overlay = self.state.probe.height_overlay();
@@ -9286,7 +9308,7 @@ impl Shell {
         });
         let export_chip = run.export.as_ref().map(|export| match &export.rows {
             Ok(rows) => (format!("EXPORTED {rows}"), p.success),
-            Err(_) => ("FAILED".to_string(), p.danger),
+            Err(_) => (t("FAILED").to_string(), p.danger),
         });
         let min_z = summary.min_z_mm.map_or_else(|| "--".to_string(), format_mm);
         let max_z = summary.max_z_mm.map_or_else(|| "--".to_string(), format_mm);
@@ -9297,9 +9319,9 @@ impl Shell {
             _ => "--".to_string(),
         };
         let partial = if summary.complete {
-            "COMPLETE"
+            t("COMPLETE")
         } else {
-            "PARTIAL"
+            t("PARTIAL")
         };
         let partial_color = if summary.complete {
             p.success
@@ -9313,7 +9335,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(section_label("HEIGHT MAP RESULT", p))
+                    .child(section_label(t("HEIGHT MAP RESULT"), p))
                     .child(
                         div()
                             .px_2()
@@ -9345,7 +9367,7 @@ impl Shell {
                         run.bound(),
                         run.expected(),
                         run.setup.plan.name,
-                        run.phase.label()
+                        t(run.phase.label())
                     )),
             )
             .when_some(run.error.clone(), |this, error| {
@@ -9371,14 +9393,14 @@ impl Shell {
                     .gap_1()
                     .child(
                         height_map_detail_cell(
-                            "VALID",
+                            t("VALID"),
                             &format!("{} / {}", summary.valid, summary.total),
                             p,
                         )
                         .w(px(96.0)),
                     )
                     .child(
-                        height_map_detail_cell("MISSING", &summary.missing.to_string(), p)
+                        height_map_detail_cell(t("MISSING"), &summary.missing.to_string(), p)
                             .w(px(96.0)),
                     )
                     .child(height_map_detail_cell("MIN Z", &format!("{min_z} mm"), p).w(px(96.0)))
@@ -9386,7 +9408,7 @@ impl Shell {
                     .child(height_map_detail_cell("COMP RANGE", &compensation, p).w(px(96.0)))
                     .child(
                         height_map_detail_cell(
-                            "SURFACE",
+                            t("SURFACE"),
                             &format!("{} mm", format_mm(summary.nominal_z_mm)),
                             p,
                         )
@@ -9440,7 +9462,7 @@ impl Shell {
                             .items_center()
                             .child(
                                 Button::new("height-map-export")
-                                    .label("EXPORT CSV")
+                                    .label(t("EXPORT CSV"))
                                     .secondary()
                                     .h(px(48.0))
                                     .w(px(130.0))
@@ -9573,10 +9595,14 @@ impl Shell {
             let cancel_view = cx.entity();
             let confirm_view = cx.entity();
             return section
-                .child(section_label("CONFIRM APPLY", p))
-                .child(compact_stat_row("PROGRAM", preview.program_name.clone(), p))
+                .child(section_label(t("CONFIRM APPLY"), p))
                 .child(compact_stat_row(
-                    "MAP",
+                    t("PROGRAM"),
+                    preview.program_name.clone(),
+                    p,
+                ))
+                .child(compact_stat_row(
+                    t("MAP"),
                     format!(
                         "{} / {} cells, {} x {} mm step",
                         preview.valid_cells,
@@ -9626,7 +9652,7 @@ impl Shell {
                         .gap_2()
                         .child(
                             Button::new("height-map-cancel")
-                                .label("CANCEL")
+                                .label(t("CANCEL"))
                                 .secondary()
                                 .h(px(48.0))
                                 .w(px(96.0))
@@ -9640,7 +9666,7 @@ impl Shell {
                         )
                         .child(
                             Button::new("height-map-confirm")
-                                .label("CONFIRM APPLY")
+                                .label(t("CONFIRM APPLY"))
                                 .primary()
                                 .h(px(48.0))
                                 .w(px(160.0))
@@ -9697,7 +9723,7 @@ impl Shell {
                         )
                         .child(
                             Button::new("height-map-revert")
-                                .label("REVERT")
+                                .label(t("REVERT"))
                                 .secondary()
                                 .h(px(48.0))
                                 .w(px(96.0))
@@ -9718,7 +9744,7 @@ impl Shell {
         let apply_view = cx.entity();
         section = section.child(
             Button::new("height-map-apply")
-                .label("APPLY HEIGHT MAP")
+                .label(t("APPLY HEIGHT MAP"))
                 .primary()
                 .h(px(48.0))
                 .w(px(168.0))
@@ -9827,9 +9853,9 @@ impl Shell {
             };
             let failed = matches!(self.state.offsets.status(), OffsetStatus::Failed(_));
             let (chip, chip_color) = if failed {
-                ("FAILED", p.danger)
+                (t("FAILED"), p.danger)
             } else {
-                ("APPLIED", p.success)
+                (t("APPLIED"), p.success)
             };
             section = section.child(
                 h_flex()
@@ -9942,7 +9968,7 @@ impl Shell {
                             .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.warning)
-                            .child("CONFIRM OFFSET WRITE"),
+                            .child(t("CONFIRM OFFSET WRITE")),
                     )
                     .child(
                         div()
@@ -9960,7 +9986,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("probe-apply-confirm")
-                                    .label("CONFIRM WRITE")
+                                    .label(t("CONFIRM WRITE"))
                                     .warning()
                                     .h(px(48.0))
                                     .w(px(150.0))
@@ -9975,7 +10001,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("probe-apply-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .w(px(100.0))
@@ -10020,7 +10046,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("probe-keep")
-                            .label("KEEP")
+                            .label(t("KEEP"))
                             .secondary()
                             .h(px(52.0))
                             .w(px(90.0))
@@ -10151,7 +10177,7 @@ impl Shell {
             )
         } else {
             (
-                "NOT READY".to_string(),
+                t("NOT READY").to_string(),
                 p.text_faint,
                 "RUN is the only action that starts motion; there is no auto-start",
             )
@@ -10189,7 +10215,7 @@ impl Shell {
             let abort_view = cx.entity();
             footer = footer.child(
                 Button::new("probe-footer-abort")
-                    .label("ABORT")
+                    .label(t("ABORT"))
                     .warning()
                     .h(px(56.0))
                     .w(px(112.0))
@@ -10204,7 +10230,7 @@ impl Shell {
             let back_footer_view = cx.entity();
             footer = footer.child(
                 Button::new("probe-run")
-                    .label(if run_exists { "RUN AGAIN" } else { "RUN" })
+                    .label(if run_exists { "RUN AGAIN" } else { t("RUN") })
                     .primary()
                     .h(px(56.0))
                     .w(px(120.0))
@@ -10217,7 +10243,7 @@ impl Shell {
             );
             footer = footer.child(
                 Button::new("probe-footer-back")
-                    .label("CYCLES")
+                    .label(t("CYCLES"))
                     .secondary()
                     .h(px(56.0))
                     .w(px(96.0))
@@ -10251,9 +10277,9 @@ impl Shell {
                             .text_size(px(18.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text)
-                            .child(self.state.mode.title()),
+                            .child(t(self.state.mode.title())),
                     )
-                    .child(chip(if self.state.live { "LIVE" } else { "MOCK" }, p)),
+                    .child(chip(if self.state.live { "LIVE" } else { t("MOCK") }, p)),
             )
             .child(div().flex_1().min_h(px(0.0)).child(body))
     }
@@ -10280,7 +10306,7 @@ impl Shell {
 
         let (status_color, status_text) = match model.status() {
             OffsetStatus::Idle if !model.reported() => (p.text_faint, "WAITING FOR $#".to_string()),
-            OffsetStatus::Idle => (p.success, "READY".to_string()),
+            OffsetStatus::Idle => (p.success, t("READY").to_string()),
             OffsetStatus::Refreshing => (p.warning, "REFRESHING AFTER WRITE".to_string()),
             OffsetStatus::Refreshed => (p.success, "REFRESHED FROM $#".to_string()),
             OffsetStatus::Failed(message) => (p.danger, format!("FAILED: {message}")),
@@ -10328,9 +10354,9 @@ impl Shell {
                                 p.text_faint
                             })
                             .child(if active_reported {
-                                "REPORTED"
+                                t("REPORTED")
                             } else {
-                                "NOT REPORTED"
+                                t("NOT REPORTED")
                             }),
                     ),
             )
@@ -10364,7 +10390,7 @@ impl Shell {
         };
         let zero_all_view = view.clone();
         let zero_all = Button::new("detail-zero-all")
-            .label("ZERO ALL")
+            .label(t("ZERO ALL"))
             .danger()
             .h(px(48.0))
             .flex_1()
@@ -10390,7 +10416,7 @@ impl Shell {
                 "offset-action-{}",
                 action.command().replace('.', "-")
             ))
-            .label(action.label())
+            .label(t(action.label()))
             .h(px(48.0))
             .flex_1()
             .rounded_lg()
@@ -10430,9 +10456,9 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("PREDEFINED POSITIONS / G92"),
+                            .child(t("PREDEFINED POSITIONS / G92")),
                     )
-                    .child(chip("CONFIRM", p)),
+                    .child(chip(t("CONFIRM"), p)),
             )
             .child(action_row)
             .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
@@ -10617,7 +10643,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("offset-export")
-                            .label("EXPORT OFFSETS")
+                            .label(t("EXPORT OFFSETS"))
                             .h(px(48.0))
                             .w(px(150.0))
                             .rounded_lg()
@@ -10639,7 +10665,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("offset-load-file")
-                            .label("LOAD OFFSETS FILE")
+                            .label(t("LOAD OFFSETS FILE"))
                             .h(px(48.0))
                             .w(px(180.0))
                             .rounded_lg()
@@ -10704,13 +10730,13 @@ impl Shell {
                                     .text_size(px(11.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text_dim)
-                                    .child("WCS OFFSETS"),
+                                    .child(t("WCS OFFSETS")),
                             )
                             .child(chip(self.state.unit(), p)),
                     )
                     .child(
                         Button::new("offset-refresh")
-                            .label("REFRESH $#")
+                            .label(t("REFRESH $#"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(112.0))
@@ -10841,14 +10867,14 @@ impl Shell {
             format!(
                 "{} sends {}. The machine will move to the stored position above. Nothing has \
                  been sent yet; CANCEL sends nothing. No homing or extra motion is added.",
-                action.label(),
+                t(action.label()),
                 pending.command()
             )
         } else {
             format!(
                 "{} sends {}. No axis moves; the displayed work position changes by the cleared \
                  offset. The old G92 values are shown above and $# is read back after the command.",
-                action.label(),
+                t(action.label()),
                 pending.command()
             )
         };
@@ -10872,7 +10898,7 @@ impl Shell {
                             .text_size(px(13.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(accent)
-                            .child(action.title()),
+                            .child(t(action.title())),
                     )
                     .child(chip("NOT SENT YET", p)),
             )
@@ -10910,7 +10936,7 @@ impl Shell {
                             .w(px(140.0))
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child(action.target_label()),
+                            .child(t(action.target_label())),
                     )
                     .child(
                         div()
@@ -10957,7 +10983,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("offset-confirm-cancel")
-                            .label("CANCEL")
+                            .label(t("CANCEL"))
                             .secondary()
                             .h(px(48.0))
                             .flex_1()
@@ -10972,9 +10998,9 @@ impl Shell {
                     .child(
                         Button::new("offset-confirm-accept")
                             .label(if action.moves_machine() {
-                                format!("CONFIRM {}", pending.command())
+                                format!("{} {}", t("CONFIRM"), pending.command())
                             } else {
-                                "CLEAR G92".to_string()
+                                t("CLEAR G92").to_string()
                             })
                             .danger()
                             .h(px(48.0))
@@ -11106,7 +11132,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("VALIDATED FILE"),
+                            .child(t("VALIDATED FILE")),
                     )
                     .child(
                         div()
@@ -11159,7 +11185,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("offsets-restore-cancel")
-                            .label("CANCEL")
+                            .label(t("CANCEL"))
                             .secondary()
                             .h(px(48.0))
                             .flex_1()
@@ -11280,7 +11306,7 @@ impl Shell {
                                             .text_color(p.text)
                                             .child(name),
                                     )
-                                    .child(chip(if confirm { "CONFIRM" } else { "DIRECT" }, p)),
+                                    .child(chip(if confirm { t("CONFIRM") } else { "DIRECT" }, p)),
                             )
                             .child(
                                 div()
@@ -11294,7 +11320,7 @@ impl Shell {
                     )
                     .child(
                         Button::new(format!("macro-run-{index}"))
-                            .label("RUN")
+                            .label(t("RUN"))
                             .primary()
                             .h(px(48.0))
                             .w(px(62.0))
@@ -11308,10 +11334,10 @@ impl Shell {
                     )
                     .child(
                         Button::new(format!("macro-edit-{index}"))
-                            .label("EDIT")
+                            .label(t("EDIT"))
                             .secondary()
                             .h(px(48.0))
-                            .w(px(62.0))
+                            .w(px(78.0))
                             .rounded_lg()
                             .text_size(px(10.0))
                             .disabled(save_blocker.is_some())
@@ -11323,7 +11349,7 @@ impl Shell {
                     )
                     .child(
                         Button::new(format!("macro-delete-{index}"))
-                            .label("DEL")
+                            .label(t("DEL"))
                             .warning()
                             .h(px(48.0))
                             .w(px(54.0))
@@ -11353,13 +11379,13 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(section_label("MACROS", p))
+                            .child(section_label(t("MACROS"), p))
                             .child(chip(&format!("{count} DEFINED"), p))
                             .child(chip("USER-DEFINED", p)),
                     )
                     .child(
                         Button::new("macro-new")
-                            .label("NEW MACRO")
+                            .label(t("NEW MACRO"))
                             .primary()
                             .h(px(48.0))
                             .w(px(124.0))
@@ -11446,10 +11472,10 @@ impl Shell {
                     )
                     .child(
                         Button::new(format!("keymap-edit-{}", action.id()))
-                            .label("EDIT")
+                            .label(t("EDIT"))
                             .secondary()
                             .h(px(40.0))
-                            .w(px(60.0))
+                            .w(px(78.0))
                             .rounded(px(6.0))
                             .text_size(px(9.0))
                             .on_click(move |_, window, cx| {
@@ -11487,8 +11513,8 @@ impl Shell {
                             .min_w(px(0.0))
                             .items_center()
                             .gap_2()
-                            .child(section_label("KEYMAP", p))
-                            .child(chip("PROFILE", p))
+                            .child(section_label(t("KEYMAP"), p))
+                            .child(chip(t("PROFILE"), p))
                             .when(dirty, |this| this.child(chip("UNSAVED", p)))
                             .child(
                                 div()
@@ -11535,7 +11561,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("keymap-reset")
-                            .label("RESET DEFAULTS")
+                            .label(t("RESET DEFAULTS"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(170.0))
@@ -11547,7 +11573,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("keymap-cancel")
-                            .label("CANCEL")
+                            .label(t("CANCEL"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(110.0))
@@ -11560,7 +11586,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("keymap-save")
-                            .label("SAVE")
+                            .label(t("SAVE"))
                             .primary()
                             .h(px(48.0))
                             .w(px(120.0))
@@ -11610,7 +11636,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(section_label("CONTROLLER DIAGNOSTICS", p))
+                    .child(section_label(t("CONTROLLER DIAGNOSTICS"), p))
                     .child(chip("READ-ONLY", p)),
             )
             .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
@@ -11639,7 +11665,7 @@ impl Shell {
             )
             .child(
                 Button::new("pins-open")
-                    .label("OPEN PINS / LIMITS")
+                    .label(t("OPEN PINS / LIMITS"))
                     .primary()
                     .h(px(48.0))
                     .w(px(220.0))
@@ -11649,6 +11675,52 @@ impl Shell {
                         view.update(cx, |shell, cx| shell.open_pins_panel(cx));
                     }),
             )
+    }
+
+    /// Compact four-way UI language selector.
+    ///
+    /// The native labels come from [`Locale::label`]; each target is 48 px
+    /// high. A change applies immediately, persists in `app.json`, and never
+    /// contacts the controller.
+    fn language_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let active = ghs_i18n::locale();
+        let buttons = Locale::ALL.iter().enumerate().map(|(index, locale)| {
+            let locale = *locale;
+            let locale_view = view.clone();
+            let selected = active == locale;
+            Button::new(format!("language-{index}"))
+                .label(locale.label())
+                .flex_1()
+                .h(px(48.0))
+                .rounded_lg()
+                .text_size(px(12.0))
+                .custom(mode_variant(cx, p, selected))
+                .border_1()
+                .border_color(if selected { p.accent } else { p.border })
+                .on_click(move |_, _, cx| {
+                    locale_view.update(cx, |this, cx| this.select_language(locale, cx));
+                })
+        });
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label("LANGUAGE", p))
+                    .child(chip(active.code(), p)),
+            )
+            .child(h_flex().w_full().gap_1().children(buttons))
+            .child(div().text_size(px(9.5)).text_color(p.text_faint).child(
+                "Applies immediately and is saved in app preferences; the controller is \
+                         not contacted.",
+            ))
     }
 
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -11700,7 +11772,7 @@ impl Shell {
             } else {
                 row.draft.clone()
             };
-            let status_label = row.status.label();
+            let status_label = t(row.status.label());
             let status_color = match &row.status {
                 StartupStatus::Verified => p.success,
                 StartupStatus::Mismatch(_) | StartupStatus::Failed(_) => p.danger,
@@ -11753,10 +11825,10 @@ impl Shell {
                             })
                             .child(
                                 Button::new(format!("startup-edit-{index}"))
-                                    .label("EDIT")
+                                    .label(t("EDIT"))
                                     .secondary()
                                     .h(px(36.0))
-                                    .w(px(62.0))
+                                    .w(px(78.0))
                                     .rounded(px(6.0))
                                     .text_size(px(10.0))
                                     .disabled(busy || !reported)
@@ -11778,7 +11850,7 @@ impl Shell {
                                         .flex_shrink_0()
                                         .text_size(px(9.0))
                                         .text_color(p.text_faint)
-                                        .child("NEW"),
+                                        .child(t("NEW")),
                                 )
                                 .child(
                                     div()
@@ -11792,7 +11864,7 @@ impl Shell {
                                 )
                                 .child(
                                     Button::new(format!("startup-apply-{index}"))
-                                        .label("APPLY")
+                                        .label(t("APPLY"))
                                         .warning()
                                         .h(px(36.0))
                                         .w(px(74.0))
@@ -11841,7 +11913,7 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(section_label("STARTUP LINES", p))
+                            .child(section_label(t("STARTUP LINES"), p))
                             .child(chip(
                                 if startup.reported() {
                                     "$N0 / $N1"
@@ -11860,7 +11932,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("startup-reload")
-                            .label("RELOAD")
+                            .label(t("RELOAD"))
                             .secondary()
                             .h(px(36.0))
                             .w(px(88.0))
@@ -11915,7 +11987,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(section_label("CONTROLLER SLEEP", p))
+                    .child(section_label(t("CONTROLLER SLEEP"), p))
                     .child(chip("$SLP", p)),
             )
             .child(div().text_size(px(10.0)).text_color(p.warning).child(
@@ -11938,7 +12010,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("sleep-open")
-                            .label("SLEEP")
+                            .label(t("SLEEP"))
                             .warning()
                             .h(px(48.0))
                             .w(px(120.0))
@@ -11973,18 +12045,18 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(section_label("CONTROLLER PROFILE", p))
+                    .child(section_label(t("CONTROLLER PROFILE"), p))
                     .child(chip(
                         if corrupt {
-                            "CORRUPT"
+                            t("CORRUPT")
                         } else if unverified {
-                            "UNVERIFIED"
+                            t("UNVERIFIED")
                         } else if has_pending {
-                            "PENDING CONFIRMATION"
+                            t("PENDING CONFIRMATION")
                         } else if config.key().is_some() {
-                            "LOCAL ONLY"
+                            t("LOCAL ONLY")
                         } else {
-                            "NO CONTROLLER"
+                            t("NO CONTROLLER")
                         },
                         p,
                     )),
@@ -12008,7 +12080,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("profile-save")
-                            .label("SAVE PROFILE")
+                            .label(t("SAVE PROFILE"))
                             .primary()
                             .h(px(48.0))
                             .w(px(140.0))
@@ -12021,7 +12093,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("profile-app-save")
-                            .label("SAVE APP")
+                            .label(t("SAVE APP"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(110.0))
@@ -12034,7 +12106,7 @@ impl Shell {
                     .when(has_pending, |this| {
                         this.child(
                             Button::new("profile-use-pending")
-                                .label("USE LOCAL DATA")
+                                .label(t("USE LOCAL DATA"))
                                 .warning()
                                 .h(px(48.0))
                                 .w(px(150.0))
@@ -12058,7 +12130,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(section_label("BACKUP BUNDLE", p))
+                    .child(section_label(t("BACKUP BUNDLE"), p))
                     .child(chip("JSON / V1", p)),
             )
             .child(
@@ -12078,7 +12150,7 @@ impl Shell {
                     .gap_2()
                     .child(
                         Button::new("backup-export")
-                            .label("EXPORT")
+                            .label(t("EXPORT"))
                             .primary()
                             .h(px(48.0))
                             .w(px(104.0))
@@ -12090,7 +12162,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("backup-validate")
-                            .label("VALIDATE")
+                            .label(t("VALIDATE"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(104.0))
@@ -12103,9 +12175,9 @@ impl Shell {
                     .child(
                         Button::new("backup-import")
                             .label(if import_armed {
-                                "CONFIRM IMPORT"
+                                t("CONFIRM IMPORT")
                             } else {
-                                "IMPORT"
+                                t("IMPORT")
                             })
                             .warning()
                             .h(px(48.0))
@@ -12126,6 +12198,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.language_card(p, cx))
             .child(self.pins_card(p, cx))
             .child(self.keymap_card(p, cx))
             .child(self.macro_card(p, cx))
@@ -12210,10 +12283,10 @@ impl Shell {
                     )
                     .child(
                         Button::new(format!("tool-edit-{number}"))
-                            .label("EDIT")
+                            .label(t("EDIT"))
                             .secondary()
                             .h(px(40.0))
-                            .w(px(62.0))
+                            .w(px(78.0))
                             .rounded(px(6.0))
                             .text_size(px(10.0))
                             .on_click(move |_, window, cx| {
@@ -12225,7 +12298,7 @@ impl Shell {
                     )
                     .child(
                         Button::new(format!("tool-delete-{number}"))
-                            .label("DEL")
+                            .label(t("DEL"))
                             .warning()
                             .h(px(40.0))
                             .w(px(54.0))
@@ -12278,7 +12351,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("tool-new")
-                                    .label("NEW TOOL")
+                                    .label(t("NEW TOOL"))
                                     .primary()
                                     .h(px(44.0))
                                     .w(px(108.0))
@@ -12292,7 +12365,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("tool-save")
-                                    .label("SAVE")
+                                    .label(t("SAVE"))
                                     .secondary()
                                     .h(px(44.0))
                                     .w(px(82.0))
@@ -12349,7 +12422,7 @@ impl Shell {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(section_label("CONTROLLER TOOLS", p))
+                                    .child(section_label(t("CONTROLLER TOOLS"), p))
                                     .child(chip("READ-ONLY", p)),
                             )
                             .child(chip(&format!("{} ENTRIES", controller.len()), p)),
@@ -12389,13 +12462,13 @@ impl Shell {
                             .text_size(px(8.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text_faint)
-                            .child(div().w(px(40.0)).child("TOOL"))
-                            .child(div().flex_1().child("NAME"))
+                            .child(div().w(px(40.0)).child(t("TOOL")))
+                            .child(div().flex_1().child(t("NAME")))
                             .child(div().w(px(68.0)).child("X"))
                             .child(div().w(px(68.0)).child("Y"))
                             .child(div().w(px(68.0)).child("Z"))
-                            .child(div().w(px(58.0)).child("RADIUS"))
-                            .child(div().w(px(46.0)).child("POCKET")),
+                            .child(div().w(px(58.0)).child(t("RADIUS")))
+                            .child(div().w(px(46.0)).child(t("POCKET"))),
                     );
                     for entry in controller.entries() {
                         panel = panel.child(
@@ -12539,7 +12612,7 @@ impl Shell {
                     .text_size(px(9.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(p.text_faint)
-                    .child("SEARCH"),
+                    .child(t("SEARCH")),
             )
             .child(
                 div()
@@ -12583,7 +12656,7 @@ impl Shell {
                         cx.notify();
                     });
                 })
-                .child("CLEAR")
+                .child(t("CLEAR"))
         });
 
         let pending_chip = div()
@@ -12621,7 +12694,7 @@ impl Shell {
             .child(pending_chip)
             .child(
                 Button::new("settings-apply")
-                    .label("APPLY")
+                    .label(t("APPLY"))
                     .primary()
                     .h(px(48.0))
                     .w(px(88.0))
@@ -12634,7 +12707,7 @@ impl Shell {
             )
             .child(
                 Button::new("settings-reset")
-                    .label("REVERT")
+                    .label(t("REVERT"))
                     .secondary()
                     .h(px(48.0))
                     .w(px(84.0))
@@ -12697,7 +12770,7 @@ impl Shell {
                 if query.is_empty() {
                     "$ES / $EG"
                 } else {
-                    "SEARCH"
+                    t("SEARCH")
                 },
                 p,
             ));
@@ -12994,7 +13067,7 @@ impl Shell {
                                 .text_size(px(14.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(p.accent)
-                                .child("PRESS A KEY COMBINATION"),
+                                .child(t("PRESS A KEY COMBINATION")),
                         )
                     })
                     .child({
@@ -13031,9 +13104,9 @@ impl Shell {
                             .child(
                                 Button::new("keymap-capture")
                                     .label(if capturing {
-                                        "PRESS A KEY..."
+                                        t("PRESS A KEY...")
                                     } else {
-                                        "RECORD KEY"
+                                        t("RECORD KEY")
                                     })
                                     .warning()
                                     .h(px(48.0))
@@ -13048,7 +13121,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("keymap-editor-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13062,7 +13135,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("keymap-editor-apply")
-                                    .label("USE KEY")
+                                    .label(t("USE KEY"))
                                     .primary()
                                     .h(px(48.0))
                                     .w(px(140.0))
@@ -13085,15 +13158,15 @@ impl Shell {
         };
         let view = cx.entity();
         let title = match entry.purpose {
-            SettingsEntryPurpose::Search => "SEARCH SETTINGS".to_string(),
+            SettingsEntryPurpose::Search => t("SEARCH SETTINGS").to_string(),
             SettingsEntryPurpose::Text(number) => self.state.settings.row(number).map_or_else(
                 || format!("SETTING ${number}"),
                 |row| format!("SETTING ${number} / {}", row.name),
             ),
             SettingsEntryPurpose::StartupLine(index) => format!("STARTUP LINE $N{index}"),
-            SettingsEntryPurpose::ToolName => "TOOL NAME".to_string(),
-            SettingsEntryPurpose::MacroName => "MACRO NAME".to_string(),
-            SettingsEntryPurpose::MacroCommand => "MACRO COMMAND".to_string(),
+            SettingsEntryPurpose::ToolName => t("TOOL NAME").to_string(),
+            SettingsEntryPurpose::MacroName => t("MACRO NAME").to_string(),
+            SettingsEntryPurpose::MacroCommand => t("MACRO COMMAND").to_string(),
             SettingsEntryPurpose::HeightMapName => "SAVE HEIGHT MAP".to_string(),
         };
         let hint = match entry.purpose {
@@ -13135,9 +13208,9 @@ impl Shell {
         let error = entry.error.clone();
         let input = entry.input.clone();
         let commit_label = match entry.purpose {
-            SettingsEntryPurpose::HeightMapName => "SAVE MAP",
+            SettingsEntryPurpose::HeightMapName => t("SAVE MAP"),
             SettingsEntryPurpose::StartupLine(_) => "KEEP DRAFT",
-            _ if masked => "SET",
+            _ if masked => t("SET"),
             _ => "APPLY TEXT",
         };
         let commit_view = view.clone();
@@ -13214,7 +13287,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("settings-entry-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13228,7 +13301,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("settings-entry-commit")
-                                    .label(commit_label)
+                                    .label(t(commit_label))
                                     .primary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13366,7 +13439,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("startup-confirm-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13380,7 +13453,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("startup-confirm-write")
-                                    .label("CONFIRM WRITE")
+                                    .label(t("CONFIRM WRITE"))
                                     .warning()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13451,7 +13524,7 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child("PUT CONTROLLER TO SLEEP"),
+                                    .child(t("PUT CONTROLLER TO SLEEP")),
                             )
                             .child(chip("$SLP", p)),
                     )
@@ -13483,7 +13556,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("sleep-confirm-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13497,7 +13570,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("sleep-confirm-send")
-                                    .label("CONFIRM SLEEP")
+                                    .label(t("CONFIRM SLEEP"))
                                     .warning()
                                     .h(px(48.0))
                                     .flex_1()
@@ -13592,7 +13665,7 @@ impl Shell {
         }
 
         let pin_state_card = match pins.pin_state() {
-            Some(state) => pins_section("PIN STATE ($PINSTATE)", p)
+            Some(state) => pins_section(t("PIN STATE ($PINSTATE)"), p)
                 .child(pins_key_value(
                     "RAW MASK",
                     signal_mask_text(state.mask),
@@ -13623,9 +13696,8 @@ impl Shell {
                     p,
                     &mono,
                 )),
-            None => {
-                pins_section("PIN STATE ($PINSTATE)", p).child(pins_empty(pins.pin_state_note(), p))
-            }
+            None => pins_section(t("PIN STATE ($PINSTATE)"), p)
+                .child(pins_empty(pins.pin_state_note(), p)),
         };
 
         let limits_card = match pins.limit_state() {
@@ -13660,7 +13732,7 @@ impl Shell {
                                     .text_size(px(9.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(if asserted { p.danger } else { p.success })
-                                    .child(if asserted { "ASSERTED" } else { "CLEAR" }),
+                                    .child(if asserted { "ASSERTED" } else { t("CLEAR") }),
                             ),
                     );
                 }
@@ -13680,10 +13752,10 @@ impl Shell {
         };
 
         let events_card = match pins.last_events() {
-            Some(events) => pins_section("LAST EVENTS ($LEV)", p)
+            Some(events) => pins_section(t("LAST EVENTS ($LEV)"), p)
                 .child(pins_key_value("COUNT", events.count.to_string(), p, &mono))
                 .child(pins_key_value(
-                    "SIGNALS",
+                    t("SIGNALS"),
                     if events.signals.is_empty() {
                         "none".to_string()
                     } else {
@@ -13698,9 +13770,8 @@ impl Shell {
                     p,
                     &mono,
                 )),
-            None => {
-                pins_section("LAST EVENTS ($LEV)", p).child(pins_empty(pins.last_events_note(), p))
-            }
+            None => pins_section(t("LAST EVENTS ($LEV)"), p)
+                .child(pins_empty(pins.last_events_note(), p)),
         };
 
         div()
@@ -13750,7 +13821,7 @@ impl Shell {
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(p.text)
-                                            .child("PINS / LIMITS"),
+                                            .child(t("PINS / LIMITS")),
                                     )
                                     .child(
                                         div()
@@ -13800,7 +13871,7 @@ impl Shell {
                                     .min_w(px(0.0))
                                     .gap_2()
                                     .child(
-                                        pins_section("PIN MAP ($PINS)", p)
+                                        pins_section(t("PIN MAP ($PINS)"), p)
                                             .child(
                                                 div()
                                                     .text_size(px(9.5))
@@ -13837,7 +13908,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("pins-refresh")
-                                    .label("REFRESH")
+                                    .label(t("REFRESH"))
                                     .primary()
                                     .h(px(48.0))
                                     .w(px(120.0))
@@ -13873,7 +13944,7 @@ impl Shell {
                                             shell.close_pins_panel(cx);
                                         });
                                     })
-                                    .child("CLOSE"),
+                                    .child(t("CLOSE")),
                             ),
                     ),
             )
@@ -13991,7 +14062,7 @@ impl Shell {
                 ("Origin Y", format!("{:>8.3}", self.state.offset(Axis::Y))),
                 ("Origin Z", format!("{:>8.3}", self.state.offset(Axis::Z))),
                 (
-                    "Feed",
+                    t("Feed"),
                     format!("{} {}/min", self.state.feed_rate, self.state.unit()),
                 ),
             ]
@@ -14001,7 +14072,7 @@ impl Shell {
                 ("Origin Y", "-87.200".to_string()),
                 ("Origin Z", "-2.000".to_string()),
                 (
-                    "Feed",
+                    t("Feed"),
                     format!("{} {}/min", self.state.feed_rate, self.state.unit()),
                 ),
             ]
@@ -14026,21 +14097,21 @@ impl Shell {
                 v_flex()
                     .gap_1()
                     .flex_shrink_0()
-                    .child(section_label("COOLANT", p))
+                    .child(section_label(t("COOLANT"), p))
                     .child(h_flex().gap_1().children(coolant)),
             )
             .child(
                 v_flex()
                     .gap_1()
                     .flex_shrink_0()
-                    .child(section_label("MACROS", p))
+                    .child(section_label(t("MACROS"), p))
                     .child(v_flex().gap_1().children(macro_rows)),
             )
             .child(
                 v_flex()
                     .gap_1()
                     .flex_shrink_0()
-                    .child(section_label("SIGNALS", p))
+                    .child(section_label(t("SIGNALS"), p))
                     .child(v_flex().gap_1().children(signal_rows))
                     .child(
                         div()
@@ -14060,7 +14131,7 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .justify_between()
-                            .child(section_label("WORK", p))
+                            .child(section_label(t("WORK"), p))
                             .child(chip(self.state.wcs(), p)),
                     )
                     .child(
@@ -14129,7 +14200,7 @@ impl Shell {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(section_label("MDI", p))
+                    .child(section_label(t("MDI"), p))
                     .child(
                         div()
                             .id("mdi-field")
@@ -14161,7 +14232,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("mdi-send")
-                            .label("SEND")
+                            .label(t("SEND"))
                             .primary()
                             .h(px(48.0))
                             .w(px(80.0))
@@ -14196,7 +14267,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("mdi-history-up")
-                                    .label("UP")
+                                    .label(t("UP"))
                                     .secondary()
                                     .h(px(30.0))
                                     .w(px(48.0))
@@ -14212,7 +14283,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("mdi-history-down")
-                                    .label("DN")
+                                    .label(t("DN"))
                                     .secondary()
                                     .h(px(30.0))
                                     .w(px(48.0))
@@ -14354,7 +14425,7 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .h(px(20.0))
-                    .child(section_label("DRO", p))
+                    .child(section_label(t("DRO"), p))
                     .child(
                         h_flex()
                             .items_center()
@@ -14392,7 +14463,7 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(section_label("FEED OVERRIDE", p))
+                            .child(section_label(t("FEED OVERRIDE"), p))
                             .child(
                                 div()
                                     .font_family(self.mono.clone())
@@ -14404,12 +14475,13 @@ impl Shell {
                     )
                     .child(
                         Button::new("feed-reset")
-                            .label("RESET 100%")
+                            .label(t("RESET 100%"))
                             .primary()
                             .h(px(48.0))
-                            .w(px(104.0))
+                            .w(px(148.0))
+                            .px_1()
                             .rounded_lg()
-                            .text_size(px(10.0))
+                            .text_size(px(8.0))
                             .disabled(!self.ready())
                             .on_click(move |_, window, cx| {
                                 reset_view.update(cx, |this, cx| {
@@ -14616,7 +14688,7 @@ impl Shell {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(section_label("JOG", p))
+                            .child(section_label(t("JOG"), p))
                             .child(
                                 div()
                                     .font_family(self.mono.clone())
@@ -14639,7 +14711,7 @@ impl Shell {
                     .child(
                         Switch::new("continuous")
                             .checked(self.state.continuous)
-                            .label("CONT")
+                            .label(t("CONT"))
                             .text_size(px(10.0))
                             .on_change(move |checked, _, cx| {
                                 continuous_view.update(cx, |this, cx| {
@@ -14686,7 +14758,7 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .h(px(20.0))
-                    .child(section_label("SPINDLE", p))
+                    .child(section_label(t("SPINDLE"), p))
                     .child(
                         h_flex()
                             .items_center()
@@ -14701,7 +14773,11 @@ impl Shell {
                                 Switch::new("spindle-power")
                                     .checked(self.state.spindle_on)
                                     .disabled(!self.mdi_allowed())
-                                    .label(if self.state.spindle_on { "ON" } else { "OFF" })
+                                    .label(if self.state.spindle_on {
+                                        t("ON")
+                                    } else {
+                                        t("OFF")
+                                    })
                                     .text_size(px(10.0))
                                     .on_change(move |checked, _, cx| {
                                         power_view.update(cx, |this, cx| {
@@ -14752,6 +14828,9 @@ impl Shell {
                             }),
                     )
                     .child(
+                        // CW/CCW stay as protocol direction tokens: the
+                        // compact spindle row cannot fit the full native
+                        // words without clipping the RPM field.
                         Button::new("spindle-cw")
                             .label("CW")
                             .h(px(48.0))
@@ -14824,8 +14903,8 @@ impl Shell {
         let save_view = view.clone();
         let scrim_view = view.clone();
         let title = match editor.original {
-            Some(number) => format!("EDIT TOOL T{number}"),
-            None => "NEW TOOL".to_string(),
+            Some(number) => format!("{} T{number}", t("EDIT")),
+            None => t("NEW TOOL").to_string(),
         };
         let original = editor.original;
         let error = editor.error.clone();
@@ -14854,7 +14933,7 @@ impl Shell {
                         .w(px(112.0))
                         .text_size(px(10.0))
                         .text_color(p.text_dim)
-                        .child(label),
+                        .child(t(label)),
                 )
                 .child(
                     Button::new(format!("tool-field-{}", label.replace(' ', "-")))
@@ -14893,7 +14972,7 @@ impl Shell {
                                 .w(px(112.0))
                                 .text_size(px(10.0))
                                 .text_color(p.text_dim)
-                                .child("NAME"),
+                                .child(t("NAME")),
                         )
                         .child(
                             Button::new("tool-field-name")
@@ -14965,7 +15044,7 @@ impl Shell {
                                     .child(title),
                             )
                             .child(chip(
-                                original.map_or("NEW RECORD", |_| "REPLACES BY NUMBER"),
+                                original.map_or(t("NEW RECORD"), |_| "REPLACES BY NUMBER"),
                                 p,
                             )),
                     )
@@ -14983,7 +15062,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("tool-editor-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -14999,7 +15078,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("tool-editor-save")
-                                    .label("SAVE TOOL")
+                                    .label(t("SAVE TOOL"))
                                     .primary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15029,8 +15108,8 @@ impl Shell {
         let confirm_view = view.clone();
         let scrim_view = view;
         let title = match &editor.original {
-            Some(name) => format!("EDIT MACRO / {name}"),
-            None => "NEW MACRO".to_string(),
+            Some(name) => format!("{} / {name}", t("EDIT")),
+            None => t("NEW MACRO").to_string(),
         };
         let name = editor.name.clone();
         let command = editor.command.clone();
@@ -15087,9 +15166,9 @@ impl Shell {
                             )
                             .child(chip(
                                 if editor.original.is_some() {
-                                    "PROFILE RECORD"
+                                    t("PROFILE RECORD")
                                 } else {
-                                    "NEW RECORD"
+                                    t("NEW RECORD")
                                 },
                                 p,
                             )),
@@ -15103,7 +15182,7 @@ impl Shell {
                                     .w(px(92.0))
                                     .text_size(px(10.0))
                                     .text_color(p.text_dim)
-                                    .child("NAME"),
+                                    .child(t("NAME")),
                             )
                             .child(
                                 Button::new("macro-editor-name")
@@ -15193,7 +15272,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("macro-editor-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15209,7 +15288,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("macro-editor-save")
-                                    .label("SAVE MACRO")
+                                    .label(t("SAVE MACRO"))
                                     .primary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15285,9 +15364,9 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child(format!("RUN MACRO / {name}")),
+                                    .child(format!("{} / {name}", t("RUN MACRO"))),
                             )
-                            .child(chip("CONFIRM REQUIRED", p)),
+                            .child(chip(t("CONFIRM REQUIRED"), p)),
                     )
                     .child(div().text_size(px(11.0)).text_color(p.warning).child(
                         "This command can move the machine, start the spindle, or change \
@@ -15334,7 +15413,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("macro-run-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15348,7 +15427,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("macro-run-confirm")
-                                    .label("RUN MACRO")
+                                    .label(t("RUN MACRO"))
                                     .warning()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15418,9 +15497,9 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child("DELETE MACRO"),
+                                    .child(t("DELETE MACRO")),
                             )
-                            .child(chip("PROFILE RECORD", p)),
+                            .child(chip(t("PROFILE RECORD"), p)),
                     )
                     .child(
                         div()
@@ -15440,7 +15519,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new("macro-delete-cancel")
-                                    .label("CANCEL")
+                                    .label(t("CANCEL"))
                                     .secondary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15454,7 +15533,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("macro-delete-confirm")
-                                    .label("DELETE MACRO")
+                                    .label(t("DELETE MACRO"))
                                     .warning()
                                     .h(px(48.0))
                                     .flex_1()
@@ -15527,7 +15606,7 @@ impl Shell {
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.warning)
-                                    .child("TOOL CHANGE REQUIRED"),
+                                    .child(t("TOOL CHANGE REQUIRED")),
                             )
                             .child(chip(&format!("T{}", change.tool), p)),
                     )
@@ -15567,7 +15646,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("APP TOOL"),
+                            .child(t("APP TOOL")),
                     )
                     .child(
                         div()
@@ -15597,9 +15676,9 @@ impl Shell {
                     .child(
                         Button::new("tool-ack")
                             .label(if acknowledged {
-                                "ACKNOWLEDGED"
+                                t("ACKNOWLEDGED")
                             } else {
-                                "1. ACKNOWLEDGE"
+                                t("1. ACKNOWLEDGE")
                             })
                             .primary()
                             .h(px(48.0))
@@ -15615,7 +15694,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("tool-resume")
-                            .label("2. RESUME")
+                            .label(t("2. RESUME"))
                             .primary()
                             .h(px(48.0))
                             .w(px(140.0))
@@ -15631,7 +15710,7 @@ impl Shell {
                     .child(div().flex_1())
                     .child(
                         Button::new("tool-stop")
-                            .label("STOP JOB")
+                            .label(t("STOP JOB"))
                             .warning()
                             .h(px(48.0))
                             .w(px(110.0))
@@ -15726,7 +15805,7 @@ impl Shell {
                 let active = self.panel.transport == choice;
                 let transport_view = view.clone();
                 Button::new(format!("transport-{index}"))
-                    .label(choice.label())
+                    .label(t(choice.label()))
                     .flex_1()
                     .h(px(48.0))
                     .rounded_lg()
@@ -15770,9 +15849,9 @@ impl Shell {
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child("CONNECTION"),
+                                    .child(t("CONNECTION")),
                             )
-                            .child(chip(self.state.connection.label(), p)),
+                            .child(chip(t(self.state.connection.label()), p)),
                     )
                     .child(
                         Button::new("panel-close-x")
@@ -15787,7 +15866,7 @@ impl Shell {
                             }),
                     ),
             )
-            .child(section_label("TRANSPORT", p))
+            .child(section_label(t("TRANSPORT"), p))
             .child(h_flex().gap_2().children(transports))
             .when(connected, |this| {
                 this.child(
@@ -15808,7 +15887,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("CURRENT LINK"),
+                            .child(t("CURRENT LINK")),
                     )
                     .child(
                         div()
@@ -15835,7 +15914,7 @@ impl Shell {
             .gap_2()
             .child(
                 Button::new("panel-connect")
-                    .label("CONNECT")
+                    .label(t("CONNECT"))
                     .primary()
                     .h(px(48.0))
                     .w(px(140.0))
@@ -15848,7 +15927,7 @@ impl Shell {
             )
             .child(
                 Button::new("panel-disconnect")
-                    .label("DISCONNECT")
+                    .label(t("DISCONNECT"))
                     .warning()
                     .h(px(48.0))
                     .w(px(140.0))
@@ -15862,7 +15941,7 @@ impl Shell {
             .child(div().flex_1())
             .child(
                 Button::new("panel-close")
-                    .label("CLOSE")
+                    .label(t("CLOSE"))
                     .secondary()
                     .h(px(48.0))
                     .w(px(96.0))
@@ -15921,7 +16000,7 @@ impl Shell {
                         self.panel
                             .ports_error
                             .clone()
-                            .unwrap_or_else(|| "No serial ports found".to_string()),
+                            .unwrap_or_else(|| t("No serial ports found").to_string()),
                     ),
             );
         } else {
@@ -16037,10 +16116,10 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(section_label("SERIAL PORT", p))
+                    .child(section_label(t("SERIAL PORT"), p))
                     .child(
                         Button::new("ports-refresh")
-                            .label("REFRESH")
+                            .label(t("REFRESH"))
                             .secondary()
                             .h(px(48.0))
                             .w(px(104.0))
@@ -16463,17 +16542,17 @@ fn file_browser_row(
     let is_dir = entry.is_dir;
     let kind = entry.kind_label();
     let detail = if is_dir {
-        "FOLDER".to_string()
+        t("FOLDER").to_string()
     } else {
         format_size(entry.size)
     };
     let name = entry.name.clone();
     let action = if selected {
-        "SELECTED"
+        t("SELECTED")
     } else if is_dir {
-        "OPEN"
+        t("OPEN")
     } else {
-        "SELECT"
+        t("SELECT")
     };
     let action_color = if selected { p.accent } else { p.text_faint };
     div()
@@ -16582,7 +16661,7 @@ fn no_program_matches_notice(p: Palette, query: &str) -> Div {
             div()
                 .text_size(px(12.0))
                 .text_color(p.text_dim)
-                .child("No matching lines"),
+                .child(t("No matching lines")),
         )
         .child(
             div()
@@ -16888,7 +16967,7 @@ fn probe_choice(
 
 fn tab_button(cx: &App, p: Palette, label: LeftTab, active: bool, view: Entity<Shell>) -> Button {
     Button::new(format!("left-tab-{}", label.label()))
-        .label(label.label())
+        .label(t(label.label()))
         .flex_1()
         .h(px(48.0))
         .rounded_lg()
@@ -17165,7 +17244,7 @@ fn program_mode_segment(
                 cx.notify();
             });
         })
-        .child(mode.label())
+        .child(t(mode.label()))
 }
 
 /// Compact "the numbers below are not live" marker for the DRO header.
@@ -17182,7 +17261,7 @@ fn stale_badge(p: Palette) -> Div {
         .text_size(px(9.0))
         .font_weight(FontWeight::BOLD)
         .text_color(p.danger)
-        .child("STALE")
+        .child(t("STALE"))
 }
 
 /// Compact legend for the measured-map overlay.
@@ -17211,7 +17290,7 @@ fn height_map_overlay_legend(p: Palette) -> Div {
                 .text_size(px(9.0))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("MEASURED Z"),
+                .child(t("MEASURED Z")),
         )
         .child(div().text_size(px(9.0)).text_color(p.text_dim).child("LOW"))
         .child(swatches)
@@ -17438,7 +17517,7 @@ fn settings_row_view(
     let number = row.number;
     // A queued or in-flight write owns the row until the engine answers.
     let row_enabled = enabled && !matches!(row.status, RowStatus::Queued | RowStatus::Writing);
-    let status_label = row.status.label();
+    let status_label = t(row.status.label());
     let note = row.note.clone();
     let status_is_pending = pending;
     let name = row.name.clone();
@@ -17658,7 +17737,7 @@ fn settings_toggle(
             .text_size(px(10.0))
             .font_weight(FontWeight::BOLD)
             .text_color(if checked { p.accent } else { p.text_dim })
-            .child(if checked { "ON" } else { "OFF" }),
+            .child(if checked { t("ON") } else { t("OFF") }),
     )
 }
 
@@ -17944,7 +18023,7 @@ fn settings_text_field(
                 .child(match kind {
                     SettingKind::Password => "MASKED",
                     SettingKind::IpAddress => "IPV4",
-                    _ => "EDIT",
+                    _ => t("EDIT"),
                 }),
         )
 }

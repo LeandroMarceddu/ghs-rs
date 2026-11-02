@@ -4,6 +4,7 @@
 //! This overlay owns no state of its own: it renders the buffer from
 //! [`KeypadState`] and sends [`KeypadAction`] values back to the shell.
 
+use ghs_i18n::t;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::{
     App, Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
@@ -175,8 +176,15 @@ pub fn overlay(
                 .active(palette.accent_muted);
             let digit =
                 label.len() == 1 && label.chars().next().is_some_and(|c| c.is_ascii_digit());
+            // The key grid is a table of protocol/digit tokens; only the two
+            // named actions have catalog entries. Missing keys fall back.
+            let label_text = match *label {
+                "DEL" => t("DEL"),
+                "CANCEL" => t("CANCEL"),
+                other => other,
+            };
             let button = Button::new(format!("kp-key-{row_index}-{col_index}"))
-                .label(*label)
+                .label(label_text)
                 .flex_1()
                 .h(px(58.))
                 .rounded_lg()

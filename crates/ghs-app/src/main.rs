@@ -79,6 +79,7 @@ mod console_log;
 mod file_browser;
 mod height_compensation;
 mod height_map_library;
+mod i18n;
 mod keymap;
 mod keypad;
 mod live;
