@@ -81,8 +81,9 @@ as the reference and decimate by screen-space tolerance.
   the search is cleared.
 - Block-delete, comments, and empty lines keep their source text; do not hide
   them by default.
-- Start-from-line, run-to-line, and breakpoint editing stay disabled until the
-  engine commands exist.
+- Breakpoint editing and run-to-line are implemented; start-from-line stays
+  disabled because the engine cannot synthesize the modal state for a
+  mid-program start.
 
 ## Tests and proof
 

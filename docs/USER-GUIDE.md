@@ -296,6 +296,22 @@ reports the new value. Block delete is disabled while a job is running or
 paused; optional stop and single block can be changed when the engine accepts
 them. Mock mode shows the sheet but disables every toggle.
 
+### Breakpoints and run-to
+
+- Tap a program row's line-number gutter to toggle a breakpoint. A red dot and
+  red line number mark an enabled breakpoint; the program strip shows the count
+  (`3 BP`).
+- Tap a row to select it, then use `BP` to toggle or `RUN TO` to open the
+  confirmation.
+- `RUN TO` sets a breakpoint at the chosen line and starts the program from
+  line 1. Every earlier line still runs; the job pauses before the target.
+- Earlier breakpoints still pause first. The sheet lists them; use `RESUME`
+  through each one to reach the target.
+- `START-FROM-LINE` is not supported: the engine cannot synthesize the modal
+  state for a mid-program start. The UI never sends it.
+- Breakpoints are cleared for a new program. The job toolbar shows
+  `BREAKPOINT AT LINE N` when the job pauses at one.
+
 ### Start, pause, resume, stop
 
 - `START` is enabled for a loaded program when the link is ready, the machine
@@ -771,9 +787,10 @@ Exports are user-initiated. There is no telemetry and no network transport.
   Authenticode signature. See [RELEASE.md](RELEASE.md).
 - **No keymap editor.** The keymap record exists in the profile/backup format,
   but the editor is not implemented.
-- **No start-from-line, run-to-line, breakpoints, or check mode.** The job
-  toolbar starts from the beginning; `StartProgram` has a `from_line` API but
-  the UI does not expose it.
+- **No start-from-line or check mode.** The job toolbar can set breakpoints and
+  run to a line from the beginning, but it cannot start mid-program; the engine
+  rejects `from_line > 1` because it cannot synthesize a modal preamble.
+  Dry-run/check mode is also deferred.
 - **No drag-and-drop or recent-files list.** The in-app browser lists one
   directory at a time and remembers the last folder only for the session.
 - **Advanced macros are absent.** User macros are single-line MDI commands;
