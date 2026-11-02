@@ -109,7 +109,7 @@ implemented before its UI or hardware validation row is complete.
 | JOB-09 | Console with filtering and file log | M3 | todo | Bounded ring buffer |
 | JOB-10 | Dry run and check mode | M3 | todo | Never moves |
 | JOB-11 | Defined reconnect and interruption policy | M3 | todo | No silent resume |
-| JOB-12 | Program list with follow, search, context menu | M4 | todo | Virtualized |
+| JOB-12 | Program list with follow, search, context menu | M4 | partial | Follow/search/jump done; context menu open |
 | JOB-13 | Add line numbers, strip comments | M4 | todo | Non-destructive save-as |
 | JOB-14 | Job statistics and run history | M4 | todo | Local only |
 
@@ -117,15 +117,15 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| VIEW-01 | G-code parser for lines, arcs, canned cycles, planes, units, incremental mode | M4 | todo | grblHAL dialect |
+| VIEW-01 | G-code parser for lines, arcs, canned cycles, planes, units, incremental mode | M4 | done | grblHAL dialect |
 | VIEW-02 | Expressions, parameters, and flow control | M4 | todo | `EXPR` supported |
-| VIEW-03 | Parser-state emulation with offsets, scaling, rotation, tool length | M4 | todo | Used for toolpath |
-| VIEW-04 | 2D pan, zoom, fit, grid, bounds | M4 | todo | 60 fps |
-| VIEW-05 | Live tool marker | M4 | todo | Status-driven |
-| VIEW-06 | Color by motion type, layer, or tool | M4 | todo | Configurable, color-blind safe |
+| VIEW-03 | Parser-state emulation with offsets, scaling, rotation, tool length | M4 | done | Used for toolpath |
+| VIEW-04 | 2D pan, zoom, fit, grid, bounds | M4 | done | 60 fps |
+| VIEW-05 | Live tool marker | M4 | done | Status-driven |
+| VIEW-06 | Color by motion type, layer, or tool | M4 | done | Configurable, color-blind safe |
 | VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | partial | 3D camera/grid/envelope/marker; stock mesh open |
-| VIEW-08 | Height map overlay | M6 | todo | Surface visualization |
-| VIEW-09 | 1M-line and 200k-segment performance | M4 | todo | Budgets in PLAN.md |
+| VIEW-08 | Height map overlay | M6 | done | 2D cells and 3D projection |
+| VIEW-09 | 1M-line and 200k-segment performance | M4 | partial | Benchmarked; CI threshold open |
 | VIEW-10 | Program limits and outline display | M4 | todo | Confirmation before running |
 
 ## Setup and persistence

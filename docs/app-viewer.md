@@ -73,7 +73,12 @@ as the reference and decimate by screen-space tolerance.
 - Virtualized list; a million-line program must not allocate a widget per line.
 - Columns: line number, source text, optional segment/kind marker.
 - The current line is highlighted from `JobProgress.current_line`.
-- Search/filter by line text or number remains a follow-up.
+- Search/filter by source text or line number (`120` or `N120`), with
+  FILTER/HIGHLIGHT modes, match count, PREV/NEXT, JUMP, and clear. Filter mode
+  maps visible rows to original source lines; the parsed program is never
+  rebuilt.
+- Current-line follow is suspended while a search is active and restored when
+  the search is cleared.
 - Block-delete, comments, and empty lines keep their source text; do not hide
   them by default.
 - Start-from-line, run-to-line, and breakpoint editing stay disabled until the
@@ -82,7 +87,8 @@ as the reference and decimate by screen-space tolerance.
 ## Tests and proof
 
 - Pure tests for world-to-screen mapping, bounds fit, 3D projection, orbit/pan/
-  zoom, marker projection, cache invalidation, and far-to-near ordering.
+  zoom, marker projection, cache invalidation, far-to-near ordering, and
+  program search/filter/jump.
 - Parse the demo pocket with arcs; assert a non-empty toolpath and the expected
   segment count.
 - Screenshots at 1280×800 and 1920×1080 using `docs/screenshots.md`.
