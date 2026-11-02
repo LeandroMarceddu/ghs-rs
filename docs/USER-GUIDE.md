@@ -249,11 +249,15 @@ reports. The right-rail `M8/M9` quick action toggles flood.
 
 ## 6. Jobs
 
-### Program source in this build
+### Program source
 
-The current build has **no file picker or drag-and-drop program load**. With
-the simulator, the job source is the bundled demo program loaded after
-connect:
+`LOAD PROGRAM` in the Job toolbar opens an in-app file browser. Browse one
+directory at a time, type a path or use `UP`, and select a `.nc`, `.gcode`,
+`.tap`, or `.ngc` file. Hidden names and symlinks are not shown. Binary,
+non-UTF-8, empty, and files larger than 20 MiB are rejected with a clear
+message. Loading only parses and installs the program: it never starts the job.
+
+With the simulator, the bundled demo program still loads after connect:
 
 | Program | How to select it |
 |---|---|
@@ -264,13 +268,10 @@ connect:
 `--demo-start` presses `START` once after the demo loads. It is a review
 switch, not a normal startup behavior.
 
-On a serial controller, no part program can be loaded through the UI in this
-build. The only user-selected program load is **Offset** → `LOAD OFFSETS
-FILE`, which validates an `offsets.nc` and loads it as a program. It is a
-restore tool, not a general job loader; see section 9. Probe runs load their
-own generated programs, and height-map Apply loads a rewritten copy of the
-current program. Loading a part file through the UI is a known limit
-(section 15).
+Probe runs load their own generated programs. Height-map Apply loads a
+rewritten copy of the current program, and **Offset** → `LOAD OFFSETS FILE`
+loads a validated `offsets.nc` as a restore tool. Neither is a general job
+loader.
 
 ### Program list and progress
 
@@ -759,10 +760,8 @@ Exports are user-initiated. There is no telemetry and no network transport.
   the UI does not expose it.
 - **No optional-stop or single-block controls in the UI.** The engine/protocol
   support exists; the shell does not expose the toggles.
-- **No general file picker or drag-and-drop.** The simulator job source is
-  the bundled demo program; on a serial controller there is no part-program
-  load in the UI. `offsets.nc` can be loaded as a program through the offset
-  restore sheet.
+- **No drag-and-drop or recent-files list.** The in-app browser lists one
+  directory at a time and remembers the last folder only for the session.
 - **No rapid-override control.** Feed and spindle overrides are exposed; rapid
   override is tracked but has no UI.
 - **Advanced macros are absent.** User macros are single-line MDI commands;

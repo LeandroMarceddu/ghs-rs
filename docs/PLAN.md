@@ -20,10 +20,11 @@ offset and height-map Z offset are implemented and persisted per profile.
 Startup-line read/edit/verify and the read-only controller tool table are also
 implemented. The remaining M5 work is keymap persistence; basic single-line
 user macros and the WCS-only offsets backup/restore are implemented, with
-advanced macro forms deferred. The M7 3D toolpath viewer, release workflow,
-Linux desktop entry, and release checklist are implemented. Remaining M7 work is
-i18n, stock meshes, keymap persistence, signed/installer packaging, and the full
-release QA pass. Hardware validation remains the M6 gate before publishing.
+advanced macro forms deferred. The M7 3D toolpath viewer, in-app program file
+browser/load, release workflow, Linux desktop entry, and release checklist are
+implemented. Remaining M7 work is i18n, stock meshes, keymap persistence,
+signed/installer packaging, and the full release QA pass. Hardware validation
+remains the M6 gate before publishing.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
 it parses every status field, real-time command, system command, and runtime

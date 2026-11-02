@@ -37,9 +37,9 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   alarm/error tables, parser state, and runtime enumeration.
 - **Manual control** — live DRO, hold-to-jog, MDI, feed/spindle overrides,
   spindle and coolant controls, reset/stop, and a console.
-- **Jobs** — streaming, pause/resume/stop, tool-change sheet, progress and
-  current line, a real parsed program list, and job recovery that never
-  auto-resumes after an alarm or disconnect.
+- **Jobs** — in-app program file browser and loading, streaming, pause/resume/
+  stop, tool-change sheet, progress and current line, a real parsed program
+  list, and job recovery that never auto-resumes after an alarm or disconnect.
 - **Viewer** — parsed toolpath in 2D top or 3D orbit view, fit/pan/zoom/pinch,
   ground grid and work envelope, motion-style paths, height-map overlay, and a
   live tool marker.
@@ -111,6 +111,8 @@ open the connection panel to select a real serial port.
 ## Documentation
 
 - [docs/PLAN.md](docs/PLAN.md) — milestones and release gates
+- [docs/USER-GUIDE.md](docs/USER-GUIDE.md) — operator guide and troubleshooting
+- [CHANGELOG.md](CHANGELOG.md) — implemented changes and known limits
 - [docs/architecture.md](docs/architecture.md) — crates, threading, safety
 - [docs/protocol.md](docs/protocol.md) — grblHAL protocol surface
 - [docs/parity.md](docs/parity.md) — ioSender feature checklist

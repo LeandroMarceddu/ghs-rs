@@ -98,15 +98,15 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| JOB-01 | Open, drag-and-drop, recent files | M3 | todo | `.nc`, `.gcode`, `.tap`, `.ngc` |
+| JOB-01 | Open, drag-and-drop, recent files | M3 | partial | In-app browser/load; drag-drop/recent open |
 | JOB-02 | Validate program before streaming | M3 | todo | Syntax, tools, feeds |
-| JOB-03 | Character-counting streaming with `Bf` top-up | M3 | todo | Use the reported RX buffer (1024 on FlexiHAL) |
-| JOB-04 | Pause, resume, stop | M3 | todo | Hold, resume, reset semantics |
-| JOB-05 | Manual tool change prompt and resume | M3 | todo | `TC`, persistent tool plugin |
+| JOB-03 | Character-counting streaming with `Bf` top-up | M3 | done | Uses the reported RX buffer |
+| JOB-04 | Pause, resume, stop | M3 | done | Hold, resume, reset semantics |
+| JOB-05 | Manual tool change prompt and resume | M3 | done | `TC`, persistent tool plugin |
 | JOB-06 | Optional stop, single block, block delete | M3 | todo | Realtime toggles |
 | JOB-07 | Start-from-line, run-to-line, breakpoints | M3 | todo | Confirmations |
-| JOB-08 | Progress, elapsed time, ETA | M3 | todo | Based on parsed geometry |
-| JOB-09 | Console with filtering and file log | M3 | todo | Bounded ring buffer |
+| JOB-08 | Progress, elapsed time, ETA | M3 | partial | Progress/time; ETA open |
+| JOB-09 | Console with filtering and file log | M3 | partial | Bounded console; file log open |
 | JOB-10 | Dry run and check mode | M3 | todo | Never moves |
 | JOB-11 | Defined reconnect and interruption policy | M3 | todo | No silent resume |
 | JOB-12 | Program list with follow, search, context menu | M4 | partial | Follow/search/jump done; context menu open |

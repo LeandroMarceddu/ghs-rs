@@ -63,16 +63,16 @@ cargo build --release -p ghs-app
       commit.
 - [ ] Optional: `cargo deny check` if `cargo-deny` is installed; `deny.toml`
       covers licenses, advisories, and duplicate dependencies.
-- [ ] CI currently runs formatting and clippy on Linux plus a debug build on
-      all three OSes; it does not run the workspace test suite. A green CI run
-      does not replace `cargo test --workspace`.
+- [ ] CI currently runs formatting and clippy on Linux, the workspace test
+      suite on Linux, and a debug build on all three OSes. A green CI run still
+      does not replace running the release gates locally.
 - [ ] Do not tag while any gate is failing, including a flaky test. Re-run it
       and record the result.
 
 ## 4. CI green on all three OSes
 
 - [ ] In the Actions tab, open the `CI` run for the release commit.
-- [ ] `Format`, `Clippy`, and `Build app` must all pass.
+- [ ] `Format`, `Clippy`, `Test`, and `Build app` must all pass.
 - [ ] `Build app` must be green on `ubuntu-latest`, `windows-latest`, and
       `macos-latest`.
 - [ ] Confirm the run is for the same commit SHA that will be tagged; a green
