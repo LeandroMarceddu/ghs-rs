@@ -61,8 +61,12 @@ Generate the form; do not hardcode setting numbers. Map types:
 
 ## Macros, startup lines, keymap
 
-- Macros are named MDI/system sequences; persist in the profile; confirm risky
-  motion macros.
+- User macros are named single-line MDI commands stored in the profile. The
+  editor rejects `$` system commands and newlines in this pass; new macros
+  default to confirm. RUN is explicit, idle-only, and confirmation is required
+  when the macro is marked confirm. No macro runs on load, connect, or import.
+- Parameter substitution, multi-line macros, special words, and `$` system
+  commands are deferred.
 - Startup lines `$N0`/`$N1` are read/written through the engine; never edit
   while a job is active. A write is explicit, idle-only, and read back to
   verify the stored text; it is never optimistically reflected in the UI.

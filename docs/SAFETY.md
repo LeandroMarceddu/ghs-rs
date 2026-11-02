@@ -27,7 +27,10 @@ it has been verified on the machine.
 5. A lost status stream pauses a running job; it never silently continues.
 6. The application never auto-resumes after an alarm, E-stop, or reconnect.
 7. Settings writes are idle-only and read back for verification.
-8. The stop/reset control is always visible and never disabled.
+8. User macros run only after an explicit action; a macro marked confirm
+   requires a second confirmation, and macros are refused in mock, Alarm/Door,
+   a running job, or a non-Idle state. They never auto-run on load or import.
+9. The stop/reset control is always visible and never disabled.
 
 ## Operator checklist for every release
 

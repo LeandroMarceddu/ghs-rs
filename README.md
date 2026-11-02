@@ -51,6 +51,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   confirmed `G28`/`G30` goto and `G92.1` clear; a persisted app-side tool table
   used by the M6 tool-change sheet; and a separate read-only controller tool
   table.
+- **Macros** — per-profile single-line MDI macros with explicit RUN and
+  confirmation; no macro runs on load, connect, or profile import.
 - **Profiles and backups** — identity-keyed controller profiles, app config,
   atomic saves, rolling backups, export/validate/import, and identity-mismatch
   confirmation.
@@ -71,7 +73,7 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 
 ## In progress
 
-- User-defined macros, keymap editing, and offsets backup/restore.
+- Keymap editing and offsets backup/restore.
 - Start-from-line/check mode, 3D view, i18n, packaging, and the post-v1.0
   SD/ATC/MPG surfaces.
 - Hardware validation on the reference FlexiHAL.

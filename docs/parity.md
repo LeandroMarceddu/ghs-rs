@@ -86,7 +86,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-10 | MDI with history | M2 | todo | Multi-line support |
 | CTL-11 | Home, unlock, reset, sleep | M2 | todo | State-aware |
 | CTL-12 | Signals, pins, and AUX IO display | M2 | todo | HSDEP plus 4/4 AUX |
-| CTL-13 | Macros with parameters and special words | M5 | todo | Toolbar and editor |
+| CTL-13 | Macros with parameters and special words | M5 | partial | Single-line MDI editor/run; params/system/multi-line deferred |
 | CTL-14 | Startup lines | M5 | done | Read, edit, read-back verify |
 | CTL-15 | Keymap editor | M5 | todo | Keyboard and gamepad later |
 | CTL-16 | Work offsets editor, G54–G59.3, G10 | M5 | done | Edit, zero, goto, G92 clear |
