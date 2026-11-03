@@ -7,29 +7,32 @@ The protocol layer targets grblHAL generally and parses the full command,
 status, and enumeration surface. The v1.0 UI is the reference machine; rows
 marked `post-v1.0` are parsed and modeled in M1 but their UI is deferred.
 
-Status values: `todo`, `wip`, `done`, `n/a`.
+Status values: `todo`, `partial`, `done`.
 
-A row is `done` only when it works against the simulator, has automated tests,
-has been verified on the FlexiHAL board, is usable without a mouse, is
-documented, and is localized.
+A row is `done` here when the feature works in code and is exercised against
+the simulator or in unit tests. **Hardware validation, mouse-free use, and full
+localization are tracked globally**, not repeated on every row: no row meets the
+full release definition until the FlexiHAL gate passes. See
+[PARITY-AUDIT.md](PARITY-AUDIT.md) for the evidence-based audit snapshot.
 
-## Layer status (2026-11-01)
+## Layer status (2026-11-03)
 
 | Layer | State | Evidence |
 |---|---|---|
-| Protocol/domain | Implemented | 155 tests + proptests; full grblHAL status/realtime/system/enumeration surface |
-| Serial | Implemented | 38 tests + PTY; hardware modem-control/unplug validation pending |
-| Simulator | Implemented | 80 tests; FlexiHAL fixture byte-for-byte, generic-full profile |
-| G-code | Implemented (M4 core) | 127 tests; expressions/flow control/extra axes deferred |
-| Viewer geometry | Implemented | 53 tests; 200k segments inside 60 fps budget |
-| Engine | Implemented (M3) | M2 session + job runner; 20 job tests, simulator-over-loopback |
-| App shell | Live demo + job UI | approved layout; live DRO/MDI/console; serial picker |
-| Program UI | Implemented (M3) | real parsed list, progress/current line, job controls, tool-change sheet |
-| Viewer UI | Implemented (M4/M7) | real toolpath, 2D + 3D camera, marker, pan/zoom; 177 app tests |
-| Settings UI | Implemented (M5) | generated from `$ES`/`$EG`; verified writes |
-| Offsets/tools | Implemented (M5) | live `$#`, G10 L20 edits, app-side persisted tool table |
-| Probing | Cycles + height map implemented | `ghs-probe` 105 tests; Z/edge/corner/center cards with preflight and Apply/Revert |
-| Config/backup | Implemented (M5) | app/controller profiles, atomic saves, backup bundles |
+| Protocol/domain | Implemented | full grblHAL status/realtime/system/enumeration surface; fixture tests |
+| Serial | Implemented | PTY/port tests; hardware modem-control/unplug validation pending |
+| Simulator | Implemented | FlexiHAL fixture and generic-full profile; probe/check scenarios |
+| G-code | Implemented (M4 core) | parser/arcs/cycles/height-map rewrite; expressions/flow control deferred |
+| Viewer geometry | Implemented | 2D/3D camera, render plans, 200k-segment budget |
+| Engine | Implemented | session, job runner, check mode, tools/startup/probe events |
+| App shell | Implemented | approved touch layout, live demo/serial, localized primary UI |
+| Program UI | Implemented | parsed list, follow, search, breakpoints, run-to, check |
+| Viewer UI | Implemented | 2D/3D toolpath, marker, pan/zoom, height-map overlay |
+| Settings UI | Implemented | generated `$ES`/`$EG`, verified writes |
+| Offsets/tools | Implemented | live `$#`, G10, goto/clear, offsets.nc, app/controller tool tables |
+| Probing | Implemented | Z/edge/corner/circle/rectangle/XY plate; height map Apply/Revert |
+| Config/backup | Implemented | profiles, atomic saves, backup bundles, locale/keymap |
+| Localization | Primary UI | en/it/de/nl; secondary help/warning text remains English |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
 
 Rows below are the feature-level checklist. A protocol/simulator row can be
@@ -39,44 +42,44 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| COM-01 | Serial port enumeration and selection on Linux, macOS, Windows | M1 | todo | `serialport` crate; dialout note |
-| COM-02 | Connect/disconnect with baud rate, 8N1 | M1 | todo | Default 115200 |
-| COM-03 | Optional DTR reset for 8-bit boards | M2 | todo | Default off for STM32F446 |
-| COM-04 | Banner handshake and soft reset | M1 | todo | Timeout and retry policy |
-| COM-05 | `$I` and `$I+` capability parsing | M1 | todo | Axes, all NEWOPT values, signals, plugins, buffers, spindles |
-| COM-06 | `$ES`/`$EG` settings enumeration and `$SED` descriptions | M1 | todo | Generated schema; `$$` fallback |
-| COM-07 | `$#` offsets and `$G` parser state | M1 | todo | Parse all reported fields |
-| COM-08 | Adaptive status polling and full report `0x87` | M1 | todo | 10 Hz active, 2 Hz idle |
-| COM-09 | All grblHAL status fields | M1 | todo | MPos, WPos, Bf, Ln, FS, Pn, WCO, WCS, Ov, A, H, D, Sc, TLR, In, SD, MPG, FW |
-| COM-10 | All realtime commands | M1 | todo | Reset, hold, resume, jog cancel, door, overrides, spindle stop, coolant, optional stop, single block |
-| COM-11 | `RT+` top-bit realtime negotiation | M1 | todo | Reference build advertises RT+ |
-| COM-12 | Messages, errors, alarms with descriptions | M1 | todo | `$EA`/`$EE` plus `[MSG:...]`; bundled fallback |
-| COM-13 | Probe result (`PRB`) parsing | M1 | todo | Used by the probing suite |
+| COM-01 | Serial port enumeration and selection on Linux, macOS, Windows | M1 | done | `serialport` crate; dialout note |
+| COM-02 | Connect/disconnect with baud rate, 8N1 | M1 | done | Default 115200 |
+| COM-03 | Optional DTR reset for 8-bit boards | M2 | partial | Default off for STM32F446 |
+| COM-04 | Banner handshake and soft reset | M1 | done | Timeout and retry policy |
+| COM-05 | `$I` and `$I+` capability parsing | M1 | done | Axes, all NEWOPT values, signals, plugins, buffers, spindles |
+| COM-06 | `$ES`/`$EG` settings enumeration and `$SED` descriptions | M1 | done | Generated schema; `$$` fallback |
+| COM-07 | `$#` offsets and `$G` parser state | M1 | done | Parse all reported fields |
+| COM-08 | Adaptive status polling and full report `0x87` | M1 | done | 10 Hz active, 2 Hz idle |
+| COM-09 | All grblHAL status fields | M1 | done | MPos, WPos, Bf, Ln, FS, Pn, WCO, WCS, Ov, A, H, D, Sc, TLR, In, SD, MPG, FW |
+| COM-10 | All realtime commands | M1 | done | Reset, hold, resume, jog cancel, door, overrides, spindle stop, coolant, optional stop, single block |
+| COM-11 | `RT+` top-bit realtime negotiation | M1 | done | Reference build advertises RT+ |
+| COM-12 | Messages, errors, alarms with descriptions | M1 | done | `$EA`/`$EE` plus `[MSG:...]`; bundled fallback |
+| COM-13 | Probe result (`PRB`) parsing | M1 | done | Used by the probing suite |
 | COM-14 | Disable controller auto-reporting on connect | M1 | todo | Setting `$481` when present |
-| COM-15 | Hotplug, reconnect, and status watchdog | M2 | todo | Never auto-resume a job |
+| COM-15 | Hotplug, reconnect, and status watchdog | M2 | done | Never auto-resume a job |
 | COM-16 | Session recording and replay | M1 | todo | Real captures become fixtures |
 | COM-17 | Check mode (`$C`) | M3 | done | Dry run with engine state machine |
-| COM-18 | In-process loopback simulator for demo and tests | M1 | todo | Not a user-facing network transport |
-| COM-19 | Runtime alarm/error code sets (`$EA`, `$EE`) | M1 | todo | Fallback tables only when unavailable |
-| COM-20 | Runtime settings and groups (`$ES`, `$EG`) | M1 | todo | Data types, formats, min/max, reboot flags |
-| COM-21 | Parser state report (`$G`, `0x83`) | M1 | todo | All grblHAL codes |
+| COM-18 | In-process loopback simulator for demo and tests | M1 | done | Not a user-facing network transport |
+| COM-19 | Runtime alarm/error code sets (`$EA`, `$EE`) | M1 | done | Fallback tables only when unavailable |
+| COM-20 | Runtime settings and groups (`$ES`, `$EG`) | M1 | done | Data types, formats, min/max, reboot flags |
+| COM-21 | Parser state report (`$G`, `0x83`) | M1 | done | All grblHAL codes |
 | COM-22 | Pins, limit state, last events (`$PINS`, `$PINSTATE`, `$LIM`, `$LEV`) | M1 | done | Reference pipe forms; upstream comma forms open |
-| COM-23 | Spindle and port enumeration (`$SPINDLES`, `$SPINDLESH`, `$PORTS`) | M1 | todo | Multi-spindle capable |
-| COM-24 | Manual tool change protocol (`Tool` state, `0xA3`) | M1 | todo | Jog and offsets while pending |
-| COM-25 | MPG takeover (`|MPG:1/0`) | M1 | todo | Pause UI, keep telemetry |
-| COM-26 | SD mount and streaming status (`|SD:`) | M1 | todo | Parse only; UI post-v1.0 |
-| COM-27 | Startup sequence without banner or DTR reset | M1 | todo | 400–500 ms listen, `0x87`, MPG wait |
-| COM-28 | Error persistence handling | M1 | todo | Clear with blank line or `$` before resume |
-| COM-29 | Multi-spindle status fields (`|SP<n>`) | M1 | todo | Parse; UI post-v1.0 |
-| COM-30 | Extra-axis status and capabilities | M1 | todo | 9-axis domain; UI expands if reported |
+| COM-23 | Spindle and port enumeration (`$SPINDLES`, `$SPINDLESH`, `$PORTS`) | M1 | partial | Multi-spindle capable |
+| COM-24 | Manual tool change protocol (`Tool` state, `0xA3`) | M1 | done | Jog and offsets while pending |
+| COM-25 | MPG takeover (`MPG:1/0`) | M1 | todo | Pause UI, keep telemetry |
+| COM-26 | SD mount and streaming status (`SD:`) | M1 | todo | Parse only; UI post-v1.0 |
+| COM-27 | Startup sequence without banner or DTR reset | M1 | done | 400–500 ms listen, `0x87`, MPG wait |
+| COM-28 | Error persistence handling | M1 | done | Clear with blank line or `$` before resume |
+| COM-29 | Multi-spindle status fields (`SP<n>`) | M1 | todo | Parse; UI post-v1.0 |
+| COM-30 | Extra-axis status and capabilities | M1 | done | 9-axis domain; UI expands if reported |
 
 ## Machine control
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| CTL-01 | DRO for all axes and work coordinate systems | M2 | todo | X/Y/Z first, 9-axis capable |
-| CTL-02 | Zero axes and set position | M2 | todo | Per axis and all |
-| CTL-03 | Goto and park | M2 | todo | Confirmation for Goto |
+| CTL-01 | DRO for all axes and work coordinate systems | M2 | done | X/Y/Z first, 9-axis capable |
+| CTL-02 | Zero axes and set position | M2 | done | Per axis and all |
+| CTL-03 | Goto and park | M2 | partial | Confirmation for Goto |
 | CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | partial | Keyboard one-step; hold pointer-only; jog feed global |
 | CTL-05 | Jog cancel and pendant-safe behavior | M2 | done | `0x85` |
 | CTL-06 | Feed override, fine and coarse, reset | M2 | done | Slider, ±1/±10, reset |
@@ -91,15 +94,15 @@ implemented before its UI or hardware validation row is complete.
 | CTL-15 | Keymap editor | M5 | done | Ten machine actions, runtime rebind |
 | CTL-16 | Work offsets editor, G54–G59.3, G10 | M5 | done | Edit, zero, goto, G92 clear |
 | CTL-17 | App-side tool table and manual M6 workflow | M5 | done | Controller table read-only |
-| CTL-18 | Metric and imperial units | M2 | todo | mm canonical |
-| CTL-19 | Themes and DPI scaling | M5 | todo | Dark, light, high contrast |
+| CTL-18 | Metric and imperial units | M2 | partial | mm canonical |
+| CTL-19 | Themes and DPI scaling | M5 | partial | Dark, light, high contrast |
 
 ## Jobs and program management
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
 | JOB-01 | Open, drag-and-drop, recent files | M3 | partial | In-app browser/load; drag-drop/recent open |
-| JOB-02 | Validate program before streaming | M3 | todo | Syntax, tools, feeds |
+| JOB-02 | Validate program before streaming | M3 | partial | Syntax, tools, feeds |
 | JOB-03 | Character-counting streaming with `Bf` top-up | M3 | done | Uses the reported RX buffer |
 | JOB-04 | Pause, resume, stop | M3 | done | Hold, resume, reset semantics |
 | JOB-05 | Manual tool change prompt and resume | M3 | done | `TC`, persistent tool plugin |
@@ -108,7 +111,7 @@ implemented before its UI or hardware validation row is complete.
 | JOB-08 | Progress, elapsed time, ETA | M3 | done | Progress/time and ETA |
 | JOB-09 | Console with filtering and file log | M3 | done | Bounded console, filters, 64 KiB snapshot |
 | JOB-10 | Dry run and check mode | M3 | done | `$C`; never moves |
-| JOB-11 | Defined reconnect and interruption policy | M3 | todo | No silent resume |
+| JOB-11 | Defined reconnect and interruption policy | M3 | done | No silent resume |
 | JOB-12 | Program list with follow, search, context menu | M4 | partial | Follow/search/jump done; context menu open |
 | JOB-13 | Add line numbers, strip comments | M4 | todo | Non-destructive save-as |
 | JOB-14 | Job statistics and run history | M4 | todo | Local only |
@@ -126,7 +129,7 @@ implemented before its UI or hardware validation row is complete.
 | VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | partial | 3D camera/grid/envelope/marker; stock mesh open |
 | VIEW-08 | Height map overlay | M6 | done | 2D cells and 3D projection |
 | VIEW-09 | 1M-line and 200k-segment performance | M4 | partial | Benchmarked; CI threshold open |
-| VIEW-10 | Program limits and outline display | M4 | todo | Confirmation before running |
+| VIEW-10 | Program limits and outline display | M4 | partial | Confirmation before running |
 
 ## Setup and persistence
 
@@ -172,27 +175,27 @@ implemented before its UI or hardware validation row is complete.
 | UTIL-01 | Material surfacing wizard | M7 | todo | Saves a runnable program |
 | UTIL-02 | Gantry squaring and alignment | M7 | todo | Guided |
 | UTIL-03 | Stepper and XY calibration | M7 | todo | Overlaps SETUP-04 |
-| UTIL-04 | Program outline and limits check | M7 | todo | Uses viewer geometry |
+| UTIL-04 | Program outline and limits check | M7 | partial | Uses viewer geometry |
 | UTIL-05 | Add line numbers, strip comments, transform tools | M7 | todo | Non-destructive |
-| UTIL-06 | Utility macros and quick actions | M7 | todo | Toolbar |
+| UTIL-06 | Utility macros and quick actions | M7 | done | Toolbar |
 | UTIL-07 | Machine setup wizard | M7 | todo | First-run |
 
 ## Touch UX and platform
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| UX-01 | Touch layout at 1280×800 | M2 | todo | Default |
-| UX-02 | Touch layout at 1920×1080 | M2 | todo | Scaled |
+| UX-01 | Touch layout at 1280×800 | M2 | done | Default |
+| UX-02 | Touch layout at 1920×1080 | M2 | done | Scaled |
 | UX-03 | Portrait layout | M7 | todo | 1080×1920 |
-| UX-04 | In-app numeric and text keypad | M2 | todo | No OS keyboard dependency |
-| UX-05 | 48 px targets, no hover-only actions | M2 | todo | Touch audit |
+| UX-04 | In-app numeric and text keypad | M2 | done | No OS keyboard dependency |
+| UX-05 | 48 px targets, no hover-only actions | M2 | done | Touch audit |
 | UX-06 | Dockable Workbench layout | M7 | todo | Optional mode |
-| UX-07 | Dark, light, high-contrast themes | M5 | todo | Shop-floor default |
+| UX-07 | Dark, light, high-contrast themes | M5 | partial | Shop-floor default |
 | UX-08 | Keyboard navigation and accessibility | M7 | partial | Machine keymap; full navigation/AccessKit open |
 | UX-09 | Localization, starting with en, pt-BR, de | M7 | todo | Runtime switch |
 | UX-10 | First-run safety onboarding | M7 | todo | Checklist |
-| UX-11 | Error dialogs and notifications | M2 | todo | Actionable |
-| UX-12 | Crash-safe configuration and local logs | M5 | todo | Atomic writes |
+| UX-11 | Error dialogs and notifications | M2 | partial | Actionable |
+| UX-12 | Crash-safe configuration and local logs | M5 | partial | Atomic writes |
 | UX-13 | Gamepad support | post-v1.0 | todo | Optional |
 
 ## Release and quality
@@ -202,11 +205,11 @@ implemented before its UI or hardware validation row is complete.
 | REL-01 | CI on Linux, macOS, Windows | M0 | done | fmt, clippy, tests, 3-OS build |
 | REL-02 | Unit, golden, and property tests | M1 | done | Per crate |
 | REL-03 | Simulator scenario suite | M1 | partial | Alarm/tool/probe/reconnect coverage |
-| REL-04 | Hardware-in-the-loop checklist | M2 | todo | FlexiHAL |
+| REL-04 | Hardware-in-the-loop checklist | M2 | partial | FlexiHAL |
 | REL-05 | Windows, macOS, Linux packaging | M7 | partial | Draft archives; signed installers open |
 | REL-06 | Code signing and notarization | M7 | todo | Best effort |
-| REL-07 | User manual and troubleshooting guide | M7 | todo | Docs site or mdBook |
-| REL-08 | Versioning and changelog | M7 | todo | Semver |
+| REL-07 | User manual and troubleshooting guide | M7 | done | Docs site or mdBook |
+| REL-08 | Versioning and changelog | M7 | done | Semver |
 | REL-09 | License and attribution review | M0 | done | MIT/Apache plus NOTICE |
 | REL-10 | Performance benchmarks in CI | M4 | todo | Thresholds |
 
