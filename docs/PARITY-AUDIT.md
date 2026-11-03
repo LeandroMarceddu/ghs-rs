@@ -1,5 +1,11 @@
 # v1.0 milling parity audit
 
+> **Historical snapshot — 2026-11-02, code basis `b82c9a4`.** Several rows have
+> since been implemented: dry-run/check mode, keymap, rectangle/XY-plate probes,
+> primary en/it/de/nl localization, typed pins/limits, console filtering/log,
+> and run options. Use [`parity.md`](parity.md) for the current checklist; keep
+> this file for its dated evidence and gap analysis.
+
 **Audit date:** 2026-11-02  
 **Code basis:** `b82c9a4`, clean worktree  
 **Scope:** all 130 numbered rows in [`docs/parity.md`](parity.md), with the

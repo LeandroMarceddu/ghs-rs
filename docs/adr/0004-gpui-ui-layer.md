@@ -1,6 +1,7 @@
 # ADR 0004: GPUI Kit with a thin internal UI layer
 
-**Status:** accepted
+**Status:** superseded — `ghs-ui` was never created; design tokens and thin
+wrappers live in `ghs-app` for now. See [architecture.md](../architecture.md).
 **Date:** 2026-11-01
 
 ## Context
@@ -16,6 +17,8 @@ constrained by a generic component theme.
 - Pin exact versions and commit `Cargo.lock`.
 - Introduce `ghs-ui` at M2 with design tokens (spacing, type scale, touch sizes,
   colors) and wrappers for the components used by more than one panel.
+  **Superseded:** `ghs-ui` was not created; `ghs-app/src/theme.rs` and the
+  existing GPUI Kit wrappers own this today.
 - Keep GPUI-specific code out of `ghs-core`, `ghs-proto`, `ghs-engine`, and
   `ghs-viewer` geometry.
 

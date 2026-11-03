@@ -83,8 +83,8 @@ impl JobInfo {
 
 /// Immutable snapshot of the controller and job state.
 ///
-/// The engine publishes this through a watch-style channel; the UI reads the
-/// latest value at frame time. Positions are in millimetres.
+/// The engine publishes this through shared telemetry and an `Arc` snapshot;
+/// the UI reads the latest value at frame time. Positions are in millimetres.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MachineSnapshot {
     /// Current machine state.

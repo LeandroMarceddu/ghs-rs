@@ -170,6 +170,6 @@ release section exists to diff against.
 - **Post-v1.0 surfaces.** SD-card browsing/YModem, ATC flows, and MPG/pendant
   UI are parsed and modeled but have no UI in this preview. Multi-spindle,
   extra-axis, and gamepad UI are also deferred.
-- **Other deferred work.** Localization, high-contrast theme, first-run
-  onboarding, and the material-surfacing, gantry-squaring, and calibration
-  wizards are not implemented.
+- **Other deferred work.** Secondary localization of long-form help/status
+  text, high-contrast theme, first-run onboarding, and the material-surfacing,
+  gantry-squaring, and calibration wizards are not implemented.

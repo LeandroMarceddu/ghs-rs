@@ -66,11 +66,11 @@ implemented before its UI or hardware validation row is complete.
 | COM-22 | Pins, limit state, last events (`$PINS`, `$PINSTATE`, `$LIM`, `$LEV`) | M1 | done | Reference pipe forms; upstream comma forms open |
 | COM-23 | Spindle and port enumeration (`$SPINDLES`, `$SPINDLESH`, `$PORTS`) | M1 | partial | Multi-spindle capable |
 | COM-24 | Manual tool change protocol (`Tool` state, `0xA3`) | M1 | done | Jog and offsets while pending |
-| COM-25 | MPG takeover (`MPG:1/0`) | M1 | todo | Pause UI, keep telemetry |
-| COM-26 | SD mount and streaming status (`SD:`) | M1 | todo | Parse only; UI post-v1.0 |
+| COM-25 | MPG takeover (`MPG:1/0`) | M1 | done | Telemetry/pause; MPG UI post-v1.0 |
+| COM-26 | SD mount and streaming status (`SD:`) | M1 | done | Parse only; UI post-v1.0 |
 | COM-27 | Startup sequence without banner or DTR reset | M1 | done | 400–500 ms listen, `0x87`, MPG wait |
 | COM-28 | Error persistence handling | M1 | done | Clear with blank line or `$` before resume |
-| COM-29 | Multi-spindle status fields (`SP<n>`) | M1 | todo | Parse; UI post-v1.0 |
+| COM-29 | Multi-spindle status fields (`SP<n>`) | M1 | done | Parse; UI post-v1.0 |
 | COM-30 | Extra-axis status and capabilities | M1 | done | 9-axis domain; UI expands if reported |
 
 ## Machine control
@@ -192,7 +192,7 @@ implemented before its UI or hardware validation row is complete.
 | UX-06 | Dockable Workbench layout | M7 | todo | Optional mode |
 | UX-07 | Dark, light, high-contrast themes | M5 | partial | Shop-floor default |
 | UX-08 | Keyboard navigation and accessibility | M7 | partial | Machine keymap; full navigation/AccessKit open |
-| UX-09 | Localization, starting with en, pt-BR, de | M7 | todo | Runtime switch |
+| UX-09 | Localization, starting with en, it, de, nl | M7 | partial | Primary UI localized; long-form/secondary text English |
 | UX-10 | First-run safety onboarding | M7 | todo | Checklist |
 | UX-11 | Error dialogs and notifications | M2 | partial | Actionable |
 | UX-12 | Crash-safe configuration and local logs | M5 | partial | Atomic writes |
