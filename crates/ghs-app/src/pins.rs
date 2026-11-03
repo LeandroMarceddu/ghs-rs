@@ -150,19 +150,6 @@ pub enum PinsStatus {
     Stopped(String),
 }
 
-impl PinsStatus {
-    /// Short uppercase label for the panel header.
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Idle => "NOT REQUESTED",
-            Self::Refreshing => "READING CONTROLLER",
-            Self::Busy => "CONTROLLER BUSY - RETRYING",
-            Self::Requested => "REPORTS REQUESTED",
-            Self::Stopped(reason) => reason.as_str(),
-        }
-    }
-}
-
 /// Whether one report has arrived and whether it carried any entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportState {

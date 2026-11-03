@@ -74,7 +74,7 @@ pub fn overlay(
                     div()
                         .text_size(px(11.))
                         .text_color(palette.text_dim)
-                        .child(format!("TOUCH KEYPAD / {}", target.title())),
+                        .child(format!("{} / {}", t("TOUCH KEYPAD"), target.title())),
                 )
                 .child(
                     div()
@@ -90,25 +90,27 @@ pub fn overlay(
                 .text_size(px(11.))
                 .text_color(palette.text_faint)
                 .child(match target {
-                    KeypadTarget::Mdi => "TOKENS + DIGITS".to_string(),
+                    KeypadTarget::Mdi => t("TOKENS + DIGITS").to_string(),
                     KeypadTarget::Rpm => "0 - 24000".to_string(),
-                    KeypadTarget::Dro(_) => format!("{} UNITS", unit.to_uppercase()),
+                    KeypadTarget::Dro(_) => {
+                        format!("{} {}", unit.to_uppercase(), t("UNITS"))
+                    }
                     KeypadTarget::WorkOffset { .. } => keypad
                         .hint
                         .clone()
-                        .unwrap_or_else(|| "G10 L20 | DISPLAY UNITS".to_string()),
+                        .unwrap_or_else(|| t("G10 L20 | DISPLAY UNITS").to_string()),
                     KeypadTarget::Setting(_) => keypad
                         .hint
                         .clone()
-                        .unwrap_or_else(|| "RANGE N/A".to_string()),
+                        .unwrap_or_else(|| t("RANGE N/A").to_string()),
                     KeypadTarget::Tool(_) => keypad
                         .hint
                         .clone()
-                        .unwrap_or_else(|| "TOOL FIELD".to_string()),
+                        .unwrap_or_else(|| t("TOOL FIELD").to_string()),
                     KeypadTarget::ProbeField(_) => keypad
                         .hint
                         .clone()
-                        .unwrap_or_else(|| "PROBE FIELD (mm)".to_string()),
+                        .unwrap_or_else(|| t("PROBE FIELD (mm)").to_string()),
                 }),
         );
 

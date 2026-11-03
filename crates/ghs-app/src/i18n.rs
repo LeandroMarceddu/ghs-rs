@@ -64,6 +64,7 @@ pub fn choose_locale(config: &mut ConfigModel, locale: Locale) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
@@ -231,5 +232,126 @@ mod tests {
             "CONNETTI",
             "primary controls use the active catalog"
         );
+    }
+
+    #[test]
+    fn check_mode_labels_translate_in_every_catalog() {
+        assert_eq!(
+            ghs_i18n::t_in(Locale::It, "CHECK COMPLETE"),
+            "CONTROLLO COMPLETATO"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::De, "CHECK COMPLETE"),
+            "PRÜFLAUF ABGESCHLOSSEN"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::Nl, "CHECK COMPLETE"),
+            "CONTROLE VOLTOOID"
+        );
+        assert_eq!(ghs_i18n::t_in(Locale::It, "CHECK"), "CONTROLLO");
+        assert_eq!(ghs_i18n::t_in(Locale::De, "CHECK"), "PRÜFEN");
+        assert_eq!(ghs_i18n::t_in(Locale::Nl, "CHECK"), "CONTROLE");
+        assert_eq!(ghs_i18n::t_in(Locale::It, "START CHECK"), "AVVIA CONTROLLO");
+        assert_eq!(
+            ghs_i18n::t_in(Locale::De, "START CHECK"),
+            "PRÜFLAUF STARTEN"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::Nl, "DRY RUN - NO MOTION"),
+            "DROOGLOOP - GEEN BEWEGING"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::It, "CHECK STOPPED"),
+            "CONTROLLO INTERROTTO"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::De, "CHECK PROGRAM (DRY RUN)"),
+            "PROGRAMM PRÜFEN (TROCKENLAUF)"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::Nl, "WHAT THE DRY RUN DOES"),
+            "WAT DE DROOGLOOP DOET"
+        );
+    }
+
+    #[test]
+    fn language_card_labels_are_translated_but_selector_stays_native() {
+        assert_eq!(ghs_i18n::t_in(Locale::It, "LANGUAGE"), "LINGUA");
+        assert_eq!(ghs_i18n::t_in(Locale::De, "LANGUAGE"), "SPRACHE");
+        assert_eq!(ghs_i18n::t_in(Locale::Nl, "LANGUAGE"), "TAAL");
+        // A language is always offered in its own language, never translated
+        // by whichever catalog happens to be active.
+        for active in Locale::ALL {
+            assert_eq!(
+                Locale::ALL.map(|locale| ghs_i18n::t_in(active, locale.label())),
+                ["English", "Italiano", "Deutsch", "Nederlands"]
+            );
+        }
+    }
+
+    #[test]
+    fn file_browser_and_run_options_labels_use_the_catalog() {
+        assert_eq!(ghs_i18n::t_in(Locale::It, "FOLDERS"), "CARTELLE");
+        assert_eq!(ghs_i18n::t_in(Locale::De, "FOLDERS"), "ORDNER");
+        assert_eq!(ghs_i18n::t_in(Locale::Nl, "FOLDERS"), "MAPPEN");
+        assert_eq!(
+            ghs_i18n::t_in(Locale::Nl, "READY TO LOAD"),
+            "KLAAR OM TE LADEN"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::It, "LIVE / READY"),
+            "ATTIVO / PRONTO"
+        );
+        assert_eq!(
+            ghs_i18n::t_in(Locale::Nl, "OPTIONAL STOP"),
+            "OPTIONELE STOP"
+        );
+        assert_eq!(ghs_i18n::t_in(Locale::It, "BLOCK DELETE"), "ELIMINA BLOCCO");
+        assert_eq!(ghs_i18n::t_in(Locale::De, "SINGLE BLOCK"), "EINZELSATZ");
+        assert_eq!(
+            ghs_i18n::t_in(
+                Locale::De,
+                "BLOCK DELETE IS LOCKED WHILE A JOB IS RUNNING OR PAUSED"
+            ),
+            "SATZ LÖSCHEN IST GESPERRT, WÄHREND EIN AUFTRAG LÄUFT ODER PAUSIERT"
+        );
+    }
+
+    #[test]
+    fn catalog_keys_are_non_empty_unique_and_bounded() {
+        let english = ghs_i18n::catalog_entries(Locale::En);
+        let english_keys: HashSet<&str> = english.iter().map(|(key, _)| *key).collect();
+        assert!(english.len() > 500, "the second pass adds the UI labels");
+
+        for locale in Locale::ALL {
+            let entries = ghs_i18n::catalog_entries(locale);
+            let mut seen = HashSet::new();
+            for (key, translation) in entries {
+                assert!(!key.is_empty(), "{locale:?} has an empty key");
+                assert!(
+                    !translation.is_empty(),
+                    "{locale:?} has an empty translation for {key:?}"
+                );
+                assert!(
+                    seen.insert(*key),
+                    "{locale:?} contains duplicate key {key:?}"
+                );
+                assert!(
+                    key.len() <= ghs_i18n::MAX_KEY_BYTES,
+                    "{locale:?} key {key:?} exceeds the byte bound"
+                );
+                assert!(
+                    translation.len() <= ghs_i18n::MAX_TRANSLATION_BYTES,
+                    "{locale:?} translation for {key:?} exceeds the byte bound"
+                );
+            }
+            let keys: HashSet<&str> = entries.iter().map(|(key, _)| *key).collect();
+            if locale != Locale::En {
+                assert_eq!(
+                    keys, english_keys,
+                    "{locale:?} must cover every English key exactly once"
+                );
+            }
+        }
     }
 }

@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ghs_engine::{Setting, SettingDescription, SettingGroup, SettingValue};
+use ghs_i18n::t;
 
 /// App-side mirror of the `$ES` type code.
 ///
@@ -431,22 +432,22 @@ impl SettingRow {
         }
         parts.push(self.range_text());
         if let Some(format) = &self.format {
-            parts.push(format!("FORMAT {format}"));
+            parts.push(format!("{} {format}", t("FORMAT")));
         }
         if self.reboot {
-            parts.push("REBOOT REQUIRED".to_string());
+            parts.push(t("REBOOT REQUIRED").to_string());
         }
         if self.null_allowed {
             parts.push(self.null_label.as_ref().map_or_else(
-                || "BLANK ALLOWED".to_string(),
+                || t("BLANK ALLOWED").to_string(),
                 |label| format!("BLANK = {label}"),
             ));
         }
         if self.kind == SettingKind::ExclusiveBitfield {
-            parts.push("BIT 0 ENABLES THE OTHERS".to_string());
+            parts.push(t("BIT 0 ENABLES THE OTHERS").to_string());
         }
         if !self.described {
-            parts.push("INFERRED FROM VALUE".to_string());
+            parts.push(t("INFERRED FROM VALUE").to_string());
         }
         parts.join(" | ")
     }

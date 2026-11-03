@@ -21,6 +21,7 @@ use ghs_engine::{
     PinState, Program, ProgramLine as EngineProgramLine, SettingValue, Signals as CoreSignals,
     StartupLine, StatusReport, ToolEntry, Wcs,
 };
+use ghs_i18n::t;
 use ghs_probe::XyPoint;
 
 use crate::config::ConfigModel;
@@ -410,19 +411,19 @@ impl KeypadTarget {
     pub fn title(self) -> String {
         match self {
             KeypadTarget::Dro(axis) => match axis.index() {
-                0 => "SET X".to_string(),
-                1 => "SET Y".to_string(),
-                2 => "SET Z".to_string(),
-                _ => "SET AXIS".to_string(),
+                0 => t("SET X").to_string(),
+                1 => t("SET Y").to_string(),
+                2 => t("SET Z").to_string(),
+                _ => t("SET AXIS").to_string(),
             },
-            KeypadTarget::Mdi => "MDI TEXT".to_string(),
-            KeypadTarget::Rpm => "SPINDLE RPM".to_string(),
-            KeypadTarget::Setting(number) => format!("SETTING ${number}"),
+            KeypadTarget::Mdi => t("MDI TEXT").to_string(),
+            KeypadTarget::Rpm => t("SPINDLE RPM").to_string(),
+            KeypadTarget::Setting(number) => format!("{} ${number}", t("SETTING")),
             KeypadTarget::WorkOffset { wcs, axis } => {
-                format!("{} {} OFFSET", AppState::wcs_at(wcs), axis.label())
+                format!("{} {} {}", AppState::wcs_at(wcs), axis.label(), t("OFFSET"))
             }
-            KeypadTarget::Tool(field) => field.title().to_string(),
-            KeypadTarget::ProbeField(field) => field.label().to_string(),
+            KeypadTarget::Tool(field) => t(field.title()).to_string(),
+            KeypadTarget::ProbeField(field) => t(field.label()).to_string(),
         }
     }
 }

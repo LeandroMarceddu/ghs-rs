@@ -30,11 +30,16 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// Maximum accepted length of an English catalog key, in UTF-8 bytes.
 ///
 /// Catalog maintenance tests reject longer keys so a full label cannot turn
-/// into an unbounded layout surprise.
-pub const MAX_KEY_BYTES: usize = 64;
+/// into an unbounded layout surprise. The bound is generous enough for the
+/// short explanatory paragraphs used by confirmation sheets and card help
+/// text, while still rejecting accidentally pasted documents.
+pub const MAX_KEY_BYTES: usize = 320;
 
 /// Maximum accepted length of one translation, in UTF-8 bytes.
-pub const MAX_TRANSLATION_BYTES: usize = 96;
+///
+/// Translated paragraphs are usually longer than the English source, so this
+/// bound is wider than [`MAX_KEY_BYTES`].
+pub const MAX_TRANSLATION_BYTES: usize = 400;
 
 /// Supported UI locale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -136,6 +141,16 @@ pub fn t(key: &'static str) -> &'static str {
 #[must_use]
 pub fn t_in(locale: Locale, key: &'static str) -> &'static str {
     catalog::lookup(locale, key).unwrap_or(key)
+}
+
+/// Read-only catalog slice for `locale`.
+///
+/// The slice is the crate's immutable table of `(english_key, translation)`
+/// pairs. It exists for diagnostics and for app-level catalog tests; callers
+/// must not assume any ordering.
+#[must_use]
+pub fn catalog_entries(locale: Locale) -> &'static [(&'static str, &'static str)] {
+    catalog::entries(locale)
 }
 
 /// Translate `key` using the active locale, falling back to `fallback`.

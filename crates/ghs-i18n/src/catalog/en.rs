@@ -356,4 +356,566 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
     ("SETUP", "SETUP"),
     ("VIEW", "VIEW"),
     ("FIT", "FIT"),
+    ("CHECK", "CHECK"),
+    ("CHECKING", "CHECKING"),
+    ("CHECK COMPLETE", "CHECK COMPLETE"),
+    ("CHECK STOPPED", "CHECK STOPPED"),
+    ("CHECK PROGRAM (DRY RUN)", "CHECK PROGRAM (DRY RUN)"),
+    ("START CHECK", "START CHECK"),
+    ("DRY RUN - NO MOTION", "DRY RUN - NO MOTION"),
+    (
+        "WAITING FOR CONTROLLER CHECK MODE ($C)",
+        "WAITING FOR CONTROLLER CHECK MODE ($C)",
+    ),
+    ("WHAT THE DRY RUN DOES", "WHAT THE DRY RUN DOES"),
+    ("MOTION IS SUPPRESSED", "MOTION IS SUPPRESSED"),
+    ("SPINDLE / COOLANT", "SPINDLE / COOLANT"),
+    ("WHEN FINISHED", "WHEN FINISHED"),
+    (
+        "The controller parses and streams the loaded program with check mode ($C) enabled. \
+        Nothing in this sheet starts a real job or moves an axis.",
+        "The controller parses and streams the loaded program with check mode ($C) enabled. \
+        Nothing in this sheet starts a real job or moves an axis.",
+    ),
+    (
+        "MOTION IS SUPPRESSED: the controller acknowledges program lines without moving the \
+        machine.",
+        "MOTION IS SUPPRESSED: the controller acknowledges program lines without moving the \
+        machine.",
+    ),
+    (
+        "SPINDLE / COOLANT: M3, M4, M5, M7, M8 and M9 are parsed and acknowledged but never \
+        run as real outputs.",
+        "SPINDLE / COOLANT: M3, M4, M5, M7, M8 and M9 are parsed and acknowledged but never \
+        run as real outputs.",
+    ),
+    (
+        "WHEN FINISHED: the engine leaves check mode and waits for the machine to report \
+        IDLE. The program stays loaded for a separate real START.",
+        "WHEN FINISHED: the engine leaves check mode and waits for the machine to report \
+        IDLE. The program stays loaded for a separate real START.",
+    ),
+    (
+        "STOP remains available while the check streams; it never resumes or restarts the \
+        run.",
+        "STOP remains available while the check streams; it never resumes or restarts the \
+        run.",
+    ),
+    ("CANCEL sends nothing.", "CANCEL sends nothing."),
+    (
+        "Parse and stream the loaded program in check mode ($C); no motion.",
+        "Parse and stream the loaded program in check mode ($C); no motion.",
+    ),
+    ("LOADED", "LOADED"),
+    ("LANGUAGE", "LANGUAGE"),
+    ("FOLDERS", "FOLDERS"),
+    ("LIVE", "LIVE"),
+    ("JUMP", "JUMP"),
+    ("DEFAULTS", "DEFAULTS"),
+    ("RUN AGAIN", "RUN AGAIN"),
+    ("APPLY TEXT", "APPLY TEXT"),
+    ("KEEP DRAFT", "KEEP DRAFT"),
+    ("DIRECT", "DIRECT"),
+    ("SYNTHETIC", "SYNTHETIC"),
+    ("TOUCH KEYPAD", "TOUCH KEYPAD"),
+    ("NO LINE SELECTED", "NO LINE SELECTED"),
+    ("REPORTS REQUESTED", "REPORTS REQUESTED"),
+    ("OFFLINE", "OFFLINE"),
+    ("UNSAVED", "UNSAVED"),
+    ("USER-DEFINED", "USER-DEFINED"),
+    ("READ-ONLY", "READ-ONLY"),
+    ("NOT LOADED", "NOT LOADED"),
+    (
+        "Choose a file for the job; loading never starts it.",
+        "Choose a file for the job; loading never starts it.",
+    ),
+    (
+        "No folders or program files here",
+        "No folders or program files here",
+    ),
+    (
+        "Tap UP or type another folder path.",
+        "Tap UP or type another folder path.",
+    ),
+    (
+        "48 px rows | folders open on tap | hidden files and symlinks are not shown | .nc \
+        .gcode .tap .ngc | 20 MB limit",
+        "48 px rows | folders open on tap | hidden files and symlinks are not shown | .nc \
+        .gcode .tap .ngc | 20 MB limit",
+    ),
+    (
+        "Tap a program file to select it",
+        "Tap a program file to select it",
+    ),
+    ("READY TO LOAD", "READY TO LOAD"),
+    ("MOCK / BROWSE ONLY", "MOCK / BROWSE ONLY"),
+    ("LINK NOT READY", "LINK NOT READY"),
+    ("LIVE / READY", "LIVE / READY"),
+    ("DIR", "DIR"),
+    ("OPTIONAL STOP", "OPTIONAL STOP"),
+    ("SINGLE BLOCK", "SINGLE BLOCK"),
+    ("BLOCK DELETE", "BLOCK DELETE"),
+    (
+        "M1 optional stops are honored",
+        "M1 optional stops are honored",
+    ),
+    ("Hold after each block", "Hold after each block"),
+    ("Skip blocks marked with /", "Skip blocks marked with /"),
+    (
+        "Each tap sends one command. A row keeps showing the value the controller reports; \
+        it changes on the next poll, not when the button is pressed.",
+        "Each tap sends one command. A row keeps showing the value the controller reports; \
+        it changes on the next poll, not when the button is pressed.",
+    ),
+    ("Mock mode: no controller", "Mock mode: no controller"),
+    ("Link not ready", "Link not ready"),
+    (
+        "Locked while a job runs or pauses",
+        "Locked while a job runs or pauses",
+    ),
+    (
+        "MOCK MODE: run options need a live controller",
+        "MOCK MODE: run options need a live controller",
+    ),
+    (
+        "LINK NOT READY: run options are disabled until the handshake completes",
+        "LINK NOT READY: run options are disabled until the handshake completes",
+    ),
+    (
+        "BLOCK DELETE IS LOCKED WHILE A JOB IS RUNNING OR PAUSED",
+        "BLOCK DELETE IS LOCKED WHILE A JOB IS RUNNING OR PAUSED",
+    ),
+    (
+        "Closing this sheet sends nothing.",
+        "Closing this sheet sends nothing.",
+    ),
+    (
+        "CANCEL, the scrim, and closing this sheet send nothing.",
+        "CANCEL, the scrim, and closing this sheet send nothing.",
+    ),
+    ("CONFIRMING WILL", "CONFIRMING WILL"),
+    ("RUN TO LINE", "RUN TO LINE"),
+    ("SET BREAKPOINT AT LINE", "SET BREAKPOINT AT LINE"),
+    ("START PROGRAM AT LINE 1", "START PROGRAM AT LINE 1"),
+    ("PAUSE BEFORE LINE", "PAUSE BEFORE LINE"),
+    (
+        "LEAVE THE ACTIVE JOB AT ITS CURRENT POSITION",
+        "LEAVE THE ACTIVE JOB AT ITS CURRENT POSITION",
+    ),
+    ("RUN TO BLOCKED", "RUN TO BLOCKED"),
+    ("SET BP + START", "SET BP + START"),
+    (
+        "A job is already running or paused. Confirming only sets a breakpoint at the \
+        selected line; it does not start, restart, or resume the job.",
+        "A job is already running or paused. Confirming only sets a breakpoint at the \
+        selected line; it does not start, restart, or resume the job.",
+    ),
+    (
+        "All earlier lines still run from the beginning. The job starts at line 1 and \
+        pauses before the selected line. Start-from-line is not supported.",
+        "All earlier lines still run from the beginning. The job starts at line 1 and \
+        pauses before the selected line. Start-from-line is not supported.",
+    ),
+    (
+        "One step per press; off while typing. RESET DEFAULTS restores.",
+        "One step per press; off while typing. RESET DEFAULTS restores.",
+    ),
+    (
+        "Named single-line MDI commands, saved in this controller profile. RUN sends only \
+        after a click; CONFIRM macros require a second explicit confirmation.",
+        "Named single-line MDI commands, saved in this controller profile. RUN sends only \
+        after a click; CONFIRM macros require a second explicit confirmation.",
+    ),
+    (
+        "No user macros for this controller profile. Add a named, single-line MDI command; \
+        it is saved only here and never runs on connect.",
+        "No user macros for this controller profile. Add a named, single-line MDI command; \
+        it is saved only here and never runs on connect.",
+    ),
+    ("MACRO SAVES LOCKED", "MACRO SAVES LOCKED"),
+    ("MACRO RUNS LOCKED", "MACRO RUNS LOCKED"),
+    (
+        "Startup lines execute automatically on every controller reset and can command \
+        motion, spindle, or coolant. Writes are allowed only while the controller is Idle; \
+        nothing is written until APPLY and CONFIRM WRITE.",
+        "Startup lines execute automatically on every controller reset and can command \
+        motion, spindle, or coolant. Writes are allowed only while the controller is Idle; \
+        nothing is written until APPLY and CONFIRM WRITE.",
+    ),
+    (
+        "WRITE NOT APPLIED - THE PREVIOUS VALUE IS STILL ACTIVE",
+        "WRITE NOT APPLIED - THE PREVIOUS VALUE IS STILL ACTIVE",
+    ),
+    (
+        "This startup line executes automatically on every controller reset. It can command \
+        motion, spindle, or coolant.",
+        "This startup line executes automatically on every controller reset. It can command \
+        motion, spindle, or coolant.",
+    ),
+    ("EXACT TEXT TO STORE", "EXACT TEXT TO STORE"),
+    ("Previous controller value", "Previous controller value"),
+    (
+        "CONFIRM WRITE sends the exact text shown. The app does not update the row itself: \
+        it reads the line back and reports the result.",
+        "CONFIRM WRITE sends the exact text shown. The app does not update the row itself: \
+        it reads the line back and reports the result.",
+    ),
+    ("RESET EXECUTION", "RESET EXECUTION"),
+    (
+        "CONFIRM FIRST; CANCEL SENDS NOTHING",
+        "CONFIRM FIRST; CANCEL SENDS NOTHING",
+    ),
+    (
+        "Sleep stops controller status polling until RESET or a status wake. The app does \
+        not wake the controller automatically; the DRO and job view stay frozen until the \
+        controller answers again.",
+        "Sleep stops controller status polling until RESET or a status wake. The app does \
+        not wake the controller automatically; the DRO and job view stay frozen until the \
+        controller answers again.",
+    ),
+    ("BEFORE YOU CONFIRM", "BEFORE YOU CONFIRM"),
+    (
+        "The controller must report Idle and no job may be running or paused. One confirmed \
+        tap sends one sleep command; CANCEL sends nothing.",
+        "The controller must report Idle and no job may be running or paused. One confirmed \
+        tap sends one sleep command; CANCEL sends nothing.",
+    ),
+    (
+        "Pin map, auxiliary pin levels, limit switches and last control events. Opening the \
+        panel sends nothing; REFRESH sends only $PINS, $PINSTATE, $LIM and $LEV.",
+        "Pin map, auxiliary pin levels, limit switches and last control events. Opening the \
+        panel sends nothing; REFRESH sends only $PINS, $PINSTATE, $LIM and $LEV.",
+    ),
+    (
+        "No $PINS report in this session",
+        "No $PINS report in this session",
+    ),
+    (
+        "The controller reported no pin entries",
+        "The controller reported no pin entries",
+    ),
+    ("pin entries reported", "pin entries reported"),
+    (
+        "Applies immediately and is saved in app preferences; the controller is not \
+        contacted.",
+        "Applies immediately and is saved in app preferences; the controller is not \
+        contacted.",
+    ),
+    (
+        "Export writes app prefs, identity, settings, offsets, tools, macros, startup \
+        lines, and keymap; import validates before writing and never pushes to the \
+        controller.",
+        "Export writes app prefs, identity, settings, offsets, tools, macros, startup \
+        lines, and keymap; import validates before writing and never pushes to the \
+        controller.",
+    ),
+    (
+        "The app owns this table; it persists in the per-controller profile. Controller \
+        [T:] entries stay read-only and are never merged silently.",
+        "The app owns this table; it persists in the per-controller profile. Controller \
+        [T:] entries stay read-only and are never merged silently.",
+    ),
+    (
+        "No controller tool table has been reported yet.",
+        "No controller tool table has been reported yet.",
+    ),
+    (
+        "The controller reports an empty tool table (0 entries).",
+        "The controller reports an empty tool table (0 entries).",
+    ),
+    (
+        "Reported by the controller through [T:...]; this panel never writes, overwrites, \
+        or merges into the app table above.",
+        "Reported by the controller through [T:...]; this panel never writes, overwrites, \
+        or merges into the app table above.",
+    ),
+    ("STARTUP WRITES LOCKED", "STARTUP WRITES LOCKED"),
+    ("SAVE LOCKED", "SAVE LOCKED"),
+    ("KEYMAP NOT VALID", "KEYMAP NOT VALID"),
+    ("Program has no lines", "Program has no lines"),
+    (
+        "Load a non-empty source file to search it.",
+        "Load a non-empty source file to search it.",
+    ),
+    ("Nothing matches", "Nothing matches"),
+    (
+        "Switch to HIGHLIGHT or clear the field to restore the full list.",
+        "Switch to HIGHLIGHT or clear the field to restore the full list.",
+    ),
+    (
+        "DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM",
+        "DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM",
+    ),
+    ("GENERATED PROGRAM", "GENERATED PROGRAM"),
+    (
+        "No axes reported by the controller",
+        "No axes reported by the controller",
+    ),
+    (
+        "ONE WRITE AT A TIME | READ-BACK VERIFIED",
+        "ONE WRITE AT A TIME | READ-BACK VERIFIED",
+    ),
+    ("WRITES LOCKED", "WRITES LOCKED"),
+    ("IDLE: WRITES ENABLED", "IDLE: WRITES ENABLED"),
+    (
+        "MOCK MODE: NO CONTROLLER SETTINGS",
+        "MOCK MODE: NO CONTROLLER SETTINGS",
+    ),
+    (
+        "The generated editor is built from the controller's $$ values and $ES/$EG \
+        metadata. The design-review mock supplies neither. Start without --mock to connect \
+        the in-process FlexiHAL demo controller.",
+        "The generated editor is built from the controller's $$ values and $ES/$EG \
+        metadata. The design-review mock supplies neither. Start without --mock to connect \
+        the in-process FlexiHAL demo controller.",
+    ),
+    ("WAITING FOR SETTINGS", "WAITING FOR SETTINGS"),
+    (
+        "The handshake has not reported $$, $ES, or $EG yet. The form appears as soon as \
+        the controller answers.",
+        "The handshake has not reported $$, $ES, or $EG yet. The form appears as soon as \
+        the controller answers.",
+    ),
+    (
+        "THE CONTROLLER REPORTED NO SETTINGS",
+        "THE CONTROLLER REPORTED NO SETTINGS",
+    ),
+    (
+        "$$ returned no values and $ES/$EG returned no metadata. The editor stays empty \
+        rather than inventing a setting list.",
+        "$$ returned no values and $ES/$EG returned no metadata. The editor stays empty \
+        rather than inventing a setting list.",
+    ),
+    (
+        "EXAMPLE SHAPE (NO VALUES ARE WRITTEN)",
+        "EXAMPLE SHAPE (NO VALUES ARE WRITTEN)",
+    ),
+    ("LOW", "LOW"),
+    ("HIGH", "HIGH"),
+    ("dashed = missing", "dashed = missing"),
+    ("QUEUED", "QUEUED"),
+    ("BLANK ALLOWED", "BLANK ALLOWED"),
+    ("BIT 0 ENABLES THE OTHERS", "BIT 0 ENABLES THE OTHERS"),
+    ("INFERRED FROM VALUE", "INFERRED FROM VALUE"),
+    (
+        "No saved maps for this controller profile yet.",
+        "No saved maps for this controller profile yet.",
+    ),
+    (
+        "Read-only view; opening does not apply compensation or start a job",
+        "Read-only view; opening does not apply compensation or start a job",
+    ),
+    (
+        "Nothing is applied automatically",
+        "Nothing is applied automatically",
+    ),
+    (
+        "No automatic retry or resume. Recover the machine, then run again.",
+        "No automatic retry or resume. Recover the machine, then run again.",
+    ),
+    (
+        "every gate must pass before RUN",
+        "every gate must pass before RUN",
+    ),
+    ("PROBE CYCLES", "PROBE CYCLES"),
+    (
+        "Pick a card, inspect the preflight, then press RUN",
+        "Pick a card, inspect the preflight, then press RUN",
+    ),
+    (
+        "millimetres; tap a value to edit",
+        "millimetres; tap a value to edit",
+    ),
+    ("recorded vs live", "recorded vs live"),
+    ("per controller profile", "per controller profile"),
+    ("APPLY OFFSET", "APPLY OFFSET"),
+    ("NOT SENT YET", "NOT SENT YET"),
+    ("EXACT MDI LINE", "EXACT MDI LINE"),
+    ("CURRENT DRO (DISPLAY UNITS)", "CURRENT DRO (DISPLAY UNITS)"),
+    (
+        "DRO CHANGED SINCE THIS SHEET OPENED; CANCEL AND RECHECK",
+        "DRO CHANGED SINCE THIS SHEET OPENED; CANCEL AND RECHECK",
+    ),
+    ("READ-ONLY $# PARAMETERS", "READ-ONLY $# PARAMETERS"),
+    ("X / Y / Z IN DISPLAY UNITS", "X / Y / Z IN DISPLAY UNITS"),
+    ("TAP TO EDIT", "TAP TO EDIT"),
+    (
+        "RESTORE WORK OFFSETS - PREVIEW",
+        "RESTORE WORK OFFSETS - PREVIEW",
+    ),
+    (
+        "G10 L2 LINES IN THIS FILE (VALUES IN MILLIMETRES)",
+        "G10 L2 LINES IN THIS FILE (VALUES IN MILLIMETRES)",
+    ),
+    (
+        "THE FILE BEGINS WITH G21: EVERY VALUE IS INTERPRETED IN MILLIMETRES.",
+        "THE FILE BEGINS WITH G21: EVERY VALUE IS INTERPRETED IN MILLIMETRES.",
+    ),
+    ("LOAD AS PROGRAM", "LOAD AS PROGRAM"),
+    (
+        "LOCKED: A JOB IS ACTIVE; STOP IT BEFORE LOADING A PROGRAM",
+        "LOCKED: A JOB IS ACTIVE; STOP IT BEFORE LOADING A PROGRAM",
+    ),
+    ("SET X", "SET X"),
+    ("SET Y", "SET Y"),
+    ("SET Z", "SET Z"),
+    ("SET AXIS", "SET AXIS"),
+    ("MDI TEXT", "MDI TEXT"),
+    ("SPINDLE RPM", "SPINDLE RPM"),
+    ("SETTING", "SETTING"),
+    ("OFFSET", "OFFSET"),
+    ("TOKENS + DIGITS", "TOKENS + DIGITS"),
+    ("G10 L20 | DISPLAY UNITS", "G10 L20 | DISPLAY UNITS"),
+    ("RANGE N/A", "RANGE N/A"),
+    ("TOOL FIELD", "TOOL FIELD"),
+    ("PROBE FIELD (mm)", "PROBE FIELD (mm)"),
+    ("Demo FlexiHAL", "Demo FlexiHAL"),
+    (
+        "In-process FlexiHAL simulator over the loopback transport. No serial port is \
+        opened.",
+        "In-process FlexiHAL simulator over the loopback transport. No serial port is \
+        opened.",
+    ),
+    (
+        "Same engine, handshake, streamer and safety gateway as a real controller.",
+        "Same engine, handshake, streamer and safety gateway as a real controller.",
+    ),
+    (
+        "Tap a port to select it; nothing opens until CONNECT.",
+        "Tap a port to select it; nothing opens until CONNECT.",
+    ),
+    (
+        "Line settings are fixed at 8 data bits, no parity, one stop bit. DTR reset pulses \
+        are not implemented in M2.",
+        "Line settings are fixed at 8 data bits, no parity, one stop bit. DTR reset pulses \
+        are not implemented in M2.",
+    ),
+    ("serial port", "serial port"),
+    ("NOT REQUESTED", "NOT REQUESTED"),
+    ("READING CONTROLLER", "READING CONTROLLER"),
+    ("CONTROLLER BUSY - RETRYING", "CONTROLLER BUSY - RETRYING"),
+    (
+        "No $PINS report has arrived in this session.",
+        "No $PINS report has arrived in this session.",
+    ),
+    (
+        "No $PINSTATE report has arrived in this session.",
+        "No $PINSTATE report has arrived in this session.",
+    ),
+    (
+        "The controller reported no auxiliary pin levels.",
+        "The controller reported no auxiliary pin levels.",
+    ),
+    (
+        "No $LIM report has arrived in this session.",
+        "No $LIM report has arrived in this session.",
+    ),
+    (
+        "No $LEV report has arrived in this session.",
+        "No $LEV report has arrived in this session.",
+    ),
+    (
+        "The controller reports no control or limit events yet.",
+        "The controller reports no control or limit events yet.",
+    ),
+    ("PROBE PLAN", "PROBE PLAN"),
+    ("CUSTOM", "CUSTOM"),
+    ("No settings in this group", "No settings in this group"),
+    ("No setting matches", "No setting matches"),
+    (
+        "Pick another group in the rail.",
+        "Pick another group in the rail.",
+    ),
+    (
+        "Search matches a number, name, or group. Clear the search to browse groups.",
+        "Search matches a number, name, or group. Clear the search to browse groups.",
+    ),
+    ("CONTROLLER STATE", "CONTROLLER STATE"),
+    (
+        "CONTROLLER DIAGNOSTIC DATA - READ-ONLY",
+        "CONTROLLER DIAGNOSTIC DATA - READ-ONLY",
+    ),
+    ("SAVE BLOCKED", "SAVE BLOCKED"),
+    (
+        "KEPT: offsets are unchanged. Apply stays available.",
+        "KEPT: offsets are unchanged. Apply stays available.",
+    ),
+    ("COMMAND", "COMMAND"),
+    ("Ask before running", "Ask before running"),
+    (
+        "New macros default to CONFIRM. A direct macro runs on one click.",
+        "New macros default to CONFIRM. A direct macro runs on one click.",
+    ),
+    ("EXACT COMMAND TO SEND", "EXACT COMMAND TO SEND"),
+    (
+        "Jogging is allowed while the job waits; the Jog panel stays active. The job will \
+        not send another line until you resume.",
+        "Jogging is allowed while the job waits; the Jog panel stays active. The job will \
+        not send another line until you resume.",
+    ),
+    (
+        "Jogging is allowed while the job waits; the Jog panel stays active. The job will \
+        not send another line until you resume. RESET and STOP above remain available.",
+        "Jogging is allowed while the job waits; the Jog panel stays active. The job will \
+        not send another line until you resume. RESET and STOP above remain available.",
+    ),
+    ("VERIFYING", "VERIFYING"),
+    ("VERIFIED", "VERIFIED"),
+    ("MISMATCH", "MISMATCH"),
+    ("MEASUREMENT ONLY", "MEASUREMENT ONLY"),
+    ("READY TO APPLY", "READY TO APPLY"),
+    ("REVERTED", "REVERTED"),
+    ("FEED", "FEED"),
+    ("RETRACT", "RETRACT"),
+    ("CENTER X", "CENTER X"),
+    ("CENTER Y", "CENTER Y"),
+    ("ORIGIN X WORK", "ORIGIN X WORK"),
+    ("ORIGIN Y WORK", "ORIGIN Y WORK"),
+    ("SURFACE Z MACH", "SURFACE Z MACH"),
+    ("PROBE OFFSET X", "PROBE OFFSET X"),
+    ("PROBE OFFSET Y", "PROBE OFFSET Y"),
+    (
+        "MOCK MODE: browsing only; loading needs a live controller",
+        "MOCK MODE: browsing only; loading needs a live controller",
+    ),
+    (
+        "LINK NOT READY: finish the connection handshake before loading a program",
+        "LINK NOT READY: finish the connection handshake before loading a program",
+    ),
+    (
+        "JOB ACTIVE: stop the running job before loading another program",
+        "JOB ACTIVE: stop the running job before loading another program",
+    ),
+    (
+        "MOCK MODE: a check run needs a live controller",
+        "MOCK MODE: a check run needs a live controller",
+    ),
+    (
+        "LINK NOT READY: finish the connection handshake before a check run",
+        "LINK NOT READY: finish the connection handshake before a check run",
+    ),
+    (
+        "MACHINE LOCKED: clear Alarm or Door before a check run",
+        "MACHINE LOCKED: clear Alarm or Door before a check run",
+    ),
+    (
+        "NO PROGRAM: load a program before a check run",
+        "NO PROGRAM: load a program before a check run",
+    ),
+    (
+        "JOB ACTIVE: stop the running job before a check run",
+        "JOB ACTIVE: stop the running job before a check run",
+    ),
+    (
+        "MACHINE NOT IDLE: a check run starts only from IDLE",
+        "MACHINE NOT IDLE: a check run starts only from IDLE",
+    ),
+    (
+        "CHECK RUN ACTIVE: wait for the controller to finish check mode",
+        "CHECK RUN ACTIVE: wait for the controller to finish check mode",
+    ),
+    (
+        "PROBE PROGRAM: a generated probe plan cannot be checked from the job toolbar",
+        "PROBE PROGRAM: a generated probe plan cannot be checked from the job toolbar",
+    ),
 ];

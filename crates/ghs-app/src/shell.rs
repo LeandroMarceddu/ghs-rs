@@ -1619,13 +1619,13 @@ impl Shell {
     /// loaded and the failed exact source is discarded.
     fn load_program_file(&mut self, path: &Path) -> Result<String, String> {
         if let Some(refusal) = self.state.program_load_refusal() {
-            return Err(refusal.message().to_string());
+            return Err(t(refusal.message()).to_string());
         }
         let file = read_program(path).map_err(|error| error.to_string())?;
         let command = self
             .state
             .program_load(&file.name, &file.source)
-            .map_err(|refusal| refusal.message().to_string())?;
+            .map_err(|refusal| t(refusal.message()).to_string())?;
         match self.send_command_quiet(command) {
             Ok(()) => Ok(format!(
                 "Loading program: {} ({})",
@@ -5500,7 +5500,7 @@ impl Shell {
                     )
                     .child(program_search_button(
                         "program-search-jump",
-                        "JUMP",
+                        t("JUMP"),
                         has_matches,
                         p,
                         view,
@@ -5554,7 +5554,7 @@ impl Shell {
                 let detail = gate
                     .map(|refusal| refusal.message().to_string())
                     .unwrap_or_else(|| t("TAP A LINE TO SELECT").to_string());
-                (String::from("NO LINE SELECTED"), detail, p.text_faint)
+                (t("NO LINE SELECTED").to_string(), detail, p.text_faint)
             }
         };
 
@@ -6102,18 +6102,16 @@ impl Shell {
         let scrim_view = view;
 
         let warning = if active {
-            format!(
-                "A job is already running or paused. Confirming only sets a breakpoint at line \
-                 {line}; it does not start, restart, or resume the job."
+            t(
+                "A job is already running or paused. Confirming only sets a breakpoint at the selected line; it does not start, restart, or resume the job.",
             )
         } else {
-            format!(
-                "All lines before line {line} still run from the beginning. The job starts at \
-                 line 1 and pauses before line {line}. Start-from-line is not supported."
+            t(
+                "All earlier lines still run from the beginning. The job starts at line 1 and pauses before the selected line. Start-from-line is not supported.",
             )
         };
         let confirm_label = if will_start {
-            "SET BP + START"
+            t("SET BP + START")
         } else {
             t("SET BREAKPOINT")
         };
@@ -6162,7 +6160,7 @@ impl Shell {
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.warning)
-                                    .child(format!("RUN TO LINE {line}")),
+                                    .child(format!("{} {line}", t("RUN TO LINE"))),
                             )
                             .child(chip(t("CONFIRM REQUIRED"), p)),
                     )
@@ -6218,22 +6216,27 @@ impl Shell {
                                     .text_size(px(9.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text_faint)
-                                    .child("CONFIRMING WILL"),
+                                    .child(t("CONFIRMING WILL")),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(p.text)
-                                    .child(format!("SET BREAKPOINT AT LINE {line}")),
+                                    .child(format!("{} {line}", t("SET BREAKPOINT AT LINE"))),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(if will_start { p.accent } else { p.text_dim })
                                     .child(if will_start {
-                                        format!("START PROGRAM AT LINE 1 | PAUSE AT LINE {line}")
+                                        format!(
+                                            "{} | {} {line}",
+                                            t("START PROGRAM AT LINE 1"),
+                                            t("PAUSE BEFORE LINE")
+                                        )
                                     } else {
-                                        "LEAVE THE ACTIVE JOB AT ITS CURRENT POSITION".to_string()
+                                        t("LEAVE THE ACTIVE JOB AT ITS CURRENT POSITION")
+                                            .to_string()
                                     }),
                             ),
                     )
@@ -6244,7 +6247,8 @@ impl Shell {
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(p.danger)
                                 .child(format!(
-                                    "RUN TO BLOCKED: {}",
+                                    "{}: {}",
+                                    t("RUN TO BLOCKED"),
                                     refusal.message().to_uppercase()
                                 )),
                         )
@@ -6256,7 +6260,7 @@ impl Shell {
                         div()
                             .text_size(px(9.5))
                             .text_color(p.text_faint)
-                            .child("CANCEL, the scrim, and closing this sheet send nothing."),
+                            .child(t("CANCEL, the scrim, and closing this sheet send nothing.")),
                     )
                     .child(
                         h_flex()
@@ -6310,7 +6314,7 @@ impl Shell {
         let rows = RunOption::ALL.into_iter().map(|option| {
             let value = self.state.run_option_value(option);
             let enabled = self.state.run_option_refusal(option).is_none();
-            let hint = self.state.run_option_hint(option);
+            let hint = t(self.state.run_option_hint(option));
             let id = match option {
                 RunOption::OptionalStop => "run-option-optional-stop",
                 RunOption::SingleBlock => "run-option-single-block",
@@ -6358,7 +6362,7 @@ impl Shell {
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(if enabled { p.text } else { p.text_dim })
-                                .child(option.label()),
+                                .child(t(option.label())),
                         )
                         .child(
                             div()
@@ -6387,12 +6391,15 @@ impl Shell {
                 )
         });
         let error = self.state.run_options_error.clone();
-        let lock_reason = self.state.run_options_lock_reason();
+        let lock_reason = self
+            .state
+            .run_options_lock_reason()
+            .map(|reason| t(reason).to_string());
         let check_refusal = self.state.check_refusal();
         let check_enabled = check_refusal.is_none();
         let check_hint = check_refusal.map_or(
-            "Parse and stream the loaded program in check mode ($C); no motion.",
-            |refusal| refusal.message(),
+            t("Parse and stream the loaded program in check mode ($C); no motion."),
+            |refusal| t(refusal.message()),
         );
 
         div()
@@ -6438,18 +6445,16 @@ impl Shell {
                                     .text_color(p.text)
                                     .child(t("RUN OPTIONS")),
                             )
-                            .child(chip("CONTROLLER STATE", p)),
+                            .child(chip(t("CONTROLLER STATE"), p)),
                     )
                     .child(
                         div()
                             .text_size(px(10.0))
                             .line_height(px(14.0))
                             .text_color(p.text_dim)
-                            .child(
-                                "Each tap sends one command. A row keeps showing the value the \
-                                 controller reports; it changes on the next poll, not when the \
-                                 button is pressed.",
-                            ),
+                            .child(t(
+                                "Each tap sends one command. A row keeps showing the value the controller reports; it changes on the next poll, not when the button is pressed.",
+                            )),
                     )
                     .children(rows)
                     .child(
@@ -6489,7 +6494,7 @@ impl Shell {
                                             } else {
                                                 p.text_dim
                                             })
-                                            .child("CHECK PROGRAM (DRY RUN)"),
+                                            .child(t("CHECK PROGRAM (DRY RUN)")),
                                     )
                                     .child(
                                         div()
@@ -6518,7 +6523,7 @@ impl Shell {
                                     .text_size(px(10.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text_dim)
-                                    .child("CHECK"),
+                                    .child(t("CHECK")),
                             ),
                     )
                     .when_some(error, |this, error| {
@@ -6546,7 +6551,7 @@ impl Shell {
                                     .flex_1()
                                     .text_size(px(9.5))
                                     .text_color(p.text_faint)
-                                    .child("Closing this sheet sends nothing."),
+                                    .child(t("Closing this sheet sends nothing.")),
                             )
                             .child(
                                 div()
@@ -6636,7 +6641,7 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text)
-                                    .child("CHECK PROGRAM (DRY RUN)"),
+                                    .child(t("CHECK PROGRAM (DRY RUN)")),
                             )
                             .child(chip("$C", p)),
                     )
@@ -6645,11 +6650,9 @@ impl Shell {
                             .text_size(px(11.0))
                             .line_height(px(15.0))
                             .text_color(p.text)
-                            .child(
-                                "The controller parses and streams the loaded program with \
-                                 check mode ($C) enabled. Nothing in this sheet starts a real \
-                                 job or moves an axis.",
-                            ),
+                            .child(t(
+                                "The controller parses and streams the loaded program with check mode ($C) enabled. Nothing in this sheet starts a real job or moves an axis.",
+                            )),
                     )
                     .child(
                         v_flex()
@@ -6661,49 +6664,43 @@ impl Shell {
                                 div()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child("WHAT THE DRY RUN DOES"),
+                                    .child(t("WHAT THE DRY RUN DOES")),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.0))
                                     .line_height(px(14.0))
                                     .text_color(p.text_dim)
-                                    .child(
-                                        "MOTION IS SUPPRESSED: the controller acknowledges \
-                                         program lines without moving the machine.",
-                                    ),
+                                    .child(t(
+                                        "MOTION IS SUPPRESSED: the controller acknowledges program lines without moving the machine.",
+                                    )),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.0))
                                     .line_height(px(14.0))
                                     .text_color(p.text_dim)
-                                    .child(
-                                        "SPINDLE / COOLANT: M3, M4, M5, M7, M8 and M9 are \
-                                         parsed and acknowledged but never run as real \
-                                         outputs.",
-                                    ),
+                                    .child(t(
+                                        "SPINDLE / COOLANT: M3, M4, M5, M7, M8 and M9 are parsed and acknowledged but never run as real outputs.",
+                                    )),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.0))
                                     .line_height(px(14.0))
                                     .text_color(p.text_dim)
-                                    .child(
-                                        "WHEN FINISHED: the engine leaves check mode and waits \
-                                         for the machine to report IDLE. The program stays \
-                                         loaded for a separate real START.",
-                                    ),
+                                    .child(t(
+                                        "WHEN FINISHED: the engine leaves check mode and waits for the machine to report IDLE. The program stays loaded for a separate real START.",
+                                    )),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.0))
                                     .line_height(px(14.0))
                                     .text_color(p.text_dim)
-                                    .child(
-                                        "STOP remains available while the check streams; it \
-                                         never resumes or restarts the run.",
-                                    ),
+                                    .child(t(
+                                        "STOP remains available while the check streams; it never resumes or restarts the run.",
+                                    )),
                             ),
                     )
                     .child(
@@ -6726,7 +6723,7 @@ impl Shell {
                                 div()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child("CANCEL sends nothing."),
+                                    .child(t("CANCEL sends nothing.")),
                             ),
                     )
                     .child(
@@ -6748,7 +6745,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new("check-confirm-start")
-                                    .label("START CHECK")
+                                    .label(t("START CHECK"))
                                     .primary()
                                     .h(px(48.0))
                                     .flex_1()
@@ -6780,14 +6777,14 @@ impl Shell {
         let detail = self
             .state
             .pause_detail()
-            .or_else(|| self.state.check_detail().map(str::to_string));
+            .or_else(|| self.state.check_detail().map(|text| t(text).to_string()));
         let elapsed = format_elapsed(self.state.job.elapsed);
         // A check badge carries its elapsed time inside the pill: at 1280 px
         // the toolbar has no room for a separate TIME field beside a long
         // `CHECK COMPLETE` label.
         let check_status = self.state.job.is_check() || self.state.job.check_pending();
         let badge_label = if check_status {
-            format!("{status}  {elapsed}")
+            format!("{}  {elapsed}", t(status))
         } else {
             t(status).to_string()
         };
@@ -6945,7 +6942,7 @@ impl Shell {
         let path_label = match (&program, self.state.live) {
             (Some(_), _) => t("TOOLPATH"),
             (None, true) => t("NO PROGRAM"),
-            (None, false) => "SYNTHETIC",
+            (None, false) => t("SYNTHETIC"),
         };
         let segments = program
             .as_ref()
@@ -7033,7 +7030,7 @@ impl Shell {
                                 .border_color(p.border)
                                 .text_size(px(9.0))
                                 .text_color(p.text_faint)
-                                .child("DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM"),
+                                .child(t("DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM")),
                         )
                     }),
             )
@@ -7103,7 +7100,7 @@ impl Shell {
         let folder_label = if folder_count == 1 {
             t("FOLDER")
         } else {
-            "FOLDERS"
+            t("FOLDERS")
         };
         let file_label = if file_count == 1 {
             t("PROGRAM")
@@ -7114,21 +7111,23 @@ impl Shell {
         let refusal = self.state.program_load_refusal();
         let can_load = selected.is_some() && refusal.is_none();
         let (link_label, link_color) = match refusal {
-            Some(ProgramLoadRefusal::Mock) => ("MOCK / BROWSE ONLY", p.warning),
-            Some(ProgramLoadRefusal::NotReady) => ("LINK NOT READY", p.warning),
+            Some(ProgramLoadRefusal::Mock) => (t("MOCK / BROWSE ONLY"), p.warning),
+            Some(ProgramLoadRefusal::NotReady) => (t("LINK NOT READY"), p.warning),
             Some(ProgramLoadRefusal::JobActive) => (t("JOB ACTIVE"), p.warning),
-            None => ("LIVE / READY", p.success),
+            None => (t("LIVE / READY"), p.success),
         };
         let selected_name = selected.as_ref().map_or_else(
             || t("No file selected").to_string(),
             |entry| entry.name.clone(),
         );
         let selected_meta = match (&selected, refusal) {
-            (Some(entry), None) => format!("{} | READY TO LOAD", format_size(entry.size)),
-            (Some(entry), Some(reason)) => {
-                format!("{} | {}", format_size(entry.size), reason.message())
+            (Some(entry), None) => {
+                format!("{} | {}", format_size(entry.size), t("READY TO LOAD"))
             }
-            (None, _) => "Tap a program file to select it".to_string(),
+            (Some(entry), Some(reason)) => {
+                format!("{} | {}", format_size(entry.size), t(reason.message()))
+            }
+            (None, _) => t("Tap a program file to select it").to_string(),
         };
         let load_disabled = !can_load;
 
@@ -7160,13 +7159,13 @@ impl Shell {
                     div()
                         .text_size(px(11.0))
                         .text_color(p.text_dim)
-                        .child("No folders or program files here"),
+                        .child(t("No folders or program files here")),
                 )
                 .child(
                     div()
                         .text_size(px(9.5))
                         .text_color(p.text_faint)
-                        .child("Tap UP or type another folder path."),
+                        .child(t("Tap UP or type another folder path.")),
                 )
                 .into_any_element()
         } else {
@@ -7224,7 +7223,7 @@ impl Shell {
                                 div()
                                     .text_size(px(9.5))
                                     .text_color(p.text_dim)
-                                    .child("Choose a file for the job; loading never starts it."),
+                                    .child(t("Choose a file for the job; loading never starts it.")),
                             ),
                     )
                     .child(
@@ -7337,10 +7336,9 @@ impl Shell {
                     .text_size(px(9.0))
                     .line_height(px(12.0))
                     .text_color(p.text_faint)
-                    .child(
-                        "48 px rows | folders open on tap | hidden files and symlinks are not \
-                         shown | .nc .gcode .tap .ngc | 20 MB limit",
-                    ),
+                    .child(t(
+                        "48 px rows | folders open on tap | hidden files and symlinks are not shown | .nc .gcode .tap .ngc | 20 MB limit",
+                    )),
             );
 
         if let Some(error) = error {
@@ -7516,19 +7514,19 @@ impl Shell {
                                     .text_size(px(10.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.text_dim)
-                                    .child("PROBE CYCLES"),
+                                    .child(t("PROBE CYCLES")),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(p.text_faint)
-                                    .child("Pick a card, inspect the preflight, then press RUN"),
+                                    .child(t("Pick a card, inspect the preflight, then press RUN")),
                             ),
                     )
                     .child(div().flex_1())
                     .child(chip(self.state.wcs(), p))
                     .child(chip(self.state.unit(), p))
-                    .child(chip(if ctx.ready { "LIVE" } else { "OFFLINE" }, p)),
+                    .child(chip(if ctx.ready { t("LIVE") } else { t("OFFLINE") }, p)),
             )
             .child(self.probe_offset_bar(p, cx))
             .child(banner)
@@ -7970,7 +7968,7 @@ impl Shell {
                         div()
                             .text_size(px(9.0))
                             .text_color(p.text_faint)
-                            .child("millimetres; tap a value to edit"),
+                            .child(t("millimetres; tap a value to edit")),
                     ),
             );
         if card == ProbeCard::HeightMap {
@@ -8630,7 +8628,7 @@ impl Shell {
                         div()
                             .text_size(px(9.0))
                             .text_color(p.text_faint)
-                            .child("every gate must pass before RUN"),
+                            .child(t("every gate must pass before RUN")),
                     ),
             );
 
@@ -8766,7 +8764,7 @@ impl Shell {
                     .items_center()
                     .flex_wrap()
                     .gap_2()
-                    .child(section_label("SEARCH BOUND (CONTROLLED-POINT XY)", p))
+                    .child(section_label(t("SEARCH BOUND (CONTROLLED-POINT XY)"), p))
                     .child(
                         div()
                             .text_size(px(9.0))
@@ -8991,9 +8989,9 @@ impl Shell {
                                 retry_view.update(cx, |this, cx| this.start_probe_run(cx));
                             }),
                     )
-                    .child(div().text_size(px(10.0)).text_color(p.warning).child(
+                    .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
                         "No automatic retry or resume. Recover the machine, then run again.",
-                    )),
+                    ))),
             );
         }
 
@@ -9048,7 +9046,7 @@ impl Shell {
                         div()
                             .text_size(px(8.0))
                             .text_color(p.text_faint)
-                            .child("per controller profile"),
+                            .child(t("per controller profile")),
                     ),
             )
             .child(
@@ -9067,7 +9065,7 @@ impl Shell {
                     .text_size(px(8.5))
                     .line_height(px(10.5))
                     .text_color(p.warning)
-                    .child(format!("SAVE BLOCKED: {blocker}")),
+                    .child(format!("{}: {blocker}", t("SAVE BLOCKED"))),
             );
         }
         if let Some(notice) = self.state.height_map_library.last_saved() {
@@ -9107,7 +9105,7 @@ impl Shell {
                     .bg(p.panel)
                     .text_size(px(9.5))
                     .text_color(p.text_dim)
-                    .child("No saved maps for this controller profile yet."),
+                    .child(t("No saved maps for this controller profile yet.")),
             );
         } else {
             for (index, record) in maps.iter().enumerate() {
@@ -9423,7 +9421,7 @@ impl Shell {
                                 div()
                                     .text_size(px(8.0))
                                     .text_color(p.text_faint)
-                                    .child("recorded vs live"),
+                                    .child(t("recorded vs live")),
                             ),
                     )
                     .child(frame_rows)
@@ -9532,9 +9530,9 @@ impl Shell {
                             .text_color(p.info)
                             .child(format!("SAVED MAP: {}", saved.record.name)),
                     )
-                    .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                    .child(div().text_size(px(9.0)).text_color(p.text_faint).child(t(
                         "Read-only view; opening does not apply compensation or start a job",
-                    )),
+                    ))),
             )
             .child(
                 Button::new("saved-map-close")
@@ -9618,14 +9616,14 @@ impl Shell {
                     .text_size(px(8.5))
                     .line_height(px(10.5))
                     .text_color(p.warning)
-                    .child(format!("SAVE BLOCKED: {blocker}")),
+                    .child(format!("{}: {blocker}", t("SAVE BLOCKED"))),
             );
         } else if valid_cells == 0 {
             section = section.child(
                 div()
                     .text_size(px(8.5))
                     .text_color(p.warning)
-                    .child("SAVE BLOCKED: the map has no valid cell"),
+                    .child(format!("{}: the map has no valid cell", t("SAVE BLOCKED"))),
             );
         } else if let Some(notice) = last_saved {
             section = section.child(
@@ -10337,7 +10335,7 @@ impl Shell {
                 div()
                     .text_size(px(11.0))
                     .text_color(p.text_dim)
-                    .child("KEPT: offsets are unchanged. Apply stays available."),
+                    .child(t("KEPT: offsets are unchanged. Apply stays available.")),
             );
         }
 
@@ -10426,7 +10424,7 @@ impl Shell {
                     .items_center()
                     .child(
                         Button::new("probe-apply")
-                            .label("APPLY OFFSET")
+                            .label(t("APPLY OFFSET"))
                             .primary()
                             .h(px(52.0))
                             .w(px(150.0))
@@ -10457,7 +10455,7 @@ impl Shell {
                         div()
                             .text_size(px(9.0))
                             .text_color(p.text_faint)
-                            .child("Nothing is applied automatically"),
+                            .child(t("Nothing is applied automatically")),
                     ),
             );
         }
@@ -10625,7 +10623,7 @@ impl Shell {
             let back_footer_view = cx.entity();
             footer = footer.child(
                 Button::new("probe-run")
-                    .label(if run_exists { "RUN AGAIN" } else { t("RUN") })
+                    .label(if run_exists { t("RUN AGAIN") } else { t("RUN") })
                     .primary()
                     .h(px(56.0))
                     .w(px(120.0))
@@ -10674,7 +10672,14 @@ impl Shell {
                             .text_color(p.text)
                             .child(t(self.state.mode.title())),
                     )
-                    .child(chip(if self.state.live { "LIVE" } else { t("MOCK") }, p)),
+                    .child(chip(
+                        if self.state.live {
+                            t("LIVE")
+                        } else {
+                            t("MOCK")
+                        },
+                        p,
+                    )),
             )
             .child(div().flex_1().min_h(px(0.0)).child(body))
     }
@@ -10955,7 +10960,7 @@ impl Shell {
             div()
                 .text_size(px(10.0))
                 .text_color(p.text_faint)
-                .child("READ-ONLY $# PARAMETERS"),
+                .child(t("READ-ONLY $# PARAMETERS")),
         );
         for row in named {
             let value_color = if row.note == Some("NON-PERSISTENT") {
@@ -11163,13 +11168,13 @@ impl Shell {
                             .flex_1()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("X / Y / Z IN DISPLAY UNITS"),
+                            .child(t("X / Y / Z IN DISPLAY UNITS")),
                     )
                     .child(
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("TAP TO EDIT"),
+                            .child(t("TAP TO EDIT")),
                     ),
             )
             .child(list);
@@ -11295,7 +11300,7 @@ impl Shell {
                             .text_color(accent)
                             .child(t(action.title())),
                     )
-                    .child(chip("NOT SENT YET", p)),
+                    .child(chip(t("NOT SENT YET"), p)),
             )
             .child(
                 h_flex()
@@ -11316,7 +11321,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("EXACT MDI LINE"),
+                            .child(t("EXACT MDI LINE")),
                     ),
             )
             .child(
@@ -11347,7 +11352,7 @@ impl Shell {
                 div()
                     .text_size(px(10.0))
                     .text_color(p.text_faint)
-                    .child("CURRENT DRO (DISPLAY UNITS)"),
+                    .child(t("CURRENT DRO (DISPLAY UNITS)")),
             )
             .child(dro_row)
             .when(dro_changed, |this| {
@@ -11355,7 +11360,7 @@ impl Shell {
                     div()
                         .text_size(px(10.0))
                         .text_color(p.warning)
-                        .child("DRO CHANGED SINCE THIS SHEET OPENED; CANCEL AND RECHECK"),
+                        .child(t("DRO CHANGED SINCE THIS SHEET OPENED; CANCEL AND RECHECK")),
                 )
             })
             .child(
@@ -11513,9 +11518,9 @@ impl Shell {
                             .text_size(px(13.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.warning)
-                            .child("RESTORE WORK OFFSETS - PREVIEW"),
+                            .child(t("RESTORE WORK OFFSETS - PREVIEW")),
                     )
-                    .child(chip("NOT LOADED", p)),
+                    .child(chip(t("NOT LOADED"), p)),
             )
             .child(
                 v_flex()
@@ -11550,7 +11555,7 @@ impl Shell {
                 div()
                     .text_size(px(10.0))
                     .text_color(p.text_faint)
-                    .child("G10 L2 LINES IN THIS FILE (VALUES IN MILLIMETRES)"),
+                    .child(t("G10 L2 LINES IN THIS FILE (VALUES IN MILLIMETRES)")),
             )
             .child(lines)
             .child(div().text_size(px(11.0)).text_color(p.text_dim).child(
@@ -11560,19 +11565,13 @@ impl Shell {
                          stored WCS offsets listed above and requires Idle with a ready \
                          controller. The engine safety gateway remains the final authority.",
             ))
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(p.warning)
-                    .child("THE FILE BEGINS WITH G21: EVERY VALUE IS INTERPRETED IN MILLIMETRES."),
-            )
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                "THE FILE BEGINS WITH G21: EVERY VALUE IS INTERPRETED IN MILLIMETRES.",
+            )))
             .when(job_active, |this| {
-                this.child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(p.danger)
-                        .child("LOCKED: A JOB IS ACTIVE; STOP IT BEFORE LOADING A PROGRAM"),
-                )
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(t(
+                    "LOCKED: A JOB IS ACTIVE; STOP IT BEFORE LOADING A PROGRAM",
+                )))
             })
             .child(
                 h_flex()
@@ -11594,7 +11593,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("offsets-restore-load")
-                            .label("LOAD AS PROGRAM")
+                            .label(t("LOAD AS PROGRAM"))
                             .primary()
                             .h(px(48.0))
                             .flex_1()
@@ -11659,10 +11658,9 @@ impl Shell {
                     .bg(p.panel)
                     .text_size(px(11.0))
                     .text_color(p.text_dim)
-                    .child(
-                        "No user macros for this controller profile. Add a named, single-line \
-                         MDI command; it is saved only here and never runs on connect.",
-                    ),
+                    .child(t(
+                        "No user macros for this controller profile. Add a named, single-line MDI command; it is saved only here and never runs on connect.",
+                    )),
             );
         }
         for (index, mac) in macros.into_iter().enumerate() {
@@ -11701,7 +11699,10 @@ impl Shell {
                                             .text_color(p.text)
                                             .child(name),
                                     )
-                                    .child(chip(if confirm { t("CONFIRM") } else { "DIRECT" }, p)),
+                                    .child(chip(
+                                        if confirm { t("CONFIRM") } else { t("DIRECT") },
+                                        p,
+                                    )),
                             )
                             .child(
                                 div()
@@ -11776,7 +11777,7 @@ impl Shell {
                             .gap_2()
                             .child(section_label(t("MACROS"), p))
                             .child(chip(&format!("{count} DEFINED"), p))
-                            .child(chip("USER-DEFINED", p)),
+                            .child(chip(t("USER-DEFINED"), p)),
                     )
                     .child(
                         Button::new("macro-new")
@@ -11794,10 +11795,9 @@ impl Shell {
                             }),
                     ),
             )
-            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "Named single-line MDI commands, saved in this controller profile. RUN sends only \
-                 after a click; CONFIRM macros require a second explicit confirmation.",
-            ))
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Named single-line MDI commands, saved in this controller profile. RUN sends only after a click; CONFIRM macros require a second explicit confirmation.",
+            )))
             .child(list)
             .when_some(save_blocker, |this, reason| {
                 this.child(
@@ -11805,7 +11805,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.warning)
-                        .child(format!("MACRO SAVES LOCKED: {}", reason.to_uppercase())),
+                        .child(format!("{}: {}", t("MACRO SAVES LOCKED"), reason.to_uppercase())),
                 )
             })
             .when_some(run_lock, |this, reason| {
@@ -11814,7 +11814,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.warning)
-                        .child(format!("MACRO RUNS LOCKED: {}", reason.to_uppercase())),
+                        .child(format!("{}: {}", t("MACRO RUNS LOCKED"), reason.to_uppercase())),
                 )
             })
             .when_some(last_error, |this, error| {
@@ -11910,7 +11910,7 @@ impl Shell {
                             .gap_2()
                             .child(section_label(t("KEYMAP"), p))
                             .child(chip(t("PROFILE"), p))
-                            .when(dirty, |this| this.child(chip("UNSAVED", p)))
+                            .when(dirty, |this| this.child(chip(t("UNSAVED"), p)))
                             .child(
                                 div()
                                     .flex_1()
@@ -11918,14 +11918,16 @@ impl Shell {
                                     .truncate()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child("One step per press; off while typing. RESET DEFAULTS restores."),
+                                    .child(t(
+                                        "One step per press; off while typing. RESET DEFAULTS restores.",
+                                    )),
                             ),
                     )
                     .child(chip(
                         if self.keymap.is_default() {
-                            "DEFAULTS"
+                            t("DEFAULTS")
                         } else {
-                            "CUSTOM"
+                            t("CUSTOM")
                         },
                         p,
                     )),
@@ -11937,7 +11939,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.danger)
-                        .child(format!("KEYMAP NOT VALID: {message}")),
+                        .child(format!("{}: {message}", t("KEYMAP NOT VALID"))),
                 )
             })
             .when_some(blocker.clone(), |this, reason| {
@@ -11946,7 +11948,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.warning)
-                        .child(format!("SAVE LOCKED: {}", reason.to_uppercase())),
+                        .child(format!("{}: {}", t("SAVE LOCKED"), reason.to_uppercase())),
                 )
             })
             .child(
@@ -12009,15 +12011,16 @@ impl Shell {
             PinsStatus::Requested => p.success,
             PinsStatus::Stopped(_) => p.danger,
         };
-        let status_text = pins.status().label().to_string();
+        let status_text = pins_status_label(pins.status());
         let map_state = pins.pin_map_report();
         let summary = match map_state {
-            ReportState::Missing => "No $PINS report in this session".to_string(),
-            ReportState::Empty => "The controller reported no pin entries".to_string(),
+            ReportState::Missing => t("No $PINS report in this session").to_string(),
+            ReportState::Empty => t("The controller reported no pin entries").to_string(),
             ReportState::Reported => {
                 format!(
-                    "{} pin entries reported",
-                    pins.pin_map().map_or(0, |map| map.len())
+                    "{} {}",
+                    pins.pin_map().map_or(0, |map| map.len()),
+                    t("pin entries reported")
                 )
             }
         };
@@ -12032,13 +12035,11 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .child(section_label(t("CONTROLLER DIAGNOSTICS"), p))
-                    .child(chip("READ-ONLY", p)),
+                    .child(chip(t("READ-ONLY"), p)),
             )
-            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "Pin map, auxiliary pin levels, limit switches and last control events. \
-                 Opening the panel sends nothing; REFRESH sends only $PINS, $PINSTATE, \
-                 $LIM and $LEV.",
-            ))
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Pin map, auxiliary pin levels, limit switches and last control events. Opening the panel sends nothing; REFRESH sends only $PINS, $PINSTATE, $LIM and $LEV.",
+            )))
             .child(
                 h_flex().items_center().gap_2().children(
                     PinsRequest::ALL
@@ -12108,14 +12109,13 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(section_label("LANGUAGE", p))
+                    .child(section_label(t("LANGUAGE"), p))
                     .child(chip(active.code(), p)),
             )
             .child(h_flex().w_full().gap_1().children(buttons))
-            .child(div().text_size(px(9.5)).text_color(p.text_faint).child(
-                "Applies immediately and is saved in app preferences; the controller is \
-                         not contacted.",
-            ))
+            .child(div().text_size(px(9.5)).text_color(p.text_faint).child(t(
+                "Applies immediately and is saved in app preferences; the controller is not contacted.",
+            )))
     }
 
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -12288,7 +12288,7 @@ impl Shell {
                                 .text_size(px(9.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(p.danger)
-                                .child("WRITE NOT APPLIED - THE PREVIOUS VALUE IS STILL ACTIVE"),
+                                .child(t("WRITE NOT APPLIED - THE PREVIOUS VALUE IS STILL ACTIVE")),
                         )
                     }),
             );
@@ -12323,7 +12323,7 @@ impl Shell {
                                     p,
                                 ))
                             })
-                            .child(chip("RESET EXECUTION", p)),
+                            .child(chip(t("RESET EXECUTION"), p)),
                     )
                     .child(
                         Button::new("startup-reload")
@@ -12348,11 +12348,9 @@ impl Shell {
                             }),
                     ),
             )
-            .child(div().text_size(px(10.0)).text_color(p.warning).child(
-                "Startup lines execute automatically on every controller reset and can command \
-                 motion, spindle, or coolant. Writes are allowed only while the controller is Idle; \
-                 nothing is written until APPLY and CONFIRM WRITE.",
-            ))
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                "Startup lines execute automatically on every controller reset and can command motion, spindle, or coolant. Writes are allowed only while the controller is Idle; nothing is written until APPLY and CONFIRM WRITE.",
+            )))
             .child(startup_list)
             .when_some(startup_lock, |this, reason| {
                 this.child(
@@ -12360,7 +12358,11 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.warning)
-                        .child(format!("STARTUP WRITES LOCKED: {}", reason.to_uppercase())),
+                        .child(format!(
+                            "{}: {}",
+                            t("STARTUP WRITES LOCKED"),
+                            reason.to_uppercase()
+                        )),
                 )
             })
             .when_some(startup_result, |this, (ok, text)| {
@@ -12385,11 +12387,9 @@ impl Shell {
                     .child(section_label(t("CONTROLLER SLEEP"), p))
                     .child(chip("$SLP", p)),
             )
-            .child(div().text_size(px(10.0)).text_color(p.warning).child(
-                "Sleep stops controller status polling until RESET or a status wake. \
-                         The app does not wake the controller automatically; the DRO and job \
-                         view stay frozen until the controller answers again.",
-            ))
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                "Sleep stops controller status polling until RESET or a status wake. The app does not wake the controller automatically; the DRO and job view stay frozen until the controller answers again.",
+            )))
             .when_some(sleep_refusal, |this, refusal| {
                 this.child(
                     div()
@@ -12420,7 +12420,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("CONFIRM FIRST; CANCEL SENDS NOTHING"),
+                            .child(t("CONFIRM FIRST; CANCEL SENDS NOTHING")),
                     ),
             );
 
@@ -12534,11 +12534,9 @@ impl Shell {
                     .text_color(p.text_faint)
                     .child(format!("PATH   {backup_path}")),
             )
-            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "Export writes app prefs, identity, settings, offsets, tools, macros, startup \
-                 lines, and keymap; import validates before writing and never pushes to the \
-                 controller.",
-            ))
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Export writes app prefs, identity, settings, offsets, tools, macros, startup lines, and keymap; import validates before writing and never pushes to the controller.",
+            )))
             .child(
                 h_flex()
                     .items_center()
@@ -12629,10 +12627,9 @@ impl Shell {
                     .bg(p.panel_alt)
                     .text_size(px(12.0))
                     .text_color(p.text_dim)
-                    .child(
-                        "No tools in the app table. Add one so the M6 sheet can show a \
-                         name, diameter, and length instead of only the number.",
-                    ),
+                    .child(t(
+                        "No tools in the app table. Add one so the M6 sheet can show a name, diameter, and length instead of only the number.",
+                    )),
             );
         }
         for record in rows {
@@ -12723,7 +12720,7 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .child(chip(&format!("{count} TOOLS"), p))
-                            .when(dirty, |this| this.child(chip("UNSAVED", p)))
+                            .when(dirty, |this| this.child(chip(t("UNSAVED"), p)))
                             .child(chip(
                                 if self.state.profile.capabilities.has_tool_table {
                                     "CONTROLLER TABLE"
@@ -12795,10 +12792,9 @@ impl Shell {
             .when_some(error, |this, error| {
                 this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
             })
-            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "The app owns this table; it persists in the per-controller profile. \
-                         Controller [T:] entries stay read-only and are never merged silently.",
-            ))
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "The app owns this table; it persists in the per-controller profile. Controller [T:] entries stay read-only and are never merged silently.",
+            )))
             .child(list)
             .child({
                 let controller = &self.state.controller_tools;
@@ -12818,14 +12814,13 @@ impl Shell {
                                     .items_center()
                                     .gap_2()
                                     .child(section_label(t("CONTROLLER TOOLS"), p))
-                                    .child(chip("READ-ONLY", p)),
+                                    .child(chip(t("READ-ONLY"), p)),
                             )
                             .child(chip(&format!("{} ENTRIES", controller.len()), p)),
                     )
-                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                        "Reported by the controller through [T:...]; this panel never writes, \
-                         overwrites, or merges into the app table above.",
-                    ));
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                        "Reported by the controller through [T:...]; this panel never writes, overwrites, or merges into the app table above.",
+                    )));
                 if !controller.reported() {
                     panel = panel.child(
                         div()
@@ -12835,7 +12830,7 @@ impl Shell {
                             .bg(p.panel)
                             .text_size(px(11.0))
                             .text_color(p.text_dim)
-                            .child("No controller tool table has been reported yet."),
+                            .child(t("No controller tool table has been reported yet.")),
                     );
                 } else if controller.is_empty() {
                     panel = panel.child(
@@ -12846,7 +12841,7 @@ impl Shell {
                             .bg(p.panel)
                             .text_size(px(11.0))
                             .text_color(p.text_dim)
-                            .child("The controller reports an empty tool table (0 entries)."),
+                            .child(t("The controller reports an empty tool table (0 entries).")),
                     );
                 } else {
                     panel = panel.child(
@@ -13183,9 +13178,9 @@ impl Shell {
             .children(form_rows);
 
         let lock_text = if can_write {
-            "IDLE: WRITES ENABLED".to_string()
+            t("IDLE: WRITES ENABLED").to_string()
         } else {
-            format!("WRITES LOCKED: {lock_reason}")
+            format!("{}: {lock_reason}", t("WRITES LOCKED"))
         };
         let footer = h_flex()
             .h(px(30.0))
@@ -13207,7 +13202,7 @@ impl Shell {
                 div()
                     .flex_shrink_0()
                     .text_color(p.text_faint)
-                    .child("ONE WRITE AT A TIME | READ-BACK VERIFIED"),
+                    .child(t("ONE WRITE AT A TIME | READ-BACK VERIFIED")),
             )
             .child(div().flex_1())
             .when_some(last_result, |this, result| {
@@ -13241,18 +13236,24 @@ impl Shell {
     fn settings_empty_state(&self, p: Palette) -> Div {
         let (title, detail) = if !self.state.live {
             (
-                "MOCK MODE: NO CONTROLLER SETTINGS",
-                "The generated editor is built from the controller's $$ values and $ES/$EG metadata. The design-review mock supplies neither. Start without --mock to connect the in-process FlexiHAL demo controller.",
+                t("MOCK MODE: NO CONTROLLER SETTINGS"),
+                t(
+                    "The generated editor is built from the controller's $$ values and $ES/$EG metadata. The design-review mock supplies neither. Start without --mock to connect the in-process FlexiHAL demo controller.",
+                ),
             )
         } else if !self.ready() {
             (
-                "WAITING FOR SETTINGS",
-                "The handshake has not reported $$, $ES, or $EG yet. The form appears as soon as the controller answers.",
+                t("WAITING FOR SETTINGS"),
+                t(
+                    "The handshake has not reported $$, $ES, or $EG yet. The form appears as soon as the controller answers.",
+                ),
             )
         } else {
             (
-                "THE CONTROLLER REPORTED NO SETTINGS",
-                "$$ returned no values and $ES/$EG returned no metadata. The editor stays empty rather than inventing a setting list.",
+                t("THE CONTROLLER REPORTED NO SETTINGS"),
+                t(
+                    "$$ returned no values and $ES/$EG returned no metadata. The editor stays empty rather than inventing a setting list.",
+                ),
             )
         };
         let capabilities = &self.state.profile.capabilities;
@@ -13315,7 +13316,7 @@ impl Shell {
                             .text_size(px(9.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.text_faint)
-                            .child("EXAMPLE SHAPE (NO VALUES ARE WRITTEN)"),
+                            .child(t("EXAMPLE SHAPE (NO VALUES ARE WRITTEN)")),
                     )
                     .child(settings_example_row(
                         "Example boolean",
@@ -13454,7 +13455,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_dim)
-                            .child(format!("KEYMAP / {}", action.label())),
+                            .child(format!("{} / {}", t("KEYMAP"), action.label())),
                     )
                     .when(capturing, |this| {
                         this.child(
@@ -13604,9 +13605,9 @@ impl Shell {
         let input = entry.input.clone();
         let commit_label = match entry.purpose {
             SettingsEntryPurpose::HeightMapName => t("SAVE MAP"),
-            SettingsEntryPurpose::StartupLine(_) => "KEEP DRAFT",
+            SettingsEntryPurpose::StartupLine(_) => t("KEEP DRAFT"),
             _ if masked => t("SET"),
-            _ => "APPLY TEXT",
+            _ => t("APPLY TEXT"),
         };
         let commit_view = view.clone();
         let cancel_view = view.clone();
@@ -13783,16 +13784,13 @@ impl Shell {
                                     .text_color(p.text)
                                     .child(format!("WRITE $N{index}")),
                             )
-                            .child(chip("RESET EXECUTION", p)),
+                            .child(chip(t("RESET EXECUTION"), p)),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
                             .text_color(p.warning)
-                            .child(
-                                "This startup line executes automatically on every controller \
-                                 reset. It can command motion, spindle, or coolant.",
-                            ),
+                            .child(t("This startup line executes automatically on every controller reset. It can command motion, spindle, or coolant.")),
                     )
                     .child(
                         v_flex()
@@ -13804,7 +13802,7 @@ impl Shell {
                                 div()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child("EXACT TEXT TO STORE"),
+                                    .child(t("EXACT TEXT TO STORE")),
                             )
                             .child(
                                 div()
@@ -13822,12 +13820,13 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child(format!("Previous controller value   {previous}")),
+                            .child(format!(
+                                "{}   {previous}",
+                                t("Previous controller value")
+                            )),
                     )
-                    .child(div().text_size(px(10.0)).text_color(p.text_dim).child(format!(
-                        "CONFIRM WRITE sends $N{index}=<text> with exactly this text. The app does \
-                         not update the row itself: it reads the line back and shows VERIFIED, \
-                         MISMATCH, or FAILED."
+                    .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                        "CONFIRM WRITE sends the exact text shown. The app does not update the row itself: it reads the line back and reports the result.",
                     )))
                     .child(
                         h_flex()
@@ -13923,11 +13922,9 @@ impl Shell {
                             )
                             .child(chip("$SLP", p)),
                     )
-                    .child(div().text_size(px(11.0)).text_color(p.warning).child(
-                        "Sleep stops controller status polling until RESET or a status \
-                                 wake. The app will not wake the controller automatically; the \
-                                 DRO, signals, and job status stay frozen until it answers again.",
-                    ))
+                    .child(div().text_size(px(11.0)).text_color(p.warning).child(t(
+                        "Sleep stops controller status polling until RESET or a status wake. The app does not wake the controller automatically; the DRO and job view stay frozen until the controller answers again.",
+                    )))
                     .child(
                         v_flex()
                             .gap_1()
@@ -13938,13 +13935,11 @@ impl Shell {
                                 div()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child("BEFORE YOU CONFIRM"),
+                                    .child(t("BEFORE YOU CONFIRM")),
                             )
-                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(
-                                "The controller must report Idle and no job may be \
-                                         running or paused. One confirmed tap sends one sleep \
-                                         command; CANCEL sends nothing.",
-                            )),
+                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                                "The controller must report Idle and no job may be running or paused. One confirmed tap sends one sleep command; CANCEL sends nothing.",
+                            ))),
                     )
                     .child(
                         h_flex()
@@ -14004,7 +13999,7 @@ impl Shell {
             PinsStatus::Requested => p.success,
             PinsStatus::Stopped(_) => p.danger,
         };
-        let status_text = pins.status().label().to_string();
+        let status_text = pins_status_label(pins.status());
 
         let pin_count = pins.pin_map().map_or(0, |map| map.len());
         let mut map_list = v_flex()
@@ -14222,7 +14217,7 @@ impl Shell {
                                         div()
                                             .text_size(px(9.0))
                                             .text_color(p.text_faint)
-                                            .child("CONTROLLER DIAGNOSTIC DATA - READ-ONLY"),
+                                            .child(t("CONTROLLER DIAGNOSTIC DATA - READ-ONLY")),
                                     ),
                             )
                             .child(
@@ -15608,7 +15603,7 @@ impl Shell {
                                     .w(px(92.0))
                                     .text_size(px(10.0))
                                     .text_color(p.text_dim)
-                                    .child("COMMAND"),
+                                    .child(t("COMMAND")),
                             )
                             .child(
                                 Button::new("macro-editor-command")
@@ -15639,7 +15634,7 @@ impl Shell {
                             .child(
                                 Switch::new("macro-editor-confirm")
                                     .checked(confirm)
-                                    .label("Ask before running")
+                                    .label(t("Ask before running"))
                                     .text_size(px(11.0))
                                     .on_change(move |checked, _, cx| {
                                         confirm_view.update(cx, |this, cx| {
@@ -15650,9 +15645,9 @@ impl Shell {
                                         });
                                     }),
                             )
-                            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
                                 "New macros default to CONFIRM. A direct macro runs on one click.",
-                            )),
+                            ))),
                     )
                     .when_some(error, |this, error| {
                         this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
@@ -15777,7 +15772,7 @@ impl Shell {
                                 div()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child("EXACT COMMAND TO SEND"),
+                                    .child(t("EXACT COMMAND TO SEND")),
                             )
                             .child(
                                 div()
@@ -16062,7 +16057,7 @@ impl Shell {
                     )),
             )
             .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
-                "Jogging is allowed while the job waits; the Jog panel stays active. The job will not send another line until you resume. RESET and STOP above remain available.",
+                t("Jogging is allowed while the job waits; the Jog panel stays active. The job will not send another line until you resume. RESET and STOP above remain available."),
             ))
             .child(
                 h_flex()
@@ -16180,13 +16175,13 @@ impl Shell {
                     div()
                         .text_size(px(11.0))
                         .text_color(p.text_dim)
-                        .child("In-process FlexiHAL simulator over the loopback transport. No serial port is opened."),
+                        .child(t("In-process FlexiHAL simulator over the loopback transport. No serial port is opened.")),
                 )
                 .child(
                     div()
                         .text_size(px(10.0))
                         .text_color(p.text_faint)
-                        .child("Same engine, handshake, streamer and safety gateway as a real controller."),
+                        .child(t("Same engine, handshake, streamer and safety gateway as a real controller.")),
                 )
                 .into_any_element(),
             TransportChoice::Serial => self.serial_picker(p, &view, cx).into_any_element(),
@@ -16268,7 +16263,7 @@ impl Shell {
                     div()
                         .text_size(px(10.0))
                         .text_color(p.text_faint)
-                        .child("Disconnect before switching transport."),
+                        .child(t("Disconnect before switching transport.")),
                 )
             })
             .child(body)
@@ -16407,7 +16402,7 @@ impl Shell {
                     .description
                     .clone()
                     .or_else(|| port.manufacturer.clone())
-                    .unwrap_or_else(|| "serial port".to_string());
+                    .unwrap_or_else(|| t("serial port").to_string());
                 rows = rows.child(
                     h_flex()
                         .id(format!("port-{index}"))
@@ -16536,7 +16531,7 @@ impl Shell {
                         div()
                             .text_size(px(10.0))
                             .text_color(p.text_faint)
-                            .child("Tap a port to select it; nothing opens until CONNECT."),
+                            .child(t("Tap a port to select it; nothing opens until CONNECT.")),
                     )
                 },
             )
@@ -16557,7 +16552,7 @@ impl Shell {
                 div()
                     .text_size(px(10.0))
                     .text_color(p.text_faint)
-                    .child("Line settings are fixed at 8 data bits, no parity, one stop bit. DTR reset pulses are not implemented in M2."),
+                    .child(t("Line settings are fixed at 8 data bits, no parity, one stop bit. DTR reset pulses are not implemented in M2.")),
             )
     }
 
@@ -16938,7 +16933,16 @@ fn file_browser_row(
     view: Entity<Shell>,
 ) -> AnyElement {
     let is_dir = entry.is_dir;
-    let kind = entry.kind_label();
+    let kind = if is_dir {
+        t("DIR").to_string()
+    } else {
+        let label = entry.kind_label();
+        if label == "FILE" {
+            t("FILE").to_string()
+        } else {
+            label
+        }
+    };
     let detail = if is_dir {
         t("FOLDER").to_string()
     } else {
@@ -17037,13 +17041,13 @@ fn empty_program_lines_notice(p: Palette) -> Div {
             div()
                 .text_size(px(12.0))
                 .text_color(p.text_dim)
-                .child("Program has no lines"),
+                .child(t("Program has no lines")),
         )
         .child(
             div()
                 .text_size(px(10.0))
                 .text_color(p.text_faint)
-                .child("Load a non-empty source file to search it."),
+                .child(t("Load a non-empty source file to search it.")),
         )
 }
 
@@ -17067,14 +17071,16 @@ fn no_program_matches_notice(p: Palette, query: &str) -> Div {
                 .truncate()
                 .text_size(px(10.0))
                 .text_color(p.text_faint)
-                .child(format!("Nothing matches '{query}'.")),
+                .child(format!("{} '{query}'.", t("Nothing matches"))),
         )
         .child(
             div()
                 .max_w(px(260.0))
                 .text_size(px(10.0))
                 .text_color(p.text_faint)
-                .child("Switch to HIGHLIGHT or clear the field to restore the full list."),
+                .child(t(
+                    "Switch to HIGHLIGHT or clear the field to restore the full list.",
+                )),
         )
 }
 
@@ -17237,7 +17243,7 @@ fn probe_program_block(program: &str, limit: Option<usize>, p: Palette) -> Div {
     }
     v_flex()
         .gap_1()
-        .child(section_label("GENERATED PROGRAM", p))
+        .child(section_label(t("GENERATED PROGRAM"), p))
         .child(
             div()
                 .id("probe-program-scroll")
@@ -17403,7 +17409,7 @@ fn pins_section(title: &'static str, p: Palette) -> Div {
 }
 
 /// Explicit missing/empty report state for one diagnostics block.
-fn pins_empty(note: &str, p: Palette) -> Div {
+fn pins_empty(note: &'static str, p: Palette) -> Div {
     div()
         .p_2()
         .rounded(px(5.0))
@@ -17412,7 +17418,18 @@ fn pins_empty(note: &str, p: Palette) -> Div {
         .bg(p.panel)
         .text_size(px(10.0))
         .text_color(p.text_dim)
-        .child(note.to_string())
+        .child(t(note))
+}
+
+/// Localized request-state label for the diagnostics card and sheet.
+fn pins_status_label(status: &PinsStatus) -> String {
+    match status {
+        PinsStatus::Stopped(reason) => reason.clone(),
+        PinsStatus::Idle => t("NOT REQUESTED").to_string(),
+        PinsStatus::Refreshing => t("READING CONTROLLER").to_string(),
+        PinsStatus::Busy => t("CONTROLLER BUSY - RETRYING").to_string(),
+        PinsStatus::Requested => t("REPORTS REQUESTED").to_string(),
+    }
 }
 
 /// One label/value row inside the diagnostics sheet.
@@ -17701,19 +17718,24 @@ fn height_map_overlay_legend(p: Palette) -> Div {
                 .text_color(p.text_faint)
                 .child(t("MEASURED Z")),
         )
-        .child(div().text_size(px(9.0)).text_color(p.text_dim).child("LOW"))
+        .child(
+            div()
+                .text_size(px(9.0))
+                .text_color(p.text_dim)
+                .child(t("LOW")),
+        )
         .child(swatches)
         .child(
             div()
                 .text_size(px(9.0))
                 .text_color(p.text_dim)
-                .child("HIGH"),
+                .child(t("HIGH")),
         )
         .child(
             div()
                 .text_size(px(9.0))
                 .text_color(p.text_faint)
-                .child("dashed = missing"),
+                .child(t("dashed = missing")),
         )
 }
 
@@ -18172,7 +18194,7 @@ fn settings_bits(
             div()
                 .text_size(px(10.0))
                 .text_color(p.text_faint)
-                .child("No axes reported by the controller"),
+                .child(t("No axes reported by the controller")),
         );
     }
     for bit in 0..count {
@@ -18469,9 +18491,9 @@ fn settings_no_rows(query: &str, p: Palette) -> Div {
                 .text_size(px(12.0))
                 .text_color(p.text_dim)
                 .child(if query.is_empty() {
-                    "No settings in this group".to_string()
+                    t("No settings in this group").to_string()
                 } else {
-                    format!("No setting matches \"{query}\"")
+                    format!("{} \"{query}\"", t("No setting matches"))
                 }),
         )
         .child(
@@ -18479,9 +18501,9 @@ fn settings_no_rows(query: &str, p: Palette) -> Div {
                 .text_size(px(10.0))
                 .text_color(p.text_faint)
                 .child(if query.is_empty() {
-                    "Pick another group in the rail."
+                    t("Pick another group in the rail.")
                 } else {
-                    "Search matches a number, name, or group. Clear the search to browse groups."
+                    t("Search matches a number, name, or group. Clear the search to browse groups.")
                 }),
         )
 }

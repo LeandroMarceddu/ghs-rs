@@ -368,4 +368,594 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
     ("SETUP", "EINRICHTUNG"),
     ("VIEW", "ANSICHT"),
     ("FIT", "EINPASSEN"),
+    ("CHECK", "PRÜFEN"),
+    ("CHECKING", "PRÜFLAUF LÄUFT"),
+    ("CHECK COMPLETE", "PRÜFLAUF ABGESCHLOSSEN"),
+    ("CHECK STOPPED", "PRÜFLAUF GESTOPPT"),
+    ("CHECK PROGRAM (DRY RUN)", "PROGRAMM PRÜFEN (TROCKENLAUF)"),
+    ("START CHECK", "PRÜFLAUF STARTEN"),
+    ("DRY RUN - NO MOTION", "TROCKENLAUF - KEINE BEWEGUNG"),
+    (
+        "WAITING FOR CONTROLLER CHECK MODE ($C)",
+        "WARTE AUF PRÜFMODUS ($C)",
+    ),
+    ("WHAT THE DRY RUN DOES", "WAS DER TROCKENLAUF TUT"),
+    ("MOTION IS SUPPRESSED", "BEWEGUNG UNTERDRÜCKT"),
+    ("SPINDLE / COOLANT", "SPINDEL / KÜHLMITTEL"),
+    ("WHEN FINISHED", "WENN FERTIG"),
+    (
+        "The controller parses and streams the loaded program with check mode ($C) enabled. \
+        Nothing in this sheet starts a real job or moves an axis.",
+        "Der Controller liest das geladene Programm im Prüfmodus ($C) und streamt es. \
+        Nichts in diesem Fenster startet einen echten Auftrag oder bewegt eine Achse.",
+    ),
+    (
+        "MOTION IS SUPPRESSED: the controller acknowledges program lines without moving the \
+        machine.",
+        "BEWEGUNG UNTERDRÜCKT: Der Controller bestätigt Programmzeilen, ohne die Maschine \
+        zu bewegen.",
+    ),
+    (
+        "SPINDLE / COOLANT: M3, M4, M5, M7, M8 and M9 are parsed and acknowledged but never \
+        run as real outputs.",
+        "SPINDEL / KÜHLMITTEL: M3, M4, M5, M7, M8 und M9 werden gelesen und bestätigt, aber \
+        nie als echte Ausgänge geschaltet.",
+    ),
+    (
+        "WHEN FINISHED: the engine leaves check mode and waits for the machine to report \
+        IDLE. The program stays loaded for a separate real START.",
+        "WENN FERTIG: Die Engine verlässt den Prüfmodus und wartet, bis die Maschine IDLE \
+        meldet. Das Programm bleibt für einen separaten echten START geladen.",
+    ),
+    (
+        "STOP remains available while the check streams; it never resumes or restarts the \
+        run.",
+        "STOPP bleibt während des Prüflaufs verfügbar; er setzt den Lauf niemals fort oder \
+        startet ihn neu.",
+    ),
+    ("CANCEL sends nothing.", "ABBRECHEN sendet nichts."),
+    (
+        "Parse and stream the loaded program in check mode ($C); no motion.",
+        "Lädt das geladene Programm im Prüfmodus ($C); keine Bewegung.",
+    ),
+    ("LOADED", "GELADEN"),
+    ("LANGUAGE", "SPRACHE"),
+    ("FOLDERS", "ORDNER"),
+    ("LIVE", "LIVE"),
+    ("JUMP", "SPRINGEN"),
+    ("DEFAULTS", "STANDARD"),
+    ("RUN AGAIN", "ERNEUT STARTEN"),
+    ("APPLY TEXT", "TEXT ANWENDEN"),
+    ("KEEP DRAFT", "ENTWURF BEHALTEN"),
+    ("DIRECT", "DIREKT"),
+    ("SYNTHETIC", "SYNTHETISCH"),
+    ("TOUCH KEYPAD", "TOUCH-TASTATUR"),
+    ("NO LINE SELECTED", "KEINE ZEILE AUSGEWÄHLT"),
+    ("REPORTS REQUESTED", "BERICHTE ANGEFORDERT"),
+    ("OFFLINE", "OFFLINE"),
+    ("UNSAVED", "UNGESPEICHERT"),
+    ("USER-DEFINED", "BENUTZERDEFINIERT"),
+    ("READ-ONLY", "NUR LESEN"),
+    ("NOT LOADED", "NICHT GELADEN"),
+    (
+        "Choose a file for the job; loading never starts it.",
+        "Datei für den Auftrag wählen; Laden startet sie nie.",
+    ),
+    (
+        "No folders or program files here",
+        "Keine Ordner oder Programmdateien hier",
+    ),
+    (
+        "Tap UP or type another folder path.",
+        "Tippe AUF oder gib einen anderen Ordnerpfad ein.",
+    ),
+    (
+        "48 px rows | folders open on tap | hidden files and symlinks are not shown | .nc \
+        .gcode .tap .ngc | 20 MB limit",
+        "48-px-Zeilen | Ordner öffnen per Tipp | versteckte Dateien und Symlinks werden \
+        nicht angezeigt | .nc .gcode .tap .ngc | 20-MB-Grenze",
+    ),
+    (
+        "Tap a program file to select it",
+        "Tippe eine Programmdatei zum Auswählen",
+    ),
+    ("READY TO LOAD", "BEREIT ZUM LADEN"),
+    ("MOCK / BROWSE ONLY", "SIMULATION / NUR DURCHSUCHEN"),
+    ("LINK NOT READY", "VERBINDUNG NICHT BEREIT"),
+    ("LIVE / READY", "LIVE / BEREIT"),
+    ("DIR", "ORDN."),
+    ("OPTIONAL STOP", "OPTIONALER STOPP"),
+    ("SINGLE BLOCK", "EINZELSATZ"),
+    ("BLOCK DELETE", "SATZ LÖSCHEN"),
+    (
+        "M1 optional stops are honored",
+        "Optionale Stopps M1 werden beachtet",
+    ),
+    ("Hold after each block", "Halt nach jedem Satz"),
+    ("Skip blocks marked with /", "Sätze mit / überspringen"),
+    (
+        "Each tap sends one command. A row keeps showing the value the controller reports; \
+        it changes on the next poll, not when the button is pressed.",
+        "Jeder Tipp sendet einen Befehl. Eine Zeile zeigt weiter den vom Controller \
+        gemeldeten Wert; er ändert sich beim nächsten Poll, nicht beim Tastendruck.",
+    ),
+    ("Mock mode: no controller", "Mock-Modus: kein Controller"),
+    ("Link not ready", "Verbindung nicht bereit"),
+    (
+        "Locked while a job runs or pauses",
+        "Gesperrt während Auftrag läuft oder pausiert",
+    ),
+    (
+        "MOCK MODE: run options need a live controller",
+        "MOCK-MODUS: Laufoptionen benötigen einen aktiven Controller",
+    ),
+    (
+        "LINK NOT READY: run options are disabled until the handshake completes",
+        "VERBINDUNG NICHT BEREIT: Laufoptionen sind bis zum Abschluss des Handshakes \
+        deaktiviert",
+    ),
+    (
+        "BLOCK DELETE IS LOCKED WHILE A JOB IS RUNNING OR PAUSED",
+        "SATZ LÖSCHEN IST GESPERRT, WÄHREND EIN AUFTRAG LÄUFT ODER PAUSIERT",
+    ),
+    (
+        "Closing this sheet sends nothing.",
+        "Dieses Fenster zu schließen sendet nichts.",
+    ),
+    (
+        "CANCEL, the scrim, and closing this sheet send nothing.",
+        "ABBRECHEN, der Hintergrund und das Schließen dieses Fensters senden nichts.",
+    ),
+    ("CONFIRMING WILL", "BESTÄTIGUNG BEWIRKT"),
+    ("RUN TO LINE", "LAUF BIS ZEILE"),
+    ("SET BREAKPOINT AT LINE", "HALTESTELLE SETZEN BEI ZEILE"),
+    ("START PROGRAM AT LINE 1", "PROGRAMM AB ZEILE 1 STARTEN"),
+    ("PAUSE BEFORE LINE", "PAUSE VOR ZEILE"),
+    (
+        "LEAVE THE ACTIVE JOB AT ITS CURRENT POSITION",
+        "AKTIVEN AUFTRAG AN DER AKTUELLEN POSITION LASSEN",
+    ),
+    ("RUN TO BLOCKED", "LAUF BIS BLOCKIERT"),
+    ("SET BP + START", "HP SETZEN + START"),
+    (
+        "A job is already running or paused. Confirming only sets a breakpoint at the \
+        selected line; it does not start, restart, or resume the job.",
+        "Ein Auftrag läuft bereits oder ist pausiert. Bestätigen setzt nur eine Haltestelle \
+        an der gewählten Zeile; der Auftrag wird nicht gestartet, neu gestartet oder \
+        fortgesetzt.",
+    ),
+    (
+        "All earlier lines still run from the beginning. The job starts at line 1 and \
+        pauses before the selected line. Start-from-line is not supported.",
+        "Alle vorherigen Zeilen laufen weiterhin von Anfang an. Der Auftrag startet bei \
+        Zeile 1 und pausiert vor der gewählten Zeile. Start ab Zeile wird nicht \
+        unterstützt.",
+    ),
+    (
+        "One step per press; off while typing. RESET DEFAULTS restores.",
+        "Ein Schritt pro Tastendruck; beim Tippen aus. STANDARD WIEDERHERSTELLEN stellt \
+        wieder her.",
+    ),
+    (
+        "Named single-line MDI commands, saved in this controller profile. RUN sends only \
+        after a click; CONFIRM macros require a second explicit confirmation.",
+        "Benannte einzeilige MDI-Befehle, in diesem Controller-Profil gespeichert. STARTEN \
+        sendet erst nach einem Klick; BESTÄTIGEN-Makros verlangen eine zweite \
+        ausdrückliche Bestätigung.",
+    ),
+    (
+        "No user macros for this controller profile. Add a named, single-line MDI command; \
+        it is saved only here and never runs on connect.",
+        "Keine Benutzer-Makros für dieses Controller-Profil. Füge einen benannten \
+        einzeiligen MDI-Befehl hinzu; er wird nur hier gespeichert und nie beim Verbinden \
+        ausgeführt.",
+    ),
+    ("MACRO SAVES LOCKED", "MAKRO-SPEICHERN GESPERRT"),
+    ("MACRO RUNS LOCKED", "MAKRO-AUSFÜHRUNG GESPERRT"),
+    (
+        "Startup lines execute automatically on every controller reset and can command \
+        motion, spindle, or coolant. Writes are allowed only while the controller is Idle; \
+        nothing is written until APPLY and CONFIRM WRITE.",
+        "Startzeilen werden bei jedem Controller-Reset automatisch ausgeführt und können \
+        Bewegung, Spindel oder Kühlmittel befehlen. Schreiben ist nur bei Leerlauf des \
+        Controllers erlaubt; nichts wird geschrieben, bis ANWENDEN und SCHREIBEN \
+        BESTÄTIGEN gedrückt wird.",
+    ),
+    (
+        "WRITE NOT APPLIED - THE PREVIOUS VALUE IS STILL ACTIVE",
+        "SCHREIBEN NICHT ANGEWENDET - DER VORHERIGE WERT IST WEITER AKTIV",
+    ),
+    (
+        "This startup line executes automatically on every controller reset. It can command \
+        motion, spindle, or coolant.",
+        "Diese Startzeile wird bei jedem Controller-Reset automatisch ausgeführt. Sie kann \
+        Bewegung, Spindel oder Kühlmittel befehlen.",
+    ),
+    ("EXACT TEXT TO STORE", "EXAKTER TEXT ZUM SPEICHERN"),
+    ("Previous controller value", "Vorheriger Controller-Wert"),
+    (
+        "CONFIRM WRITE sends the exact text shown. The app does not update the row itself: \
+        it reads the line back and reports the result.",
+        "SCHREIBEN BESTÄTIGEN sendet den exakt angezeigten Text. Die App aktualisiert die \
+        Zeile nicht selbst: Sie liest sie zurück und meldet das Ergebnis.",
+    ),
+    ("RESET EXECUTION", "AUSFÜHRUNG BEI RESET"),
+    (
+        "CONFIRM FIRST; CANCEL SENDS NOTHING",
+        "ERST BESTÄTIGEN; ABBRECHEN SENDET NICHTS",
+    ),
+    (
+        "Sleep stops controller status polling until RESET or a status wake. The app does \
+        not wake the controller automatically; the DRO and job view stay frozen until the \
+        controller answers again.",
+        "Schlafen stoppt die Statusabfrage des Controllers bis RESET oder ein \
+        Status-Weckruf. Die App weckt den Controller nicht automatisch; DRO und \
+        Auftragsansicht bleiben eingefroren, bis der Controller wieder antwortet.",
+    ),
+    ("BEFORE YOU CONFIRM", "BEVOR SIE BESTÄTIGEN"),
+    (
+        "The controller must report Idle and no job may be running or paused. One confirmed \
+        tap sends one sleep command; CANCEL sends nothing.",
+        "Der Controller muss Leerlauf melden und kein Auftrag darf laufen oder pausiert \
+        sein. Ein bestätigter Tipp sendet einen Schlafbefehl; ABBRECHEN sendet nichts.",
+    ),
+    (
+        "Pin map, auxiliary pin levels, limit switches and last control events. Opening the \
+        panel sends nothing; REFRESH sends only $PINS, $PINSTATE, $LIM and $LEV.",
+        "Pinbelegung, auxiliäre Pinpegel, Endschalter und letzte Steuerereignisse. Das \
+        Öffnen des Fensters sendet nichts; AKTUALISIEREN sendet nur $PINS, $PINSTATE, $LIM \
+        und $LEV.",
+    ),
+    (
+        "No $PINS report in this session",
+        "Kein $PINS-Bericht in dieser Sitzung",
+    ),
+    (
+        "The controller reported no pin entries",
+        "Der Controller meldete keine Pin-Einträge",
+    ),
+    ("pin entries reported", "Pin-Einträge gemeldet"),
+    (
+        "Applies immediately and is saved in app preferences; the controller is not \
+        contacted.",
+        "Wird sofort angewendet und in den App-Einstellungen gespeichert; der Controller \
+        wird nicht kontaktiert.",
+    ),
+    (
+        "Export writes app prefs, identity, settings, offsets, tools, macros, startup \
+        lines, and keymap; import validates before writing and never pushes to the \
+        controller.",
+        "Export schreibt App-Einstellungen, Identität, Einstellungen, Nullpunkte, \
+        Werkzeuge, Makros, Startzeilen und Tastaturbelegung; Import prüft vor dem \
+        Schreiben und sendet nie an den Controller.",
+    ),
+    (
+        "The app owns this table; it persists in the per-controller profile. Controller \
+        [T:] entries stay read-only and are never merged silently.",
+        "Diese Tabelle gehört der App; sie wird im Controller-Profil gespeichert. \
+        [T:]-Einträge des Controllers bleiben schreibgeschützt und werden nie \
+        stillschweigend zusammengeführt.",
+    ),
+    (
+        "No controller tool table has been reported yet.",
+        "Es wurde noch keine Controller-Werkzeugtabelle gemeldet.",
+    ),
+    (
+        "The controller reports an empty tool table (0 entries).",
+        "Der Controller meldet eine leere Werkzeugtabelle (0 Einträge).",
+    ),
+    (
+        "Reported by the controller through [T:...]; this panel never writes, overwrites, \
+        or merges into the app table above.",
+        "Vom Controller über [T:...] gemeldet; dieses Fenster schreibt, überschreibt oder \
+        führt nie in die App-Tabelle oben ein.",
+    ),
+    ("STARTUP WRITES LOCKED", "STARTZEILEN-SCHREIBEN GESPERRT"),
+    ("SAVE LOCKED", "SPEICHERN GESPERRT"),
+    ("KEYMAP NOT VALID", "TASTATURBELEGUNG UNGÜLTIG"),
+    ("Program has no lines", "Programm hat keine Zeilen"),
+    (
+        "Load a non-empty source file to search it.",
+        "Lade eine nicht leere Quelldatei zum Durchsuchen.",
+    ),
+    ("Nothing matches", "Keine Treffer"),
+    (
+        "Switch to HIGHLIGHT or clear the field to restore the full list.",
+        "Wechsle zu HERVORHEBEN oder leere das Feld, um die vollständige Liste \
+        wiederherzustellen.",
+    ),
+    (
+        "DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM",
+        "ZIEHEN ORBIT | UMSCHALT/MITTELTASTE PAN | RAD ZOOM",
+    ),
+    ("GENERATED PROGRAM", "GENERIERTES PROGRAMM"),
+    (
+        "No axes reported by the controller",
+        "Keine Achsen vom Controller gemeldet",
+    ),
+    (
+        "ONE WRITE AT A TIME | READ-BACK VERIFIED",
+        "EIN SCHREIBVORGANG ZUGLEICH | RÜCKLESSEN VERIFIZIERT",
+    ),
+    ("WRITES LOCKED", "SCHREIBEN GESPERRT"),
+    ("IDLE: WRITES ENABLED", "LEERLAUF: SCHREIBEN AKTIV"),
+    (
+        "MOCK MODE: NO CONTROLLER SETTINGS",
+        "MOCK-MODUS: KEINE CONTROLLER-EINSTELLUNGEN",
+    ),
+    (
+        "The generated editor is built from the controller's $$ values and $ES/$EG \
+        metadata. The design-review mock supplies neither. Start without --mock to connect \
+        the in-process FlexiHAL demo controller.",
+        "Der generierte Editor basiert auf den $$-Werten und $ES/$EG-Metadaten des \
+        Controllers. Die Design-Review-Simulation liefert beides nicht. Starte ohne \
+        --mock, um den In-Process-FlexiHAL-Demo-Controller zu verbinden.",
+    ),
+    ("WAITING FOR SETTINGS", "WARTE AUF EINSTELLUNGEN"),
+    (
+        "The handshake has not reported $$, $ES, or $EG yet. The form appears as soon as \
+        the controller answers.",
+        "Der Handshake hat $$, $ES oder $EG noch nicht gemeldet. Das Formular erscheint, \
+        sobald der Controller antwortet.",
+    ),
+    (
+        "THE CONTROLLER REPORTED NO SETTINGS",
+        "DER CONTROLLER MELDETE KEINE EINSTELLUNGEN",
+    ),
+    (
+        "$$ returned no values and $ES/$EG returned no metadata. The editor stays empty \
+        rather than inventing a setting list.",
+        "$$ lieferte keine Werte und $ES/$EG keine Metadaten. Der Editor bleibt leer, statt \
+        eine Liste zu erfinden.",
+    ),
+    (
+        "EXAMPLE SHAPE (NO VALUES ARE WRITTEN)",
+        "BEISPIEL (KEINE WERTE WERDEN GESCHRIEBEN)",
+    ),
+    ("LOW", "NIEDRIG"),
+    ("HIGH", "HOCH"),
+    ("dashed = missing", "gestrichelt = fehlt"),
+    ("QUEUED", "IN WARTESCHLANGE"),
+    ("BLANK ALLOWED", "LEER ERLAUBT"),
+    ("BIT 0 ENABLES THE OTHERS", "BIT 0 AKTIVIERT DIE ANDEREN"),
+    ("INFERRED FROM VALUE", "AUS WERT ABGELEITET"),
+    (
+        "No saved maps for this controller profile yet.",
+        "Noch keine gespeicherten Karten für dieses Controller-Profil.",
+    ),
+    (
+        "Read-only view; opening does not apply compensation or start a job",
+        "Nur-Lese-Ansicht; Öffnen wendet keine Kompensation an und startet keinen Auftrag",
+    ),
+    (
+        "Nothing is applied automatically",
+        "Nichts wird automatisch angewendet",
+    ),
+    (
+        "No automatic retry or resume. Recover the machine, then run again.",
+        "Kein automatischer Wiederholungs- oder Fortsetzungsversuch. Maschine \
+        wiederherstellen, dann erneut starten.",
+    ),
+    (
+        "every gate must pass before RUN",
+        "alle Prüfungen müssen vor START bestehen",
+    ),
+    ("PROBE CYCLES", "TASTZYKLEN"),
+    (
+        "Pick a card, inspect the preflight, then press RUN",
+        "Karte wählen, Vorabprüfung ansehen, dann STARTEN",
+    ),
+    (
+        "millimetres; tap a value to edit",
+        "Millimeter; Wert zum Bearbeiten antippen",
+    ),
+    ("recorded vs live", "aufgezeichnet vs. live"),
+    ("per controller profile", "pro Controller-Profil"),
+    ("APPLY OFFSET", "VERSATZ ANWENDEN"),
+    ("NOT SENT YET", "NOCH NICHT GESENDET"),
+    ("EXACT MDI LINE", "EXAKTE MDI-ZEILE"),
+    (
+        "CURRENT DRO (DISPLAY UNITS)",
+        "AKTUELLE DRO (ANZEIGEEINHEITEN)",
+    ),
+    (
+        "DRO CHANGED SINCE THIS SHEET OPENED; CANCEL AND RECHECK",
+        "DRO SEIT DEM ÖFFNEN GEÄNDERT; ABBRECHEN UND NEU PRÜFEN",
+    ),
+    ("READ-ONLY $# PARAMETERS", "$#-PARAMETER NUR LESEN"),
+    (
+        "X / Y / Z IN DISPLAY UNITS",
+        "X / Y / Z IN ANZEIGEEINHEITEN",
+    ),
+    ("TAP TO EDIT", "ZUM BEARBEITEN ANTIPPEN"),
+    (
+        "RESTORE WORK OFFSETS - PREVIEW",
+        "WERKSTÜCKNULLPUNKTE WIEDERHERSTELLEN - VORSCHAU",
+    ),
+    (
+        "G10 L2 LINES IN THIS FILE (VALUES IN MILLIMETRES)",
+        "G10-L2-ZEILEN IN DIESER DATEI (WERTE IN MILLIMETERN)",
+    ),
+    (
+        "THE FILE BEGINS WITH G21: EVERY VALUE IS INTERPRETED IN MILLIMETRES.",
+        "DIE DATEI BEGINNT MIT G21: JEDER WERT WIRD IN MILLIMETERN INTERPRETIERT.",
+    ),
+    ("LOAD AS PROGRAM", "ALS PROGRAMM LADEN"),
+    (
+        "LOCKED: A JOB IS ACTIVE; STOP IT BEFORE LOADING A PROGRAM",
+        "GESPERRT: EIN AUFTRAG IST AKTIV; VOR DEM LADEN STOPPEN",
+    ),
+    ("SET X", "X SETZEN"),
+    ("SET Y", "Y SETZEN"),
+    ("SET Z", "Z SETZEN"),
+    ("SET AXIS", "ACHSE SETZEN"),
+    ("MDI TEXT", "MDI-TEXT"),
+    ("SPINDLE RPM", "SPINDEL-DREHZAHL"),
+    ("SETTING", "EINSTELLUNG"),
+    ("OFFSET", "VERSATZ"),
+    ("TOKENS + DIGITS", "TOKENS + ZIFFERN"),
+    ("G10 L20 | DISPLAY UNITS", "G10 L20 | ANZEIGEEINHEITEN"),
+    ("RANGE N/A", "BEREICH N/V"),
+    ("TOOL FIELD", "WERKZEUGFELD"),
+    ("PROBE FIELD (mm)", "TASTFELD (mm)"),
+    ("Demo FlexiHAL", "Demo FlexiHAL"),
+    (
+        "In-process FlexiHAL simulator over the loopback transport. No serial port is \
+        opened.",
+        "In-Process-FlexiHAL-Simulator über den Loopback-Transport. Es wird kein serieller \
+        Port geöffnet.",
+    ),
+    (
+        "Same engine, handshake, streamer and safety gateway as a real controller.",
+        "Gleiche Engine, Handshake, Streamer und Sicherheits-Gateway wie ein echter \
+        Controller.",
+    ),
+    (
+        "Tap a port to select it; nothing opens until CONNECT.",
+        "Port antippen zum Auswählen; nichts öffnet vor VERBINDEN.",
+    ),
+    (
+        "Line settings are fixed at 8 data bits, no parity, one stop bit. DTR reset pulses \
+        are not implemented in M2.",
+        "Leitungseinstellungen sind fest: 8 Datenbits, keine Parität, 1 Stoppbit. \
+        DTR-Resetimpulse sind in M2 nicht implementiert.",
+    ),
+    ("serial port", "serieller Port"),
+    ("NOT REQUESTED", "NICHT ANGEFORDERT"),
+    ("READING CONTROLLER", "CONTROLLER WIRD GELESEN"),
+    (
+        "CONTROLLER BUSY - RETRYING",
+        "CONTROLLER BESCHÄFTIGT - WIEDERHOLUNG",
+    ),
+    (
+        "No $PINS report has arrived in this session.",
+        "In dieser Sitzung ist kein $PINS-Bericht eingegangen.",
+    ),
+    (
+        "No $PINSTATE report has arrived in this session.",
+        "In dieser Sitzung ist kein $PINSTATE-Bericht eingegangen.",
+    ),
+    (
+        "The controller reported no auxiliary pin levels.",
+        "Der Controller meldete keine auxiliären Pinpegel.",
+    ),
+    (
+        "No $LIM report has arrived in this session.",
+        "In dieser Sitzung ist kein $LIM-Bericht eingegangen.",
+    ),
+    (
+        "No $LEV report has arrived in this session.",
+        "In dieser Sitzung ist kein $LEV-Bericht eingegangen.",
+    ),
+    (
+        "The controller reports no control or limit events yet.",
+        "Der Controller meldet noch keine Steuer- oder Grenzereignisse.",
+    ),
+    ("PROBE PLAN", "TASTPLAN"),
+    ("CUSTOM", "BENUTZERDEFINIERT"),
+    (
+        "No settings in this group",
+        "Keine Einstellungen in dieser Gruppe",
+    ),
+    ("No setting matches", "Keine Einstellung entspricht"),
+    (
+        "Pick another group in the rail.",
+        "Wähle eine andere Gruppe in der Leiste.",
+    ),
+    (
+        "Search matches a number, name, or group. Clear the search to browse groups.",
+        "Die Suche findet Nummer, Name oder Gruppe. Leere die Suche, um Gruppen zu \
+        durchsuchen.",
+    ),
+    ("CONTROLLER STATE", "CONTROLLER-STATUS"),
+    (
+        "CONTROLLER DIAGNOSTIC DATA - READ-ONLY",
+        "CONTROLLER-DIAGNOSEDATEN - NUR LESEN",
+    ),
+    ("SAVE BLOCKED", "SPEICHERN GESPERRT"),
+    (
+        "KEPT: offsets are unchanged. Apply stays available.",
+        "BEHALTEN: Die Nullpunkte sind unverändert. Anwenden bleibt verfügbar.",
+    ),
+    ("COMMAND", "BEFEHL"),
+    ("Ask before running", "Vor Ausführung fragen"),
+    (
+        "New macros default to CONFIRM. A direct macro runs on one click.",
+        "Neue Makros verwenden standardmäßig BESTÄTIGEN. Ein direktes Makro läuft mit einem \
+        Klick.",
+    ),
+    ("EXACT COMMAND TO SEND", "EXAKTER ZU SENDENDER BEFEHL"),
+    (
+        "Jogging is allowed while the job waits; the Jog panel stays active. The job will \
+        not send another line until you resume.",
+        "Joggen ist erlaubt, während der Auftrag wartet; das Jog-Fenster bleibt aktiv. Der \
+        Auftrag sendet keine weitere Zeile, bis du fortsetzt.",
+    ),
+    (
+        "Jogging is allowed while the job waits; the Jog panel stays active. The job will \
+        not send another line until you resume. RESET and STOP above remain available.",
+        "Joggen ist erlaubt, während der Auftrag wartet; das Jog-Fenster bleibt aktiv. Der \
+        Auftrag sendet keine weitere Zeile, bis du fortsetzt. RESET und STOPP oben bleiben \
+        verfügbar.",
+    ),
+    ("VERIFYING", "PRÜFUNG LÄUFT"),
+    ("VERIFIED", "VERIFIZIERT"),
+    ("MISMATCH", "ABWEICHUNG"),
+    ("MEASUREMENT ONLY", "NUR MESSUNG"),
+    ("READY TO APPLY", "BEREIT ZUM ANWENDEN"),
+    ("REVERTED", "ZURÜCKGESETZT"),
+    ("FEED", "VORSCHUB"),
+    ("RETRACT", "RÜCKZUG"),
+    ("CENTER X", "MITTE X"),
+    ("CENTER Y", "MITTE Y"),
+    ("ORIGIN X WORK", "NULLPUNKT X WERKSTÜCK"),
+    ("ORIGIN Y WORK", "NULLPUNKT Y WERKSTÜCK"),
+    ("SURFACE Z MACH", "OBERFLÄCHE Z MASCHINE"),
+    ("PROBE OFFSET X", "TASTVERSATZ X"),
+    ("PROBE OFFSET Y", "TASTVERSATZ Y"),
+    (
+        "MOCK MODE: browsing only; loading needs a live controller",
+        "MOCK-MODUS: nur Durchsuchen; Laden benötigt einen aktiven Controller",
+    ),
+    (
+        "LINK NOT READY: finish the connection handshake before loading a program",
+        "VERBINDUNG NICHT BEREIT: Schließe den Handshake ab, bevor du ein Programm lädst",
+    ),
+    (
+        "JOB ACTIVE: stop the running job before loading another program",
+        "AUFTRAG AKTIV: Stoppe den laufenden Auftrag, bevor du ein anderes Programm lädst",
+    ),
+    (
+        "MOCK MODE: a check run needs a live controller",
+        "MOCK-MODUS: Ein Prüflauf benötigt einen aktiven Controller",
+    ),
+    (
+        "LINK NOT READY: finish the connection handshake before a check run",
+        "VERBINDUNG NICHT BEREIT: Schließe den Handshake vor dem Prüflauf ab",
+    ),
+    (
+        "MACHINE LOCKED: clear Alarm or Door before a check run",
+        "MASCHINE GESPERRT: Alarm oder Tür vor dem Prüflauf quittieren",
+    ),
+    (
+        "NO PROGRAM: load a program before a check run",
+        "KEIN PROGRAMM: Lade vor dem Prüflauf ein Programm",
+    ),
+    (
+        "JOB ACTIVE: stop the running job before a check run",
+        "AUFTRAG AKTIV: Stoppe den laufenden Auftrag vor dem Prüflauf",
+    ),
+    (
+        "MACHINE NOT IDLE: a check run starts only from IDLE",
+        "MASCHINE NICHT LEERLAUF: Ein Prüflauf startet nur aus IDLE",
+    ),
+    (
+        "CHECK RUN ACTIVE: wait for the controller to finish check mode",
+        "PRÜFLAUF AKTIV: Warte, bis der Controller den Prüfmodus beendet",
+    ),
+    (
+        "PROBE PROGRAM: a generated probe plan cannot be checked from the job toolbar",
+        "TASTPROGRAMM: Ein generierter Tastplan kann nicht über die Auftragsleiste geprüft \
+        werden",
+    ),
 ];
