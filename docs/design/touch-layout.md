@@ -1,26 +1,29 @@
-# Touch shell layout review
+# Touch shell layout
 
-Status: first M0 shell reviewed; **layout not approved**. The visual language
-(dark shop-floor, teal accents, card treatment, status colors) is good and stays.
+**Status: approved and implemented.** The landscape C1/C2/C3 grid below is the
+shipped shell in `ghs-app/src/shell.rs`; `theme.rs` owns the tokens. Portrait
+reflow remains deferred (UX-03). The first-pass review is kept as design
+history.
 
-## What is wrong with the first pass
+## Design history: the first pass (superseded)
 
-Observed at 2048×1152:
+The original M0 shell was reviewed at 2048×1152 and rejected. These
+observations drove the approved layout; they do not describe the current build.
 
-- The bottom area is two rows of cards with **different heights and widths**:
-  MDI/DRO/Work are taller than Feed/Jog/Spindle; widths range from ~210 px to
+- The bottom area was two rows of cards with **different heights and widths**:
+  MDI/DRO/Work were taller than Feed/Jog/Spindle; widths ranged from ~210 px to
   ~1400 px.
-- **MDI is ~850 px wide while the console above it is ~380 px.** The MDI input
-  is one line but its card is mostly empty space.
-- **Feed override is ~210 px wide** and cramped, while **Jog is ~1400 px** and
+- **MDI was ~850 px wide while the console above it was ~380 px.** The MDI input
+  is one line but its card was mostly empty space.
+- **Feed override was ~210 px wide** and cramped, while **Jog was ~1400 px** and
   mostly empty.
-- The **Work card is ~200 px wide** and its values are clipped/tiny.
-- The deck is ~350 px tall. At 1280×800 that consumes ~44% of the window and
-  leaves too little viewer.
-- Top mode tabs are ~40 px, below the 48 px touch target.
-- Signals/Work labels are ~10 px, below the comfortable touch reading size.
+- The **Work card was ~200 px wide** and its values were clipped/tiny.
+- The deck was ~350 px tall. At 1280×800 that consumed ~44% of the window and
+  left too little viewer.
+- Top mode tabs were ~40 px, below the 48 px touch target.
+- Signals/Work labels were ~10 px, below the comfortable touch reading size.
 
-## Confirmed layout: asymmetric three-column grid
+## Approved layout: asymmetric three-column grid
 
 C1 and C2 have three rows. C3 has two rows: its top cell spans C1/C2 rows 1–2
 and holds Coolant → Macros → Signals → Work as one continuous area, with **no
@@ -57,12 +60,18 @@ Rules:
   divider between Signals and Work; then Spindle (112 px).
 - The right flex cell must end on the MDI/DRO bottom line. If its content
   overflows, scroll inside it; never push Spindle down.
-- Work finally gets the height of rows 1+2, so its four rows can breathe.
+- Work gets the height of rows 1+2, so its four rows can breathe.
 - Every card fills its grid cell; no fixed pixel widths.
 - The bottom controls are not a separate full-width strip; they are the bottom
   of each column.
 
+The implementation uses plain flex stacks with a shared 12 px gap and 112 px
+bottom rows. The right column is one flexible cell plus a 112 px Spindle cell,
+which makes its tall cell end exactly on the MDI/DRO baseline.
+
 ## Grid and tokens
+
+Implemented values from `shell.rs` and `theme.rs`:
 
 | Token | Value |
 |---|---|
@@ -84,14 +93,16 @@ Column widths:
 - 1920×1080: left 400, right 260, center flexible.
 - 1280×800: left 340, right 220, center flexible. MDI/DRO and Feed/Jog rows 104 px.
 - Portrait: top bar; viewer ~45% height; console collapsible; bottom controls
-  become a 2×2 or 2×3 grid. Test 1080×1920.
+  become a 2×2 or 2×3 grid. Test 1080×1920. This reflow is **not implemented**
+  (UX-03).
 
 ## Card requirements
 
 ### MDI
 
 - One row: 48 px text input + 80 px Send button, 8 px gap.
-- Hint ("Mock send appends to console") is one 11 px line under the input.
+- Hint is one 11 px line under the input: `Live: engine logs command + ok` when
+  connected to the engine, or the mock-preview text in `--mock`.
 - No giant empty card. Height 112 px.
 - Input never spans the viewer.
 
@@ -148,13 +159,17 @@ Column widths:
 - Remove duplicate unit labels inside DRO fields; one unit per axis is enough.
 - The Reset/Stop pair stays large and high-contrast.
 
-## Review gate
+## Layout review gate
 
-Before approval, capture at least:
+The landscape layout is approved for 1920×1080 and 1280×800. Portrait
+(1080×1920) is the acceptance target for the deferred UX-03 work, not an
+approved current layout.
+
+For every layout change, capture at least:
 
 1. 1920×1080 landscape.
 2. 1280×800 landscape (the target mini-PC).
-3. 1080×1920 portrait.
+3. 1080×1920 portrait when portrait support is in scope.
 
 For each: no clipped text, no horizontal scroll, no card with a different
 height than its row (except the intentional C3 top cell spanning rows 1–2),

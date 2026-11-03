@@ -1,30 +1,38 @@
 # ghs-rs — implementation plan
 
-**Status:** M7 — 3D viewer and release packaging done; i18n/keymap/hardware pending
-**Updated:** 2026-11-02
+**Status:** M7 closeout — `v0.5.0` preview released; V1.0 total-parity gate open
+**Updated:** 2026-11-03
+**V1.0 target:** total ioSender milling parity
 **Reference hardware:** FlexiHAL / STM32F446, grblHAL `1.1f.20240604`
 
 Protocol, serial, viewer geometry, the capability-configured simulator, the
-G-code parser, the demo loopback bridge, the headless engine, the M3 job runner,
-the job UI, the M4 real viewer, the M5 generated settings, live offsets, tool
-table, and profile/backup wiring are implemented. The approved touch shell runs
-live against the in-process simulator with serial connect, hold-to-jog, a real
-program list, job controls, progress, the tool-change sheet, the parsed
+G-code parser, the demo loopback bridge, the headless engine, the job runner,
+the job UI, the 2D/3D viewer, generated settings, live offsets, the tool table,
+profile/backup wiring, startup lines, the machine keymap, primary localization
+(en/it/de/nl), pins/limits diagnostics, console filtering/log export, dry-run
+check mode, breakpoints/run-to-line, rectangle-center and XY-plate probing, and
+the height-map Apply/Revert workflow are implemented. The approved touch shell
+runs live against the in-process simulator with serial connect, hold-to-jog, a
+real program list, job controls, progress, the tool-change sheet, the parsed
 toolpath, generated settings, offsets, and a persisted app-side tool table. The
 M6 probe plans and the Probe workspace (Z plate, edge X/Y, corner, center
-circle, rotation and tool-length reporting) are implemented with mandatory
-preflight, PRB correlation, and confirmed `G10 L2` application. The height-map
-measurement and explicit Apply/Revert workflow are implemented, including the
-sender-side G-code rewrite and compensated-job labelling. The probe mount XY
-offset and height-map Z offset are implemented and persisted per profile.
-Startup-line read/edit/verify and the read-only controller tool table are also
-implemented. The remaining M5 work is keymap persistence; basic single-line
-user macros and the WCS-only offsets backup/restore are implemented, with
-advanced macro forms deferred. The M7 3D toolpath viewer, in-app program file
-browser/load, release workflow, Linux desktop entry, and release checklist are
-implemented. Remaining M7 work is i18n, stock meshes, keymap persistence,
-signed/installer packaging, and the full release QA pass. Hardware validation
-remains the M6 gate before publishing.
+circle, center rectangle, XY touch plate, rotation and tool-length reporting)
+are implemented with mandatory preflight, PRB correlation, and confirmed
+`G10 L2` application. The probe mount XY offset and height-map Z offset are
+implemented and persisted per profile.
+
+The remaining V1.0 gaps are hardware validation on the reference FlexiHAL;
+secondary localization (help, warnings, and other long-form text remain
+English); signed installers and notarization; the full release QA pass;
+start-from-line; the utility and calibration set (material surfacing, gantry
+squaring, stepper/XY calibration, first-run machine setup, non-destructive
+transforms, pre-run limits check); and the probe remainder (TLO apply,
+work-rotation apply/straightness, pre/post probe macros, retry strategy, and
+persisted cycle settings). The viewer remainder (3D stock mesh and pre-run
+limits confirmation), portrait reflow, high-contrast theme, first-run safety
+onboarding, session recording, `$RST` confirmation, and the optional Workbench
+mode are also open against the full checklist in [parity.md](parity.md).
+`v0.5.0` is an optional preview pre-release; it does not close the V1.0 gate.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
 it parses every status field, real-time command, system command, and runtime
@@ -73,10 +81,11 @@ where fallback bugs hide. `generic-full` is the superset used for broad scenario
 board-specific product mode: every panel is driven by reported capabilities.
 
 > **Hardware access note.** The controller lives offline in a garden shed, so
-> M1 is simulator-first. Hardware-in-the-loop validation is a gate at M2/M3
-> once the board is reachable. The first hardware session will be captured with
-> a standalone capture tool into one file, brought back on a USB stick, and
-> imported as a fixture. No feature depends on internet access at the machine.
+> development is simulator-first. Hardware-in-the-loop validation is the V1.0
+> release gate once the board is reachable. The first hardware session will be
+> captured with a standalone capture tool into one file, brought back on a USB
+> stick, and imported as a fixture. No feature depends on internet access at the
+> machine.
 
 ## 3. Scope
 
@@ -85,8 +94,9 @@ board-specific product mode: every panel is driven by reported capabilities.
 - Serial connection, controller identification, capability discovery.
 - Full grblHAL protocol surface: status fields, realtime commands, system
   commands, parser state, probe results, tool change, MPG takeover, SD status.
-- Runtime code sets and settings from `$EA`/`$EE`/`$ES`/`$EG`/`$SED`, with
-  bundled fallbacks for older builds.
+- Runtime code sets and settings from `$EA`/`$EE`/`$ES`/`$EG` (`$SED`
+  description encoding is available in the protocol crate), with bundled
+  fallbacks for older builds.
 - Live status, DRO, work offsets, jogging, MDI, overrides, spindle, coolant.
 - Program load, validation, streaming, pause/resume/stop, tool change.
 - Program list, 2D toolpath, 3D toolpath, live tool marker.
@@ -127,7 +137,8 @@ milling feature bar is solid:
 overrides, spindle/coolant, console, alarms, load and stream a program with
 pause/resume/stop, manual tool change.
 
-**P2 — Milling parity (v1.0).** Everything the reference machine needs:
+**P2 — Total parity (v1.0).** Every applicable ioSender and ioSender Touch
+feature for the reference 3-axis mill:
 
 - ioSender Touch layout and touch workflows.
 - ioSender milling features: settings, offsets, tools, macros, 2D/3D viewer,
@@ -136,29 +147,30 @@ pause/resume/stop, manual tool change.
 - Generic grblHAL protocol support, with runtime enumerations and
   capability-gated panels rather than a board-specific UI.
 - Serial hotplug/reconnect, session logging, crash-safe configuration.
-- Windows, macOS, Linux builds and installers.
+- Windows, macOS, Linux builds and signed installers.
 
 A feature is **done** only when it: works against the simulator, has automated
 tests, is verified on the FlexiHAL board, is usable without a mouse, is
-documented, and is localized. The live checklist is [parity.md](parity.md).
+documented, and is localized (primary UI plus operator-facing help and
+warnings). The live checklist is [parity.md](parity.md).
 
 ## 5. Architecture (summary)
 
 Details: [architecture.md](architecture.md).
 
 ```text
-ghs-app        GPUI shell, touch layout, panels, keypad, gamepad
-ghs-ui         design tokens and thin gpui-kit wrappers (introduced at M2)
+ghs-app        GPUI shell, touch layout, panels, keypad, keymap, i18n adapter
 ghs-engine     session, streamer, job runner, safety gateway (own thread)
 ghs-proto      sans-IO grblHAL framing, status, commands, ACK tracking
 ghs-core       axes, positions, units, WCS, settings, tools, capabilities
-ghs-serial     serial reader/writer threads, hotplug, loopback
+ghs-serial     serial reader thread, hotplug, loopback
 ghs-sim        deterministic grblHAL simulator for tests and demo mode
-ghs-gcode      parser, expressions, parser-state emulation, toolpath (M4)
-ghs-viewer     geometry cache, 2D/3D projection (M4)
-ghs-probe      probe cycles and height map (M6)
-ghs-config     profiles, backups, import/export (M5)
-ghs-i18n       locales (M7)
+ghs-demo       in-process simulator session for the app demo
+ghs-gcode      parser, expressions, parser-state emulation, toolpath
+ghs-viewer     geometry cache, 2D/3D projection
+ghs-probe      probe cycles and height map
+ghs-config     profiles, backups, import/export
+ghs-i18n       locale catalogs and active-locale lookup
 ```
 
 Decisions already made:
@@ -175,12 +187,14 @@ Decisions already made:
    UI initially exposes X/Y/Z and expands if the controller reports more.
 6. **mm is canonical.** G20/G21 changes display and protocol state, not stored
    coordinates. Domain uses `f64`; rendering uses `f32`.
-7. **GPUI Kit 0.8.x, pinned exactly.** A thin `ghs-ui` layer contains the API
-   churn.
+7. **GPUI Kit 0.8.1, pinned exactly.** Theme tokens and thin app-side wrappers
+   live in `ghs-app`; ADR 0004 keeps a `ghs-ui` facade as a future option if
+   API churn grows.
 8. **Protocol breadth, UI depth.** Parse the full grblHAL surface and ignore
    unknown extensions; expose only what the controller supports.
 9. **Runtime enumeration over hardcoded tables.** Prefer `$EA`/`$EE`/`$ES`/
-   `$EG`/`$SED`; bundled tables are fallbacks, not the source of truth.
+   `$EG` (`$SED` encoding is available); bundled tables are fallbacks, not the
+   source of truth.
 
 ## 6. UI direction
 
@@ -209,9 +223,15 @@ configurable and color-blind safe.
 | **M2 Manual control — v0.1** | 2–3 wk | Engine, serial transport, DRO/WCS, jog, overrides, spindle/coolant, MDI, home/unlock/reset, signals, touch shell | Operate simulator and the real board from the UI; guards and stop always visible |
 | **M3 Job engine — v0.2** | 3 wk | Load/validate/stream, pause/resume/stop, tool change, single block/optional stop, start-from-line, timer/progress, console | 100k-line job with repeated pause/abort/reconnect; zero buffer overruns; hardware run |
 | **M4 Program + 2D — v0.5** | 3 wk | G-code parser, geometry, 2D viewer, virtualized program list | 1M lines under 2 s; 60 fps pan/zoom; live marker; arcs/incremental/planes correct |
-| **M5 Setup & data — v0.6** | 3 wk | Generated settings editor (`$ES`/`$EG`/`$SED`), offsets, tool table, macros, keymap, profiles, backup | Configure the FlexiHAL machine end-to-end; settings round-trip; restore verified |
+| **M5 Setup & data — v0.6** | 3 wk | Generated settings editor (`$ES`/`$EG`), offsets, tool table, macros, keymap, profiles, backup | Configure the FlexiHAL machine end-to-end; settings round-trip; restore verified |
 | **M6 Probing + height map — v0.8** | 4 wk | Probe framework, Z/edge/center/rotation/tool-length/XY plate, height map, compensation | Golden tests per cycle; hardware sign-off; safe-Z and probe interlocks proven |
-| **M7 3D, utilities, release — v1.0** | 4 wk | 3D viewer, surfacing/squaring/calibration, i18n, installers, first-run wizard, docs | P2 audit signed off; installers on 3 OSes; safety onboarding complete |
+| **M7 3D, total parity, release — v1.0** | 4 wk | 3D viewer, dry-run check, i18n, keymap, utilities/calibration, signed installers, first-run wizard, docs | Total-parity audit signed off; hardware gate passed; installers on 3 OSes; secondary localization complete |
+
+The `Ships` column records the original milestone intent, not a fresh status
+audit. Current exceptions: start-from-line is still open (M3); the probe
+remainder and hardware sign-off are still open (M6); utility/calibration,
+signed installers, secondary localization, and the full release QA pass are
+still open (M7). See the gap list at the top of this document.
 
 Total to v1.0: **~5.5–7 months** for one focused developer with AI assistance and
 the machine available. The critical path is hardware validation of streaming,
@@ -237,7 +257,7 @@ well-specified chunks in parallel.
 - `protocol`: `ghs-core` + `ghs-proto`.
 - `simulator`: `ghs-sim` and fixture replay.
 - `serial`: `ghs-serial`, hotplug/reconnect, loopback.
-- `ui-shell`: `ghs-app` and `ghs-ui` shell, theme, touch layout.
+- `ui-shell`: `ghs-app` shell, theme, touch layout, keymap, i18n adapter.
 - `viewer`: `ghs-viewer` geometry and projection.
 - `settings`: settings engine and forms.
 - `probing`: `ghs-probe` and wizards.
@@ -258,8 +278,9 @@ well-specified chunks in parallel.
 - Edit only the paths assigned in the brief. Never edit root `Cargo.toml`,
   `docs/`, CI, or another crate.
 - No commits; report files changed, test results, open questions, and risks.
-- Run `cargo fmt` and `cargo clippy -p <crate> --all-targets -- -D warnings`;
-  use `CARGO_TARGET_DIR=/tmp/opencode/ghs-target-<role>` to avoid lock contention.
+- Run `cargo fmt` and `cargo clippy -p <crate> --all-targets -- -D warnings`.
+  Build with the repository's default `target/`; parallel agents share Cargo's
+  lock, so serialize heavy builds instead of creating extra target directories.
 - No network transports, no legacy Grbl, no lathe/plasma/drag-knife code.
 - No copied ioSender source. Behavior and protocol compatibility only.
 
@@ -305,21 +326,21 @@ interlocks, and check mode promoted in the UI. See [SAFETY.md](SAFETY.md).
 
 | Risk | Mitigation |
 |---|---|
-| GPUI pre-1.0 API churn | Pin exact versions; thin `ghs-ui`; upgrade sprints |
+| GPUI pre-1.0 API churn | Pin exact versions; thin app-side UI layer; add `ghs-ui` only if churn grows |
 | Linux GPUI/X11/Wayland issues | Spike in M0 before deeper work |
 | 3D performance in a 2D painter | Software projection first; decimation/caching; wgpu fallback |
 | Streaming correctness | Sans-IO core, property tests, simulator, hardware early |
 | Real-machine safety | Interlocks, dry runs, HIL checklist, conservative defaults |
 | Intermittent hardware access | Simulator-first M1; recorded fixtures; HIL gate when the board is reachable |
 | Scope creep | Explicit exclusions; parity checklist; v1.0 gate |
-| Long GPUI compile times | Shared target cache for orchestrator; per-agent target dirs |
+| Long GPUI compile times | Serialize heavy builds; keep one default `target/` directory |
 | Serial quirks (DTR/RTS, permissions) | Dedicated transport tests; document dialout setup |
 
 ## 12. Decision log
 
 | Date | Decision |
 |---|---|
-| 2026-11-01 | v1.0 = P2 milling parity; no full-ioSender P3 gate |
+| 2026-11-01 | v1.0 = P2 milling parity; no full-ioSender P3 gate (superseded 2026-11-03) |
 | 2026-11-01 | Serial only; no network transports |
 | 2026-11-01 | grblHAL only; no legacy Grbl compatibility mode |
 | 2026-11-01 | No lathe, plasma THC, or drag knife |
@@ -328,3 +349,4 @@ interlocks, and check mode promoted in the UI. See [SAFETY.md](SAFETY.md).
 | 2026-11-01 | Touch-first layout plus optional dockable Workbench |
 | 2026-11-01 | MIT OR Apache-2.0; ioSender credited in NOTICE |
 | 2026-11-01 | Subagent execution with orchestrator review gates |
+| 2026-11-03 | v1.0 = total ioSender milling parity; `v0.5.0` is an optional preview pre-release |

@@ -1,7 +1,11 @@
-# M5 settings, offsets, tools, and profiles
+# Settings, offsets, tools, and profiles
 
-M5 turns the engine's already-discovered metadata into editable UI and persists
-safe local data. The engine remains the only writer to the controller.
+**Status:** implemented in M5 and still current. This document describes the
+shipped contract; the acceptance section at the end is the original M5 gate kept
+as milestone history.
+
+The app turns the engine's already-discovered metadata into editable UI and
+persists safe local data. The engine remains the only writer to the controller.
 
 ## Settings editor
 
@@ -32,8 +36,10 @@ Generate the form; do not hardcode setting numbers. Map types:
   "reboot required".
 - Write is explicit: edit locally, then Apply; show pending, verified, or error
   state. Do not mark a setting applied until `SettingWritten.verified`.
-- Batch changes and export a backup before settings writes; never auto-restore.
-- `$RST` is destructive; require a typed confirmation and a backup.
+- Batch changes; export a backup from Profiles before risky edits. Writes are
+  never auto-restored.
+- `$RST` is not exposed in this build. If it is added, it must require a typed
+  confirmation and a backup.
 - EEPROM on the reference board means avoid unnecessary writes.
 
 ## Offsets
@@ -56,12 +62,14 @@ Generate the form; do not hardcode setting numbers. Map types:
 - The reference board has zero controller tool-table entries; the app owns the
   table (number, name, diameter, length) and persists it in the profile.
 - Tool change: engine `ToolChangeRequired` → sheet with tool number, jog and
-  set-offset actions, acknowledge (`0xA3`), then resume. The sheet already
-  exists; M5 adds tool length probing and offset editing.
+  set-offset actions, acknowledge (`0xA3`), then resume. The tool-length probe
+  reports a measured delta in the Probe workspace; applying TLO/`$TLR` from that
+  card is deferred until the tool-change workflow owns it.
 - If the controller reports `[T:...]` entries, display them read-only plus the
   app table; do not silently overwrite controller data. The engine exposes a
   typed controller table and the app shows it in a separate read-only panel.
-- Tool length can be set with `$TLR`/probe (M6) or a controlled MDI move.
+- Tool length can be measured with the probe or set with a controlled MDI move.
+  The measured TLO is reported, not written automatically.
 
 ## Macros, startup lines, keymap
 
@@ -77,7 +85,7 @@ Generate the form; do not hardcode setting numbers. Map types:
 - The keymap editor covers ten machine actions and persists per profile.
   Bindings apply at runtime after profile load or save. Keyboard jog is one
   step per press; text fields suppress machine actions.
-- Keymap and app settings are local; JSON/TOML with atomic writes and rolling
+- Keymap and app settings are local; JSON with atomic writes and rolling
   backups.
 
 ## Height maps
@@ -100,13 +108,17 @@ Generate the form; do not hardcode setting numbers. Map types:
 - Profile keyed by `$I+` identity: firmware, board, driver, serial number when
   available. A reconnect with a different controller must not silently apply
   another machine's offsets/tools.
-- Backup bundle: app settings, controller settings snapshot, offsets, tool
-  table, macros, keymap, saved height maps, and the probe offset. Versioned
-  schema; import validates before writing.
+- Backup bundle: app settings (including the locale), controller identity,
+  controller settings snapshot, offsets, tool table, macros, startup lines,
+  keymap, saved height maps, and the probe offset. Versioned schema; import
+  validates before writing.
 - Atomic writes: temp file → fsync → rename; keep the last N backups.
 - No telemetry; exports are user-initiated.
 
-## Acceptance
+## M5 acceptance (historical)
+
+These were the original M5 exit criteria. Current status and remaining gaps are
+tracked in [PLAN.md](PLAN.md) and [parity.md](parity.md).
 
 - The Settings tab is generated from the FlexiHAL simulator's `$ES`/`$EG` and
   writes a representative boolean/numeric/enum setting with read-back

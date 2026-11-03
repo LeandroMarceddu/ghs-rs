@@ -26,20 +26,24 @@
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
-| `ghs-core` | Axes, positions, units, WCS, overrides, signals, capabilities, settings, tools, alarms/errors | — |
-| `ghs-proto` | Framing, status/response parsing, command encoding, ACK/buffer tracking | `ghs-core` |
-| `ghs-serial` | Port enumeration, serial reader/writer threads, hotplug, loopback | — |
+| `ghs-core` | Axes, positions, units, WCS, overrides, signals, capabilities, settings, tools, alarms/errors, `MachineSnapshot` | — |
+| `ghs-proto` | Sans-IO framing, status/response parsing, command encoding, streamer, ACK/buffer accounting, typed pins/offsets/parser state | `ghs-core` |
+| `ghs-serial` | Port enumeration, serial reader/writer threads, hotplug, loopback transport | — |
 | `ghs-sim` | Deterministic grblHAL simulator and scenario fixtures | `ghs-core`, `ghs-proto` |
-| `ghs-engine` | Session state machine, streamer, job runner, safety gateway | all of the above |
-| `ghs-gcode` | G-code lexer/parser, expressions, parser-state emulation, toolpath (M4) | `ghs-core` |
-| `ghs-viewer` | Geometry cache, 2D/3D projection, render plan (M4) | — |
-| `ghs-config` | Profiles, app settings, backups (M5) | `ghs-core` |
-| `ghs-probe` | Probe cycles, height map, compensation (M6) | `ghs-core`, `ghs-gcode` |
-| `ghs-ui` | Design tokens and thin GPUI Kit wrappers (M2) | `ghs-app` |
-| `ghs-app` | GPUI shell, panels, touch layout, keypad, dialogs | all |
+| `ghs-engine` | Session state machine, streamer, job runner, check mode, safety gateway | `ghs-core`, `ghs-proto`, `ghs-serial`, `ghs-gcode` |
+| `ghs-gcode` | G-code lexer/parser, parser-state emulation, toolpath; expressions are deferred | `ghs-core`, `ghs-viewer` |
+| `ghs-viewer` | Geometry cache, 2D/3D cameras, render plans | — |
+| `ghs-config` | Profiles, app settings, tool table, macros, keymap, height maps, backups | `ghs-core` |
+| `ghs-probe` | Probe cycles, height-map plans, result math | `ghs-core`, `ghs-viewer` |
+| `ghs-i18n` | Locale catalogs (en/it/de/nl) and active-locale lookup | — |
+| `ghs-demo` | In-process simulator session and loopback bridge for demo/tests | `ghs-serial`, `ghs-sim` |
+| `ghs-app` | GPUI shell, touch layout, panels, keypad, keymap, i18n adapter | `ghs-core`, `ghs-engine`, `ghs-demo`, `ghs-serial`, `ghs-gcode`, `ghs-viewer`, `ghs-config`, `ghs-probe`, `ghs-i18n`, `gpui-kit` |
 
-`ghs-gcode`, `ghs-probe`, `ghs-config`, and `ghs-i18n` are introduced when their
-milestone starts; creating empty crates early is avoided.
+All twelve workspace crates exist; there are no placeholder crates. `ghs-app`
+does not depend on `ghs-proto` directly: protocol types come through
+`ghs-engine` re-exports. There is no `ghs-ui` crate. Design tokens and thin
+GPUI Kit wrappers live in `ghs-app` (`theme.rs` and `shell.rs`) for now; ADR
+0004 keeps a `ghs-ui` facade as a future option if the API churn justifies it.
 
 ## Runtime topology
 
@@ -47,13 +51,13 @@ milestone starts; creating empty crates early is avoided.
 ┌───────────────────────────── GPUI main thread ─────────────────────────────┐
 │ ghs-app views ── Command ──▶ EngineHandle                                  │
 │      ▲                        │                                            │
-│      └── Arc<MachineSnapshot>, Vec<Event> ◀── telemetry channel            │
+│      └── Arc<MachineSnapshot> + EngineEvent queue ◀── shared telemetry     │
 └───────────────────────────────┼────────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼─────────────── ghs-engine thread ──────────┐
 │ Session state machine                                                      │
-│   ├─ ProtocolSession (ghs-proto)                                           │
-│   ├─ Streamer (ghs-proto)                                                  │
+│   ├─ Parser + Streamer (ghs-proto)                                         │
+│   ├─ Discovery + status polling                                            │
 │   ├─ JobRunner                                                             │
 │   └─ SafetyGateway                                                         │
 └───────────────────────────────┬────────────────────────────────────────────┘
@@ -64,36 +68,54 @@ milestone starts; creating empty crates early is avoided.
 ```
 
 - **Engine input:** one bounded `crossbeam-channel` of `EngineInput` values
-  (`Command`, `TransportBytes`, `TransportError`, `Tick`).
-- **Telemetry:** the engine publishes an `Arc<MachineSnapshot>` through a
-  `watch`-style channel; the UI reads the latest value at frame time. Events
-  (messages, alarms, job transitions) go through a bounded queue with an
-  explicit drop-oldest policy for the console.
-- **Timers:** the engine uses `recv_timeout` to schedule status polls and
-  watchdog checks; no timer thread.
-- **Parsing/geometry:** CPU-heavy work runs on a worker thread (or rayon pool at
-  M4) and returns `Arc` results.
+  (`Command`, `Connect`, `Disconnect`, `Shutdown`), plus a one-slot reply
+  channel per `send`/`connect`. `EngineHandle` waits up to `command_timeout`
+  for the engine to accept or reject the request; it never waits for the
+  controller's `ok`, which arrives later as an event.
+- **Telemetry:** the engine publishes the latest `Arc<MachineSnapshot>` (and the
+  other cached discovery data) through a shared `Mutex<Telemetry>`.
+  `EngineHandle::snapshot()` clones the `Arc` without copying the snapshot, so
+  the UI reads a cheap latest value at frame time. Events (messages, alarms, job
+  transitions) go through a bounded queue; when it is full the engine drops the
+  oldest event rather than blocking.
+- **Timers:** the engine uses a `crossbeam-channel` tick plus `recv_timeout` to
+  schedule status polls and watchdog checks; no timer thread.
+- **Parsing/geometry:** protocol parsing and job parsing run on the engine
+  thread; viewer geometry is pure and called from the app. There is no rayon or
+  worker pool. If a UI parse exceeds the frame budget, move that path behind a
+  worker rather than making geometry stateful.
 
 ## Session state machine
+
+Once discovery completes, the engine is **ready** and mirrors the controller's
+reported `MachineState`. The connection phase is tracked separately from the
+machine state:
 
 ```text
 Disconnected
   └─ open(port) ─▶ Connecting
         └─ port opened ─▶ Handshaking
-              ├─ banner received ─▶ Discovering
-              │     ├─ $I+ / $$ / $# / $G / $SED ─▶ Ready
+              ├─ banner/status received ─▶ Discovering
+              │     ├─ $I+ / $$ / $# / $G / $EA / $EE / $ES / $EG ─▶ Ready
               │     └─ timeout/error ─▶ Failed
               └─ port error ─▶ Disconnected
-Ready ⇄ Jogging
-Ready ⇄ Running ⇄ Paused
-Running ─▶ ToolChange ─▶ Running
-Running ─▶ Alarm (terminal until unlock/reset)
+
+Idle ⇄ Jog
+Idle ⇄ Run ⇄ Hold
+Idle → Run: Tool (manual M6) → Run
+Idle → Check (dry run) → Idle
+Idle → Home → Idle
+Idle → Sleep → (reset or wake) → Idle
+Any → Alarm (terminal until explicit unlock/reset)
+Any → Door (motion locked until the door clears)
 ```
 
 Rules:
 
-- Motion is only accepted in `Ready`, `Jogging`, `Running`, or `Paused` as
-  appropriate; probing requires `Ready`.
+- Motion is accepted only in `Idle`, `Jog`, `Run`, or `Hold` as appropriate;
+  probing and configuration require `Idle`.
+- A `Door` state locks motion until the door clears; it is not cleared by an
+  alarm unlock.
 - An `ALARM` transitions to `Alarm`, stops the streamer, and requires an explicit
   unlock or reset. Never auto-resume.
 - A disconnect during a job marks the job `Interrupted`; the file and line
@@ -111,23 +133,24 @@ Handshake (do not assume a banner or a DTR reset):
 2. Listen for 400–500 ms. If a status report with `|MPG:1` arrives, a
    pendant/secondary sender is in control: stay passive and wait for
    `|MPG:0`.
-3. Request a full status report (`0x87`; `0x80` when `RT+`, otherwise `?`) and
-   wait up to ~250 ms. This confirms an extended grblHAL controller without
-   relying on the banner.
+3. Request a full status report (`0x87`) and wait up to ~250 ms. Fall back to
+   the printable `?` when the extended request is not answered. This confirms a
+   grblHAL controller without relying on the banner.
 4. If the report is `Alarm:<n>`, treat critical alarms (1, 2, 10, 17, 20) as
    locked: no motion or configuration until the condition clears and the user
    unlocks/homes/resets.
 5. Query `$I+` for axes, options, signals, buffers, driver, board, plugins, and
    tool-table entries.
-6. With `ENUMS`, fetch `$EA` (alarms), `$EE` (errors), `$ES` (settings), and
-   `$EG` (groups). With `SED`, fetch `$SED=<n>` descriptions. Fall back to
-   `$$`/bundled tables only when needed.
-7. Disable controller auto-reporting if enabled (`$481` or `0x8C`).
-8. Start status polling.
+6. Fetch `$$` (settings), `$#` (offsets), and `$G` (parser state). When
+   `ENUMS` is reported, also fetch `$EA` (alarms), `$EE` (errors), `$ES`
+   (settings metadata), and `$EG` (groups). `$SED` is encoded in the protocol
+   crate but is not part of the current discovery sequence. Fall back to
+   bundled tables only when needed.
+7. Start status polling.
 
 Status polling is adaptive: 10 Hz while running/jogging, 2 Hz when idle. A full
-report (`0x87`) is requested after connect, after alarm/unlock, and every few
-seconds during a job to refresh fields that are only sent on change.
+report (`0x87`) is requested after connect, after alarm/unlock, and every 5 s
+by default during a job to refresh fields that are only sent on change.
 
 Streamer:
 
@@ -154,13 +177,20 @@ Streamer:
 
 Job runner responsibilities:
 
-- Validate the program before streaming (syntax, unsupported codes, missing
-  feed/spindle where required, tool changes).
+- Validate the program before streaming: syntax and unsupported codes are
+  rejected up front. Tool/feed/bounds validation reports are not implemented
+  (JOB-02).
 - Track line numbers, byte offsets, progress, elapsed time, and estimated
   remaining time.
 - Stop at `M0`, `M1`, optional stop, single-block, breakpoints, and manual `M6`.
 - Capture `PRB` results for probing and `[MSG:...]` for the console.
-- Support start-from-line and run-to-line with explicit confirmations.
+- Run-to-line sets a breakpoint. With no active job it starts from line 1; with
+  an active job it only sets the breakpoint and leaves the job running.
+  Start-from-line is rejected for a line greater than 1 until a safe modal
+  preamble can be synthesized (JOB-07).
+- Dry-run check mode is a guarded engine state machine: `$C` is sent by the
+  engine, streaming starts only after a status reports `Check`, and the engine
+  restores `Idle` afterwards unless the operator had already entered check mode.
 
 ### Tool change and MPG
 
@@ -180,14 +210,15 @@ Job runner responsibilities:
   A/B/C/U/V/W.
 - All stored coordinates are millimetres. `Units::Inch` is a display/protocol
   mode; conversion happens at the edges.
-- `MachineSnapshot` is immutable and cheap to clone via `Arc`: state, positions,
-  offsets, overrides, feed/spindle, signals, pins, buffer, job info, and
-  timestamp.
+- `MachineSnapshot` is immutable and cheap to clone via `Arc`: state, substate,
+  positions, offsets, overrides, feed/spindle, signals, aux pins, buffer, job
+  info, probe, alarm, and homing.
 - `Capabilities` is parsed from `$I+` and drives UI visibility: axes, options,
   signals, AUX IO, plugins, buffer sizes, tool-table entries.
-- Settings are a `BTreeMap<u16, Setting>` with a typed value and metadata from
-  `$ES`/`$EG`/`$SED`; a bundled fallback covers controllers without runtime
-  enumeration. The settings UI is generated from the metadata, never hardcoded.
+- Settings are a controller-ordered `Vec<Setting>` with a typed value, enriched
+  by `SettingDescription`/`SettingGroup` metadata from `$ES`/`$EG`; a bundled
+  fallback covers controllers without runtime enumeration. The settings UI is
+  generated from the metadata, never hardcoded.
 - A `ControllerProfile` is pure data: firmware version/build, option set,
   signals, axes, RX/planner buffers, tool-table entries, plugins, and known
   quirks. `Capabilities` is derived from it and from runtime responses. The UI
@@ -204,11 +235,12 @@ Every command is classified:
 | State | unlock, homing, sleep, reset | State checks + confirmation for reset during job |
 | Motion | jog, goto, MDI, run, probe | Not in alarm; homing state; soft-limit awareness |
 | Spindle/coolant | M3/M4/M5, M7/M8/M9 | Not in alarm; visible state |
-| Configuration | `$` writes, offsets, tools | Idle only; backup before write |
+| Configuration | `$` writes, offsets, tools | Idle only; read-back verification for settings and startup lines |
 
 Hard rules:
 
-- No motion while `Alarm` or `Door` without an explicit, confirmed unlock.
+- No jog, MDI, job, or probe motion while `Alarm`; homing and unlock are the
+  explicit recovery exceptions. `Door` locks motion until the door clears.
 - Probe cycles require a probe-connected signal when available, a safe Z, and a
   bounded search distance.
 - A job never starts with an unknown position after connect unless the user
@@ -218,38 +250,51 @@ Hard rules:
 
 ## Persistence
 
-- App config: TOML in the platform config directory
+- App config: JSON (`app.json`) in the platform config directory
   (`~/.config/ghs-rs`, `%APPDATA%\ghs-rs`, `~/Library/Application Support/ghs-rs`).
-- Controller profiles keyed by `$I` identity plus board and firmware.
-- Tool table and offsets exported as JSON/CSV; backups keep the last N versions.
+- Controller profiles: `profiles/<id>.json`, keyed by `$I` identity plus board
+  and firmware.
+- Backup bundles are versioned JSON: app config, controller identity, settings,
+  offsets, tool table, macros, startup lines, keymap, height maps, and the probe
+  offset. The store also keeps rolling copies of previous documents.
+- Work offsets export as WCS-only G-code (`offsets.nc`); it is not a JSON or CSV
+  export and deliberately omits G92, G28/G30, HOME, TLO/TLR, G51, and PRB.
 - Atomic writes: write to a temporary file, fsync, rename.
-- No telemetry. Logs are local and opt-in for sharing.
+- No telemetry. The console log export is user-initiated and local.
 
 ## UI
 
-- `ghs-app` uses GPUI Kit components: dock, tabs, buttons, switches, sliders,
-  tables, virtual lists, modals, notifications, charts.
-- `ghs-ui` owns tokens (spacing, type scale, colors, touch sizes) and wraps
-  GPUI Kit so version upgrades are localized.
-- Layout modes: **Touch** (fixed, large, responsive to 1280×800, 1920×1080, and
-  portrait) and **Workbench** (dockable panels).
+- `ghs-app` uses GPUI Kit components: buttons, switches, sliders, tables,
+  virtual lists, modals, notifications, charts.
+- Design tokens and shared shell helpers live in `ghs-app/src/theme.rs` and
+  `ghs-app/src/shell.rs`. There is no separate `ghs-ui` crate; ADR 0004 keeps
+  that facade as an option if GPUI Kit churn grows.
+- Layout modes: **Touch** (implemented at 1280×800 and 1920×1080) and
+  **Workbench** (optional dockable panels, not implemented; UX-06). Portrait
+  reflow is deferred (UX-03).
 - The numeric keypad is an in-app bottom sheet; no dependency on an OS keyboard.
-- All interactive elements have keyboard equivalents; gamepad mapping is added
-  after v1.0 if needed.
+- The machine keymap binds ten actions (six jog, start, pause, resume, stop) and
+  is persisted per profile. Full keyboard navigation, screen-reader support, and
+  gamepad mapping are not implemented.
+- The primary UI is localized in English, Italian, German, and Dutch
+  (`ghs-i18n`). Long-form help, warnings, and other secondary text remain
+  English.
 
 ## Viewer
 
-- Parsing produces a compact segment stream: `Line`, `Arc` (tessellated on
-  demand), `Rapid`, and `Plunge`, with layer/tool/feature metadata.
+- Parsing produces a compact segment stream: `Rapid`, `Feed`, `Plunge`, `Arc`
+  (tessellated on demand), and `Probe`, with layer/tool/feature metadata.
 - Geometry is stored in flat arrays and shared via `Arc`; the viewer never
   copies a whole program per frame.
 - 2D: orthographic top view, pan/zoom/fit, grid, bounds, work envelope, tool
   marker, color by motion type.
-- 3D: software projection into painter-sorted polylines, orbit/pan/zoom, stock
-  and tool primitives. If profiling fails the budget, render offscreen with wgpu
-  into a texture and present it as an image; the geometry layer is independent
-  of either path.
-- Decimation is zoom-dependent; hit testing and selection use the same index.
+- 3D: software projection into painter-sorted polylines, orbit/pan/zoom, grid,
+  work envelope, and tool marker. There is no stock mesh or orthographic toggle
+  (VIEW-07). If profiling fails the budget, render offscreen with wgpu into a
+  texture and present it as an image; the geometry layer is independent of
+  either path.
+- Decimation is zoom-dependent; culling and decimation happen while building the
+  screen-space render plan. Hit testing and path selection are not implemented.
 
 ## Testing
 
@@ -263,11 +308,14 @@ Hard rules:
   testing absence and fallback paths (no `SD`, no `PC`, no extra axes, older
   build, different reported buffer). Product code never branches on a profile
   name.
-- Recorded real sessions replayed through the same parser.
+- Recorded real sessions replay through the same parser; no real capture has
+  been imported yet (COM-16).
 - `ghs-gcode` golden toolpaths, differential tests against hand-computed
   geometry, and fuzzing.
-- GPUI headless tests and layout snapshots at the three target sizes.
-- Hardware-in-the-loop checklist for every release.
+- Layout review at 1280×800, 1920×1080, and portrait; automated layout snapshots
+  are not yet in CI.
+- The hardware-in-the-loop checklist is written in [RELEASE.md](RELEASE.md) and
+  [SAFETY.md](SAFETY.md); it has not been run because the board is unavailable.
 
 ## Explicit non-goals
 
