@@ -132,8 +132,17 @@ pub enum Command {
         /// Whether the job pauses before this line.
         enabled: bool,
     },
-    /// Enter controller check mode and stream the loaded program.
+    /// Enter controller check mode and stream the loaded program as a dry run.
     ///
-    /// Deferred until check mode is wired end to end.
+    /// Requires a ready link with no pendant, a loaded program, an idle
+    /// streamer and an `Idle` controller (or a controller already in `Check`).
+    /// The engine sends the guarded `$C` command itself and waits for a status
+    /// that reports `Check` before the first line is streamed. When the engine
+    /// entered check mode, it leaves it again with `$C` after the run and
+    /// waits for `Idle`; a controller the operator had already put in check
+    /// mode is left untouched.
+    ///
+    /// The controller suppresses motion in check mode; the engine never sends
+    /// jog, spindle or coolant commands on its own for a dry run.
     StartCheckRun,
 }

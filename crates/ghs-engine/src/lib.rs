@@ -28,7 +28,9 @@
 //! read-back verification, logs and the safety gateway. M3 adds the job
 //! runner: validated program loading, one-line-at-a-time streaming through
 //! the same streamer, pause/resume/stop, stop conditions, breakpoints and the
-//! manual tool-change handshake.
+//! manual tool-change handshake. Dry runs use the controller's `$C` check
+//! mode: the engine enters it, streams the same program with motion
+//! suppressed, and restores `Idle` without ever resuming a stopped job.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

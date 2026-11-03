@@ -261,4 +261,28 @@ pub enum EngineEvent {
         /// Human-readable description.
         message: String,
     },
+
+    /// A dry run started: the controller is in `Check` (`$C`) and the loaded
+    /// program is streaming without motion.
+    ///
+    /// [`EngineEvent::JobStarted`] follows this event, and progress, pause and
+    /// stop events keep their usual meaning. Poll
+    /// [`crate::EngineHandle::check_run`] to label a snapshot without keeping
+    /// event state in the UI.
+    CheckStarted {
+        /// Number of source lines in the dry run.
+        total_lines: u32,
+    },
+
+    /// The dry run finished.
+    ///
+    /// When the engine entered check mode for this run, the controller has
+    /// also been observed back in `Idle` before this event is emitted. When
+    /// the operator had already enabled check mode before the run, the engine
+    /// does not toggle `$C` and the controller is left in `Check` as the
+    /// operator set it.
+    CheckCompleted {
+        /// Active dry-run time; paused periods are excluded.
+        elapsed: Duration,
+    },
 }

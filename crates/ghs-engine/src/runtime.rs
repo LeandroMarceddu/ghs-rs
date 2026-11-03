@@ -46,6 +46,15 @@ const MAX_CONTROLLER_TOOLS: usize = 256;
 /// corrupt or hostile `OPT` field must not let the streamer send unbounded
 /// bytes before an acknowledgement.
 const MAX_RX_BUFFER_SIZE: usize = 64 * 1_024;
+/// How long the controller may take to report `Check` after an entering
+/// `$C`, in wall-clock time.
+const CHECK_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Maximum number of `$C` toggles used to leave check mode after a dry run.
+///
+/// A controller may end the program in `Idle` while its `$C` flag is still
+/// set; one extra toggle then restores `Idle` with the flag clear. The bound
+/// keeps a controller that never changes state from being toggled forever.
+const MAX_CHECK_TOGGLES: u8 = 4;
 
 /// What wakes the engine loop.
 enum Wake {
@@ -140,6 +149,7 @@ enum LinePurpose {
     SettingWrite,
     SettingRead,
     ClearError,
+    CheckMode,
     JobLine { index: usize, line: u32 },
 }
 
@@ -154,6 +164,91 @@ struct PendingWrite {
     number: u16,
     expected: SettingValue,
     stage: WriteStage,
+}
+
+/// How far a check-mode (`$C`) transition has progressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CheckPhase {
+    /// Not entering, running or leaving check mode.
+    #[default]
+    Off,
+    /// The entering `$C` was written; wait for a status that reports `Check`.
+    Entering {
+        /// Wall-clock deadline for the transition.
+        deadline: Instant,
+    },
+    /// A dry run is streaming with the controller in `Check`.
+    Running,
+    /// The dry run ended; restore the controller to `Idle`.
+    ExitPending {
+        /// Completion time for a successful run, if it finished normally.
+        elapsed: Option<Duration>,
+    },
+}
+
+/// Engine-owned check-mode bookkeeping.
+///
+/// The engine only ever toggles `$C` itself, and it remembers whether it sent
+/// the toggle that entered check mode. A controller the operator put in check
+/// mode by hand is never toggled by the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CheckSession {
+    phase: CheckPhase,
+    /// The engine sent the `$C` that entered check mode.
+    entered: bool,
+    /// A `$C` line is in flight and has not been acknowledged yet.
+    awaiting_ack: bool,
+    /// When the last `$C` line was written.
+    toggled_at: Option<Instant>,
+    /// `$C` toggles written while leaving check mode.
+    toggles: u8,
+    /// The stuck-exit error was already reported.
+    reported: bool,
+}
+
+impl CheckSession {
+    fn reset(&mut self) {
+        *self = CheckSession::default();
+    }
+
+    fn begin_enter(&mut self, now: Instant) {
+        self.reset();
+        self.entered = true;
+        self.phase = CheckPhase::Entering {
+            deadline: deadline(now, CHECK_TRANSITION_TIMEOUT),
+        };
+    }
+
+    fn begin_running(&mut self, entered: bool) {
+        self.phase = CheckPhase::Running;
+        self.entered = entered;
+    }
+
+    fn request_exit(&mut self, elapsed: Option<Duration>) {
+        if !self.entered {
+            self.phase = CheckPhase::Off;
+            return;
+        }
+        let elapsed = match self.phase {
+            CheckPhase::ExitPending { elapsed: previous } => previous.or(elapsed),
+            _ => elapsed,
+        };
+        self.phase = CheckPhase::ExitPending { elapsed };
+        // An entering `$C` may still be in flight; its acknowledgement and the
+        // first status after it must settle before another toggle is written.
+        self.toggles = 0;
+        self.reported = false;
+    }
+
+    fn note_toggle_sent(&mut self, now: Instant) {
+        self.awaiting_ack = true;
+        self.toggled_at = Some(now);
+        self.toggles = self.toggles.saturating_add(1);
+    }
+
+    fn note_ack(&mut self) {
+        self.awaiting_ack = false;
+    }
 }
 
 /// The engine thread's owned state.
@@ -180,6 +275,7 @@ pub(crate) struct EngineRuntime {
     error_latched: bool,
     settings_dump_pending: bool,
     job: JobRunner,
+    check: CheckSession,
 
     snapshot: Arc<MachineSnapshot>,
     last_status: Option<Arc<StatusReport>>,
@@ -243,6 +339,7 @@ impl EngineRuntime {
             error_latched: false,
             settings_dump_pending: false,
             job: JobRunner::new(),
+            check: CheckSession::default(),
             snapshot: Arc::new(MachineSnapshot::default()),
             last_status: None,
             last_status_at: None,
@@ -459,6 +556,7 @@ impl EngineRuntime {
                 line,
                 reason: JobAbortReason::ProgramError,
             });
+            self.on_check_job_ended(None);
             return;
         }
         if let Some(last_status) = self.last_status_at {
@@ -503,6 +601,8 @@ impl EngineRuntime {
                 self.close_link(&format!("status request failed: {error}"));
             }
         }
+        self.check_enter_timeout(now);
+        self.drive_check_exit(now);
         self.pump_job();
     }
 
@@ -628,9 +728,11 @@ impl EngineRuntime {
         self.sleeping = false;
         self.sleep_on_ack = false;
         self.wake_probe_pending = false;
+        self.check.reset();
 
         let mut snapshot = MachineSnapshot::default();
         self.job.apply_info(&mut snapshot.job);
+        self.shared.set_check_run(self.job.is_check());
         self.snapshot = Arc::new(snapshot);
         self.last_status = None;
         self.last_status_at = None;
@@ -661,6 +763,7 @@ impl EngineRuntime {
 
     fn close_link(&mut self, reason: &str) {
         let was_connected = self.transport.is_some();
+        let check_was_active = self.check.entered;
         if let Some(mut transport) = self.transport.take() {
             transport.close();
         }
@@ -683,6 +786,9 @@ impl EngineRuntime {
         self.mpg_active = false;
         self.watchdog_paused = false;
         self.last_status_at = None;
+        // There is no link left to send `$C`; check mode is controller state
+        // and may survive the disconnect until a reset.
+        self.check.reset();
         // Live pin levels and events belong to the link that just closed. The
         // static `$PINS` mapping is retained until the next session starts.
         self.clear_live_pin_reports();
@@ -702,9 +808,16 @@ impl EngineRuntime {
             next.alarm = None;
             self.job.apply_info(&mut next.job);
             self.snapshot = Arc::new(next);
+            self.shared.set_check_run(self.job.is_check());
             self.publish_snapshot();
             if let Some((line, reason)) = aborted {
                 self.emit(EngineEvent::JobAborted { line, reason });
+            }
+            if check_was_active {
+                self.log_warn(
+                    "Link closed while check mode was active; the controller may stay in check \
+                     mode until a reset",
+                );
             }
             self.emit(EngineEvent::Disconnected);
             self.log_warn(format!("Disconnected: {reason}"));
@@ -751,9 +864,7 @@ impl EngineRuntime {
             Command::SetSingleBlock(enabled) => self.execute_set_single_block(enabled),
             Command::SetBlockDelete(enabled) => self.execute_set_block_delete(enabled),
             Command::SetBreakpoint { line, enabled } => self.job.set_breakpoint(line, enabled),
-            Command::StartCheckRun => Err(EngineError::Unsupported(
-                "controller check mode ($C) is not wired end to end".into(),
-            )),
+            Command::StartCheckRun => self.execute_start_check_run(),
         }
     }
 
@@ -857,6 +968,10 @@ impl EngineRuntime {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
         self.ensure_job_stream_available()?;
+        if matches!(command, SystemCommand::CheckMode) && self.check.phase != CheckPhase::Off {
+            // The engine owns `$C` while a dry run or its exit is in progress.
+            return Err(EngineError::Busy);
+        }
 
         match &command {
             SystemCommand::WriteSetting { .. } => {
@@ -868,7 +983,16 @@ impl EngineRuntime {
                 self.ensure_home_allowed()?;
             }
             SystemCommand::Unlock => {}
-            SystemCommand::Sleep | SystemCommand::CheckMode => self.ensure_idle()?,
+            SystemCommand::Sleep => self.ensure_idle()?,
+            SystemCommand::CheckMode => {
+                // `$C` toggles; the operator may use it to enter or leave
+                // check mode. The engine only owns it while a dry run (or its
+                // exit) is in progress, which is rejected above.
+                let state = self.snapshot.state;
+                if !matches!(state, MachineState::Idle | MachineState::Check) {
+                    return Err(EngineError::NotIdle { state });
+                }
+            }
             SystemCommand::SetBuildInfo(_)
             | SystemCommand::WriteStartupLine { .. }
             | SystemCommand::Reset(_)
@@ -1201,6 +1325,11 @@ impl EngineRuntime {
         self.ensure_ready()?;
         self.ensure_not_pendant()?;
         self.ensure_motion_unlocked()?;
+        if self.check.phase != CheckPhase::Off {
+            // Never start a real job while a `$C` transition is outstanding;
+            // a late toggle could put the controller in check mode mid-run.
+            return Err(EngineError::Busy);
+        }
         if !self.job.has_program() {
             return Err(EngineError::NoProgram);
         }
@@ -1295,8 +1424,20 @@ impl EngineRuntime {
         let now = Instant::now();
         let state = self.snapshot.state;
         let active = self.job.is_active();
+        let check_run = self.job.is_check();
+        if matches!(self.check.phase, CheckPhase::Entering { .. }) && !active {
+            // The check run was still waiting for the controller; cancel the
+            // pending entry and restore the controller instead of starting it.
+            self.check.request_exit(None);
+        }
         if active && self.transport.is_some() && !reset {
-            if state == MachineState::Tool {
+            if check_run {
+                // A dry run has no motion to hold. Stop feeding; `$C` below
+                // restores the controller to Idle.
+                self.streamer.clear();
+                self.streamer.resume();
+                self.current_purpose = None;
+            } else if state == MachineState::Tool {
                 self.send_realtime_command(RealtimeCommand::Stop, true)?;
                 self.streamer.clear();
                 self.streamer.resume();
@@ -1323,6 +1464,7 @@ impl EngineRuntime {
             line,
             reason: JobAbortReason::OperatorStop,
         });
+        self.on_check_job_ended(None);
         if reset && self.transport.is_some() {
             self.execute_realtime(RealtimeCommand::SoftReset)?;
         }
@@ -1434,6 +1576,273 @@ impl EngineRuntime {
         }
     }
 
+    // ------------------------------------------------------------- check mode
+
+    fn execute_start_check_run(&mut self) -> Result<(), EngineError> {
+        self.ensure_ready()?;
+        self.ensure_not_pendant()?;
+        if self.check.phase != CheckPhase::Off {
+            return Err(EngineError::Busy);
+        }
+        if !self.job.has_program() {
+            return Err(EngineError::NoProgram);
+        }
+        if self.job.is_active() {
+            return Err(EngineError::JobState {
+                action: "start a check run",
+                state: self.job.job_state(),
+            });
+        }
+        if !self.streamer.is_idle() || self.current_purpose.is_some() {
+            return Err(EngineError::Busy);
+        }
+
+        let now = Instant::now();
+        let state = self.snapshot.state;
+        match state {
+            MachineState::Check => {
+                // The operator already enabled check mode. The engine did not
+                // toggle it and must not clear it when the run finishes.
+                self.start_check_job(now, false);
+                Ok(())
+            }
+            MachineState::Idle => {
+                self.check.begin_enter(now);
+                self.log_info("Entering controller check mode ($C)");
+                if let Err(error) = self.send_check_toggle(now) {
+                    self.check.reset();
+                    return Err(error);
+                }
+                Ok(())
+            }
+            _ if state.is_locked() => Err(EngineError::MotionBlocked { state }),
+            _ => Err(EngineError::NotIdle { state }),
+        }
+    }
+
+    fn start_check_job(&mut self, now: Instant, entered: bool) {
+        match self.job.start_check(now) {
+            Ok(from) => {
+                self.check.begin_running(entered);
+                self.streamer.resume();
+                self.sync_job_snapshot();
+                let total_lines = self.job.total_lines();
+                self.emit(EngineEvent::CheckStarted { total_lines });
+                self.emit(EngineEvent::JobStarted {
+                    from_line: from,
+                    total_lines,
+                });
+                self.emit_job_progress(now);
+                self.pump_job();
+            }
+            Err(error) => {
+                self.log_error(format!("Could not start the dry run: {error}"));
+                self.emit(EngineEvent::JobError {
+                    line: 0,
+                    code: 0,
+                    message: error.to_string(),
+                });
+                if self.check.entered {
+                    self.check.request_exit(None);
+                } else {
+                    self.check.reset();
+                }
+            }
+        }
+    }
+
+    fn send_check_toggle(&mut self, now: Instant) -> Result<(), EngineError> {
+        let line = SystemCommand::CheckMode.encode()?;
+        self.enqueue_line(&line, LinePurpose::CheckMode)?;
+        self.check.note_toggle_sent(now);
+        Ok(())
+    }
+
+    /// Whether the controller reports check mode.
+    ///
+    /// The state word is authoritative while the controller is in `Check`. A
+    /// controller that ends the program in `Idle` may still carry the `$C`
+    /// flag, so the raw status field is checked as well.
+    fn check_mode_on(&self) -> bool {
+        self.snapshot.state == MachineState::Check
+            || self
+                .last_status
+                .as_ref()
+                .and_then(|status| status.check_mode)
+                == Some(true)
+    }
+
+    /// Handle the status-driven half of the check-mode transitions.
+    fn on_check_status(&mut self, now: Instant) {
+        match self.check.phase {
+            CheckPhase::Off => {}
+            CheckPhase::Entering { .. } => {
+                if self.snapshot.state == MachineState::Check {
+                    self.log_info("Controller entered check mode; starting the dry run");
+                    self.start_check_job(now, true);
+                }
+            }
+            CheckPhase::Running => {
+                // Leaving check mode mid-program would let the next line
+                // move. Stop feeding at once; nothing resumes automatically.
+                if self.job.is_check()
+                    && self.job.is_active()
+                    && !self.check_mode_on()
+                    && !self.job.in_flight_is_program_end()
+                {
+                    let line = self.job.current_line().max(1);
+                    self.log_error("Controller left check mode during the dry run; stopping");
+                    self.emit(EngineEvent::JobError {
+                        line,
+                        code: 0,
+                        message: "controller left check mode during the dry run; stopped feeding"
+                            .into(),
+                    });
+                    self.abort_job(JobAbortReason::ProgramError, true, true);
+                }
+            }
+            CheckPhase::ExitPending { .. } => self.drive_check_exit(now),
+        }
+    }
+
+    /// Fail an entering `$C` that never produced a `Check` status.
+    fn check_enter_timeout(&mut self, now: Instant) {
+        let CheckPhase::Entering { deadline: until } = self.check.phase else {
+            return;
+        };
+        if now < until {
+            return;
+        }
+        if self.snapshot.state == MachineState::Check {
+            self.start_check_job(now, true);
+            return;
+        }
+        self.log_error("The controller did not report Check after $C; no dry run was started");
+        self.emit(EngineEvent::JobError {
+            line: 0,
+            code: 0,
+            message: "controller did not enter check mode ($C)".into(),
+        });
+        self.check.reset();
+        self.shared.set_check_run(self.job.is_check());
+    }
+
+    /// Restore the controller to `Idle` after a dry run.
+    ///
+    /// The exit is driven by observed status, never by a blind double toggle:
+    /// a `$C` is sent only when the engine entered check mode, the streamer is
+    /// free, and the previous toggle (if any) has been acknowledged and
+    /// followed by a fresh status report.
+    fn drive_check_exit(&mut self, now: Instant) {
+        let CheckPhase::ExitPending { elapsed } = self.check.phase else {
+            return;
+        };
+        if !self.check.entered {
+            self.finish_check_exit(elapsed);
+            return;
+        }
+        if self.mpg_active
+            || self.phase != Phase::Ready
+            || self.sleeping
+            || !self.streamer.is_idle()
+            || self.current_purpose.is_some()
+        {
+            return;
+        }
+
+        let state = self.snapshot.state;
+        if self.check.awaiting_ack {
+            if self
+                .check
+                .toggled_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= CHECK_TRANSITION_TIMEOUT)
+                && !self.check.reported
+            {
+                self.check.reported = true;
+                self.log_error(
+                    "Controller did not acknowledge the $C toggle; a reset may be required",
+                );
+                self.emit(EngineEvent::JobError {
+                    line: 0,
+                    code: 0,
+                    message: "controller did not acknowledge the $C toggle; send a reset".into(),
+                });
+            }
+            return;
+        }
+        if let Some(toggled_at) = self.check.toggled_at
+            && !self.last_status_at.is_some_and(|at| at > toggled_at)
+        {
+            // The status in hand may predate the toggle; wait for a fresh one
+            // before deciding that check mode is already off.
+            return;
+        }
+        if state == MachineState::Idle && !self.check_mode_on() {
+            self.finish_check_exit(elapsed);
+            return;
+        }
+        // `$C` is only accepted in Idle or Check. Alarm, Door, Hold, Tool and
+        // motion states need an explicit reset, unlock or cycle start first;
+        // the exit is retried when the controller is Idle or Check again.
+        if !matches!(state, MachineState::Idle | MachineState::Check) {
+            if !self.check.reported {
+                self.check.reported = true;
+                self.log_warn(format!(
+                    "Check mode exit waits for the controller to leave {state}; \
+                     a reset or cycle start may be required"
+                ));
+            }
+            return;
+        }
+        if self.check.toggles >= MAX_CHECK_TOGGLES {
+            if !self.check.reported {
+                self.check.reported = true;
+                self.log_error(
+                    "Controller did not leave check mode after repeated $C toggles; \
+                     a reset may be required",
+                );
+                self.emit(EngineEvent::JobError {
+                    line: 0,
+                    code: 0,
+                    message: "controller did not leave check mode; send a reset".into(),
+                });
+            }
+            return;
+        }
+        if self.check.toggles == 0 {
+            self.log_info("Leaving controller check mode ($C)");
+        }
+        if let Err(error) = self.send_check_toggle(now) {
+            self.check.reported = true;
+            self.log_error(format!("Could not leave controller check mode: {error}"));
+        }
+    }
+
+    fn finish_check_exit(&mut self, elapsed: Option<Duration>) {
+        let was_entered = self.check.entered;
+        self.check.reset();
+        self.shared.set_check_run(self.job.is_check());
+        if was_entered {
+            self.log_info("Controller left check mode; ready for the next command");
+        }
+        if let Some(elapsed) = elapsed {
+            self.emit(EngineEvent::CheckCompleted { elapsed });
+        }
+    }
+
+    /// Schedule the check-mode epilogue when a dry run ends.
+    fn on_check_job_ended(&mut self, elapsed: Option<Duration>) {
+        if !self.job.is_check() {
+            return;
+        }
+        if self.check.entered {
+            self.check.request_exit(elapsed);
+        } else {
+            // The operator owned check mode before this run; leave it as-is.
+            self.finish_check_exit(elapsed);
+        }
+    }
+
     fn abort_job(&mut self, reason: JobAbortReason, interrupt: bool, clear_stream: bool) {
         let now = Instant::now();
         if let Some(line) = self.job.abort(now, interrupt) {
@@ -1447,6 +1856,7 @@ impl EngineRuntime {
             self.sync_job_snapshot();
             self.emit_job_progress(now);
             self.emit(EngineEvent::JobAborted { line, reason });
+            self.on_check_job_ended(None);
         }
     }
 
@@ -1459,6 +1869,7 @@ impl EngineRuntime {
         self.sync_job_snapshot();
         self.emit_job_progress(now);
         self.emit(EngineEvent::JobCompleted { elapsed });
+        self.on_check_job_ended(Some(elapsed));
     }
 
     fn fail_job_controller(&mut self, line: u32, code: u16) {
@@ -1475,6 +1886,7 @@ impl EngineRuntime {
             code,
             message,
         });
+        self.on_check_job_ended(None);
     }
 
     fn fail_job_stream(&mut self, line: u32, error: EngineError) {
@@ -1494,6 +1906,7 @@ impl EngineRuntime {
             line,
             reason: JobAbortReason::ProgramError,
         });
+        self.on_check_job_ended(None);
     }
 
     fn on_job_ack(&mut self) {
@@ -1548,7 +1961,10 @@ impl EngineRuntime {
         {
             return;
         }
-        if !matches!(self.snapshot.state, MachineState::Idle | MachineState::Run) {
+        let state = self.snapshot.state;
+        let state_allows = matches!(state, MachineState::Idle | MachineState::Run)
+            || (state == MachineState::Check && self.job.is_check());
+        if !state_allows {
             return;
         }
         loop {
@@ -1606,6 +2022,7 @@ impl EngineRuntime {
         let mut next = (*self.snapshot).clone();
         self.job.apply_info(&mut next.job);
         self.snapshot = Arc::new(next);
+        self.shared.set_check_run(self.job.is_check());
         self.publish_snapshot();
     }
 
@@ -1634,7 +2051,9 @@ impl EngineRuntime {
     fn ensure_resume_allowed(&self) -> Result<(), EngineError> {
         let state = self.snapshot.state;
         match state {
-            MachineState::Idle | MachineState::Hold | MachineState::Tool => Ok(()),
+            MachineState::Idle | MachineState::Hold | MachineState::Tool | MachineState::Check => {
+                Ok(())
+            }
             _ if state.is_locked() => Err(EngineError::MotionBlocked { state }),
             _ => Err(EngineError::NotIdle { state }),
         }
@@ -1643,6 +2062,9 @@ impl EngineRuntime {
     fn soft_reset(&mut self) -> Result<(), EngineError> {
         self.abort_job(JobAbortReason::SoftReset, false, true);
         self.abort_pending_lines("soft reset");
+        // A soft reset exits controller check mode; there is nothing left to
+        // restore with `$C`.
+        self.check.reset();
         self.parser.reset();
         self.wake_probe_pending = false;
         self.error_latched = false;
@@ -1685,6 +2107,7 @@ impl EngineRuntime {
 
     fn enter_sleep(&mut self) {
         self.abort_job(JobAbortReason::ControllerSleep, false, true);
+        self.check.reset();
         self.sleeping = true;
         self.sleep_on_ack = false;
         self.wake_probe_pending = false;
@@ -2092,6 +2515,7 @@ impl EngineRuntime {
         }
 
         self.update_phase_after_status(now);
+        self.on_check_status(now);
         if self.phase == Phase::Ready && !self.sleeping {
             if self.next_poll_at > deadline(now, self.poll_interval()) {
                 self.next_poll_at = deadline(now, self.poll_interval());
@@ -2158,6 +2582,9 @@ impl EngineRuntime {
             }
             Some(LinePurpose::MdiLine) => self.send_next_mdi_line(),
             Some(LinePurpose::JobLine { .. }) => self.on_job_ack(),
+            Some(LinePurpose::CheckMode) => {
+                self.check.note_ack();
+            }
             Some(LinePurpose::ClearError) => {
                 self.error_latched = false;
                 if self.advance_after_clear {
@@ -2196,7 +2623,7 @@ impl EngineRuntime {
         };
 
         let label = self.error_codes.error_label(code);
-        self.log_error(label);
+        self.log_error(label.clone());
         self.emit(EngineEvent::Error(code));
         self.error_latched = true;
 
@@ -2231,6 +2658,41 @@ impl EngineRuntime {
             Some(LinePurpose::System) => {
                 self.settings_dump_pending = false;
                 self.sleep_on_ack = false;
+            }
+            Some(LinePurpose::CheckMode) => {
+                self.check.note_ack();
+                match self.check.phase {
+                    CheckPhase::Entering { .. } => {
+                        self.log_error(
+                            "The controller rejected check mode; the dry run was not started",
+                        );
+                        self.check.reset();
+                        self.emit(EngineEvent::JobError {
+                            line: 0,
+                            code,
+                            message: label,
+                        });
+                    }
+                    CheckPhase::ExitPending { .. } => {
+                        // Do not toggle blindly: the controller still holds the
+                        // check flag and a reset is the documented escape.
+                        self.check.awaiting_ack = false;
+                        self.check.toggles = MAX_CHECK_TOGGLES;
+                        if !self.check.reported {
+                            self.check.reported = true;
+                            self.log_error(
+                                "The controller rejected leaving check mode; a reset may be required",
+                            );
+                            self.emit(EngineEvent::JobError {
+                                line: 0,
+                                code,
+                                message: "controller rejected leaving check mode; send a reset"
+                                    .into(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
             }
             Some(LinePurpose::JobLine { line, .. }) => {
                 self.fail_job_controller(line, code);

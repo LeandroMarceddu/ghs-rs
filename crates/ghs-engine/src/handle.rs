@@ -63,6 +63,7 @@ pub(crate) struct SharedState {
     optional_stop: AtomicBool,
     single_block: AtomicBool,
     block_delete: AtomicBool,
+    check_run: AtomicBool,
 }
 
 impl SharedState {
@@ -238,6 +239,15 @@ impl SharedState {
         self.block_delete.store(enabled, Ordering::Release);
     }
 
+    /// Whether the loaded program's current or most recent run is a dry run.
+    pub(crate) fn check_run(&self) -> bool {
+        self.check_run.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_check_run(&self, enabled: bool) {
+        self.check_run.store(enabled, Ordering::Release);
+    }
+
     /// Reset the virtual optional-stop, single-block and block-delete flags.
     pub(crate) fn reset_toggles(&self) {
         self.optional_stop.store(false, Ordering::Release);
@@ -250,6 +260,7 @@ impl SharedState {
     pub(crate) fn reset(&self) {
         *self.telemetry() = Telemetry::default();
         self.reset_toggles();
+        self.check_run.store(false, Ordering::Release);
         self.connected.store(false, Ordering::Release);
         self.ready.store(false, Ordering::Release);
     }
@@ -434,6 +445,21 @@ impl EngineHandle {
     #[must_use]
     pub fn block_delete(&self) -> bool {
         self.shared.block_delete()
+    }
+
+    /// Whether the loaded program's current or most recent run is a dry run.
+    ///
+    /// Set when [`Command::StartCheckRun`] starts streaming in controller
+    /// check mode, and kept after the run completes or is stopped so the UI can
+    /// label the result. It is cleared when [`Command::LoadProgram`] installs a
+    /// new program and when a normal [`Command::StartProgram`] starts.
+    ///
+    /// This is the engine-level companion to [`EngineEvent::CheckStarted`] and
+    /// [`EngineEvent::CheckCompleted`]; the machine snapshot is unchanged so
+    /// existing consumers keep working.
+    #[must_use]
+    pub fn check_run(&self) -> bool {
+        self.shared.check_run()
     }
 
     /// Last raw status report, including fields that are not part of

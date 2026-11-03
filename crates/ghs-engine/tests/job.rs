@@ -9,9 +9,12 @@ use crossbeam_channel::RecvTimeoutError;
 use ghs_engine::{
     Command, ConnectTarget, Engine, EngineConfig, EngineError, EngineEvent, EngineHandle,
     JobAbortReason, JobPauseReason, JobState, JogCommand, MachineSnapshot, MachineState, Position,
-    RealtimeCommand,
+    RealtimeCommand, SystemCommand,
 };
-use support::{Control, ScriptedTransport, standard_script, standard_script_with_opt, wait_until};
+use support::{
+    Control, IDLE_STATUS, ScriptedTransport, standard_script, standard_script_with_opt,
+    standard_script_with_options, wait_until,
+};
 
 fn config() -> EngineConfig {
     EngineConfig {
@@ -822,7 +825,7 @@ fn job_streaming_never_exceeds_the_reported_rx_buffer() {
 }
 
 #[test]
-fn start_from_line_and_check_mode_are_explicitly_deferred() {
+fn start_from_line_is_explicitly_deferred() {
     let (handle, _control) = connected_engine(standard_script);
     load(&handle, "G0 X1\nG0 X2\nM2\n");
     let error = handle
@@ -832,10 +835,6 @@ fn start_from_line_and_check_mode_are_explicitly_deferred() {
         matches!(error, EngineError::Unsupported(_)),
         "unexpected error: {error:?}"
     );
-    let error = handle
-        .send(Command::StartCheckRun)
-        .expect_err("check mode is deferred");
-    assert!(matches!(error, EngineError::Unsupported(_)));
     assert_eq!(handle.snapshot().job.state, JobState::Idle);
     handle.shutdown();
 }
@@ -868,5 +867,364 @@ fn manual_realtime_feed_hold_and_cycle_start_drive_the_job() {
         matches!(event, EngineEvent::JobCompleted { .. })
     });
     assert_program_order(&control, &lines);
+    handle.shutdown();
+}
+
+/// Status used while the scripted controller is in check mode.
+const CHECK_STATUS: &str = "<Check|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|Bf:15,1024|FS:0,0|Pn:|WCS:G54|Ov:100,100,100|A:|$C:1>";
+
+fn start_check(handle: &EngineHandle) {
+    handle
+        .send(Command::StartCheckRun)
+        .expect("start check run");
+}
+
+#[test]
+fn check_run_waits_for_check_status_then_streams_and_returns_idle() {
+    let (handle, control) = connected_engine(standard_script);
+    let lines = ["G0 X1", "G0 X2", "M2"];
+    load(&handle, &lines.join("\n"));
+
+    control.expect_line("$C", &["ok"]);
+    for line in lines {
+        control.expect_line(line, &["ok"]);
+    }
+    // The exit `$C` also delivers the Idle status that completes the exit.
+    control.expect_line("$C", &["ok", IDLE_STATUS]);
+    start_check(&handle);
+    assert!(
+        wait_until(
+            || control.sent_lines().iter().any(|line| line == "$C"),
+            Duration::from_secs(1)
+        ),
+        "the entering $C was not sent"
+    );
+    assert_eq!(handle.snapshot().job.state, JobState::Idle);
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        !control.sent_lines().iter().any(|line| line == "G0 X1"),
+        "no program line may be sent before the controller reports Check"
+    );
+
+    control.set_status(CHECK_STATUS);
+    let started = wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::CheckStarted { .. })
+    });
+    assert_eq!(started, EngineEvent::CheckStarted { total_lines: 3 });
+    assert!(
+        wait_until(|| handle.check_run(), Duration::from_secs(1)),
+        "the engine must label the run as a dry run"
+    );
+
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::JobCompleted { .. })
+    });
+    let completed = wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::CheckCompleted { .. })
+    });
+    assert!(matches!(completed, EngineEvent::CheckCompleted { .. }));
+
+    // Future status polls must not put the controller back in Check.
+    control.set_status(support::IDLE_STATUS);
+    assert!(
+        wait_until(
+            || handle.snapshot().state == MachineState::Idle,
+            Duration::from_secs(1)
+        ),
+        "the controller did not return to Idle: {:?}",
+        handle.snapshot().state
+    );
+    assert_eq!(
+        control
+            .sent_lines()
+            .iter()
+            .filter(|line| line.as_str() == "$C")
+            .count(),
+        2,
+        "exactly one $C enters and one exits check mode"
+    );
+    assert_program_order(&control, &lines);
+    assert!(!control.sent_bytes().contains(&0x81));
+    assert_eq!(handle.snapshot().job.state, JobState::Completed);
+    assert!(handle.check_run());
+    assert!(
+        handle
+            .last_status()
+            .is_none_or(|status| status.check_mode != Some(true)),
+        "check mode must be off after the run"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn check_run_requires_a_loaded_program_and_an_idle_machine() {
+    let (handle, control) = connected_engine(standard_script);
+    let error = handle
+        .send(Command::StartCheckRun)
+        .expect_err("no program is loaded");
+    assert!(matches!(error, EngineError::NoProgram), "{error:?}");
+    assert!(!control.sent_lines().iter().any(|line| line == "$C"));
+
+    load(&handle, "G0 X1\nM2\n");
+    control.set_status("<Alarm:1|MPos:0.000,0.000,0.000>");
+    assert!(wait_until(
+        || handle.snapshot().state == MachineState::Alarm,
+        Duration::from_secs(1)
+    ));
+    let error = handle
+        .send(Command::StartCheckRun)
+        .expect_err("alarm blocks a check run");
+    assert!(
+        matches!(
+            error,
+            EngineError::MotionBlocked {
+                state: MachineState::Alarm
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(!control.sent_lines().iter().any(|line| line == "$C"));
+    handle.shutdown();
+}
+
+#[test]
+fn check_run_is_refused_while_a_job_is_active() {
+    let (handle, control) = connected_engine(standard_script);
+    let lines = ["G0 X1", "G0 X2", "M2"];
+    control.expect_line(lines[0], &[]);
+    load(&handle, &lines.join("\n"));
+    start(&handle);
+    assert!(
+        wait_until(
+            || control.sent_lines().iter().any(|line| line == lines[0]),
+            Duration::from_secs(1)
+        ),
+        "the normal job did not start"
+    );
+    let error = handle
+        .send(Command::StartCheckRun)
+        .expect_err("a running job blocks a check run");
+    assert!(
+        matches!(error, EngineError::JobState { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(!control.sent_lines().iter().any(|line| line == "$C"));
+    handle
+        .send(Command::StopProgram { reset: false })
+        .expect("stop the normal job");
+    handle.shutdown();
+}
+
+#[test]
+fn stopping_while_entering_check_mode_restores_idle() {
+    let (handle, control) = connected_engine(standard_script);
+    load(&handle, "G0 X1\nM2\n");
+
+    // Hold the entering `$C` without an acknowledgement so the stop happens
+    // while the engine is still waiting for the controller.
+    control.expect_line("$C", &[]);
+    control.expect_line("$C", &["ok", IDLE_STATUS]);
+    start_check(&handle);
+    assert!(wait_until(
+        || control.sent_lines().iter().any(|line| line == "$C"),
+        Duration::from_secs(1)
+    ));
+    handle
+        .send(Command::StopProgram { reset: false })
+        .expect("stop before the check transition");
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::JobAborted { .. })
+    });
+
+    // The controller acknowledges the entry and reports Check; the engine
+    // must now leave check mode instead of starting the program late.
+    control.set_status(CHECK_STATUS);
+    control.push_line("ok");
+    assert!(wait_until(
+        || control
+            .sent_lines()
+            .iter()
+            .filter(|line| line.as_str() == "$C")
+            .count()
+            == 2,
+        Duration::from_secs(2)
+    ));
+    control.set_status(IDLE_STATUS);
+    assert!(
+        wait_until(
+            || handle.snapshot().state == MachineState::Idle,
+            Duration::from_secs(1)
+        ),
+        "the cancelled entry left the controller in {:?}",
+        handle.snapshot().state
+    );
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(
+        !control.sent_lines().iter().any(|line| line == "G0 X1"),
+        "a cancelled check entry must not stream the program"
+    );
+    assert_eq!(handle.snapshot().job.state, JobState::Aborted);
+    handle.shutdown();
+}
+
+#[test]
+fn a_controller_error_during_check_still_leaves_check_mode() {
+    let (handle, control) = connected_engine(standard_script);
+    let lines = ["G0 X1", "G0 X2", "M2"];
+    load(&handle, &lines.join("\n"));
+
+    control.expect_line("$C", &["ok"]);
+    control.expect_line(lines[0], &["error:20"]);
+    // The sticky error is cleared with a blank line before `$C` is sent.
+    control.expect_line("", &["ok"]);
+    control.expect_line("$C", &["ok", IDLE_STATUS]);
+    start_check(&handle);
+    assert!(wait_until(
+        || control.sent_lines().iter().any(|line| line == "$C"),
+        Duration::from_secs(1)
+    ));
+    control.set_status(CHECK_STATUS);
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::CheckStarted { .. })
+    });
+    let error = wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::JobError { .. })
+    });
+    assert!(matches!(error, EngineEvent::JobError { code: 20, .. }));
+    assert!(wait_until(
+        || control
+            .sent_lines()
+            .iter()
+            .filter(|line| line.as_str() == "$C")
+            .count()
+            == 2,
+        Duration::from_secs(2)
+    ));
+    control.set_status(IDLE_STATUS);
+    assert!(wait_until(
+        || handle.snapshot().state == MachineState::Idle,
+        Duration::from_secs(1)
+    ));
+    assert_eq!(handle.snapshot().job.state, JobState::Aborted);
+    assert!(!control.sent_lines().iter().any(|line| line == lines[1]));
+    assert!(!control.sent_bytes().contains(&0x81));
+    handle.shutdown();
+}
+
+#[test]
+fn operator_owned_check_mode_is_not_toggled_by_the_engine() {
+    let (handle, control) = connected_engine_with(config(), |control| {
+        standard_script_with_options(
+            control,
+            "[OPT:VNMSL+2,64,1024,3,0]",
+            "[NEWOPT:ENUMS,RT+,HOME,ES,EXPR,TC,SED]",
+            CHECK_STATUS,
+        );
+    });
+    let lines = ["G0 X1", "M2"];
+    load(&handle, &lines.join("\n"));
+    for line in lines {
+        control.expect_line(line, &["ok"]);
+    }
+    start_check(&handle);
+
+    let started = wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::CheckStarted { .. })
+    });
+    assert_eq!(started, EngineEvent::CheckStarted { total_lines: 2 });
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::JobCompleted { .. })
+    });
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::CheckCompleted { .. })
+    });
+    assert!(
+        !control.sent_lines().iter().any(|line| line == "$C"),
+        "the engine must not toggle a check mode the operator enabled"
+    );
+    assert_eq!(handle.snapshot().state, MachineState::Check);
+    assert!(handle.check_run());
+
+    // The operator can still leave the mode they entered.
+    control.expect_line("$C", &["ok", IDLE_STATUS]);
+    handle
+        .send(Command::System(SystemCommand::CheckMode))
+        .expect("operator exits check mode");
+    control.set_status(IDLE_STATUS);
+    assert!(
+        wait_until(
+            || handle.snapshot().state == MachineState::Idle,
+            Duration::from_secs(1)
+        ),
+        "the operator could not leave check mode"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn stopping_a_check_run_exits_check_mode_once_without_moving() {
+    let (handle, control) = connected_engine(standard_script);
+    let lines = ["G0 X1", "G0 X2", "M2"];
+    load(&handle, &lines.join("\n"));
+
+    control.expect_line("$C", &["ok"]);
+    // Hold the first line without an acknowledgement so the job is in flight.
+    control.expect_line(lines[0], &[]);
+    control.expect_line("$C", &["ok", IDLE_STATUS]);
+    start_check(&handle);
+    assert!(wait_until(
+        || control.sent_lines().iter().any(|line| line == "$C"),
+        Duration::from_secs(1)
+    ));
+    control.set_status(CHECK_STATUS);
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::CheckStarted { .. })
+    });
+
+    assert!(wait_until(
+        || control.sent_lines().iter().any(|line| line == lines[0]),
+        Duration::from_secs(1)
+    ));
+    handle
+        .send(Command::StopProgram { reset: false })
+        .expect("stop the check run");
+    wait_event(&handle, Duration::from_secs(2), |event| {
+        matches!(event, EngineEvent::JobAborted { .. })
+    });
+
+    assert!(wait_until(
+        || control
+            .sent_lines()
+            .iter()
+            .filter(|line| line.as_str() == "$C")
+            .count()
+            == 2,
+        Duration::from_secs(2)
+    ));
+    let exit_count = control
+        .sent_lines()
+        .iter()
+        .filter(|line| line.as_str() == "$C")
+        .count();
+    assert_eq!(exit_count, 2);
+    control.set_status(IDLE_STATUS);
+    assert!(wait_until(
+        || handle.snapshot().state == MachineState::Idle,
+        Duration::from_secs(1)
+    ));
+    std::thread::sleep(Duration::from_millis(80));
+    assert_eq!(
+        control
+            .sent_lines()
+            .iter()
+            .filter(|line| line.as_str() == "$C")
+            .count(),
+        2,
+        "the exit $C must not be repeated"
+    );
+    assert!(!control.sent_bytes().contains(&0x81));
+    assert!(!control.sent_lines().iter().any(|line| line == lines[1]));
+    assert_eq!(handle.snapshot().job.state, JobState::Aborted);
+    assert!(handle.check_run(), "the stopped run is still a dry run");
     handle.shutdown();
 }

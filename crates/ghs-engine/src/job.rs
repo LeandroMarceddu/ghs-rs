@@ -139,6 +139,7 @@ pub(crate) struct JobRunner {
     block_delete: bool,
     active_tool: u32,
     tool_change: Option<PendingToolChange>,
+    check: bool,
 }
 
 impl JobRunner {
@@ -235,6 +236,7 @@ impl JobRunner {
         self.last_breakpoint_hit = None;
         self.active_tool = 0;
         self.tool_change = None;
+        self.check = false;
         Ok(program)
     }
 
@@ -287,6 +289,10 @@ impl JobRunner {
     }
 
     /// Copies job bookkeeping into a machine snapshot.
+    ///
+    /// `JobInfo` (from `ghs-core`) has no dry-run field yet, so a check run is
+    /// reported through [`crate::EngineHandle::check_run`] and the
+    /// `CheckStarted`/`CheckCompleted` events instead of the snapshot.
     pub(crate) fn apply_info(&self, info: &mut JobInfo) {
         if matches!(self.phase(), Phase::Empty) {
             return;
@@ -415,7 +421,41 @@ impl JobRunner {
         self.last_breakpoint_hit = None;
         self.active_tool = 0;
         self.tool_change = None;
+        self.check = false;
         Ok(1)
+    }
+
+    /// Starts the loaded program as a dry run (`$C`).
+    ///
+    /// The runner itself does not send `$C`; the engine enters check mode
+    /// first and only then calls this method. The run behaves exactly like
+    /// [`JobRunner::start`] for progress, pause and stop, but it is marked as
+    /// a check run until the next load or normal start.
+    pub(crate) fn start_check(&mut self, now: Instant) -> Result<u32, EngineError> {
+        if !self.has_program() {
+            return Err(EngineError::NoProgram);
+        }
+        if !matches!(
+            self.phase(),
+            Phase::Loaded | Phase::Completed | Phase::Aborted | Phase::Interrupted
+        ) {
+            return Err(EngineError::JobState {
+                action: "start a check run",
+                state: self.job_state(),
+            });
+        }
+        let from = self.start(now)?;
+        self.check = true;
+        Ok(from)
+    }
+
+    /// Whether the loaded program's current or most recent run is a check run.
+    ///
+    /// Set by [`JobRunner::start_check`] and cleared by a new load or a normal
+    /// [`JobRunner::start`]. The flag survives completion and abort so the UI
+    /// can label the result of a dry run.
+    pub(crate) const fn is_check(&self) -> bool {
+        self.check
     }
 
     /// Pauses a running job.
@@ -632,6 +672,15 @@ impl JobRunner {
             || (in_flight.meta.is_optional_stop() && self.optional_stop)
     }
 
+    /// Whether the in-flight block is `M2` or `M30`.
+    ///
+    /// A check run uses this to accept a controller that returns to `Idle` at
+    /// program end while the final block is still unacknowledged.
+    pub(crate) fn in_flight_is_program_end(&self) -> bool {
+        self.in_flight
+            .is_some_and(|in_flight| in_flight.meta.is_program_end())
+    }
+
     /// Marks the pending tool change acknowledged with `0xA3`.
     pub(crate) fn acknowledge_tool_change(&mut self) -> bool {
         let Some(pending) = self.tool_change.as_mut() else {
@@ -770,6 +819,25 @@ mod tests {
         assert_eq!(ack.meta, meta);
         assert_eq!(runner.completed_lines(), 1);
         assert_eq!(runner.cursor(), 1);
+    }
+
+    #[test]
+    fn check_run_is_flagged_and_cleared_by_a_normal_start() {
+        let mut runner = JobRunner::new();
+        load(&mut runner, "G0 X1\nM2\n");
+        assert!(!runner.is_check());
+        runner.start_check(Instant::now()).expect("check start");
+        assert!(runner.is_check());
+        assert!(runner.is_running());
+        runner.complete(Instant::now()).expect("complete");
+        assert!(runner.is_check(), "a finished dry run stays labelled");
+
+        runner.start(Instant::now()).expect("normal restart");
+        assert!(!runner.is_check());
+
+        runner.complete(Instant::now()).expect("complete");
+        load(&mut runner, "G0 X2\nM2\n");
+        assert!(!runner.is_check(), "a new program is not a dry run");
     }
 
     #[test]
