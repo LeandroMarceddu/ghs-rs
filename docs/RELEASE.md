@@ -2,8 +2,8 @@
 
 This is the release runbook for ghs-rs. It covers the three desktop platforms
 built by [`.github/workflows/release.yml`](../.github/workflows/release.yml):
-Linux x86_64, Windows x86_64, and macOS (the archive name records the runner
-architecture).
+Linux x86_64 (`.tar.gz`, `.deb`, and `.AppImage`), Windows x86_64, and macOS
+(the archive name records the runner architecture).
 
 The workflow builds and packages the app, then opens a **draft** GitHub
 Release. It does not sign, notarize, test on hardware, or publish anything by
@@ -27,11 +27,11 @@ whether to publish.
 - [ ] Refresh the lock file with `cargo check --workspace`, then commit
       `Cargo.toml` and `Cargo.lock` in the release commit.
 - [ ] Confirm the tag equals the workspace version with a leading `v`
-      (`0.1.0` -> `v0.1.0`). The workflow accepts
+      (`0.5.0` -> `v0.5.0`). The workflow accepts
       `vMAJOR.MINOR[.PATCH][-pre]` and rejects anything else.
 - [ ] Create an annotated tag on the exact commit that passed CI:
 
-      git tag -a v0.1.0 -m "ghs-rs v0.1.0"
+      git tag -a v0.5.0 -m "ghs-rs v0.5.0"
 
 - [ ] Never move, force-push, or reuse a published tag. If the tag is wrong and
       nothing has been published or downloaded, delete it and start over.
@@ -114,63 +114,102 @@ that settings writes remain idle-only. These are non-negotiable rules in
       GPUI Kit.
 - [ ] Review new dependencies for license compatibility; `cargo deny check
       licenses` is the automated check when available.
-- [ ] `packaging/README.md` and `packaging/linux/ghs-rs.desktop` are current.
+- [ ] `packaging/README.md`, `packaging/linux/ghs-rs.desktop`, and
+      `packaging/linux/ghs-rs.svg` are current.
 - [ ] Validate the desktop entry:
 
       desktop-file-validate packaging/linux/ghs-rs.desktop
 
 - [ ] The Linux archive includes `ghs-app`, `README.md`, both licenses,
-      `NOTICE`, `PACKAGING.md`, and `ghs-rs.desktop`.
+      `NOTICE`, `PACKAGING.md`, `ghs-rs.desktop`, and `ghs-rs.svg`.
+- [ ] The Debian package installs `usr/bin/ghs-app`, the desktop entry and
+      icon, and the README, licenses, NOTICE, copyright, and changelog under
+      `usr/share/doc/ghs-rs/`. Check `ar t` reports `debian-binary`,
+      `control.tar.gz`, and `data.tar.gz` when `dpkg-deb` is unavailable.
+- [ ] The AppImage contains `AppRun`, a root `ghs-rs.desktop` and `ghs-rs.svg`,
+      a relative `.DirIcon` symlink, and the same documentation under
+      `usr/share/doc/ghs-rs/`.
 
 ## 7. Run the release workflow
 
-- [ ] Push the tag: `git push origin v0.1.0`.
+- [ ] Push the tag: `git push origin v0.5.0`.
 - [ ] Alternatively, open Actions -> `Release` -> `Run workflow` from `main`
       and enter the existing tag in the `tag` input. The workflow does not
       create tags.
-- [ ] Watch the jobs: `Resolve release tag`, the three `Package (<os>)`
-      matrix jobs, and `Draft GitHub Release`.
-- [ ] The `Package` jobs run `cargo build --release -p ghs-app`, list the
-      archive contents in the log, and upload one artifact each.
-- [ ] The final job verifies that exactly one Linux, one Windows, and one macOS
-      archive exist, writes `SHA256SUMS.txt`, and creates a **draft** release.
+- [ ] Watch the jobs: `Resolve release tag`, `Package (Linux x86_64)`,
+      `Package (Windows x86_64)`, `Package (macOS)`, and
+      `Draft GitHub Release`.
+- [ ] The Linux job runs `cargo build --release -p ghs-app`, then
+      `packaging/linux/build-deb.sh` and
+      `packaging/linux/build-appimage.sh`, and logs the tar, `ar t` members,
+      and AppImage layout. It uploads the tar.gz, `.deb`, and `.AppImage` as
+      one artifact.
+- [ ] The Windows job builds the zip; the macOS job builds `ghs-rs.app`, tars
+      the bundle, and uploads one archive.
+- [ ] The AppImage build downloads appimagetool 1.9.1 (checksum-pinned) and its
+      type 2 runtime, so the Linux job needs network access to GitHub. It uses
+      `--appimage-extract-and-run`, so FUSE is not required on the runner.
+- [ ] The final job verifies exactly five assets (Linux tar.gz, `.deb`, and
+      `.AppImage`, the Windows zip, and one macOS tar.gz), writes
+      `SHA256SUMS.txt`, and creates a **draft** release.
 - [ ] If a job fails, fix the cause on a branch and re-run. Do not publish a
       partial release.
 
 ## 8. Artifact inspection
 
-Expected assets for tag `v0.1.0`. All archives contain `README.md`,
+Expected assets for tag `v0.5.0`. The tar.gz archives contain `README.md`,
 `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE`, and `PACKAGING.md`; the table lists
 only the differences.
 
-| Platform | Asset | Binary | Extra |
-|---|---|---|---|
-| Linux x86_64 | `ghs-rs-v0.1.0-linux-x86_64.tar.gz` | `ghs-app` | `ghs-rs.desktop` |
-| Windows x86_64 | `ghs-rs-v0.1.0-windows-x86_64.zip` | `ghs-app.exe` | none |
-| macOS | `ghs-rs-v0.1.0-macos-<arch>.tar.gz` | `ghs-app` | none |
+| Platform | Asset | Contents |
+|---|---|---|
+| Linux x86_64 | `ghs-rs-v0.5.0-linux-x86_64.tar.gz` | `ghs-app`, `ghs-rs.desktop`, `ghs-rs.svg` |
+| Linux x86_64 | `ghs-rs_0.5.0_amd64.deb` | `usr/bin/ghs-app`, desktop entry and icon, docs |
+| Linux x86_64 | `ghs-rs-v0.5.0-x86_64.AppImage` | AppDir payload plus `AppRun` |
+| Windows x86_64 | `ghs-rs-v0.5.0-windows-x86_64.zip` | `ghs-app.exe` |
+| macOS | `ghs-rs-v0.5.0-macos-<arch>.tar.gz` | `ghs-rs.app` bundle |
 
 - [ ] Download every asset from the draft release, not from a local build.
-- [ ] List each archive and confirm the layout above. The archive must unpack
-      to one top-level directory named after the archive.
+- [ ] List each archive and confirm the layout above. The tar.gz archives must
+      unpack to one top-level directory named after the archive; the `.deb` and
+      `.AppImage` are single files.
 - [ ] Confirm there are no stray files: no `target/` tree, no `.pdb`, no test
       binaries, no local config.
 - [ ] Linux: `file ghs-app` reports an x86-64 ELF executable; it starts on a
       desktop with X11/Wayland and Vulkan, and the desktop entry starts the
       same binary via `Exec=ghs-app`.
+- [ ] Linux `.deb`: `ar t` reports exactly `debian-binary`, `control.tar.gz`,
+      and `data.tar.gz`. On a disposable VM or container,
+      `sudo apt install ./ghs-rs_0.5.0_amd64.deb` installs `/usr/bin/ghs-app`,
+      the desktop entry, and the icon; `sudo apt remove ghs-rs` removes them.
+      `sudo dpkg -i ghs-rs_0.5.0_amd64.deb` plus `sudo apt-get install -f` is
+      the fallback when dependencies are missing. If `dpkg` is unavailable,
+      record that the package was only structurally validated.
+- [ ] Linux `.AppImage`: after `chmod +x`, running
+      `./ghs-rs-v0.5.0-x86_64.AppImage --appimage-extract` works without
+      FUSE. The extracted `.DirIcon` is a relative symlink to `ghs-rs.svg`;
+      the root desktop entry and icon exist; `usr/bin/ghs-app` is mode 755;
+      `desktop-file-validate` passes. Run it on a host without `libfuse2`
+      using `--appimage-extract-and-run`.
 - [ ] Windows: `Get-AuthenticodeSignature` reports `NotSigned` (expected), and
       the executable starts on a clean VM.
-- [ ] macOS: `codesign -dv ghs-app` reports an unsigned or ad-hoc binary,
-      `spctl -a -vv ghs-app` rejects it (expected), and it starts after the
-      per-file quarantine removal described in `packaging/README.md`.
+- [ ] macOS: the tar contains `ghs-rs.app` with `Contents/MacOS/ghs-app`,
+      `Contents/Info.plist` (CFBundleName `grblHAL Sender`, identifier
+      `org.ghs-rs.sender`), and licenses/NOTICE in `Contents/Resources/`.
+      `codesign -dv ghs-rs.app` reports that the bundle is not signed, and
+      `spctl -a -vv ghs-rs.app` rejects it (expected); it starts after the
+      per-app quarantine removal described in `packaging/README.md`.
 - [ ] Each binary starts against the simulator, shows the connection panel,
       and keeps the stop/reset control visible.
-- [ ] Re-check the archive names against the tag. A mismatch means the wrong
-      ref was built; delete the draft and fix it.
+- [ ] Re-check the asset names against the tag. A mismatch means the wrong ref
+      was built; delete the draft and fix it.
 
 ## 9. Checksums
 
-- [ ] The release job writes `SHA256SUMS.txt` next to the archives.
-- [ ] Download the archives and the checksum file into one directory, then run:
+- [ ] The release job writes `SHA256SUMS.txt` next to the artifacts. It covers
+      the Linux tar.gz, `.deb`, and `.AppImage`, the Windows zip, and the macOS
+      tar.gz.
+- [ ] Download the assets and the checksum file into one directory, then run:
 
       sha256sum -c SHA256SUMS.txt
 
@@ -187,16 +226,17 @@ The workflow uses only `GITHUB_TOKEN` and does no signing. Be explicit about
 this in the release notes:
 
 - macOS builds are not code-signed or notarized. Gatekeeper blocks the first
-  launch until the user allows that single file.
+  launch of `ghs-rs.app` until the user allows that app.
 - Windows builds have no Authenticode signature. SmartScreen warns on first
   launch.
-- Linux archives have no signature and no distro package. Users must verify the
-  SHA-256 checksum themselves.
+- Linux assets have no signature. The `.deb` is not from a signed repository,
+  and the `.AppImage` has no embedded signature or update information. Users
+  must verify the SHA-256 checksum themselves.
 
 Never tell users to disable Gatekeeper or SmartScreen system-wide; only
-per-file overrides are acceptable. Code signing, notarization, and an update
-channel are follow-ups that need maintainer certificates and managed secrets,
-which are deliberately out of scope for this workflow.
+per-file or per-app overrides are acceptable. Code signing, notarization, and an
+update channel are follow-ups that need maintainer certificates and managed
+secrets, which are deliberately out of scope for this workflow.
 
 ## 11. Hardware validation gate
 
@@ -217,7 +257,7 @@ grblHAL `1.1f.20240604`:
 
 If any item fails, stop. Do not publish that build as validated; fix the
 problem, cut a new patch tag, and repeat the whole gate. Record the controller
-`$I+` response and the archive SHA-256 in the release record, because a later
+`$I+` response and the asset SHA-256 in the release record, because a later
 rebuild from the same tag is not the same artifact.
 
 A release that has not passed this checklist must say so in the release notes.
@@ -227,7 +267,7 @@ simulator-only previews.
 ## 12. Publish
 
 - [ ] The draft has the right tag, target commit, title, and notes.
-- [ ] All three archives and `SHA256SUMS.txt` are attached.
+- [ ] All five assets and `SHA256SUMS.txt` are attached.
 - [ ] The notes state the hardware status and the signing caveat.
 - [ ] Mark it pre-release for `-rc`/`-beta` tags or while the hardware gate is
       open.
@@ -269,6 +309,8 @@ Copy this table into the release issue, the draft notes, or the maintenance log.
 | CI run URL | |
 | Release run URL | |
 | `ghs-rs-*-linux-x86_64.tar.gz` SHA-256 | |
+| `ghs-rs_*_amd64.deb` SHA-256 | |
+| `ghs-rs-*-x86_64.AppImage` SHA-256 | |
 | `ghs-rs-*-windows-x86_64.zip` SHA-256 | |
 | `ghs-rs-*-macos-<arch>.tar.gz` SHA-256 | |
 | Simulator scenarios | pass / fail |

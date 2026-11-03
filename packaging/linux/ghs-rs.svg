@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="grblHAL Sender">
+  <rect width="256" height="256" rx="56" fill="#111827"/>
+  <path d="M180 96a64 64 0 1 0 8 48h-52" fill="none" stroke="#f9fafb" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="190" cy="70" r="14" fill="#38bdf8"/>
+</svg>

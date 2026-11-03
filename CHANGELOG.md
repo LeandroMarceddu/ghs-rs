@@ -6,14 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ghs-rs is pre-1.0: every version before 1.0.0 is pre-alpha, may change without
 notice, and carries no compatibility guarantee. Version numbers will follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0.0 onward.
-Until a release is tagged, changes stay under `Unreleased`; a version section
-is added only when that release is cut, with its release date. No released
-version is recorded yet.
+Before 0.5.0 there was no tagged release; changes now live under `Unreleased`
+until the next release is cut.
 
 ## [Unreleased]
 
-This initial entry summarizes the whole pre-alpha tree; no earlier release
-section exists to diff against.
+No changes yet after the first pre-release.
+
+## [0.5.0] - 2026-11-03
+
+First pre-release. It summarizes the whole tree up to this point; no earlier
+release section exists to diff against.
 
 ### Added
 

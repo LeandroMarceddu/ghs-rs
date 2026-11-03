@@ -1,7 +1,8 @@
 name: Release
 
-# Tag pushes and manual runs build the three desktop archives and attach them to
-# a DRAFT GitHub Release. Nothing is signed, notarized, or published
+# Tag pushes and manual runs build the three desktop releases and attach them
+# to a DRAFT GitHub Release: a Linux tar.gz, .deb and AppImage, a Windows zip,
+# and a macOS .app inside a tar.gz. Nothing is signed, notarized, or published
 # automatically; see docs/RELEASE.md for the checklist and the hardware gate.
 
 "on":
@@ -11,7 +12,7 @@ name: Release
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to build, for example v0.1.0"
+        description: "Existing release tag to build, for example v0.5.0"
         required: false
         type: string
 
@@ -50,14 +51,10 @@ jobs:
           echo "Releasing $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Package (${{ matrix.os }})
+  linux:
+    name: Package (Linux x86_64)
     needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - name: Check out release tag
         uses: actions/checkout@v7
@@ -72,7 +69,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install Linux GPUI dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -80,14 +76,13 @@ jobs:
             libfontconfig1-dev libfreetype6-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
-            libxcb-xfixes0-dev libvulkan1
+            libxcb-xfixes0-dev libvulkan1 desktop-file-utils
 
       - name: Build release binary
         run: cargo build --release -p ghs-app
 
-      - name: Package archive (Linux, macOS)
-        id: package_unix
-        if: runner.os != 'Windows'
+      - name: Package Linux archive
+        id: package
         shell: bash
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -102,34 +97,84 @@ jobs:
               exit 1
               ;;
           esac
-          case "$RUNNER_OS" in
-            Linux) platform="linux-${arch}" ;;
-            macOS) platform="macos-${arch}" ;;
-            *)
-              echo "::error::Unsupported runner OS: $RUNNER_OS"
-              exit 1
-              ;;
-          esac
-          name="ghs-rs-${TAG}-${platform}"
+          name="ghs-rs-${TAG}-linux-${arch}"
           stage="dist/${name}"
           mkdir -p "$stage"
-          cp target/release/ghs-app "$stage/ghs-app"
-          cp README.md LICENSE-APACHE LICENSE-MIT NOTICE "$stage/"
-          cp packaging/README.md "$stage/PACKAGING.md"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            cp packaging/linux/ghs-rs.desktop "$stage/ghs-rs.desktop"
-          fi
+          install -m 0755 target/release/ghs-app "$stage/ghs-app"
+          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT NOTICE "$stage/"
+          install -m 0644 packaging/README.md "$stage/PACKAGING.md"
+          install -m 0644 packaging/linux/ghs-rs.desktop "$stage/ghs-rs.desktop"
+          install -m 0644 packaging/linux/ghs-rs.svg "$stage/ghs-rs.svg"
           tar -czf "dist/${name}.tar.gz" -C dist "$name"
-          {
-            echo "name=${name}"
-            echo "archive=dist/${name}.tar.gz"
-          } >> "$GITHUB_OUTPUT"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           ls -l "dist/${name}.tar.gz"
           tar -tzf "dist/${name}.tar.gz" | sort
 
+      - name: Build Debian package
+        id: deb
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          packaging/linux/build-deb.sh target/release/ghs-app "$TAG" "$(uname -m)" dist
+          shopt -s nullglob
+          debs=(dist/ghs-rs_*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one .deb, found ${#debs[@]}"
+            exit 1
+          fi
+          echo "deb=${debs[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Build AppImage
+        id: appimage
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          packaging/linux/build-appimage.sh target/release/ghs-app "$TAG" "$(uname -m)" dist
+          shopt -s nullglob
+          appimages=(dist/ghs-rs-*.AppImage)
+          if [ "${#appimages[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one .AppImage, found ${#appimages[@]}"
+            exit 1
+          fi
+          echo "appimage=${appimages[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghs-rs-${{ needs.prepare.outputs.tag }}-linux
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.deb.outputs.deb }}
+            ${{ steps.appimage.outputs.appimage }}
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Package (Windows x86_64)
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p ghs-app
+
       - name: Package archive (Windows)
-        id: package_windows
-        if: runner.os == 'Windows'
+        id: package
         shell: pwsh
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -151,26 +196,92 @@ jobs:
           $tar = Join-Path $env:SystemRoot "System32\tar.exe"
           & $tar -c --format zip -f $archive -C "dist" $name
           if ($LASTEXITCODE -ne 0) { throw "tar.exe failed to create $archive" }
-          "name=$name" >> $env:GITHUB_OUTPUT
           "archive=$archive" >> $env:GITHUB_OUTPUT
           Get-Item $archive | ForEach-Object { "archive: $($_.FullName) ($($_.Length) bytes)" }
           & $tar -tf $archive
           if ($LASTEXITCODE -ne 0) { throw "tar.exe failed to list $archive" }
 
-      - name: Upload packaged archive
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.package_unix.outputs.name || steps.package_windows.outputs.name }}
-          path: ${{ steps.package_unix.outputs.archive || steps.package_windows.outputs.archive }}
+          name: ghs-rs-${{ needs.prepare.outputs.tag }}-windows
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: Package (macOS)
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p ghs-app
+
+      - name: Build .app bundle
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          packaging/macos/build-app.sh target/release/ghs-app "$TAG" dist
+          plutil -lint dist/ghs-rs.app/Contents/Info.plist
+          test -x dist/ghs-rs.app/Contents/MacOS/ghs-app
+          test -f dist/ghs-rs.app/Contents/Resources/LICENSE-APACHE
+          test -f dist/ghs-rs.app/Contents/Resources/NOTICE
+
+      - name: Package .app archive
+        id: package
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) arch="x86_64" ;;
+            arm64|aarch64) arch="aarch64" ;;
+            *)
+              echo "::error::Unsupported architecture: $arch"
+              exit 1
+              ;;
+          esac
+          name="ghs-rs-${TAG}-macos-${arch}"
+          stage="dist/${name}"
+          mkdir -p "$stage"
+          mv dist/ghs-rs.app "$stage/ghs-rs.app"
+          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT NOTICE "$stage/"
+          install -m 0644 packaging/README.md "$stage/PACKAGING.md"
+          tar -czf "dist/${name}.tar.gz" -C dist "$name"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -l "dist/${name}.tar.gz"
+          tar -tzf "dist/${name}.tar.gz" | sort
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghs-rs-${{ needs.prepare.outputs.tag }}-macos
+          path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Draft GitHub Release
-    needs: [prepare, build]
+    needs: [prepare, linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
-      - name: Download packaged archives
+      - name: Download packaged artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
@@ -182,9 +293,12 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
+          version="${TAG#v}"
           ls -l dist
           expected=(
             "dist/ghs-rs-${TAG}-linux-x86_64.tar.gz"
+            "dist/ghs-rs_${version}_amd64.deb"
+            "dist/ghs-rs-${TAG}-x86_64.AppImage"
             "dist/ghs-rs-${TAG}-windows-x86_64.zip"
           )
           for file in "${expected[@]}"; do
@@ -199,6 +313,12 @@ jobs:
             echo "::error::Expected exactly one macOS archive, found ${#macos[@]}"
             exit 1
           fi
+          found=(dist/*)
+          if [ "${#found[@]}" -ne 5 ]; then
+            echo "::error::Expected exactly 5 release assets, found ${#found[@]}"
+            printf '%s\n' "${found[@]}"
+            exit 1
+          fi
           echo "macOS archive: ${macos[0]}"
 
       - name: Generate SHA-256 checksums
@@ -206,7 +326,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ghs-rs-*.tar.gz ghs-rs-*.zip > SHA256SUMS.txt
+          sha256sum ghs-rs-*.tar.gz ghs-rs-*.zip ghs-rs_*.deb ghs-rs-*.AppImage > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create draft release
@@ -221,23 +341,24 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.AppImage
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
           body: |
-            Build of the grblHAL sender. The archives are unsigned and were
-            produced without code signing or notarization.
+            Build of the grblHAL sender. Every asset is unsigned and was
+            produced without code signing, notarization, or Authenticode.
 
             A build is not hardware-validated until the FlexiHAL operator
             checklist in docs/SAFETY.md passes for these exact archives. Record
             that result in these notes before publishing.
 
-            - Linux x86_64: `.tar.gz` with `ghs-app`, notices, and a desktop entry.
+            - Linux x86_64: `.tar.gz` with `ghs-app`, notices, and a desktop
+              entry; `.deb` for a system install; `.AppImage` for a portable
+              run. The AppImage uses the host GPUI runtime libraries.
             - Windows x86_64: `.zip` with `ghs-app.exe` and notices. No installer.
-            - macOS: `.tar.gz` with an unsigned `ghs-app`; no `.app` bundle yet.
+            - macOS: `.tar.gz` with an unsigned, unnotarized `ghs-rs.app`.
+              Gatekeeper blocks the first launch until the user allows it.
 
             Verify downloads against `SHA256SUMS.txt`. Read `docs/RELEASE.md` and
             `docs/SAFETY.md` in the repository before connecting a machine.
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/SHA256SUMS.txt

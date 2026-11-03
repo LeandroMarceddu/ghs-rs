@@ -9,13 +9,13 @@ The goal is a touch-first CNC sender with the ergonomics of
 feature set of [ioSender](https://github.com/terjeio/ioSender) — on Windows,
 macOS, and Linux.
 
-> **Status: pre-alpha, M5/M6 closeout.** Protocol, simulator, serial, job
-> streaming, the real 2D viewer, generated settings, live offsets, the tool
-> table, profiles, backups, the probe workspace, the height-map
-> measurement/Apply/Revert/save-load workflow, confirmed offset goto, and
-> startup-line editing are implemented. The reference FlexiHAL is not yet
-> available for hardware validation, so all evidence so far is simulator and
-> unit-test based. See [docs/PLAN.md](docs/PLAN.md).
+> **Status: v0.5.0 pre-release.** Protocol, simulator, serial, job streaming,
+> the 2D/3D viewer, generated settings, live offsets, tools, profiles, backups,
+> probing, height maps with Apply/Revert, macros, startup lines, keymap, pins
+> diagnostics, and primary localization are implemented. **V1.0 means total
+> ioSender milling parity.** This pre-release is simulator/unit-test evidence
+> only, packages are unsigned, and the reference FlexiHAL has not yet been
+> hardware-validated. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
 
@@ -121,6 +121,7 @@ open the connection panel to select a real serial port.
 - [docs/architecture.md](docs/architecture.md) — crates, threading, safety
 - [docs/protocol.md](docs/protocol.md) — grblHAL protocol surface
 - [docs/parity.md](docs/parity.md) — ioSender feature checklist
+- [docs/PARITY-AUDIT.md](docs/PARITY-AUDIT.md) — evidence-based parity audit snapshot
 - [docs/app-viewer.md](docs/app-viewer.md) — 2D/3D viewer and program list
 - [docs/settings.md](docs/settings.md) — settings, offsets, tools, backups
 - [docs/probing.md](docs/probing.md) — probing and height-map contract
