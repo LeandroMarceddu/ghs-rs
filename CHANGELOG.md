@@ -36,9 +36,10 @@ section exists to diff against.
 - **Jobs** — in-app program file browser and loading with a 20 MiB UTF-8
   bound; character-counting streaming against the reported receive buffer;
   pause, resume, and stop; a tool-change sheet; optional-stop, single-block, and
-  block-delete run options; breakpoints and run-to-line; progress, elapsed time,
-  and an ETA; a parsed program list with text/line-number search, filter,
-  highlight, previous/next, and jump. Job recovery never auto-resumes.
+  block-delete run options; breakpoints and run-to-line; dry-run/check mode;
+  progress, elapsed time, and an ETA; a parsed program list with text/line-
+  number search, filter, highlight, previous/next, and jump. Job recovery never
+  auto-resumes.
 - **Viewer** — parsed toolpath in 2D top view or 3D orbit view, with fit, pan,
   zoom, pinch, ground grid, work envelope, motion-style paths, a live tool
   marker, and height-map cells projected in both views.
@@ -153,9 +154,10 @@ section exists to diff against.
 - **Machine keymap only.** Keyboard jog/start/pause/resume/stop are configurable;
   full keyboard navigation, screen-reader labels, and gamepad mapping are not
   implemented. Keyboard jog is one step per press; hold-to-jog is pointer-only.
-- **No start-from-line or check mode.** The UI has no start-from-line or
-  dry-run/check workflow, and the engine only accepts a start at line 1 because
-  it cannot synthesize a modal preamble for a later line.
+- **No start-from-line.** The UI can set breakpoints, run to a line from the
+  beginning, and dry-run the whole program, but it cannot start mid-program;
+  the engine rejects `from_line > 1` because it cannot synthesize a modal
+  preamble.
 - **No advanced macros.** Macros are single-line MDI commands; parameter
   substitution, multi-line macros, special words, and `$` system commands are
   deferred.

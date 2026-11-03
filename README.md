@@ -79,7 +79,7 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
 
 ## In progress
 
-- Start-from-line/check mode, i18n, utilities/calibration, and signed
+- Start-from-line, secondary localization, utilities/calibration, and signed
   installers.
 - Hardware validation on the reference FlexiHAL.
 

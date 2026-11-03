@@ -87,6 +87,24 @@ text and displays the returned line list/toolpath; it does not stream lines.
 | `ALARM`/E-stop | Stop, emit, no resume |
 | Lost status/link | Interrupt, emit, no resume |
 
+## Check mode
+
+`Command::StartCheckRun` runs the loaded program through the controller's `$C`
+dry-run mode. The engine:
+
+1. Requires a ready link, a loaded program, and `Idle` (or a controller already
+   in `Check`).
+2. Sends `$C` and waits for a fresh status reporting `Check` before streaming.
+3. Streams the program with `pump_job` allowed in `Check`; the controller
+   acknowledges lines without motion.
+4. On completion or stop, exits `Check` with `$C` when the engine entered it;
+   it never leaves a controller it found already in `Check` in that mode.
+5. Refuses a second transition, caps exit retries, and never auto-resumes.
+
+`EngineEvent::CheckStarted`/`CheckCompleted` and
+`EngineHandle::check_run()` distinguish a dry run from a real job. The normal
+`StartProgram` path is unchanged.
+
 ## Start-from-line
 
 A plain line skip is not enough: the modal parser state (units, plane, WCS,

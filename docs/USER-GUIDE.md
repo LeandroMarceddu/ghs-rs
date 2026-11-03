@@ -315,6 +315,15 @@ reports the new value. Block delete is disabled while a job is running or
 paused; optional stop and single block can be changed when the engine accepts
 them. Mock mode shows the sheet but disables every toggle.
 
+### Dry run / Check
+
+`RUN OPTIONS` → `CHECK PROGRAM (DRY RUN)` loads the program through the
+controller's `$C` check mode. Motion is suppressed; the controller still parses
+and acknowledges every block, and spindle/coolant commands are not real output
+in check mode. The job shows `CHECKING` / `CHECK COMPLETE`, then returns to
+`Idle` with the program still loaded. STOP during a check uses a non-resetting
+stop. A normal START still runs the program for real.
+
 ### Breakpoints and run-to
 
 - Tap a program row's line-number gutter to toggle a breakpoint. A red dot and
@@ -831,10 +840,10 @@ Exports are user-initiated. There is no telemetry and no network transport.
 - **Machine keymap only.** The editor covers jog/start/pause/resume/stop; full
   keyboard navigation, screen-reader labels, and gamepad mapping are not
   implemented.
-- **No start-from-line or check mode.** The job toolbar can set breakpoints and
-  run to a line from the beginning, but it cannot start mid-program; the engine
-  rejects `from_line > 1` because it cannot synthesize a modal preamble.
-  Dry-run/check mode is also deferred.
+- **No start-from-line.** The job toolbar can set breakpoints, run to a line
+  from the beginning, and dry-run the whole program, but it cannot start
+  mid-program; the engine rejects `from_line > 1` because it cannot synthesize
+  a modal preamble.
 - **No drag-and-drop or recent-files list.** The in-app browser lists one
   directory at a time and remembers the last folder only for the session.
 - **Advanced macros are absent.** User macros are single-line MDI commands;

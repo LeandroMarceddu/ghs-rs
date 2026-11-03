@@ -55,7 +55,7 @@ implemented before its UI or hardware validation row is complete.
 | COM-14 | Disable controller auto-reporting on connect | M1 | todo | Setting `$481` when present |
 | COM-15 | Hotplug, reconnect, and status watchdog | M2 | todo | Never auto-resume a job |
 | COM-16 | Session recording and replay | M1 | todo | Real captures become fixtures |
-| COM-17 | Check mode (`$C`) | M3 | todo | Dry run |
+| COM-17 | Check mode (`$C`) | M3 | done | Dry run with engine state machine |
 | COM-18 | In-process loopback simulator for demo and tests | M1 | todo | Not a user-facing network transport |
 | COM-19 | Runtime alarm/error code sets (`$EA`, `$EE`) | M1 | todo | Fallback tables only when unavailable |
 | COM-20 | Runtime settings and groups (`$ES`, `$EG`) | M1 | todo | Data types, formats, min/max, reboot flags |
@@ -107,7 +107,7 @@ implemented before its UI or hardware validation row is complete.
 | JOB-07 | Start-from-line, run-to-line, breakpoints | M3 | partial | Run-to + breakpoints; start-from-line open |
 | JOB-08 | Progress, elapsed time, ETA | M3 | done | Progress/time and ETA |
 | JOB-09 | Console with filtering and file log | M3 | done | Bounded console, filters, 64 KiB snapshot |
-| JOB-10 | Dry run and check mode | M3 | todo | Never moves |
+| JOB-10 | Dry run and check mode | M3 | done | `$C`; never moves |
 | JOB-11 | Defined reconnect and interruption policy | M3 | todo | No silent resume |
 | JOB-12 | Program list with follow, search, context menu | M4 | partial | Follow/search/jump done; context menu open |
 | JOB-13 | Add line numbers, strip comments | M4 | todo | Non-destructive save-as |
