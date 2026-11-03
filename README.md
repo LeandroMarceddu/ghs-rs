@@ -9,13 +9,14 @@ The goal is a touch-first CNC sender with the ergonomics of
 feature set of [ioSender](https://github.com/terjeio/ioSender) — on Windows,
 macOS, and Linux.
 
-> **Status: v0.5.0 pre-release.** Protocol, simulator, serial, job streaming,
-> the 2D/3D viewer, generated settings, live offsets, tools, profiles, backups,
-> probing, height maps with Apply/Revert, macros, startup lines, keymap, pins
-> diagnostics, and primary localization are implemented. **V1.0 means total
-> ioSender milling parity.** This pre-release is simulator/unit-test evidence
-> only, packages are unsigned, and the reference FlexiHAL has not yet been
-> hardware-validated. See [docs/PLAN.md](docs/PLAN.md).
+> **Status: v0.5.0 pre-release published.** Protocol, simulator, serial, job
+> streaming, the 2D/3D viewer, generated settings, live offsets, tools,
+> profiles, backups, probing, height maps with Apply/Revert, macros, startup
+> lines, keymap, pins diagnostics, dry-run check mode, and localization are
+> implemented. **V1.0 means total ioSender milling parity.** The v0.5.0
+> packages are unsigned and not hardware-validated; see
+> [GitHub Releases](https://github.com/LeandroMarceddu/ghs-rs/releases/tag/v0.5.0).
+> See [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope
 
