@@ -89,11 +89,11 @@ use crate::probe::{
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
-    AppState, Axis, BreakpointOutcome, ConnectionState, ConsoleCounts, ConsoleFilter, ConsoleLevel,
-    FEED_OVERRIDE_MAX, FEED_OVERRIDE_MIN, FEED_OVERRIDE_RESET, JobView, KeypadAction, KeypadTarget,
-    LeftTab, Mode, ProgramBreakpoints, ProgramKind, ProgramLoadRefusal, ProgramSearch,
-    ProgramSearchMode, RunOption, RunOptionOutcome, RunToOutcome, SignalState, SleepOutcome,
-    format_elapsed,
+    AppState, Axis, BreakpointOutcome, CheckOutcome, ConnectionState, ConsoleCounts, ConsoleFilter,
+    ConsoleLevel, FEED_OVERRIDE_MAX, FEED_OVERRIDE_MIN, FEED_OVERRIDE_RESET, JobView, KeypadAction,
+    KeypadTarget, LeftTab, Mode, ProgramBreakpoints, ProgramKind, ProgramLoadRefusal,
+    ProgramSearch, ProgramSearchMode, RunOption, RunOptionOutcome, RunToOutcome, SignalState,
+    SleepOutcome, StartOutcome, format_elapsed,
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
@@ -310,6 +310,12 @@ pub struct Shell {
     demo_program: DemoProgram,
     demo_start: bool,
     demo_start_sent: bool,
+    /// Screenshot switch: open the check-run confirmation without confirming.
+    demo_check_confirm: bool,
+    demo_check_confirm_done: bool,
+    /// Screenshot switch: confirm and start a demo check run once.
+    demo_check: bool,
+    demo_check_done: bool,
     /// Screenshot switch: open the read-only pins/limits diagnostics sheet.
     demo_pins: bool,
     demo_pins_done: bool,
@@ -568,6 +574,8 @@ impl Shell {
             DemoProgram::Pocket
         };
         let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+        let demo_check = std::env::args().any(|arg| arg == "--demo-check");
+        let demo_check_confirm = std::env::args().any(|arg| arg == "--demo-check-confirm");
         let demo_pins = std::env::args().any(|arg| arg == "--pins");
         let demo_run_options = std::env::args().any(|arg| arg == "--demo-run-options");
         let demo_load_file = std::env::args()
@@ -695,6 +703,10 @@ impl Shell {
             demo_program,
             demo_start,
             demo_start_sent: false,
+            demo_check_confirm,
+            demo_check_confirm_done: false,
+            demo_check,
+            demo_check_done: false,
             demo_pins,
             demo_pins_done: false,
             demo_run_options,
@@ -989,6 +1001,36 @@ impl Shell {
         {
             self.demo_start_sent = true;
             self.start_job(cx);
+            changed = true;
+        }
+        // `--demo-check-confirm` opens the check confirmation through the
+        // normal request action and leaves it open; it sends nothing.
+        if self.demo_check_confirm
+            && !self.demo_check_confirm_done
+            && self.state.live
+            && self.state.job.has_program()
+            && self.state.check_refusal().is_none()
+        {
+            self.demo_check_confirm_done = true;
+            self.state.mode = Mode::Job;
+            self.open_check_confirm(cx);
+            changed = true;
+        }
+        // `--demo-check` presses CHECK and START CHECK through the same model
+        // actions as the sheet, once the demo program is loaded.
+        if self.demo_check
+            && !self.demo_check_done
+            && self.state.live
+            && self.state.job.has_program()
+            && self.state.check_refusal().is_none()
+        {
+            self.demo_check_done = true;
+            self.state.mode = Mode::Job;
+            if self.state.request_check().is_ok() {
+                self.confirm_check(cx);
+            } else {
+                self.state.check_confirm_open = false;
+            }
             changed = true;
         }
         // Screenshot switch: open the RUN OPTIONS sheet and flip optional stop
@@ -1761,6 +1803,7 @@ impl Shell {
         self.state.offsets_backup.close_preview();
         self.state.cancel_macro_run();
         self.state.cancel_sleep_confirm();
+        self.state.cancel_check_confirm();
         self.state.connection = ConnectionState::Disconnected;
         self.state.push_console(
             ConsoleLevel::Warn,
@@ -3134,6 +3177,7 @@ impl Shell {
             || self.startup_confirm.is_some()
             || self.state.keypad.is_some()
             || self.state.sleep_confirm_open
+            || self.state.check_confirm_open
             || self.state.macro_run_pending().is_some()
             || self.state.run_options_open
             || self.state.job.breakpoints.pending_run_to().is_some()
@@ -3260,6 +3304,11 @@ impl Shell {
             return false;
         }
         if !self.ready() || self.locked() || !self.job_loaded() {
+            return false;
+        }
+        // A check that is still entering `$C` owns the runner even before the
+        // job state changes; never race it with a normal start.
+        if self.state.job.check_pending() {
             return false;
         }
         if !matches!(
@@ -4464,6 +4513,65 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the check-run confirmation. Opening sends nothing.
+    ///
+    /// A refused action never opens a sheet; its reason goes to the console so
+    /// a disabled or locked action still has an explanation.
+    fn open_check_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Err(refusal) = self.state.request_check() {
+            self.state
+                .push_console(ConsoleLevel::Warn, refusal.message());
+        }
+        cx.notify();
+    }
+
+    /// Close the check confirmation without sending anything.
+    fn cancel_check_confirm(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_check_confirm();
+        cx.notify();
+    }
+
+    /// CHECK action in the RUN OPTIONS sheet.
+    ///
+    /// A successful request closes the run-options sheet and opens the
+    /// confirmation; a refusal keeps the sheet open and shows its reason in
+    /// the console. Nothing is sent here.
+    fn open_check_from_run_options(&mut self, cx: &mut Context<Self>) {
+        match self.state.request_check() {
+            Ok(()) => self.state.close_run_options(),
+            Err(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+        }
+        cx.notify();
+    }
+
+    /// Confirm the check sheet and send exactly one `Command::StartCheckRun`.
+    ///
+    /// The gate is re-checked after the sheet is consumed; a refusal or a
+    /// sender rejection is reported in the console and nothing is claimed.
+    fn confirm_check(&mut self, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome = self.state.confirm_check(|command| match link {
+            Some(link) => link.send(command).map_err(|error| error.to_string()),
+            None => Err("no engine connection".to_string()),
+        });
+        match outcome {
+            CheckOutcome::Started => self.state.push_console(
+                ConsoleLevel::Info,
+                "Check run requested; the controller parses the program with motion suppressed",
+            ),
+            CheckOutcome::Rejected(detail) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("CHECK NOT STARTED: {detail}")),
+            CheckOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+            CheckOutcome::NotConfirmed => {}
+        }
+        cx.notify();
+    }
+
     /// Close the run-options sheet. Closing sends nothing.
     fn close_run_options(&mut self, cx: &mut Context<Self>) {
         self.state.close_run_options();
@@ -4574,7 +4682,15 @@ impl Shell {
             cx.notify();
             return;
         }
-        self.send_command(Command::StartProgram { from_line: None });
+        let link = self.link.as_ref();
+        let outcome = self.state.dispatch_start(|command| match link {
+            Some(link) => link.send(command).map_err(|error| error.to_string()),
+            None => Err("no engine connection".to_string()),
+        });
+        if let StartOutcome::Rejected(error) = outcome {
+            self.state
+                .push_console(ConsoleLevel::Error, format!("Engine: {error}"));
+        }
         cx.notify();
     }
 
@@ -4610,10 +4726,12 @@ impl Shell {
 
     /// Stop the job for good.
     ///
-    /// `reset: true` sends a soft reset after the runner aborts: it discards
+    /// `reset: true` sends a soft reset after a real job aborts: it discards
     /// the controller's buffered motion, so a queued block cannot execute after
-    /// the stop. The loaded program stays in the engine for a restart; the
-    /// top-bar STOP remains the gentler feed hold.
+    /// the stop. A dry run has no motion to discard, so it stops without a
+    /// reset and lets the engine restore `Idle`. The loaded program stays in
+    /// the engine for a restart; the top-bar STOP remains the gentler feed
+    /// hold.
     fn stop_job(&mut self, cx: &mut Context<Self>) {
         if !self.job_stop_allowed() {
             return;
@@ -4627,7 +4745,7 @@ impl Shell {
             cx.notify();
             return;
         }
-        self.send_command(Command::StopProgram { reset: true });
+        self.send_command(self.state.stop_program_command());
         cx.notify();
     }
 
@@ -6188,6 +6306,7 @@ impl Shell {
         let view = cx.entity();
         let scrim_view = view.clone();
         let close_view = view.clone();
+        let check_view = view.clone();
         let rows = RunOption::ALL.into_iter().map(|option| {
             let value = self.state.run_option_value(option);
             let enabled = self.state.run_option_refusal(option).is_none();
@@ -6269,6 +6388,12 @@ impl Shell {
         });
         let error = self.state.run_options_error.clone();
         let lock_reason = self.state.run_options_lock_reason();
+        let check_refusal = self.state.check_refusal();
+        let check_enabled = check_refusal.is_none();
+        let check_hint = check_refusal.map_or(
+            "Parse and stream the loaded program in check mode ($C); no motion.",
+            |refusal| refusal.message(),
+        );
 
         div()
             .absolute()
@@ -6327,6 +6452,75 @@ impl Shell {
                             ),
                     )
                     .children(rows)
+                    .child(
+                        h_flex()
+                            .id("run-option-check")
+                            .h(px(48.0))
+                            .w_full()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .rounded(px(7.0))
+                            .bg(p.panel_alt)
+                            .border_1()
+                            .border_color(p.border)
+                            .when(check_enabled, |this| {
+                                this.cursor_pointer()
+                                    .hover(|style| style.bg(p.raised_hover).border_color(p.accent))
+                                    .on_click(move |_, _, cx| {
+                                        check_view.update(cx, |shell, cx| {
+                                            shell.open_check_from_run_options(cx);
+                                        });
+                                    })
+                            })
+                            .when(!check_enabled, |this| this.opacity(0.55))
+                            .child(
+                                v_flex()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .gap_0()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if check_enabled {
+                                                p.text
+                                            } else {
+                                                p.text_dim
+                                            })
+                                            .child("CHECK PROGRAM (DRY RUN)"),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(9.5))
+                                            .text_color(if check_enabled {
+                                                p.text_faint
+                                            } else {
+                                                p.warning
+                                            })
+                                            .child(check_hint),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(28.0))
+                                    .w(px(62.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(999.0))
+                                    .bg(p.panel)
+                                    .border_1()
+                                    .border_color(p.border)
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text_dim)
+                                    .child("CHECK"),
+                            ),
+                    )
                     .when_some(error, |this, error| {
                         this.child(
                             div()
@@ -6384,6 +6578,193 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Confirmation for a controller check run (`$C` dry run).
+    ///
+    /// Opening or dismissing the sheet sends nothing. START CHECK sends exactly
+    /// one `StartCheckRun`; the engine owns the `$C` toggle and the observed
+    /// return to `Idle`. The sheet is not the motion gateway: it only explains
+    /// what the controller will do with the program.
+    fn check_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.state.check_confirm_open {
+            return div().into_any_element();
+        }
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let scrim_view = view;
+        let name = self.state.job.name.clone();
+        let total = self.state.job.total;
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("check-confirm-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_check_confirm(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(620.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child("CHECK PROGRAM (DRY RUN)"),
+                            )
+                            .child(chip("$C", p)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(15.0))
+                            .text_color(p.text)
+                            .child(
+                                "The controller parses and streams the loaded program with \
+                                 check mode ($C) enabled. Nothing in this sheet starts a real \
+                                 job or moves an axis.",
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child("WHAT THE DRY RUN DOES"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .line_height(px(14.0))
+                                    .text_color(p.text_dim)
+                                    .child(
+                                        "MOTION IS SUPPRESSED: the controller acknowledges \
+                                         program lines without moving the machine.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .line_height(px(14.0))
+                                    .text_color(p.text_dim)
+                                    .child(
+                                        "SPINDLE / COOLANT: M3, M4, M5, M7, M8 and M9 are \
+                                         parsed and acknowledged but never run as real \
+                                         outputs.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .line_height(px(14.0))
+                                    .text_color(p.text_dim)
+                                    .child(
+                                        "WHEN FINISHED: the engine leaves check mode and waits \
+                                         for the machine to report IDLE. The program stays \
+                                         loaded for a separate real START.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .line_height(px(14.0))
+                                    .text_color(p.text_dim)
+                                    .child(
+                                        "STOP remains available while the check streams; it \
+                                         never resumes or restarts the run.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child(if name.is_empty() {
+                                        format!("{total} LINES")
+                                    } else {
+                                        format!("{name} / {total} LINES")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child("CANCEL sends nothing."),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("check-confirm-cancel")
+                                    .label(t("CANCEL"))
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_check_confirm(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("check-confirm-start")
+                                    .label("START CHECK")
+                                    .primary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |shell, cx| {
+                                            shell.confirm_check(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Slim toolbar inside the viewer: job state, elapsed time and the four
     /// job controls. Keeping it here preserves the approved three-column grid.
     fn job_toolbar(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6396,8 +6777,20 @@ impl Shell {
 
         let status = self.state.display_job_status();
         let color = job_status_color(&self.state.job, p);
-        let detail = self.state.pause_detail();
+        let detail = self
+            .state
+            .pause_detail()
+            .or_else(|| self.state.check_detail().map(str::to_string));
         let elapsed = format_elapsed(self.state.job.elapsed);
+        // A check badge carries its elapsed time inside the pill: at 1280 px
+        // the toolbar has no room for a separate TIME field beside a long
+        // `CHECK COMPLETE` label.
+        let check_status = self.state.job.is_check() || self.state.job.check_pending();
+        let badge_label = if check_status {
+            format!("{status}  {elapsed}")
+        } else {
+            t(status).to_string()
+        };
         let start_ok = self.job_start_allowed();
         let pause_ok = self.job_pause_allowed();
         let resume_ok = self.job_resume_allowed();
@@ -6429,7 +6822,7 @@ impl Shell {
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(color)
-                            .child(t(status)),
+                            .child(badge_label),
                     )
                     .when_some(detail, |this, detail| {
                         this.child(
@@ -6459,14 +6852,16 @@ impl Shell {
                                 .child(t("HEIGHT MAP / COMPENSATED")),
                         )
                     })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .font_family(self.mono.clone())
-                            .text_size(px(10.0))
-                            .text_color(p.text_faint)
-                            .child(format!("{} {elapsed}", t("TIME"))),
-                    ),
+                    .when(!check_status, |this| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(self.mono.clone())
+                                .text_size(px(10.0))
+                                .text_color(p.text_faint)
+                                .child(format!("{} {elapsed}", t("TIME"))),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -6478,7 +6873,7 @@ impl Shell {
                             .label(t("LOAD PROGRAM"))
                             .secondary()
                             .h(px(48.0))
-                            .w(px(156.0))
+                            .w(px(132.0))
                             .rounded_lg()
                             .text_size(px(10.0))
                             .on_click(move |_, window, cx| {
@@ -16303,6 +16698,9 @@ impl Render for Shell {
         if self.state.run_options_open {
             root = root.child(self.run_options_overlay(p, cx));
         }
+        if self.state.check_confirm_open {
+            root = root.child(self.check_confirm_overlay(p, cx));
+        }
         if self.state.job.breakpoints.pending_run_to().is_some() {
             root = root.child(self.run_to_overlay(p, cx));
         }
@@ -16683,6 +17081,17 @@ fn no_program_matches_notice(p: Palette, query: &str) -> Div {
 fn job_status_color(job: &JobView, p: Palette) -> Hsla {
     if job.tool_change.is_some() {
         return p.warning;
+    }
+    if job.check_pending() {
+        return p.warning;
+    }
+    if job.is_check() {
+        return match job.state {
+            JobState::Running | JobState::Paused => p.accent,
+            JobState::Completed => p.success,
+            JobState::Aborted | JobState::Interrupted => p.danger,
+            JobState::Idle => p.text_dim,
+        };
     }
     match job.state {
         JobState::Running => p.accent,

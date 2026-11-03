@@ -284,6 +284,14 @@ impl LiveLink {
         self.engine.block_delete()
     }
 
+    /// Whether the loaded program's current or most recent run is a dry run.
+    ///
+    /// Read from [`EngineHandle::check_run`] so the UI label survives a
+    /// missed event, a reconnect, and the 50 ms poll.
+    pub fn check_run(&self) -> bool {
+        self.engine.check_run()
+    }
+
     /// Transport requested for the current session, if one was opened.
     pub fn mode(&self) -> Option<&LinkMode> {
         self.mode.as_ref()
@@ -343,6 +351,11 @@ impl LiveLink {
             self.single_block(),
             self.block_delete(),
         );
+
+        // The dry-run label is engine state, not event-only state. Copying the
+        // accessor every poll recovers a missed `CheckStarted` and clears the
+        // label after a normal start or a new load.
+        changed |= state.job.sync_check_run(self.check_run());
 
         // Demo mode supplies its own source: send it exactly once per
         // connection after the handshake, never on every poll.
@@ -703,10 +716,15 @@ impl LiveLink {
                 total_lines,
             } => {
                 state.probe.on_job_started();
-                state.push_console(
-                    ConsoleLevel::Info,
-                    format!("Job started at line {from_line} ({total_lines} lines)"),
-                );
+                let text = if state.job.is_check() {
+                    format!(
+                        "Check run streaming from line {from_line} ({total_lines} lines); \
+                         the controller suppresses motion"
+                    )
+                } else {
+                    format!("Job started at line {from_line} ({total_lines} lines)")
+                };
+                state.push_console(ConsoleLevel::Info, text);
                 true
             }
             EngineEvent::JobProgress { .. } => job_changed,
@@ -726,10 +744,12 @@ impl LiveLink {
             }
             EngineEvent::JobCompleted { elapsed } => {
                 state.probe.on_job_completed();
-                state.push_console(
-                    ConsoleLevel::Ok,
-                    format!("Job completed in {}", format_elapsed(elapsed)),
-                );
+                let text = if state.job.is_check() {
+                    format!("Check run reached the end in {}", format_elapsed(elapsed))
+                } else {
+                    format!("Job completed in {}", format_elapsed(elapsed))
+                };
+                state.push_console(ConsoleLevel::Ok, text);
                 true
             }
             EngineEvent::JobAborted { line, reason } => {
@@ -742,9 +762,14 @@ impl LiveLink {
                 } else {
                     ConsoleLevel::Warn
                 };
+                let subject = if state.job.is_check() {
+                    "Check run stopped"
+                } else {
+                    "Job aborted"
+                };
                 state.push_console(
                     level,
-                    format!("Job aborted at line {line}: {}", abort_reason_label(reason)),
+                    format!("{subject} at line {line}: {}", abort_reason_label(reason)),
                 );
                 true
             }
@@ -754,7 +779,9 @@ impl LiveLink {
                 message,
             } => {
                 state.probe.on_job_error(line, &message);
-                let text = if code == 0 {
+                let text = if code == 0 && line == 0 {
+                    format!("Job error: {message}")
+                } else if code == 0 {
                     format!("Job error at line {line}: {message}")
                 } else {
                     format!("Job error at line {line}: {message} (error:{code})")
@@ -768,6 +795,20 @@ impl LiveLink {
                     format!(
                         "Tool T{tool} required at line {line}; acknowledge, then resume the job"
                     ),
+                );
+                true
+            }
+            EngineEvent::CheckStarted { total_lines } => {
+                state.push_console(
+                    ConsoleLevel::Info,
+                    format!("Check run started ({total_lines} lines); no motion will be commanded"),
+                );
+                true
+            }
+            EngineEvent::CheckCompleted { elapsed } => {
+                state.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Check run complete in {}", format_elapsed(elapsed)),
                 );
                 true
             }
@@ -1522,5 +1563,75 @@ mod tests {
             ),
             "disconnect did not clear the run switches in the engine and the view model"
         );
+    }
+
+    #[test]
+    fn demo_check_run_is_labelled_by_the_accessor_and_cleared_by_a_real_start() {
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.job.has_program()
+                },
+                Duration::from_secs(10)
+            ),
+            "the demo program was not loaded after the handshake"
+        );
+        assert!(!link.check_run());
+        assert!(!state.job.is_check());
+
+        link.send(Command::StartCheckRun)
+            .expect("start the demo check run");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.job.check_complete()
+                        && state
+                            .console
+                            .iter()
+                            .any(|line| line.text.starts_with("Check run complete"))
+                },
+                Duration::from_secs(10)
+            ),
+            "the demo check run did not complete"
+        );
+        assert!(link.check_run(), "the accessor labels the finished dry run");
+        assert!(state.job.is_check());
+        assert_eq!(state.job.status_label(), "CHECK COMPLETE");
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.text.starts_with("Check run started")),
+            "the check start was not mapped to the console"
+        );
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.text.starts_with("Check run complete")),
+            "the check completion was not mapped to the console"
+        );
+
+        link.send(Command::StartProgram { from_line: None })
+            .expect("start a real demo job");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.job.state == ghs_engine::JobState::Completed && !link.check_run()
+                },
+                Duration::from_secs(10)
+            ),
+            "the normal run did not clear the dry-run label"
+        );
+        link.poll(&mut state);
+        assert!(!state.job.is_check());
+        assert_eq!(state.job.status_label(), "COMPLETED");
+        link.disconnect();
     }
 }

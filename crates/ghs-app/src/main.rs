@@ -12,7 +12,9 @@
 //! stops at `M6 T2`; `--demo-m0` preloads the same pocket with an `M0` pause;
 //! `--demo-start` presses the job Start action once after the demo program
 //! loads (screenshot switch: it exercises the same path as the toolbar
-//! button). `--viewer-3d` starts the job viewer in the orbit view; 2D top is
+//! button). `--demo-check-confirm` opens the check-run confirmation without
+//! confirming it, and `--demo-check` presses CHECK then START CHECK through
+//! the same model actions for a dry-run status capture. `--viewer-3d` starts the job viewer in the orbit view; 2D top is
 //! the default. `--settings` opens the generated settings workspace directly;
 //! `--settings-group=NAME` selects a reported group in that workspace;
 //! `--demo-settings-write` changes one safe integer through the normal

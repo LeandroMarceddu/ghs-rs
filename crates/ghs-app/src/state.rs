@@ -1265,6 +1265,17 @@ pub struct JobView {
     pub tool_change: Option<ToolChangeView>,
     /// Breakpoint mirror, selected row, and pending run-to confirmation.
     pub breakpoints: ProgramBreakpoints,
+    /// The loaded program's current or most recent run is a controller dry run.
+    ///
+    /// Mirrors [`ghs_engine::EngineHandle::check_run`] through the live poll so
+    /// the label survives event loss, a reconnect, or a fresh snapshot. It is
+    /// cleared by a new load and by a normal start, never by completion.
+    check: bool,
+    /// [`ghs_engine::Command::StartCheckRun`] was accepted; `CheckStarted` has
+    /// not arrived yet. The controller is still entering `$C`.
+    check_pending: bool,
+    /// `CheckStarted` was seen for the run that is about to emit `JobStarted`.
+    check_started_event: bool,
 }
 
 impl JobView {
@@ -1339,6 +1350,88 @@ impl JobView {
         self.state == JobState::Paused
     }
 
+    /// Whether the loaded program's current or most recent run is a dry run.
+    pub fn is_check(&self) -> bool {
+        self.check
+    }
+
+    /// Whether a check start was accepted but `CheckStarted` has not arrived.
+    ///
+    /// While this is set the controller may be entering `$C`; no second check
+    /// and no normal start may be sent.
+    pub fn check_pending(&self) -> bool {
+        self.check_pending
+    }
+
+    /// Whether a check is being streamed (running or paused in check mode).
+    pub fn checking(&self) -> bool {
+        self.check && self.is_active()
+    }
+
+    /// Whether a check run reached the end.
+    pub fn check_complete(&self) -> bool {
+        self.check && self.state == JobState::Completed
+    }
+
+    /// Whether a check transition owns the runner right now.
+    pub fn check_busy(&self) -> bool {
+        self.check_pending || self.checking()
+    }
+
+    /// Records that `StartCheckRun` was accepted. Nothing is streamed yet.
+    pub fn begin_check(&mut self) {
+        self.check_pending = true;
+    }
+
+    /// Records `CheckStarted`.
+    pub fn check_started(&mut self, total: u32) {
+        self.check = true;
+        self.check_pending = false;
+        self.check_started_event = true;
+        if total > 0 {
+            self.total = total;
+        }
+    }
+
+    /// Records `CheckCompleted`; the dry-run label and elapsed time stay.
+    pub fn check_completed(&mut self, elapsed: Duration) {
+        self.check = true;
+        self.check_pending = false;
+        self.check_started_event = false;
+        self.elapsed = elapsed;
+    }
+
+    /// Clears the dry-run label after a normal `StartProgram`.
+    pub fn clear_check(&mut self) {
+        self.check = false;
+        self.check_pending = false;
+        self.check_started_event = false;
+    }
+
+    /// Mirrors the engine's dry-run accessor on every poll.
+    ///
+    /// Returns `true` when the displayed check state changed. A `true`
+    /// accessor also recovers a `CheckStarted` event that was drained before
+    /// the UI existed; a `false` accessor clears the label after a normal
+    /// start or a new load.
+    pub fn sync_check_run(&mut self, engine_check: bool) -> bool {
+        let mut changed = false;
+        if engine_check {
+            if !self.check {
+                self.check = true;
+                changed = true;
+            }
+            if self.check_pending {
+                self.check_pending = false;
+                changed = true;
+            }
+        } else if self.check {
+            self.check = false;
+            changed = true;
+        }
+        changed
+    }
+
     /// Whether a tool change awaits operator action.
     pub fn tool_change_pending(&self) -> bool {
         self.tool_change.is_some()
@@ -1353,6 +1446,20 @@ impl JobView {
     pub fn status_label(&self) -> &'static str {
         if self.tool_change.is_some() {
             return "TOOL CHANGE";
+        }
+        if self.check_pending || self.checking() {
+            return "CHECKING";
+        }
+        if self.check {
+            if self.check_complete() {
+                return "CHECK COMPLETE";
+            }
+            match self.state {
+                JobState::Aborted | JobState::Interrupted => return "CHECK STOPPED",
+                JobState::Idle | JobState::Running | JobState::Paused | JobState::Completed => {
+                    return "CHECKING";
+                }
+            }
         }
         if self.state == JobState::Idle {
             return if self.has_program() {
@@ -1379,11 +1486,22 @@ impl JobView {
         self.elapsed = Duration::ZERO;
         self.pause_reason = None;
         self.tool_change = None;
+        self.clear_check();
         self.breakpoints.clear_for_program();
     }
 
     /// Records `JobStarted`.
+    ///
+    /// A preceding `CheckStarted` owns the dry-run label. Any other start is a
+    /// normal `StartProgram` and clears a stale dry-run label immediately,
+    /// including the run-to and probe start paths that do not go through
+    /// [`AppState::dispatch_start`].
     pub fn started(&mut self, from_line: u32, total: u32) {
+        if self.check_started_event {
+            self.check_started_event = false;
+        } else {
+            self.clear_check();
+        }
         self.state = JobState::Running;
         self.current_line = from_line;
         self.completed = 0;
@@ -1442,6 +1560,8 @@ impl JobView {
         }
         self.pause_reason = None;
         self.tool_change = None;
+        self.check_pending = false;
+        self.check_started_event = false;
     }
 
     /// Records `JobError`. The controller rejected the line, so the runner is
@@ -1453,6 +1573,8 @@ impl JobView {
         self.state = JobState::Aborted;
         self.pause_reason = None;
         self.tool_change = None;
+        self.check_pending = false;
+        self.check_started_event = false;
     }
 
     /// Marks the job interrupted after the link closed.
@@ -1464,6 +1586,8 @@ impl JobView {
             self.state = JobState::Interrupted;
             self.pause_reason = None;
             self.tool_change = None;
+            self.check_pending = false;
+            self.check_started_event = false;
         }
     }
 
@@ -1590,6 +1714,14 @@ impl JobView {
                 self.tool_change_required(*tool, *line);
                 true
             }
+            EngineEvent::CheckStarted { total_lines } => {
+                self.check_started(*total_lines);
+                true
+            }
+            EngineEvent::CheckCompleted { elapsed } => {
+                self.check_completed(*elapsed);
+                true
+            }
             _ => false,
         }
     }
@@ -1661,6 +1793,76 @@ impl ProgramLoadRefusal {
             }
         }
     }
+}
+
+/// Why the app refuses to start a controller dry run.
+///
+/// The engine repeats these checks; the gate exists so the CHECK action is
+/// disabled before a command is built and the operator gets a reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckRefusal {
+    /// `--mock` has no engine; a dry run needs a controller.
+    Mock,
+    /// The transport is connecting, disconnected, or failed.
+    NotReady,
+    /// The controller reports Alarm or Door; clear it before checking.
+    MachineLocked,
+    /// No program is loaded in the engine.
+    NoProgram,
+    /// A real job is running or paused.
+    JobActive,
+    /// The controller is not Idle.
+    MachineNotIdle,
+    /// A check start or dry run owns the runner.
+    CheckActive,
+    /// A generated probe plan cannot be dry-run from the job toolbar.
+    ProbeProgram,
+}
+
+impl CheckRefusal {
+    /// Operator-facing reason shown in the console and the check sheet.
+    pub fn message(self) -> &'static str {
+        match self {
+            CheckRefusal::Mock => "MOCK MODE: a check run needs a live controller",
+            CheckRefusal::NotReady => {
+                "LINK NOT READY: finish the connection handshake before a check run"
+            }
+            CheckRefusal::MachineLocked => "MACHINE LOCKED: clear Alarm or Door before a check run",
+            CheckRefusal::NoProgram => "NO PROGRAM: load a program before a check run",
+            CheckRefusal::JobActive => "JOB ACTIVE: stop the running job before a check run",
+            CheckRefusal::MachineNotIdle => "MACHINE NOT IDLE: a check run starts only from IDLE",
+            CheckRefusal::CheckActive => {
+                "CHECK RUN ACTIVE: wait for the controller to finish check mode"
+            }
+            CheckRefusal::ProbeProgram => {
+                "PROBE PROGRAM: a generated probe plan cannot be checked from the job toolbar"
+            }
+        }
+    }
+}
+
+/// Result of one confirmed `StartCheckRun` action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// The sheet was confirmed and exactly one `StartCheckRun` was accepted.
+    Started,
+    /// The gate refused after confirmation; nothing was sent.
+    Refused(CheckRefusal),
+    /// The engine rejected the command; nothing was started.
+    Rejected(String),
+    /// No confirmation was open; nothing was sent.
+    NotConfirmed,
+}
+
+/// Result of one normal `StartProgram` dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// Exactly one `StartProgram { from_line: None }` was accepted.
+    Sent,
+    /// A check transition owns the runner; nothing was sent.
+    Refused(CheckRefusal),
+    /// The engine rejected the command.
+    Rejected(String),
 }
 
 /// Short scope label for a successful console-log export.
@@ -1947,6 +2149,8 @@ pub struct AppState {
     pub run_options_open: bool,
     /// Last refusal or engine rejection shown inside the run-options sheet.
     pub run_options_error: Option<String>,
+    /// The check-run confirmation sheet is open. Opening sends nothing.
+    pub check_confirm_open: bool,
     /// The sleep confirmation sheet is open. Opening sends nothing.
     pub sleep_confirm_open: bool,
     pub feed_override_active: bool,
@@ -2045,6 +2249,7 @@ impl AppState {
             block_delete: false,
             run_options_open: false,
             run_options_error: None,
+            check_confirm_open: false,
             sleep_confirm_open: false,
             feed_override_active: false,
             spindle_override_active: false,
@@ -2141,6 +2346,7 @@ impl AppState {
         self.block_delete = false;
         self.run_options_open = false;
         self.run_options_error = None;
+        self.check_confirm_open = false;
         self.sleep_confirm_open = false;
         self.mdi_history_index = None;
         self.feed_override_active = false;
@@ -2848,6 +3054,17 @@ impl AppState {
         }
     }
 
+    /// Extra toolbar detail while a check run or its entry transition is live.
+    pub fn check_detail(&self) -> Option<&'static str> {
+        if self.job.check_pending() {
+            Some("WAITING FOR CONTROLLER CHECK MODE ($C)")
+        } else if self.job.checking() {
+            Some("DRY RUN - NO MOTION")
+        } else {
+            None
+        }
+    }
+
     /// Open the `RUN OPTIONS` sheet. Nothing is sent.
     pub fn open_run_options(&mut self) {
         self.run_options_open = true;
@@ -2863,6 +3080,121 @@ impl AppState {
     /// Estimated remaining job time for the Job header, when meaningful.
     pub fn display_eta(&self) -> Option<Duration> {
         self.job.eta()
+    }
+
+    /// Why a controller check run is unavailable right now.
+    ///
+    /// This gate mirrors the engine's own requirements: a live ready link, a
+    /// loaded program, an idle controller, and no real job or check transition
+    /// active. It never sends a command.
+    pub fn check_refusal(&self) -> Option<CheckRefusal> {
+        if !self.live {
+            return Some(CheckRefusal::Mock);
+        }
+        if !self.connection.is_ready_like() {
+            return Some(CheckRefusal::NotReady);
+        }
+        if matches!(self.machine_state, "Alarm" | "Door") {
+            return Some(CheckRefusal::MachineLocked);
+        }
+        if !self.job.has_program() {
+            return Some(CheckRefusal::NoProgram);
+        }
+        if self.probe.owns_program(&self.job.name) {
+            return Some(CheckRefusal::ProbeProgram);
+        }
+        if self.job.check_busy() {
+            return Some(CheckRefusal::CheckActive);
+        }
+        if self.job.is_active() {
+            return Some(CheckRefusal::JobActive);
+        }
+        if !matches!(
+            self.job.state,
+            JobState::Idle | JobState::Completed | JobState::Aborted | JobState::Interrupted
+        ) {
+            return Some(CheckRefusal::JobActive);
+        }
+        if self.machine_state != "Idle" {
+            return Some(CheckRefusal::MachineNotIdle);
+        }
+        None
+    }
+
+    /// Open the check confirmation sheet. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate refusal; no sheet opens then.
+    pub fn request_check(&mut self) -> Result<(), CheckRefusal> {
+        if let Some(refusal) = self.check_refusal() {
+            return Err(refusal);
+        }
+        self.check_confirm_open = true;
+        Ok(())
+    }
+
+    /// Close the check confirmation sheet without sending anything.
+    pub fn cancel_check_confirm(&mut self) -> bool {
+        std::mem::take(&mut self.check_confirm_open)
+    }
+
+    /// Confirm the open check sheet with exactly one `StartCheckRun`.
+    ///
+    /// The sheet is consumed before the gate is checked, so a refusal or
+    /// rejection closes it and leaves the job view unchanged. Without an open
+    /// confirmation nothing is sent.
+    pub fn confirm_check(
+        &mut self,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> CheckOutcome {
+        if !std::mem::take(&mut self.check_confirm_open) {
+            return CheckOutcome::NotConfirmed;
+        }
+        if let Some(refusal) = self.check_refusal() {
+            return CheckOutcome::Refused(refusal);
+        }
+        match send(Command::StartCheckRun) {
+            Ok(()) => {
+                self.job.begin_check();
+                CheckOutcome::Started
+            }
+            Err(detail) => CheckOutcome::Rejected(detail),
+        }
+    }
+
+    /// Send exactly one normal `StartProgram { from_line: None }`.
+    ///
+    /// Check mode has its own `StartCheckRun`; this path never selects it. A
+    /// pending or active check refuses the start without sending, and an
+    /// accepted normal start clears the dry-run label at once (the engine's
+    /// `check_run` accessor confirms it on the next poll).
+    pub fn dispatch_start(
+        &mut self,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> StartOutcome {
+        if self.job.check_busy() {
+            return StartOutcome::Refused(CheckRefusal::CheckActive);
+        }
+        let command = Command::StartProgram { from_line: None };
+        match send(command) {
+            Ok(()) => {
+                self.job.clear_check();
+                StartOutcome::Sent
+            }
+            Err(detail) => StartOutcome::Rejected(detail),
+        }
+    }
+
+    /// The one stop command for the current job.
+    ///
+    /// A real job keeps the soft reset so buffered motion cannot execute
+    /// afterwards. A dry run has no motion to discard; it stops feeding and
+    /// lets the engine restore `Idle` without a reset.
+    pub fn stop_program_command(&self) -> Command {
+        Command::StopProgram {
+            reset: !self.job.is_check(),
+        }
     }
 
     /// Register the exact program source and build the one load command.
@@ -6425,5 +6757,260 @@ mod tests {
                 enabled: true
             })
         );
+    }
+
+    fn check_state() -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("check test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.job.loaded("check.nc".into(), sample_program(), 4);
+        state
+    }
+
+    #[test]
+    fn check_requires_confirmation_then_sends_start_check_run_once() {
+        let mut state = check_state();
+        let mut sent = Vec::new();
+
+        state.request_check().expect("check request");
+        assert!(state.check_confirm_open);
+        assert!(sent.is_empty(), "opening the sheet sends nothing");
+
+        let outcome = state.confirm_check(recorded_send(&mut sent));
+        assert_eq!(outcome, CheckOutcome::Started);
+        assert_eq!(sent, vec![Command::StartCheckRun]);
+        assert!(!state.check_confirm_open, "the sheet is consumed");
+        assert!(state.job.check_pending());
+
+        let outcome = state.confirm_check(recorded_send(&mut sent));
+        assert_eq!(outcome, CheckOutcome::NotConfirmed);
+        assert_eq!(sent, vec![Command::StartCheckRun], "only one command");
+    }
+
+    #[test]
+    fn cancelling_check_confirmation_sends_nothing() {
+        let mut state = check_state();
+        let mut sent = Vec::new();
+        state.request_check().expect("check request");
+
+        assert!(state.cancel_check_confirm());
+        assert!(!state.check_confirm_open);
+        assert!(sent.is_empty(), "cancel sends no command");
+
+        let outcome = state.confirm_check(recorded_send(&mut sent));
+        assert_eq!(outcome, CheckOutcome::NotConfirmed);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn check_is_refused_in_mock_not_ready_locked_and_active_states() {
+        let mut mock = AppState::new();
+        assert_eq!(mock.check_refusal(), Some(CheckRefusal::Mock));
+        assert_eq!(
+            mock.request_check(),
+            Err(CheckRefusal::Mock),
+            "no sheet opens in mock mode"
+        );
+
+        let mut not_ready = check_state();
+        not_ready.connection = ConnectionState::Connecting;
+        assert_eq!(not_ready.check_refusal(), Some(CheckRefusal::NotReady));
+
+        let mut alarm = check_state();
+        alarm.machine_state = "Alarm";
+        assert_eq!(
+            alarm.check_refusal(),
+            Some(CheckRefusal::MachineLocked),
+            "Alarm must refuse a dry run"
+        );
+
+        let mut door = check_state();
+        door.machine_state = "Door";
+        assert_eq!(
+            door.check_refusal(),
+            Some(CheckRefusal::MachineLocked),
+            "Door must refuse a dry run"
+        );
+
+        let mut active = check_state();
+        active.job.started(1, 4);
+        assert_eq!(active.check_refusal(), Some(CheckRefusal::JobActive));
+
+        let mut hold = check_state();
+        hold.machine_state = "Hold";
+        assert_eq!(hold.check_refusal(), Some(CheckRefusal::MachineNotIdle));
+    }
+
+    #[test]
+    fn check_started_shows_checking_and_check_completed_keeps_the_program() {
+        let mut state = check_state();
+        let mut sent = Vec::new();
+        state.request_check().expect("check request");
+        assert_eq!(
+            state.confirm_check(recorded_send(&mut sent)),
+            CheckOutcome::Started
+        );
+
+        assert!(
+            state
+                .job
+                .apply_event(&EngineEvent::CheckStarted { total_lines: 4 })
+        );
+        assert_eq!(state.job.status_label(), "CHECKING");
+        assert!(state.job.is_check());
+        assert!(!state.job.check_pending());
+
+        assert!(state.job.apply_event(&EngineEvent::JobStarted {
+            from_line: 1,
+            total_lines: 4,
+        }));
+        assert_eq!(state.job.status_label(), "CHECKING");
+
+        assert!(state.job.apply_event(&EngineEvent::JobProgress {
+            current_line: 2,
+            completed: 1,
+            total: 4,
+            elapsed: Duration::from_secs(3),
+        }));
+        assert_eq!(state.job.current_line, 2);
+
+        assert!(state.job.apply_event(&EngineEvent::JobCompleted {
+            elapsed: Duration::from_secs(5),
+        }));
+        assert_eq!(state.job.status_label(), "CHECK COMPLETE");
+        assert!(state.job.apply_event(&EngineEvent::CheckCompleted {
+            elapsed: Duration::from_secs(7),
+        }));
+        assert_eq!(state.job.status_label(), "CHECK COMPLETE");
+        assert_eq!(state.job.elapsed, Duration::from_secs(7));
+        assert!(state.job.has_program());
+        assert_eq!(state.job.name, "check.nc");
+    }
+
+    #[test]
+    fn check_pending_blocks_a_second_check_and_a_normal_start() {
+        let mut state = check_state();
+        let mut sent = Vec::new();
+        state.request_check().expect("check request");
+        assert_eq!(
+            state.confirm_check(recorded_send(&mut sent)),
+            CheckOutcome::Started
+        );
+        assert!(state.job.check_pending());
+
+        assert_eq!(state.check_refusal(), Some(CheckRefusal::CheckActive));
+        assert_eq!(state.request_check(), Err(CheckRefusal::CheckActive));
+
+        sent.clear();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::Refused(CheckRefusal::CheckActive)
+        );
+        assert!(sent.is_empty(), "a pending check blocks StartProgram");
+    }
+
+    #[test]
+    fn normal_start_sends_start_program_and_clears_the_check_label() {
+        let mut state = check_state();
+        state.job.sync_check_run(true);
+        state.job.check_started(4);
+        state.job.started(1, 4);
+        state.job.completed(Duration::from_secs(5));
+        assert_eq!(state.job.status_label(), "CHECK COMPLETE");
+
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::Sent
+        );
+        assert_eq!(sent, vec![Command::StartProgram { from_line: None }]);
+        assert!(!state.job.is_check());
+
+        state.job.apply_event(&EngineEvent::JobStarted {
+            from_line: 1,
+            total_lines: 4,
+        });
+        assert_eq!(state.job.status_label(), "RUNNING");
+    }
+
+    #[test]
+    fn stop_during_check_uses_stop_program_without_reset() {
+        let mut check = check_state();
+        check.job.check_started(4);
+        check.job.started(1, 4);
+        assert_eq!(
+            check.stop_program_command(),
+            Command::StopProgram { reset: false },
+            "a dry run has no motion to discard"
+        );
+
+        let mut job = check_state();
+        job.job.started(1, 4);
+        assert_eq!(
+            job.stop_program_command(),
+            Command::StopProgram { reset: true },
+            "a real job keeps the guarded reset"
+        );
+    }
+
+    #[test]
+    fn check_run_accessor_updates_after_polls_and_a_new_load() {
+        let mut state = check_state();
+        assert!(!state.job.is_check());
+        assert!(!state.job.sync_check_run(false));
+
+        assert!(state.job.sync_check_run(true));
+        assert!(state.job.is_check(), "the accessor recovers a missed event");
+
+        state.job.begin_check();
+        assert!(state.job.check_pending());
+        assert!(state.job.sync_check_run(true));
+        assert!(
+            !state.job.check_pending(),
+            "the accessor clears the entry wait"
+        );
+
+        assert!(state.job.sync_check_run(false));
+        assert!(!state.job.is_check(), "a normal start clears the label");
+
+        assert!(state.job.sync_check_run(true));
+        state.job.loaded("next.nc".into(), sample_program(), 4);
+        assert!(!state.job.is_check(), "a new program is not a dry run");
+    }
+
+    #[test]
+    fn job_started_without_a_check_event_clears_a_stale_check_label() {
+        let mut job = JobView::default();
+        job.loaded("check.nc".into(), sample_program(), 4);
+        job.sync_check_run(true);
+        job.check_completed(Duration::from_secs(5));
+        assert!(job.is_check());
+
+        // A run-to or probe start does not go through `dispatch_start`; the
+        // `JobStarted` event alone must clear the previous dry-run label.
+        job.started(1, 4);
+        assert!(!job.is_check());
+        assert_eq!(job.status_label(), "RUNNING");
+    }
+
+    #[test]
+    fn check_enter_error_clears_pending_and_leaves_the_program_loaded() {
+        let mut state = check_state();
+        state.request_check().expect("check request");
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.confirm_check(recorded_send(&mut sent)),
+            CheckOutcome::Started
+        );
+
+        assert!(state.job.apply_event(&EngineEvent::JobError {
+            line: 0,
+            code: 0,
+            message: "controller did not enter check mode ($C)".into(),
+        }));
+        assert!(!state.job.check_pending());
+        assert!(state.job.has_program());
+        assert!(!state.job.is_check());
     }
 }
