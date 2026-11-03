@@ -336,7 +336,7 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ghs-rs ${{ needs.prepare.outputs.tag }}
           draft: true
-          prerelease: ${{ contains(needs.prepare.outputs.tag, '-') }}
+          prerelease: ${{ startsWith(needs.prepare.outputs.tag, 'v0.') || contains(needs.prepare.outputs.tag, '-') }}
           generate_release_notes: true
           files: |
             dist/*.tar.gz
