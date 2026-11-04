@@ -24,14 +24,16 @@ implemented and persisted per profile.
 The remaining V1.0 gaps are hardware validation on the reference FlexiHAL;
 secondary localization (help, warnings, and other long-form text remain
 English); signed installers and notarization; the full release QA pass;
-start-from-line; the utility and calibration set (material surfacing, gantry
-squaring, stepper/XY calibration, first-run machine setup, non-destructive
-transforms, pre-run limits check); and the probe remainder (TLO apply,
-work-rotation apply/straightness, pre/post probe macros, retry strategy, and
-persisted cycle settings). The viewer remainder (3D stock mesh and pre-run
-limits confirmation), portrait reflow, high-contrast theme, first-run safety
-onboarding, session recording, `$RST` confirmation, and the optional Workbench
-mode are also open against the full checklist in [parity.md](parity.md).
+start-from-line; the remaining utility/calibration set (gantry squaring,
+stepper/XY calibration, first-run machine setup, rotation/scale/translate
+transforms, and a pre-run limits confirmation — surfacing, limits display, and
+line-number/comment transforms are implemented); and the probe remainder (TLO
+apply, work-rotation apply/straightness, pre/post probe macros, retry strategy,
+and persisted cycle settings). The viewer remainder (3D stock mesh and a
+pre-run limits confirmation), portrait reflow, high-contrast theme, first-run
+safety onboarding, session recording, `$RST` confirmation, and the optional
+Workbench mode are also open against the full checklist in
+[parity.md](parity.md).
 `v0.5.0` is an optional preview pre-release; it does not close the V1.0 gate.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:

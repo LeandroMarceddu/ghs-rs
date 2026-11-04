@@ -613,7 +613,28 @@ Apply only loads the rewritten program; it never starts it. `REVERT` restores
 the original source. Opening a saved map never applies compensation or starts
 a job.
 
-## 12. Macros and startup lines
+## 12. Utilities, macros, and startup lines
+
+### Utilities
+
+**Utility** contains three source-preparation tools. Each produces a program
+preview and only loads it after confirmation; nothing starts automatically.
+
+- `MATERIAL SURFACING` generates a bounded back-and-forth raster in the active
+  WCS. Fields are millimetres: stock origin/width/depth, cutter diameter,
+  stepover, total depth, depth per pass, feed, plunge feed, safe Z, and spindle
+  RPM. It reports depth passes, rows, lines, cut length, and estimated cutting
+  time. The cutter centerline is inset by its radius; there is no lead-in/ramp.
+  The generated program is **not checked against machine travel, stock, or
+  tool**.
+- `PROGRAM LIMITS` is read-only: work-coordinate X/Y/Z bounds, lines, segments,
+  arcs, and tool changes. If `$20` soft limits and `$130`–`$132` travel are
+  available it reports overruns; otherwise it says `NOT CHECKED` rather than
+  implying safety. START is never blocked.
+- `SOURCE TRANSFORMS` adds line numbers (`N10` step 10 by default) or strips
+  `(...)`/`;` comments. Preview first, then `LOAD AS PROGRAM`. Loading replaces
+  the current job source and clears any height-map Apply/Revert state for the
+  previous source.
 
 ### User macros
 
