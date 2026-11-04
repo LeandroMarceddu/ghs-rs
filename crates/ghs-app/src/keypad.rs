@@ -111,6 +111,10 @@ pub fn overlay(
                         .hint
                         .clone()
                         .unwrap_or_else(|| t("PROBE FIELD (mm)").to_string()),
+                    KeypadTarget::Utility(_) => keypad
+                        .hint
+                        .clone()
+                        .unwrap_or_else(|| t("UTILITY FIELD").to_string()),
                 }),
         );
 

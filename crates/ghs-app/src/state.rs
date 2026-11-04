@@ -18,8 +18,8 @@ use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, Command, ControllerInfo, EngineEvent, JobAbortReason, JobInfo,
     JobPauseReason, JobState, LastEvents, LimitState, MachineSnapshot, Offsets, PinMapping,
-    PinState, Program, ProgramLine as EngineProgramLine, SettingValue, Signals as CoreSignals,
-    StartupLine, StatusReport, ToolEntry, Wcs,
+    PinState, Position, Program, ProgramLine as EngineProgramLine, SettingValue,
+    Signals as CoreSignals, StartupLine, StatusReport, ToolEntry, Wcs,
 };
 use ghs_i18n::t;
 use ghs_probe::XyPoint;
@@ -36,6 +36,7 @@ use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
+use crate::utilities::{ProgramLimits, TravelSettings, UtilityField, UtilityModel};
 
 /// Connection state shown in the top-bar status pill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -405,6 +406,8 @@ pub enum KeypadTarget {
     Tool(ToolField),
     /// One numeric probe preflight field.
     ProbeField(ProbeField),
+    /// One numeric utility (surfacing or transform) field.
+    Utility(UtilityField),
 }
 
 impl KeypadTarget {
@@ -424,6 +427,7 @@ impl KeypadTarget {
             }
             KeypadTarget::Tool(field) => t(field.title()).to_string(),
             KeypadTarget::ProbeField(field) => t(field.label()).to_string(),
+            KeypadTarget::Utility(field) => t(field.label()).to_string(),
         }
     }
 }
@@ -1308,6 +1312,23 @@ impl JobView {
         self.line(index).map(|line| line.source.as_str())
     }
 
+    /// Rebuild the loaded source text, separated by `\n`.
+    ///
+    /// The engine stores parsed lines rather than the raw file, so this is the
+    /// program text the app can transform. Blank lines and comments are kept;
+    /// the original file's line terminator style is not retained.
+    pub fn source_text(&self) -> Option<String> {
+        let program = self.program.as_ref()?;
+        Some(
+            program
+                .lines
+                .iter()
+                .map(|line| line.source.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     /// Whether a 1-based line is inside the engine's streamed program.
     ///
     /// The engine stops its line count at `M2`/`M30`; lines parsed after that
@@ -1767,6 +1788,18 @@ pub fn abort_reason_label(reason: JobAbortReason) -> &'static str {
     }
 }
 
+/// One confirmed utility program ready for the shell to send.
+///
+/// The command is always [`Command::LoadProgram`]; the utility load path never
+/// constructs a start, resume, offset, or compensation command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UtilityLoad {
+    /// Program name shown in the Job workspace.
+    pub name: String,
+    /// The one command the shell must send.
+    pub command: Command,
+}
+
 /// Why the app refuses to replace the loaded program.
 ///
 /// The engine also rejects a load while its runner is active or the link is
@@ -2213,6 +2246,8 @@ pub struct AppState {
     /// The macro records themselves live in the active controller profile
     /// (`ConfigModel`); this model never stores a second copy.
     pub user_macros: MacroModel,
+    /// Material surfacing wizard, program-limits state, and source transforms.
+    pub utilities: UtilityModel,
     /// Local app preferences, controller profile, and backup helpers.
     pub config: ConfigModel,
 }
@@ -2305,6 +2340,7 @@ impl AppState {
             startup_lines: StartupLinesModel::new(),
             pins: PinsModel::new(),
             user_macros: MacroModel::new(),
+            utilities: UtilityModel::default(),
             config,
         };
         state.sync_offset_context();
@@ -2379,6 +2415,7 @@ impl AppState {
         // clears them for a new session and the mirrors follow it.
         self.pins.reset_session();
         self.user_macros.reset();
+        self.utilities.reset_session();
         self.probe = ProbeModel::default();
         self.height_map.reset();
         self.height_map_library.reset();
@@ -3222,6 +3259,106 @@ impl AppState {
             name: name.to_string(),
             source: source.to_string(),
         })
+    }
+
+    /// Build the one load command for a confirmed surfacing preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no preview exists, the operator has not
+    /// acknowledged the generated-program warning, or the normal program-load
+    /// gate refuses (mock, not ready, or a job is active).
+    pub fn take_surfacing_load(&mut self) -> Result<UtilityLoad, String> {
+        if !self.utilities.surfacing_confirmed() {
+            return Err(
+                "confirm that the program is generated, not checked against the machine"
+                    .to_string(),
+            );
+        }
+        let Some(preview) = self.utilities.surfacing_preview() else {
+            return Err("generate the surfacing program before loading it".to_string());
+        };
+        let name = preview.name.clone();
+        let source = preview.source.clone();
+        let command = self
+            .program_load(&name, &source)
+            .map_err(|refusal| refusal.message().to_string())?;
+        Ok(UtilityLoad { name, command })
+    }
+
+    /// Build the one load command for a confirmed transform preview.
+    ///
+    /// This loads the previewed source and never starts or applies
+    /// compensation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no preview exists, the operator has not
+    /// acknowledged the transformed-program warning, or the normal program-load
+    /// gate refuses (mock, not ready, or a job is active).
+    pub fn take_transform_load(&mut self) -> Result<UtilityLoad, String> {
+        if !self.utilities.transform_confirmed() {
+            return Err("confirm the transformed source before loading it".to_string());
+        }
+        let Some(preview) = self.utilities.transform_preview() else {
+            return Err("generate a transform preview before loading it".to_string());
+        };
+        let name = preview.name.clone();
+        let source = preview.source.clone();
+        let command = self
+            .program_load(&name, &source)
+            .map_err(|refusal| refusal.message().to_string())?;
+        Ok(UtilityLoad { name, command })
+    }
+
+    /// Read-only program limits for the Utility card.
+    ///
+    /// Travel values come from `$20` and `$130`/`$131`/`$132` as last reported
+    /// by the controller. The machine estimate adds the active WCS plus `G92`;
+    /// it does not add TLO. When any of those values is unavailable the result
+    /// says NOT CHECKED rather than implying that the program is safe.
+    #[must_use]
+    pub fn program_limits(&self) -> ProgramLimits {
+        let travel = TravelSettings {
+            soft_limits: self.setting_bool(20),
+            travel_mm: [
+                self.setting_f64(130),
+                self.setting_f64(131),
+                self.setting_f64(132),
+            ],
+        };
+        ProgramLimits::evaluate(
+            self.job.program().map(Arc::as_ref),
+            travel,
+            self.travel_work_offset_mm(),
+        )
+    }
+
+    fn setting_f64(&self, number: u16) -> Option<f64> {
+        self.settings
+            .row(number)
+            .and_then(|row| row.current.as_f64())
+            .filter(|value| value.is_finite())
+    }
+
+    fn setting_bool(&self, number: u16) -> Option<bool> {
+        self.settings
+            .row(number)
+            .and_then(|row| match row.current.as_bool() {
+                Some(value) => Some(value),
+                None => row.current.as_f64().map(|value| value != 0.0),
+            })
+    }
+
+    /// Active WCS plus `G92`, in millimetres, when `$#` was reported.
+    fn travel_work_offset_mm(&self) -> Option<[f64; 3]> {
+        if !self.offsets.reported() {
+            return None;
+        }
+        let wcs = self.offsets.wcs_position(self.offsets.active_wcs())?;
+        let g92 = self.offsets.g92_position().unwrap_or_else(Position::zero);
+        let sum = |axis: CoreAxis| wcs.get(axis) + g92.get(axis);
+        Some([sum(CoreAxis::X), sum(CoreAxis::Y), sum(CoreAxis::Z)])
     }
 
     /// Lines parsed in the Program tab: the engine program or the mock list.
@@ -4090,6 +4227,15 @@ impl AppState {
                 };
                 (value, true, Some(hint))
             }
+            KeypadTarget::Utility(field) => {
+                let value = self.utilities.field_text(field).to_string();
+                let hint = if field.unit().is_empty() {
+                    field.label().to_string()
+                } else {
+                    format!("{} ({})", field.label(), field.unit())
+                };
+                (value, true, Some(hint))
+            }
         };
         self.keypad = Some(KeypadState {
             target,
@@ -4235,6 +4381,11 @@ impl AppState {
             }
             KeypadTarget::ProbeField(field) => {
                 if let Err(message) = self.probe.set_field_text(field, keypad.buffer.clone()) {
+                    self.push_console(ConsoleLevel::Warn, message);
+                }
+            }
+            KeypadTarget::Utility(field) => {
+                if let Err(message) = self.utilities.set_field_text(field, keypad.buffer.clone()) {
                     self.push_console(ConsoleLevel::Warn, message);
                 }
             }
@@ -4543,6 +4694,93 @@ mod tests {
         Arc::new(
             ghs_gcode::parse_program("G21\nG0 X10\nM6 T2\nM30\n").expect("sample program parses"),
         )
+    }
+
+    #[test]
+    fn surfacing_load_requires_confirmation_and_builds_one_load_program() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        state
+            .utilities
+            .generate_surfacing(Wcs::G54)
+            .expect("preview");
+        assert!(
+            state.take_surfacing_load().is_err(),
+            "confirmation is required"
+        );
+        state.utilities.set_surfacing_confirmed(true);
+        let load = state.take_surfacing_load().expect("confirmed load");
+        assert_eq!(load.name, "surfacing-100x80-2deep.nc");
+        let Command::LoadProgram { name, source } = &load.command else {
+            panic!("utility load must be LoadProgram, got {:?}", load.command);
+        };
+        assert_eq!(name, &load.name);
+        assert!(source.starts_with("G21 G90 G54 G17 G94"));
+        assert!(!state.job.is_active(), "utility load never starts the job");
+    }
+
+    #[test]
+    fn transform_load_is_load_program_and_never_start() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        let program = Arc::new(
+            ghs_gcode::parse_program("G21\nG0 X0 (park)\nG1 X10 F100 ; cut\nM30\n")
+                .expect("program parses"),
+        );
+        state.job.loaded("part.nc".into(), Arc::clone(&program), 4);
+        let name = state.job.name.clone();
+        let source = state.job.source_text().expect("loaded source");
+        state
+            .utilities
+            .generate_transform(
+                crate::utilities::TransformKind::StripComments,
+                &name,
+                &source,
+            )
+            .expect("transform preview");
+        assert!(state.take_transform_load().is_err());
+        state.utilities.set_transform_confirmed(true);
+        let load = state.take_transform_load().expect("confirmed load");
+        assert_eq!(load.name, "part.nc [comments stripped]");
+        let Command::LoadProgram { name, source } = &load.command else {
+            panic!("transform load must be LoadProgram, got {:?}", load.command);
+        };
+        assert_eq!(name, &load.name);
+        assert_eq!(source, "G21\nG0 X0\nG1 X10 F100\nM30");
+        assert!(!state.job.is_active());
+        assert!(Arc::ptr_eq(
+            state.job.program().expect("program remains loaded"),
+            &program
+        ));
+    }
+
+    #[test]
+    fn program_limits_use_reported_settings_offsets_and_warn() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        state.settings.apply_settings(&[
+            ghs_engine::Setting::new(20, SettingValue::Bool(true)),
+            ghs_engine::Setting::new(130, SettingValue::Int(100)),
+            ghs_engine::Setting::new(131, SettingValue::Int(200)),
+            ghs_engine::Setting::new(132, SettingValue::Int(100)),
+        ]);
+        let mut offsets = Offsets::default();
+        offsets.wcs[Wcs::G54.index()] = Some(Position::xyz(10.0, 0.0, 10.0));
+        state.apply_offsets(&offsets);
+        let program = Arc::new(
+            ghs_gcode::parse_program("G21\nG0 X10 Y0 Z0\nG1 X100 F100\nM30\n")
+                .expect("program parses"),
+        );
+        state.job.loaded("limits.nc".into(), program, 4);
+        let limits = state.program_limits();
+        assert!(limits.is_over_travel());
+        assert_eq!(
+            limits.overruns(),
+            vec!["X MAX 110.000 > $130 100.000".to_string()]
+        );
     }
 
     #[test]

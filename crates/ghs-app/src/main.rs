@@ -23,8 +23,11 @@
 //! workspaces directly. `--pins` opens the read-only controller pin/limit
 //! diagnostics sheet and runs the same explicit REFRESH the Utility button
 //! uses. `--keymap` opens the Utility workspace at the machine
-//! keymap section. `--demo-tools` seeds the app-side tool table after the
-//! controller profile loads. `--macros` opens the Utility workspace with the
+//! keymap section. `--demo-surfacing` opens the material surfacing wizard and
+//! generates a preview without loading or starting it; `--demo-transform` opens
+//! the line-number transform preview for the loaded demo program.
+//! `--demo-tools` seeds the app-side tool table after the controller profile
+//! loads. `--macros` opens the Utility workspace with the
 //! user-macro section, while `--demo-macros` seeds two profile macros through
 //! the normal save path; `--demo-macro-edit` then opens the macro editor and
 //! `--demo-macro-confirm` opens the run confirmation without confirming it.
@@ -96,6 +99,7 @@ mod startup;
 mod state;
 mod theme;
 mod tools;
+mod utilities;
 mod viewer;
 
 use gpui_kit::*;

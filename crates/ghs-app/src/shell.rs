@@ -97,6 +97,7 @@ use crate::state::{
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
+use crate::utilities::{TransformKind, UtilityField};
 use crate::viewer;
 
 const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -341,6 +342,14 @@ pub struct Shell {
     macro_editor: Option<MacroEditor>,
     macro_delete: Option<String>,
     startup_confirm: Option<StartupConfirm>,
+    /// Material surfacing wizard sheet is open. Opening sends nothing.
+    surfacing_open: bool,
+    /// Screenshot switch: open the surfacing wizard and generate a preview.
+    demo_surfacing: bool,
+    demo_surfacing_done: bool,
+    /// Screenshot switch: open the line-number transform preview.
+    demo_transform: bool,
+    demo_transform_done: bool,
     offset_refresh_sent: bool,
     backup_import_armed: bool,
     settings_demo_write: bool,
@@ -618,6 +627,11 @@ impl Shell {
             || demo_macro_edit
             || demo_macro_confirm;
         let demo_startup_write = std::env::args().any(|arg| arg == "--demo-startup-write");
+        let demo_surfacing = std::env::args().any(|arg| arg == "--demo-surfacing");
+        let demo_transform = std::env::args().any(|arg| arg == "--demo-transform");
+        if demo_surfacing || demo_transform {
+            state.mode = Mode::Utility;
+        }
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
         let demo_offsets_goto = std::env::args().any(|arg| arg == "--demo-offsets-goto");
         let demo_offsets_restore = std::env::args().any(|arg| arg == "--demo-offsets-restore");
@@ -724,6 +738,11 @@ impl Shell {
             macro_editor: None,
             macro_delete: None,
             startup_confirm: None,
+            surfacing_open: false,
+            demo_surfacing,
+            demo_surfacing_done: false,
+            demo_transform,
+            demo_transform_done: false,
             offset_refresh_sent: false,
             backup_import_armed: false,
             settings_demo_write,
@@ -1164,6 +1183,47 @@ impl Shell {
                 self.confirm_startup_apply(cx);
                 changed = true;
             }
+        }
+        // Screenshot switch: open the surfacing wizard with a generated
+        // preview. Nothing is loaded or started by this switch.
+        if self.demo_surfacing
+            && !self.demo_surfacing_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_surfacing_done = true;
+            self.state.mode = Mode::Utility;
+            self.surfacing_open = true;
+            if let Err(message) = self
+                .state
+                .utilities
+                .generate_surfacing(Wcs::from_index(self.state.wcs_index).unwrap_or(Wcs::G54))
+            {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Demo surfacing: {message}"));
+            }
+            changed = true;
+        }
+        // Screenshot switch: generate the line-number transform preview for
+        // the loaded demo program. Nothing is loaded by this switch.
+        if self.demo_transform
+            && !self.demo_transform_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+        {
+            self.demo_transform_done = true;
+            self.state.mode = Mode::Utility;
+            let name = self.state.job.name.clone();
+            if let Some(source) = self.state.job.source_text()
+                && let Err(message) = self.state.utilities.generate_transform(
+                    TransformKind::AddLineNumbers,
+                    &name,
+                    &source,
+                )
+            {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Demo transform: {message}"));
+            }
+            changed = true;
         }
         // Screenshot switch: one real G10 write through the normal path.
         if self.demo_offsets_write
@@ -4616,6 +4676,113 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the material surfacing wizard. Opening sends nothing.
+    fn open_surfacing(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.state.utilities.close_transform();
+        self.state.mode = Mode::Utility;
+        self.surfacing_open = true;
+        cx.notify();
+    }
+
+    /// Close the surfacing wizard without sending or loading anything.
+    fn close_surfacing(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.surfacing_open = false;
+        cx.notify();
+    }
+
+    /// Regenerate the surfacing preview from the current fields.
+    fn generate_surfacing(&mut self, cx: &mut Context<Self>) {
+        if let Err(message) = self
+            .state
+            .utilities
+            .generate_surfacing(Wcs::from_index(self.state.wcs_index).unwrap_or(Wcs::G54))
+        {
+            self.state
+                .push_console(ConsoleLevel::Warn, format!("Surfacing: {message}"));
+        }
+        cx.notify();
+    }
+
+    /// Load the confirmed surfacing preview with exactly one `LoadProgram`.
+    fn load_surfacing(&mut self, cx: &mut Context<Self>) {
+        let load = match self.state.take_surfacing_load() {
+            Ok(load) => load,
+            Err(message) => {
+                self.state.push_console(ConsoleLevel::Warn, message);
+                cx.notify();
+                return;
+            }
+        };
+        if self.send_command(load.command) {
+            self.state.utilities.reset_session();
+            self.surfacing_open = false;
+            self.state.mode = Mode::Job;
+            self.state.left_tab = LeftTab::Program;
+            self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Loaded surfacing program {} (not started)", load.name),
+            );
+        } else {
+            self.state.height_map.discard_exact_source(&load.name);
+        }
+        cx.notify();
+    }
+
+    /// Generate one transform preview from the currently loaded source.
+    fn generate_transform(&mut self, kind: TransformKind, cx: &mut Context<Self>) {
+        let name = self.state.job.name.clone();
+        let Some(source) = self.state.job.source_text() else {
+            self.state
+                .push_console(ConsoleLevel::Warn, "No program is loaded to transform");
+            cx.notify();
+            return;
+        };
+        if let Err(message) = self
+            .state
+            .utilities
+            .generate_transform(kind, &name, &source)
+        {
+            self.state
+                .push_console(ConsoleLevel::Warn, format!("Transform: {message}"));
+        }
+        self.surfacing_open = false;
+        self.state.mode = Mode::Utility;
+        cx.notify();
+    }
+
+    /// Close the transform preview without loading anything.
+    fn close_transform(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.state.utilities.close_transform();
+        cx.notify();
+    }
+
+    /// Load the confirmed transform preview with exactly one `LoadProgram`.
+    fn load_transform(&mut self, cx: &mut Context<Self>) {
+        let load = match self.state.take_transform_load() {
+            Ok(load) => load,
+            Err(message) => {
+                self.state.push_console(ConsoleLevel::Warn, message);
+                cx.notify();
+                return;
+            }
+        };
+        if self.send_command(load.command) {
+            self.state.utilities.close_transform();
+            self.state.mode = Mode::Job;
+            self.state.left_tab = LeftTab::Program;
+            self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Loaded transformed program {} (not started)", load.name),
+            );
+        } else {
+            self.state.height_map.discard_exact_source(&load.name);
+        }
+        cx.notify();
+    }
+
     /// Send one run-option toggle through the guarded engine gateway.
     ///
     /// Exactly one command leaves this method. The displayed value is not
@@ -4960,8 +5127,10 @@ impl Shell {
                         }
                     }
                     // A settings value stays local until Apply; `AppState`
-                    // already wrote it into the row draft.
-                    KeypadTarget::Setting(_) | KeypadTarget::Tool(_) => {}
+                    // already wrote it into the row draft. Utility fields are
+                    // local wizard data and send nothing.
+                    KeypadTarget::Setting(_) | KeypadTarget::Tool(_) | KeypadTarget::Utility(_) => {
+                    }
                     KeypadTarget::ProbeField(field) => {
                         // The mount offset is setup data owned by the profile.
                         // A failed save never blocks the local value, but the
@@ -12118,6 +12287,758 @@ impl Shell {
             )))
     }
 
+    /// One tap-to-edit utility field cell, backed by the shared keypad.
+    fn utility_field_cell(&self, field: UtilityField, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let unit = field.unit();
+        let label = if unit.is_empty() {
+            t(field.label()).to_string()
+        } else {
+            format!("{} ({})", t(field.label()), unit)
+        };
+        let value = self.state.utilities.field_text(field).to_string();
+        let error = self
+            .state
+            .utilities
+            .field_error(field)
+            .map(std::string::ToString::to_string);
+        let mut cell = v_flex()
+            .w(px(136.0))
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(label),
+            )
+            .child(
+                Button::new(format!("utility-field-{}", field.key()))
+                    .label(value)
+                    .h(px(48.0))
+                    .w_full()
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(p.panel)
+                            .foreground(p.text)
+                            .hover(p.raised_hover)
+                            .active(p.accent_muted),
+                    )
+                    .border_1()
+                    .border_color(if error.is_some() { p.danger } else { p.border })
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.state.open_keypad(KeypadTarget::Utility(field));
+                            cx.notify();
+                        });
+                    }),
+            );
+        if let Some(error) = error {
+            cell = cell.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+        cell
+    }
+
+    /// Material surfacing summary card in the Utility workspace.
+    fn surfacing_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let preview = self.state.utilities.surfacing_preview();
+        let error = self.state.utilities.surfacing_error().map(str::to_string);
+        let summary = preview.map_or_else(
+            || t("No generated program yet. Open the wizard, validate the fields, and preview.").to_string(),
+            |preview| {
+                format!(
+                    "{} depth passes | {} rows/pass | {} lines | {} mm cut | EST {} (rapids excluded)",
+                    preview.depth_passes,
+                    preview.rows_per_pass,
+                    preview.line_count,
+                    preview.path_length_mm.round(),
+                    format_elapsed(Duration::from_secs(preview.estimated_secs()))
+                )
+            },
+        );
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("MATERIAL SURFACING"), p))
+                    .child(chip(t("GENERATED / NOT CHECKED"), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Back-and-forth raster at each depth, with a safe-Z retract between passes. The wizard validates every field and caps the program before LOAD AS PROGRAM; it never starts the job.",
+            )))
+            .child(div().text_size(px(11.0)).text_color(p.text_dim).child(summary))
+            .when_some(error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+            .child(
+                Button::new("surfacing-open")
+                    .label(t("OPEN WIZARD"))
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(220.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.open_surfacing(cx));
+                    }),
+            )
+    }
+
+    /// Read-only program limits card for the loaded program.
+    fn program_limits_card(&self, p: Palette) -> impl IntoElement {
+        let limits = self.state.program_limits();
+        let status_color = if limits.is_over_travel() {
+            p.danger
+        } else if limits.is_not_checked() {
+            p.warning
+        } else if limits.is_checked() {
+            p.success
+        } else {
+            p.text_faint
+        };
+        let soft_limits = match limits.soft_limits {
+            Some(true) => t("ON").to_string(),
+            Some(false) => t("OFF").to_string(),
+            None => t("NOT REPORTED").to_string(),
+        };
+        let mut overruns = v_flex().gap_1();
+        for line in limits.overruns() {
+            overruns = overruns.child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.danger)
+                    .child(line),
+            );
+        }
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("PROGRAM LIMITS"), p))
+                    .child(chip(t("READ-ONLY"), p)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(format!(
+                        "PROGRAM {} | {} lines | {} segments | {} arcs | {} tool changes",
+                        self.state.job_title(),
+                        limits.lines,
+                        limits.segments,
+                        limits.arcs,
+                        limits.tool_changes
+                    )),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "WORK BOUNDS (zero-offset parse)   {}",
+                        limits.bounds_text()
+                    )),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "TRAVEL   {}   | soft limits $20 {soft_limits}",
+                        limits.travel_text()
+                    )),
+            )
+            .when_some(limits.machine_bounds, |this, machine| {
+                this.child(
+                    div()
+                        .font_family(self.mono.clone())
+                        .text_size(px(10.0))
+                        .text_color(p.text_dim)
+                        .child(format!(
+                            "MACHINE EST (work + WCS/G92)   {}",
+                            machine.format_all()
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(status_color)
+                    .child(limits.status_text()),
+            )
+            .child(overruns)
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .line_height(px(12.0))
+                    .text_color(p.text_faint)
+                    .child(t(
+                        "Informational only: START is never blocked. The machine estimate adds the reported active WCS plus G92; TLO is not included. Missing travel or offset data shows NOT CHECKED, never a safety claim. No controller writes.",
+                    )),
+            )
+    }
+
+    /// Non-destructive source transforms for the loaded program.
+    fn transform_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let loaded = self.state.job.has_program();
+        let name = self.state.job_title().to_string();
+        let compensated = self.state.job_compensated();
+        let error = self.state.utilities.transform_error().map(str::to_string);
+        let view = cx.entity();
+        let numbers_view = view.clone();
+        let comments_view = view.clone();
+        let line_fields = [UtilityField::LineStart, UtilityField::LineStep]
+            .into_iter()
+            .map(|field| self.utility_field_cell(field, p, cx))
+            .collect::<Vec<_>>();
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("SOURCE TRANSFORMS"), p))
+                    .child(chip(t("PREVIEW FIRST"), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(format!(
+                "Loaded source: {name}. Transforms never modify it in place; LOAD AS PROGRAM replaces the job with the previewed copy and never starts it."
+            )))
+            .when(compensated, |this| {
+                this.child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                    "HEIGHT MAP / COMPENSATED: loading a transform replaces the compensated program and its Revert original. Keep an external copy if needed.",
+                )))
+            })
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(line_fields),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("transform-line-numbers")
+                            .label(t("ADD LINE NUMBERS"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(200.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!loaded)
+                            .on_click(move |_, _, cx| {
+                                numbers_view.update(cx, |this, cx| {
+                                    this.generate_transform(TransformKind::AddLineNumbers, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("transform-strip-comments")
+                            .label(t("STRIP COMMENTS"))
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(180.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!loaded)
+                            .on_click(move |_, _, cx| {
+                                comments_view.update(cx, |this, cx| {
+                                    this.generate_transform(TransformKind::StripComments, cx);
+                                });
+                            }),
+                    )
+                    .when(!loaded, |this| {
+                        this.child(
+                            div().text_size(px(10.0)).text_color(p.warning).child(t(
+                                "NO PROGRAM: load a program before transforming its source",
+                            )),
+                        )
+                    }),
+            )
+            .when_some(error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+    }
+
+    /// Material surfacing wizard sheet.
+    fn surfacing_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.surfacing_open {
+            return div().into_any_element();
+        }
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let close_view = view.clone();
+        let generate_view = view.clone();
+        let spindle_view = view.clone();
+        let confirm_view = view.clone();
+        let load_view = view.clone();
+        let mono = self.mono.clone();
+        let model = &self.state.utilities;
+        let preview = model.surfacing_preview();
+        let error = model.surfacing_error().map(str::to_string);
+        let load_refusal = self.state.program_load_refusal();
+        let can_load = preview.is_some() && model.surfacing_confirmed() && load_refusal.is_none();
+
+        let cells = UtilityField::ALL
+            .into_iter()
+            .filter(|field| field.is_surfacing())
+            .map(|field| self.utility_field_cell(field, p, cx))
+            .collect::<Vec<_>>();
+
+        let mut source_lines = v_flex()
+            .id("surfacing-preview-lines")
+            .gap_0()
+            .max_h(px(120.0))
+            .overflow_y_scrollbar();
+        let mut shown = 0usize;
+        if let Some(preview) = preview {
+            for line in preview.source.lines().take(40) {
+                shown += 1;
+                source_lines = source_lines.child(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(10.0))
+                        .line_height(px(13.0))
+                        .text_color(p.text_dim)
+                        .child(line.to_string()),
+                );
+            }
+        }
+
+        let summary = preview.map_or_else(
+            || {
+                t("GENERATE PREVIEW to validate the fields and compute passes, path length, and time.")
+                    .to_string()
+            },
+            |preview| {
+                format!(
+                    "{} depth passes | {} rows/pass | {} lines | {} mm cut | EST {} (rapids excluded)",
+                    preview.depth_passes,
+                    preview.rows_per_pass,
+                    preview.line_count,
+                    preview.path_length_mm.round(),
+                    format_elapsed(Duration::from_secs(preview.estimated_secs()))
+                )
+            },
+        );
+        let preview_name = preview.map(|preview| preview.name.clone());
+        let total_lines = preview.map_or(0, |preview| preview.line_count);
+
+        let sheet = v_flex()
+            .relative()
+            .w(px(920.0))
+            .max_w_full()
+            .max_h(px(700.0))
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border_strong)
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(t("MATERIAL SURFACING WIZARD")),
+                    )
+                    .child(chip(t("GENERATED / NOT CHECKED"), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                "The program is generated from these fields. It is not checked against this machine's travel, offsets, tool, or stock. LOAD AS PROGRAM does not start it.",
+            )))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(cells),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Switch::new("surfacing-spindle")
+                            .checked(model.spindle_on())
+                            .label(t("SPINDLE ON (M3 S... / M5)"))
+                            .text_size(px(11.0))
+                            .on_change(move |checked, _, cx| {
+                                spindle_view.update(cx, |this, cx| {
+                                    this.state.utilities.set_spindle_on(*checked);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child(t("OFF omits both M3 and M5")),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(if error.is_some() { p.danger } else { p.border })
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(section_label(t("PREVIEW SUMMARY"), p))
+                            .when_some(preview_name, |this, name| {
+                                this.child(
+                                    div()
+                                        .font_family(mono.clone())
+                                        .text_size(px(10.0))
+                                        .text_color(p.accent)
+                                        .child(name),
+                                )
+                            }),
+                    )
+                    .child(div().text_size(px(11.0)).text_color(p.text_dim).child(summary))
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    })
+                    .when_some(preview, |this, _| {
+                        this.child(source_lines).child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(p.text_faint)
+                                .child(format!(
+                                    "showing {} of {total_lines} generated lines",
+                                    shown
+                                )),
+                        )
+                    }),
+            )
+            .child(
+                Switch::new("surfacing-confirm")
+                    .checked(model.surfacing_confirmed())
+                    .label(t(
+                        "I understand this program is generated, not checked against the machine",
+                    ))
+                    .text_size(px(11.0))
+                    .on_change(move |checked, _, cx| {
+                        confirm_view.update(cx, |this, cx| {
+                            this.state.utilities.set_surfacing_confirmed(*checked);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .when_some(load_refusal, |this, refusal| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.warning)
+                        .child(t(refusal.message())),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("surfacing-generate")
+                            .label(t("GENERATE PREVIEW"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(180.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                generate_view.update(cx, |this, cx| this.generate_surfacing(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("surfacing-load")
+                            .label(t("LOAD AS PROGRAM"))
+                            .primary()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!can_load)
+                            .on_click(move |_, _, cx| {
+                                load_view.update(cx, |this, cx| this.load_surfacing(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("surfacing-close")
+                            .label(t("CLOSE"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(110.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                close_view.update(cx, |this, cx| this.close_surfacing(cx));
+                            }),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("surfacing-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_surfacing(cx));
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
+    /// Transform preview and explicit load sheet.
+    fn transform_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(preview) = self.state.utilities.transform_preview() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let close_view = view.clone();
+        let confirm_view = view.clone();
+        let load_view = view;
+        let mono = self.mono.clone();
+        let confirmed = self.state.utilities.transform_confirmed();
+        let load_refusal = self.state.program_load_refusal();
+        let can_load = confirmed && load_refusal.is_none();
+        let stats = match preview.kind {
+            TransformKind::AddLineNumbers => format!(
+                "{} numbers added | {} existing N words kept | {} checksum lines kept | {} lines changed",
+                preview.added_numbers,
+                preview.skipped_existing,
+                preview.skipped_checksums,
+                preview.changed_lines
+            ),
+            TransformKind::StripComments => format!(
+                "{} comment blocks removed | {} lines changed | {} checksum lines kept | {} -> {} lines",
+                preview.removed_comments,
+                preview.changed_lines,
+                preview.skipped_checksums,
+                preview.input_lines,
+                preview.output_lines
+            ),
+        };
+        let mut lines = v_flex()
+            .id("transform-preview-lines")
+            .gap_0()
+            .max_h(px(260.0))
+            .overflow_y_scrollbar();
+        let mut shown = 0usize;
+        for line in preview.source.lines().take(80) {
+            shown += 1;
+            lines = lines.child(
+                div()
+                    .font_family(mono.clone())
+                    .text_size(px(10.5))
+                    .line_height(px(14.0))
+                    .text_color(p.text_dim)
+                    .child(line.to_string()),
+            );
+        }
+        let total = preview.source.lines().count();
+
+        let sheet = v_flex()
+            .relative()
+            .w(px(820.0))
+            .max_w_full()
+            .max_h(px(700.0))
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.warning.opacity(0.6))
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(t("TRANSFORM PREVIEW")),
+                    )
+                    .child(chip(t(preview.kind.label()), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new program and never starts it.",
+            )))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_faint)
+                                    .child(format!("SOURCE   {}", preview.base_name)),
+                            )
+                            .child(chip(t("PREVIEW"), p)),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(10.0))
+                            .text_color(p.accent)
+                            .child(format!("LOAD NAME   {}", preview.name)),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_dim).child(stats)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .child(lines)
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child(format!("showing {shown} of {total} transformed lines")),
+                    ),
+            )
+            .child(div().text_size(px(9.5)).text_color(p.text_faint).child(preview.note.clone()))
+            .child(
+                Switch::new("transform-confirm")
+                    .checked(confirmed)
+                    .label(t("I understand this loads the previewed source and does not start it"))
+                    .text_size(px(11.0))
+                    .on_change(move |checked, _, cx| {
+                        confirm_view.update(cx, |this, cx| {
+                            this.state.utilities.set_transform_confirmed(*checked);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .when_some(load_refusal, |this, refusal| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(p.warning)
+                        .child(t(refusal.message())),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("transform-load")
+                            .label(t("LOAD AS PROGRAM"))
+                            .primary()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!can_load)
+                            .on_click(move |_, _, cx| {
+                                load_view.update(cx, |this, cx| this.load_transform(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("transform-close")
+                            .label(t("CLOSE"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(110.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                close_view.update(cx, |this, cx| this.close_transform(cx));
+                            }),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("transform-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_transform(cx));
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let config = &self.state.config;
@@ -12591,6 +13512,9 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.surfacing_card(p, cx))
+            .child(self.program_limits_card(p))
+            .child(self.transform_card(p, cx))
             .child(self.language_card(p, cx))
             .child(self.pins_card(p, cx))
             .child(self.keymap_card(p, cx))
@@ -16686,6 +17610,12 @@ impl Render for Shell {
         }
         if self.state.pins.is_open() {
             root = root.child(self.pins_overlay(p, cx));
+        }
+        if self.surfacing_open {
+            root = root.child(self.surfacing_overlay(p, cx));
+        }
+        if self.state.utilities.transform_preview().is_some() {
+            root = root.child(self.transform_overlay(p, cx));
         }
         if self.state.macro_run_pending().is_some() {
             root = root.child(self.macro_run_overlay(p, cx));
