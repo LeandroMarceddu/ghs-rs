@@ -746,6 +746,14 @@ starts automatically.
   `(...)`/`;` comments. Preview first, then `LOAD AS PROGRAM`. Loading replaces
   the current job source and clears any height-map Apply/Revert state for the
   previous source.
+- `ROTATE PROGRAM` rotates the loaded source about a work-coordinate pivot by a
+  signed angle (counter-clockwise positive). Preview shows the line/move/arc
+  counts, any `R` arc converted to `I`/`J`, and the first lines. `LOAD AS
+  PROGRAM` requires confirmation and sends one load; it never starts. The
+  transform refuses incremental motion, `G53`/`G28`/`G30`, probing, canned
+  cycles, `G10`/`G92`, `G18`/`G19` arcs, helical arcs, `G93`, `G51`, checksums,
+  and mid-program WCS switches. A completed rotation probe can copy its
+  `-deviation` into the angle field; the pivot stays manual.
 - `STEPPER CALIBRATION` calculates a new `$100`/`$101`/`$102` steps/mm value
   from the current value, commanded distance, and measured distance
   (`new = old × commanded ÷ measured`). It does **not** move the machine: jog or

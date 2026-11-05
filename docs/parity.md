@@ -156,7 +156,7 @@ implemented before its UI or hardware validation row is complete.
 | PROBE-03 | Edge finder X/Y, inside and outside | M6 | done | Edge offset |
 | PROBE-04 | Corner finder | M6 | done | XY touch plate |
 | PROBE-05 | Center finder, circle and rectangle | M6 | done | Circle and rectangle UI |
-| PROBE-06 | Rotation and straightness | M6 | partial | Reports angle; work rotation apply deferred |
+| PROBE-06 | Rotation and straightness | M6 | partial | Reports angle; `USE PROBE ANGLE` fills source rotation; controller work rotation deferred |
 | PROBE-07 | XY touch plate offsets | M6 | done | Outside-edge plate workflow |
 | PROBE-08 | Probe verify and connected flow | M6 | done | No `PC` signal on this build |
 | PROBE-09 | Pre and post probe macros | M6 | done | Bounded no-motion allowlist; per-profile editor |
@@ -176,7 +176,7 @@ implemented before its UI or hardware validation row is complete.
 | UTIL-02 | Gantry squaring and alignment | M7 | done | Guided calculator; manual adjustment; no motion |
 | UTIL-03 | Stepper and XY calibration | M7 | done | `$100`–`$102` wizard |
 | UTIL-04 | Program outline and limits check | M7 | done | Limits card; outline in viewer |
-| UTIL-05 | Add line numbers, strip comments, transform tools | M7 | partial | Numbering/comments; rotate/scale/translate open |
+| UTIL-05 | Add line numbers, strip comments, transform tools | M7 | partial | Numbering/comments/rotate; scale UI and translate open |
 | UTIL-06 | Utility macros and quick actions | M7 | done | Toolbar |
 | UTIL-07 | Machine setup wizard | M7 | done | First-run safety/setup; app-config flag |
 
