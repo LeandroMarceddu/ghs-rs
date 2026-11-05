@@ -44,7 +44,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   machine keymap, and read-only pins/limits diagnostics.
 - **Utilities** — first-run safety/setup wizard, bounded material-surfacing
   wizard, program-limits check, non-destructive line-number/comment transforms,
-  and a confirmed stepper calibration wizard.
+  a confirmed stepper calibration wizard, and a backup-gated `$RST` controller
+  reset.
 - **Jobs** — in-app program file browser and loading, streaming, pause/resume/
   stop, tool-change sheet, optional-stop/single-block/block-delete run options,
   breakpoints and run-to-line, an over-travel START confirmation based on

@@ -18,7 +18,8 @@ report the path **and** verify its pixel size with `identify`.
   `--demo-toolchange`, `--demo-surfacing`, `--demo-transform`,
   `--demo-calibration`, `--demo-calibration-confirm`, `--demo-soft-limits`,
   `--demo-over-travel`, `--demo-setup`, `--demo-setup-units`,
-  `--demo-setup-review`, `--demo-probe-tlo`, and `--demo-probe-tlo-confirm`.
+  `--demo-setup-review`, `--demo-probe-tlo`, `--demo-probe-tlo-confirm`,
+  `--demo-reset`, and `--demo-reset-confirm`.
 - Always verify the PNG with `identify`; a capture command can exit 0 and write
   nothing.
 - Kill the app and the compositor in a `trap`/cleanup step. Check

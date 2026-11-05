@@ -31,6 +31,9 @@ it has been verified on the machine.
    requires a second confirmation, and macros are refused in mock, Alarm/Door,
    a running job, or a non-Idle state. They never auto-run on load or import.
 9. The stop/reset control is always visible and never disabled.
+10. A destructive controller `$RST` is idle-only, requires a backup prompt and
+    an explicit two-step confirmation, and never changes local profiles or
+    backups automatically.
 
 ## Operator checklist for every release
 

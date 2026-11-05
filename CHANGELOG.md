@@ -11,7 +11,15 @@ until the next release is cut.
 
 ## [Unreleased]
 
-No changes yet after `v0.6.0`.
+### Added
+
+- **Controller reset** — Utility → `CONTROLLER RESET` covers `$RST=#`, `$RST=$`,
+  `$RST=&`, and `$RST=*`. Each target requires a backup prompt or explicit
+  data-loss acknowledgement and a two-step confirmation; the reset is
+  idle-only and never changes local profiles or backups.
+- **Probe defaults** — safe Z, search, feed, retract, diameter, edge offset,
+  and plate thickness are stored per controller profile with validation and
+  backward-compatible defaults. UI wiring follows.
 
 ## [0.6.0] - 2026-11-05
 

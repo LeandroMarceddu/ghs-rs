@@ -141,7 +141,7 @@ implemented before its UI or hardware validation row is complete.
 | SETUP-04 | Stepper and axis calibration | M5 | done | Steps/mm wizard; squaring/backlash open |
 | SETUP-05 | App settings and controller profiles | M5 | done | Keyed by `$I` identity |
 | SETUP-06 | Import and export settings, offsets, tools | M5 | partial | Backup bundle; offsets `.nc` open |
-| SETUP-07 | Controller reset (`$RST`) with backup prompt | M5 | todo | Destructive, confirmed |
+| SETUP-07 | Controller reset (`$RST`) with backup prompt | M5 | done | Four targets; backup + two-step confirm |
 | SETUP-08 | Keymap persistence | M5 | done | Machine actions; gamepad later |
 | SETUP-09 | Startup line persistence | M5 | done | `$N` read/edit/verify |
 | SETUP-10 | Tool table persistence | M5 | done | App-side |

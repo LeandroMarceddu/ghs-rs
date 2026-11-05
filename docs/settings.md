@@ -38,8 +38,10 @@ Generate the form; do not hardcode setting numbers. Map types:
   state. Do not mark a setting applied until `SettingWritten.verified`.
 - Batch changes; export a backup from Profiles before risky edits. Writes are
   never auto-restored.
-- `$RST` is not exposed in this build. If it is added, it must require a typed
-  confirmation and a backup.
+- `$RST` is exposed only through Utility → `CONTROLLER RESET`. Each target
+  requires a two-step confirmation and either an exported backup or an explicit
+  data-loss acknowledgement; the app sends the reset once and never restores
+  settings automatically.
 - EEPROM on the reference board means avoid unnecessary writes.
 
 ## Offsets

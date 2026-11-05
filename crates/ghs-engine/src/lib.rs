@@ -61,8 +61,8 @@ pub use ghs_gcode::{Program, ProgramLine};
 pub use ghs_proto::{
     CodeTable, EncodeError, ExtendedCommand, JogCommand, JogMode, LastEvents, LimitState, Offsets,
     ParserState, PinDirection, PinMapping, PinState, RealtimeCommand, ResetTarget,
-    SettingDescription, SettingGroup, StartupLine, StartupLineResult, StatusReport,
-    StreamerError, SystemCommand,
+    SettingDescription, SettingGroup, StartupLine, StartupLineResult, StatusReport, StreamerError,
+    SystemCommand,
 };
 pub use ghs_serial::{SerialConfig, Transport, TransportEvent};
 

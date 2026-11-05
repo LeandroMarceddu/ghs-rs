@@ -31,8 +31,8 @@ the first-run safety/setup wizard are implemented); and the probe remainder
 (work-rotation apply/straightness, pre/post probe macros, retry strategy, and
 persisted cycle settings; tool-length apply is implemented). The viewer
 remainder (3D stock mesh), portrait reflow, high-contrast theme, session
-recording, `$RST` confirmation, and the optional Workbench mode are also open
-against the full checklist in [parity.md](parity.md).
+recording, and the optional Workbench mode are also open against the full
+checklist in [parity.md](parity.md).
 `v0.6.0` is an optional preview pre-release; it does not close the V1.0 gate.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:

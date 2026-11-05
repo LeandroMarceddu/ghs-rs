@@ -468,7 +468,13 @@ This build does **not** prompt for or create a backup automatically before a
 settings write. Export a backup first (Utility → `EXPORT`). The reference
 board uses EEPROM; avoid unnecessary writes.
 
-`$RST` and a destructive reset editor are not exposed in this build.
+Utility → `CONTROLLER RESET` covers the destructive `$RST` commands. It shows
+the backup path, can export a backup, and requires either a successful export
+or the `I HAVE A BACKUP OR ACCEPT DATA LOSS` acknowledgement. Each target
+(`$RST=#`, `$RST=$`, `$RST=&`, `$RST=*`) has its own confirmation with the
+exact command and consequences. The reset is idle-only and is sent once;
+local profiles, backups, and saved maps are not changed. `$RST=*` is the most
+destructive and usually forces a controller re-handshake.
 
 ## 9. Offsets and tools
 
@@ -684,6 +690,10 @@ starts automatically.
   run the test move separately. `REVIEW & APPLY` requires confirmation, is
   idle-only, and writes through the verified setting path. The proposal is
   bounded to 1–10,000 steps/mm and shown with its delta.
+- `CONTROLLER RESET` sends one confirmed `$RST` target after a backup prompt:
+  offsets/tool data (`#`), core settings (`$`), driver/plugin defaults (`&`),
+  or everything (`*`). It is idle-only, never changes local profiles or
+  backups, and never auto-reconnects or resumes.
 
 ### User macros
 
