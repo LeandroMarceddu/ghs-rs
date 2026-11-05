@@ -65,6 +65,12 @@
 //! profile path, and `--demo-height-map-open-saved` then opens that record in
 //! the read-only saved-map browser. Normal startup never applies or starts
 //! anything.
+//! `--demo-reset` opens Utility at the `CONTROLLER RESET` card with the local
+//! backup prompt and all four targets, acknowledging nothing and sending
+//! nothing. `--demo-reset-confirm` exports a local backup through the same
+//! action the card uses, then opens the `$RST=#` confirmation without
+//! confirming it. Neither flag sends a reset, reconnects, homes, or starts a
+//! job.
 //! `--demo-setup` opens the first-run safety/setup wizard at SAFETY with
 //! nothing checked; `--demo-setup-units` acknowledges the checklist and opens
 //! UNITS, and `--demo-setup-review` does the same and opens REVIEW. The wizard
@@ -97,6 +103,7 @@
 mod config;
 mod connection;
 mod console_log;
+mod controller_reset;
 mod file_browser;
 mod height_compensation;
 mod height_map_library;

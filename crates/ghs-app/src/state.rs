@@ -26,6 +26,7 @@ use ghs_probe::XyPoint;
 
 use crate::config::ConfigModel;
 use crate::console_log::{ConsoleLogError, ConsoleLogExport, ConsoleLogStatus, write_console_log};
+use crate::controller_reset::ControllerReset;
 use crate::height_compensation::HeightMapCompensation;
 use crate::height_map_library::{HeightMapLibrary, LoadedSavedMap, record_from_run};
 use crate::macros::{MacroModel, MacroRunGate, MacroRunRequest};
@@ -2285,6 +2286,10 @@ pub struct AppState {
     pub height_map_library: HeightMapLibrary,
     /// Asserted `Pn` input bits from the last snapshot, for probe gating.
     pub signals_raw: CoreSignals,
+    /// `MPG:1`: a pendant owns the controller input stream.
+    pub mpg_active: bool,
+    /// Utility destructive `$RST` selection, confirmation, and result.
+    pub controller_reset: ControllerReset,
     /// Application-owned tool table and its profile state.
     pub tools: ToolTableModel,
     /// Read-only controller `[T:...]` report; never merged into `tools`.
@@ -2392,6 +2397,8 @@ impl AppState {
             height_map: HeightMapCompensation::default(),
             height_map_library: HeightMapLibrary::default(),
             signals_raw: CoreSignals::NONE,
+            mpg_active: false,
+            controller_reset: ControllerReset::default(),
             tools: ToolTableModel::new(),
             controller_tools: ControllerToolTable::new(),
             startup_lines: StartupLinesModel::new(),
@@ -2460,6 +2467,8 @@ impl AppState {
         self.signals.clear();
         self.signals_raw = CoreSignals::NONE;
         self.signal_caps.clear();
+        self.mpg_active = false;
+        self.controller_reset.reset_session();
         // Metadata belongs to the controller, never to the previous session.
         self.settings = SettingsModel::default();
         // Offsets and the tool table are reloaded after `$I+`; never show the
@@ -2616,6 +2625,9 @@ impl AppState {
         );
 
         if let Some(status) = status {
+            if let Some(mpg) = status.mpg {
+                self.mpg_active = mpg;
+            }
             if let Some(accessory) = &status.accessory {
                 self.coolant[0] = accessory.mist;
                 self.coolant[1] = accessory.flood;
@@ -4254,6 +4266,32 @@ impl AppState {
         }
     }
 
+    /// Export the fixed local backup bundle and update the reset card.
+    ///
+    /// This writes only `<config>/exports/ghs-backup.json`. It never sends a
+    /// command, never touches the local controller profile, and does not
+    /// change any saved height map. A successful export acknowledges the
+    /// backup requirement for a destructive `$RST` in this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the configuration error when no profile is connected, the
+    /// store is unavailable, or the write fails.
+    pub fn export_backup_for_reset(&mut self) -> Result<PathBuf, String> {
+        self.controller_reset.begin_backup_export();
+        let tools = self.tools.table().clone();
+        let offsets = self.profile_offset_snapshot();
+        let settings = self.profile_settings_snapshot();
+        let result = self.config.export_backup(&tools, &offsets, settings);
+        match &result {
+            Ok(path) => self
+                .controller_reset
+                .backup_export_succeeded(path.display().to_string()),
+            Err(message) => self.controller_reset.backup_export_failed(message.clone()),
+        }
+        result
+    }
+
     /// Copy the profile's probe mount offset into the editor fields.
     ///
     /// A missing profile or an old record loads as zero. This is setup data
@@ -4962,9 +5000,13 @@ mod tests {
     use ghs_core::{
         FeedSpindle, MachineState, Overrides, Position, Signals, Wcs, parse_controller_info,
     };
-    use ghs_engine::StatusReport;
+    use ghs_engine::{ResetTarget, StatusReport, SystemCommand};
 
     use super::*;
+    use crate::controller_reset::{
+        RESET_TARGETS, ResetGate, ResetOutcome, ResetRefusal, ResetResult, command_text,
+        refresh_commands, reset_command,
+    };
     use crate::probe::ProbeContext;
     use crate::setup::{SafetyItem, SetupStep};
     use crate::utilities::LimitsStatus;
@@ -5984,6 +6026,291 @@ mod tests {
         state.job = JobView::default();
         state.open_sleep_confirm();
         assert_eq!(state.sleep_command(), Ok(Command::Sleep));
+    }
+
+    // ------------------------------------------------------- controller reset
+
+    fn ready_reset_state() -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("reset test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state
+    }
+
+    fn snapshot_tree(root: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &std::path::Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if let Ok(bytes) = fs::read(&path) {
+                    files.insert(path, bytes);
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        walk(root, &mut files);
+        files
+    }
+
+    #[test]
+    fn controller_reset_requires_confirmation_and_cancel_sends_nothing() {
+        let mut state = ready_reset_state();
+        state.controller_reset.set_loss_accepted(true);
+        let mut sent = Vec::new();
+        assert_eq!(
+            state
+                .controller_reset
+                .confirm(ResetGate::READY_IDLE, recorded_send(&mut sent)),
+            ResetOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty());
+
+        state.controller_reset.select(ResetTarget::Offsets);
+        state
+            .controller_reset
+            .request_confirm(ResetGate::READY_IDLE)
+            .expect("confirmation opens");
+        assert!(state.controller_reset.is_confirm_open());
+        state.controller_reset.cancel_confirm();
+        assert!(!state.controller_reset.is_confirm_open());
+        assert_eq!(
+            state
+                .controller_reset
+                .confirm(ResetGate::READY_IDLE, recorded_send(&mut sent)),
+            ResetOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty(), "opening or cancelling never sends");
+    }
+
+    #[test]
+    fn controller_reset_without_a_backup_acknowledgement_sends_nothing() {
+        let mut state = ready_reset_state();
+        assert_eq!(
+            state
+                .controller_reset
+                .request_confirm(ResetGate::READY_IDLE),
+            Err(ResetRefusal::BackupNotAcknowledged)
+        );
+        assert!(!state.controller_reset.is_confirm_open());
+        let mut sent = Vec::new();
+        assert_eq!(
+            state
+                .controller_reset
+                .confirm(ResetGate::READY_IDLE, recorded_send(&mut sent)),
+            ResetOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty());
+        assert_eq!(
+            state.controller_reset.last_result(),
+            Some(ResetResult::Refused)
+        );
+    }
+
+    #[test]
+    fn controller_reset_export_acknowledges_the_backup() {
+        let (mut state, _dir, _info) = state_with_profile("reset-export-ack");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        assert!(!state.controller_reset.backup_acknowledged());
+
+        let path = state.export_backup_for_reset().expect("backup export");
+        assert_eq!(path, state.config.backup_path().expect("fixed backup path"));
+        assert!(state.controller_reset.export_succeeded_this_session());
+        assert!(state.controller_reset.backup_acknowledged());
+        assert!(
+            state
+                .controller_reset
+                .export_result()
+                .is_some_and(|result| result.ok())
+        );
+        assert!(
+            state
+                .controller_reset
+                .request_confirm(ResetGate::READY_IDLE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn controller_reset_is_refused_while_the_backup_export_is_in_flight() {
+        let mut state = ready_reset_state();
+        state.controller_reset.set_loss_accepted(true);
+        state.controller_reset.begin_backup_export();
+        assert_eq!(
+            state
+                .controller_reset
+                .request_confirm(ResetGate::READY_IDLE),
+            Err(ResetRefusal::BackupExportInFlight)
+        );
+        assert!(!state.controller_reset.is_confirm_open());
+        assert!(state.controller_reset.backup_export_in_flight());
+    }
+
+    #[test]
+    fn controller_reset_refuses_a_pendant_reported_by_the_status_stream() {
+        let mut state = ready_reset_state();
+        state.controller_reset.set_loss_accepted(true);
+        let status = StatusReport {
+            mpg: Some(true),
+            ..StatusReport::default()
+        };
+        state.apply_snapshot(
+            &MachineSnapshot {
+                state: MachineState::Idle,
+                ..MachineSnapshot::default()
+            },
+            Some(&status),
+        );
+        assert!(state.mpg_active);
+        assert_eq!(
+            state.controller_reset.request_confirm(ResetGate {
+                pendant_active: state.mpg_active,
+                ..ResetGate::READY_IDLE
+            }),
+            Err(ResetRefusal::PendantActive)
+        );
+        assert!(!state.controller_reset.is_confirm_open());
+
+        state.begin_live("fresh reset session");
+        assert!(!state.mpg_active);
+        assert!(!state.controller_reset.backup_acknowledged());
+    }
+
+    #[test]
+    fn controller_reset_sends_one_command_and_only_the_allowed_refresh() {
+        for target in RESET_TARGETS {
+            let mut state = ready_reset_state();
+            state.controller_reset.set_loss_accepted(true);
+            state.controller_reset.select(target);
+            state
+                .controller_reset
+                .request_confirm(ResetGate::READY_IDLE)
+                .expect("confirmation opens");
+            let mut sent = Vec::new();
+            let outcome = state
+                .controller_reset
+                .confirm(ResetGate::READY_IDLE, recorded_send(&mut sent));
+            assert_eq!(outcome, ResetOutcome::Sent { target });
+            assert_eq!(sent, vec![reset_command(target)]);
+
+            sent.extend(refresh_commands(target));
+            assert_eq!(
+                sent.iter()
+                    .filter(|command| matches!(command, Command::System(SystemCommand::Reset(_))))
+                    .count(),
+                1,
+                "{target:?} must send exactly one reset"
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|command| matches!(command, Command::System(SystemCommand::Offsets)))
+                    .count(),
+                usize::from(matches!(target, ResetTarget::Offsets | ResetTarget::All))
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|command| matches!(command, Command::System(SystemCommand::Settings)))
+                    .count(),
+                usize::from(matches!(target, ResetTarget::Settings | ResetTarget::All))
+            );
+        }
+    }
+
+    #[test]
+    fn controller_reset_never_emits_motion_start_load_g10_or_setting_writes() {
+        for target in RESET_TARGETS {
+            let mut commands = vec![reset_command(target)];
+            commands.extend(refresh_commands(target));
+            for command in commands {
+                match command {
+                    Command::System(SystemCommand::Reset(sent_target)) => {
+                        assert_eq!(sent_target, target);
+                    }
+                    Command::System(SystemCommand::Offsets)
+                    | Command::System(SystemCommand::Settings) => {}
+                    other => panic!("reset emitted a forbidden command: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn controller_reset_leaves_local_profile_config_and_backups_unchanged() {
+        let (mut state, dir, _info) = state_with_profile("reset-files");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.config.save_app().expect("save app config");
+        state.export_backup_for_reset().expect("backup export");
+        let before = snapshot_tree(&dir.path);
+        assert!(!before.is_empty(), "local files exist before the reset");
+
+        state.controller_reset.select(ResetTarget::All);
+        state
+            .controller_reset
+            .request_confirm(ResetGate::READY_IDLE)
+            .expect("confirmation opens for the backed-up session");
+        let mut sent = Vec::new();
+        assert_eq!(
+            state
+                .controller_reset
+                .confirm(ResetGate::READY_IDLE, recorded_send(&mut sent)),
+            ResetOutcome::Sent {
+                target: ResetTarget::All
+            }
+        );
+        assert_eq!(sent, vec![reset_command(ResetTarget::All)]);
+        assert_eq!(
+            snapshot_tree(&dir.path),
+            before,
+            "a controller reset must not write or delete local data"
+        );
+    }
+
+    #[test]
+    fn controller_reset_sender_rejection_sets_failed_result_and_error() {
+        let mut state = ready_reset_state();
+        state.controller_reset.set_loss_accepted(true);
+        state.controller_reset.select(ResetTarget::Settings);
+        state
+            .controller_reset
+            .request_confirm(ResetGate::READY_IDLE)
+            .expect("confirmation opens");
+        let outcome = state.controller_reset.confirm(ResetGate::READY_IDLE, |_| {
+            Err("streamer is busy".to_string())
+        });
+        assert_eq!(
+            outcome,
+            ResetOutcome::Failed("streamer is busy".to_string())
+        );
+        assert_eq!(
+            state.controller_reset.last_result(),
+            Some(ResetResult::Failed)
+        );
+        assert_eq!(state.controller_reset.error(), Some("streamer is busy"));
+        assert_eq!(
+            state.controller_reset.last_target(),
+            Some(ResetTarget::Settings)
+        );
+    }
+
+    #[test]
+    fn controller_reset_star_confirmation_is_the_most_destructive_text() {
+        assert_eq!(command_text(ResetTarget::All), "$RST=*");
+        let text = crate::controller_reset::consequence(ResetTarget::All);
+        assert!(crate::controller_reset::is_most_destructive(
+            ResetTarget::All
+        ));
+        assert!(text.to_lowercase().contains("most destructive"));
+        assert!(text.to_lowercase().contains("startup lines"));
+        assert!(text.to_lowercase().contains("build info"));
+        assert!(!crate::controller_reset::is_most_destructive(
+            ResetTarget::DriverParameters
+        ));
     }
 
     #[test]

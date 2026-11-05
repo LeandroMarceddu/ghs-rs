@@ -38,8 +38,8 @@ use ghs_config::{Keymap, MAX_HEIGHT_MAPS, Macro as ConfigMacro, ToolRecord};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
-    MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
-    SystemCommand, Wcs,
+    MachineState, Position, Program, RealtimeCommand, ResetTarget, SerialConfig,
+    Signals as CoreSignals, SystemCommand, Wcs,
 };
 use ghs_i18n::{Locale, t};
 use gpui_kit::component::ActiveTheme as _;
@@ -61,6 +61,10 @@ use gpui_kit::{
 
 use crate::connection::{BAUD_RATES, ConnectionPanel, TransportChoice};
 use crate::console_log::ConsoleLogStatus;
+use crate::controller_reset::{
+    LOCAL_PROFILE_NOTE, RESET_TARGETS, ResetGate, ResetOutcome, ResetResult, command_text,
+    consequence, is_most_destructive, refresh_commands, refresh_note, summary, target_title,
+};
 use crate::file_browser::{BrowserEntry, FileBrowser, compact_path, format_size, read_program};
 use crate::height_compensation::{
     HeightApplyGate, HeightApplyPreview, HeightMapApplyStatus, HeightMapSnapshot,
@@ -369,7 +373,15 @@ pub struct Shell {
     /// Screenshot switch: open the line-number transform preview.
     demo_transform: bool,
     demo_transform_done: bool,
+    /// Screenshot switch: open Utility at the controller-reset card.
+    demo_reset: bool,
+    demo_reset_done: bool,
+    /// Screenshot switch: open the `$RST=#` confirmation without confirming.
+    demo_reset_confirm: bool,
+    demo_reset_confirm_done: bool,
     offset_refresh_sent: bool,
+    /// A reset's read-only `$$` settings dump was Busy and is retried by poll.
+    reset_settings_refresh_pending: bool,
     backup_import_armed: bool,
     settings_demo_write: bool,
     settings_demo_write_done: bool,
@@ -672,7 +684,14 @@ impl Shell {
             std::env::args().any(|arg| arg == "--demo-calibration-confirm");
         let demo_surfacing = std::env::args().any(|arg| arg == "--demo-surfacing");
         let demo_transform = std::env::args().any(|arg| arg == "--demo-transform");
-        if demo_surfacing || demo_transform || demo_calibration || demo_calibration_confirm {
+        let demo_reset_confirm = std::env::args().any(|arg| arg == "--demo-reset-confirm");
+        let demo_reset = demo_reset_confirm || std::env::args().any(|arg| arg == "--demo-reset");
+        if demo_surfacing
+            || demo_transform
+            || demo_calibration
+            || demo_calibration_confirm
+            || demo_reset
+        {
             state.mode = Mode::Utility;
         }
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
@@ -803,7 +822,12 @@ impl Shell {
             demo_surfacing_done: false,
             demo_transform,
             demo_transform_done: false,
+            demo_reset,
+            demo_reset_done: false,
+            demo_reset_confirm,
+            demo_reset_confirm_done: false,
             offset_refresh_sent: false,
+            reset_settings_refresh_pending: false,
             backup_import_armed: false,
             settings_demo_write,
             settings_demo_write_done: false,
@@ -961,6 +985,15 @@ impl Shell {
             self.state.cancel_macro_run();
             changed = true;
         }
+        // A reset confirmation belongs to the link and Idle state that opened
+        // it. Once the link is no longer ready the sheet cannot send; close it
+        // rather than leaving a stale destructive action on screen.
+        if (self.state.controller_reset.is_confirm_open() && !self.ready())
+            || (self.state.controller_reset.is_confirm_open() && self.locked())
+        {
+            self.state.controller_reset.cancel_confirm();
+            changed = true;
+        }
         // An over-travel START confirmation belongs to the exact program, link,
         // and Idle machine state that opened it. Clear it as soon as any of
         // them changes; a stale start must never fire from a later sheet.
@@ -1005,6 +1038,30 @@ impl Shell {
             }
         } else {
             self.offset_refresh_sent = false;
+        }
+        // A reset's `$$` read is read-only and may be Busy behind the reset
+        // line. Retry it until the streamer accepts it; it never writes a
+        // setting or re-sends the reset.
+        if self.reset_settings_refresh_pending {
+            if !self.ready() {
+                self.reset_settings_refresh_pending = false;
+            } else {
+                match self.send_command_quiet(Command::System(SystemCommand::Settings)) {
+                    Ok(()) => {
+                        self.reset_settings_refresh_pending = false;
+                        changed = true;
+                    }
+                    Err(EngineError::Busy) => {}
+                    Err(error) => {
+                        self.reset_settings_refresh_pending = false;
+                        self.state.push_console(
+                            ConsoleLevel::Warn,
+                            format!("Reset settings refresh not sent: {error}"),
+                        );
+                        changed = true;
+                    }
+                }
+            }
         }
         // A confirmed TLO write must be verified by `$#`. If the report does not
         // arrive, fail the write and retain the old displayed value; never
@@ -1401,6 +1458,44 @@ impl Shell {
             {
                 self.state
                     .push_console(ConsoleLevel::Warn, format!("Demo transform: {message}"));
+            }
+            changed = true;
+        }
+        // Screenshot switch: open Utility at the destructive reset card.
+        // Opening the card acknowledges nothing and sends nothing.
+        if self.demo_reset
+            && !self.demo_reset_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_reset_done = true;
+            self.state.mode = Mode::Utility;
+            changed = true;
+        }
+        // Screenshot switch: export a local backup through the same action as
+        // the card, then open the `$RST=#` confirmation without confirming it.
+        // If the local export cannot run, the explicit data-loss
+        // acknowledgement stands in so the sheet still shows the real gate
+        // rather than bypassing it.
+        if self.demo_reset_confirm
+            && !self.demo_reset_confirm_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.config.key().is_some()
+        {
+            self.demo_reset_confirm_done = true;
+            self.state.mode = Mode::Utility;
+            if self.state.export_backup_for_reset().is_err() {
+                self.state.controller_reset.set_loss_accepted(true);
+            }
+            self.state.controller_reset.select(ResetTarget::Offsets);
+            if let Err(refusal) = self
+                .state
+                .controller_reset
+                .request_confirm(self.reset_gate())
+            {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Demo reset confirmation refused: {}", refusal.message()),
+                );
             }
             changed = true;
         }
@@ -2068,8 +2163,11 @@ impl Shell {
         // A confirmation captured on this link must not survive it.
         self.state.offsets.cancel_action();
         self.state.offsets_backup.close_preview();
+        self.offset_refresh_sent = false;
+        self.reset_settings_refresh_pending = false;
         self.state.cancel_macro_run();
         self.state.cancel_sleep_confirm();
+        self.state.controller_reset.cancel_confirm();
         self.state.cancel_check_confirm();
         self.state.cancel_start_confirm();
         self.state.connection = ConnectionState::Disconnected;
@@ -3189,19 +3287,7 @@ impl Shell {
     }
 
     fn export_backup(&mut self, cx: &mut Context<Self>) {
-        let tools = self.state.tools.table().clone();
-        let offsets = self.state.profile_offset_snapshot();
-        let settings = self.state.profile_settings_snapshot();
-        match self.state.config.export_backup(&tools, &offsets, settings) {
-            Ok(path) => self.state.push_console(
-                ConsoleLevel::Ok,
-                format!("Backup exported: {}", path.display()),
-            ),
-            Err(message) => self
-                .state
-                .push_console(ConsoleLevel::Error, format!("Backup export: {message}")),
-        }
-        cx.notify();
+        self.export_controller_reset_backup(cx);
     }
 
     fn validate_backup(&mut self, cx: &mut Context<Self>) {
@@ -3338,6 +3424,30 @@ impl Shell {
             ready: self.ready(),
             idle: self.machine() == MachineState::Idle,
             job_active: self.state.job.is_active(),
+        }
+    }
+
+    /// Every precondition for the destructive `$RST` card.
+    ///
+    /// A backup export in flight and the backup acknowledgement live in the
+    /// reset model itself, so they cannot be bypassed by a different caller.
+    fn reset_gate(&self) -> ResetGate {
+        ResetGate {
+            mock: self.state.connection == ConnectionState::Mock,
+            live: self.state.live,
+            ready: self.ready(),
+            idle: self.machine() == MachineState::Idle,
+            alarm_or_door: self.locked(),
+            job_active: self.state.job.is_active() || self.state.job.check_busy(),
+            tool_change_pending: self.state.job.tool_change_pending(),
+            probe_active: self.state.probe.is_running()
+                || self.state.probe.tool_length_write_in_flight(),
+            height_map_action_in_flight: self.state.height_map.pending().is_some(),
+            pendant_active: self.state.mpg_active,
+            settings_write_pending: self.state.settings.has_pending()
+                || self.state.settings.has_queued_write(),
+            offset_write_pending: self.state.offsets.status().is_pending()
+                || self.state.offsets.pending_action().is_some(),
         }
     }
 
@@ -4978,6 +5088,132 @@ impl Shell {
                 .push_console(ConsoleLevel::Warn, refusal.message()),
             SleepOutcome::NotConfirmed => {}
         }
+        cx.notify();
+    }
+
+    /// Open the destructive reset confirmation for one exact target.
+    ///
+    /// Opening sends nothing. The gate and backup acknowledgement are checked
+    /// before the sheet opens; a refusal is shown in the card and console.
+    fn request_controller_reset(&mut self, target: ResetTarget, cx: &mut Context<Self>) {
+        self.state.controller_reset.select(target);
+        match self
+            .state
+            .controller_reset
+            .request_confirm(self.reset_gate())
+        {
+            Ok(()) => {
+                self.state.mode = Mode::Utility;
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "Reset ready: confirm {} to send one command. Nothing has been sent.",
+                        command_text(target)
+                    ),
+                );
+            }
+            Err(refusal) => {
+                self.state
+                    .push_console(ConsoleLevel::Warn, refusal.message());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Close the reset confirmation without sending anything.
+    fn cancel_controller_reset(&mut self, cx: &mut Context<Self>) {
+        self.state.controller_reset.cancel_confirm();
+        self.state
+            .push_console(ConsoleLevel::Info, "Reset cancelled; nothing was sent");
+        cx.notify();
+    }
+
+    /// Confirm one destructive reset and then request only the read-only
+    /// views that belong to its target.
+    ///
+    /// The model re-checks every gate after consuming the sheet. A refusal or
+    /// sender rejection is reported and nothing is retried. No reconnect,
+    /// home, jog, start, or resume is ever produced here.
+    fn confirm_controller_reset(&mut self, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome =
+            self.state
+                .controller_reset
+                .confirm(self.reset_gate(), |command| match link {
+                    Some(link) => link.send(command).map_err(|error| error.to_string()),
+                    None => Err("no engine connection; reset not sent".to_string()),
+                });
+        match outcome {
+            ResetOutcome::Sent { target } => {
+                self.state.push_console(
+                    ConsoleLevel::Command,
+                    format!(
+                        "{} sent. The controller may reset or re-handshake. {}",
+                        command_text(target),
+                        refresh_note(target)
+                    ),
+                );
+                self.refresh_after_controller_reset(target);
+            }
+            ResetOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+            ResetOutcome::Failed(detail) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("RESET NOT SENT: {detail}")),
+            ResetOutcome::NotConfirmed => {}
+        }
+        cx.notify();
+    }
+
+    /// Request the read-only reports allowed after one reset target.
+    fn refresh_after_controller_reset(&mut self, target: ResetTarget) {
+        for command in refresh_commands(target) {
+            match command {
+                Command::System(SystemCommand::Offsets) => {
+                    self.state.offsets.refresh_requested();
+                    self.offset_refresh_sent = false;
+                    self.pump_offset_refresh();
+                }
+                Command::System(SystemCommand::Settings) => {
+                    match self.send_command_quiet(Command::System(SystemCommand::Settings)) {
+                        Ok(()) => {}
+                        Err(EngineError::Busy) => self.reset_settings_refresh_pending = true,
+                        Err(error) => self.state.push_console(
+                            ConsoleLevel::Warn,
+                            format!("Reset settings refresh not sent: {error}"),
+                        ),
+                    }
+                }
+                other => {
+                    if let Err(error) = self.send_command_quiet(other) {
+                        self.state.push_console(
+                            ConsoleLevel::Warn,
+                            format!("Reset read-only refresh not sent: {error}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Export the fixed local backup through the normal backup action.
+    fn export_controller_reset_backup(&mut self, cx: &mut Context<Self>) {
+        match self.state.export_backup_for_reset() {
+            Ok(path) => self.state.push_console(
+                ConsoleLevel::Ok,
+                format!("Backup exported: {}", path.display()),
+            ),
+            Err(message) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Backup export: {message}")),
+        }
+        cx.notify();
+    }
+
+    /// Toggle the explicit `I HAVE A BACKUP OR ACCEPT DATA LOSS` choice.
+    fn toggle_controller_reset_loss(&mut self, cx: &mut Context<Self>) {
+        self.state.controller_reset.toggle_loss_accepted();
         cx.notify();
     }
 
@@ -15049,6 +15285,294 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Destructive `$RST` card with its local backup prompt.
+    ///
+    /// Every target row opens the same two-step confirmation; the card itself
+    /// never sends. A successful local backup export or the explicit
+    /// data-loss choice is required before any row can be confirmed.
+    fn controller_reset_card(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let model = &self.state.controller_reset;
+        let backup_path = self
+            .state
+            .config
+            .backup_path()
+            .map_or_else(|| "--".to_string(), |path| path.display().to_string());
+        let gate_refusal = model.gate_refusal(self.reset_gate());
+        let backup_refusal = model.backup_acknowledgement_refusal();
+        let can_request = gate_refusal.is_none() && backup_refusal.is_none();
+        let export_succeeded = model.export_succeeded_this_session();
+        let loss_accepted = model.loss_accepted();
+
+        let export_text = if model.backup_export_in_flight() {
+            "EXPORT IN FLIGHT - WAIT FOR THE WRITE TO FINISH".to_string()
+        } else {
+            model.export_result().map_or_else(
+                || "NO BACKUP EXPORTED THIS SESSION".to_string(),
+                |result| result.text().to_string(),
+            )
+        };
+        let export_color = if model.backup_export_in_flight() {
+            p.warning
+        } else {
+            match model.export_result() {
+                Some(result) if result.ok() => p.success,
+                Some(_) => p.danger,
+                None => p.text_faint,
+            }
+        };
+
+        let result_line = model.last_result().map(|result| {
+            let target = model.last_target().map_or("--", command_text);
+            let color = match result {
+                ResetResult::Sent => p.success,
+                ResetResult::Refused => p.warning,
+                ResetResult::Failed => p.danger,
+            };
+            let detail = model.error().map_or_else(
+                || {
+                    model
+                        .last_target()
+                        .map_or("", crate::controller_reset::refresh_note)
+                        .to_string()
+                },
+                std::string::ToString::to_string,
+            );
+            (color, format!("{} {} - {detail}", result.label(), target))
+        });
+
+        let export_view = view.clone();
+        let ack_view = view.clone();
+        let mut target_rows = v_flex().gap_1();
+        for target in RESET_TARGETS {
+            let target_view = view.clone();
+            let destructive = is_most_destructive(target);
+            let row_bg = if destructive {
+                p.danger.opacity(0.10)
+            } else {
+                p.panel
+            };
+            let row_border = if destructive {
+                p.danger.opacity(0.55)
+            } else {
+                p.border
+            };
+            let button = Button::new(format!("reset-{}", target.as_str()))
+                .label(format!("RESET {}", command_text(target)))
+                .h(px(48.0))
+                .w(px(164.0))
+                .flex_shrink_0()
+                .rounded_lg()
+                .text_size(px(10.0))
+                .disabled(!can_request)
+                .on_click(move |_, _, cx| {
+                    target_view.update(cx, |this, cx| {
+                        this.request_controller_reset(target, cx);
+                    });
+                });
+            let button = if destructive {
+                button.danger()
+            } else {
+                button.warning()
+            };
+            target_rows = target_rows.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(row_border)
+                    .bg(row_bg)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap_0()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(chip(command_text(target), p))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if destructive { p.danger } else { p.text })
+                                            .child(t(target_title(target))),
+                                    )
+                                    .when(destructive, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(9.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(p.danger)
+                                                .child(t("MOST DESTRUCTIVE")),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(if destructive { p.danger } else { p.text_dim })
+                                    .child(t(summary(target))),
+                            ),
+                    )
+                    .child(button),
+            );
+        }
+
+        let ack = if export_succeeded {
+            h_flex()
+                .items_center()
+                .gap_2()
+                .h(px(48.0))
+                .flex_1()
+                .min_w(px(0.0))
+                .px_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(p.success.opacity(0.45))
+                .bg(p.success.opacity(0.10))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.success)
+                        .child(t("BACKUP EXPORTED THIS SESSION - RESET ACKNOWLEDGED")),
+                )
+                .into_any_element()
+        } else {
+            let ack_button = Button::new("reset-loss-ack")
+                .label(if loss_accepted {
+                    t("DATA LOSS ACKNOWLEDGED - RESET MAY PROCEED")
+                } else {
+                    t("I HAVE A BACKUP OR ACCEPT DATA LOSS")
+                })
+                .h(px(48.0))
+                .flex_1()
+                .min_w(px(0.0))
+                .rounded_lg()
+                .text_size(px(10.0))
+                .on_click(move |_, _, cx| {
+                    ack_view.update(cx, |this, cx| this.toggle_controller_reset_loss(cx));
+                });
+            let ack_button = if loss_accepted {
+                ack_button.danger()
+            } else {
+                ack_button.secondary()
+            };
+            ack_button.into_any_element()
+        };
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.danger.opacity(0.45))
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label(t("CONTROLLER RESET"), p))
+                            .child(chip("$RST", p))
+                            .child(chip(t("BACKUP REQUIRED"), p)),
+                    )
+                    .child(chip(t("DESTRUCTIVE"), p)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .truncate()
+                    .child(format!("BACKUP FILE   {backup_path}")),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("reset-export-backup")
+                            .label(t("EXPORT BACKUP"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(160.0))
+                            .flex_shrink_0()
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(model.backup_export_in_flight())
+                            .on_click(move |_, _, cx| {
+                                export_view.update(cx, |this, cx| {
+                                    this.export_controller_reset_backup(cx);
+                                });
+                            }),
+                    )
+                    .child(ack),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(export_color)
+                    .truncate()
+                    .child(export_text),
+            )
+            .when_some(gate_refusal, |this, refusal| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.danger)
+                        .child(format!(
+                            "RESET LOCKED: {}",
+                            refusal.message().to_uppercase()
+                        )),
+                )
+            })
+            .when_some(backup_refusal, |this, refusal| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(refusal.message().to_uppercase()),
+                )
+            })
+            .when(can_request, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.success)
+                        .child(t("RESET GATES READY - TWO-STEP CONFIRMATION REQUIRED")),
+                )
+            })
+            .child(target_rows)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.warning)
+                    .child(t(LOCAL_PROFILE_NOTE)),
+            )
+            .when_some(result_line, |this, (color, text)| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(color)
+                        .child(text),
+                )
+            })
+            .into_any_element()
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let config = &self.state.config;
@@ -15522,6 +16046,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.controller_reset_card(p, cx))
             .child(self.machine_setup_card(p, cx))
             .child(self.calibration_card(p, cx))
             .child(self.surfacing_card(p, cx))
@@ -16908,6 +17433,160 @@ impl Shell {
                                         });
                                     }),
                             ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Exact-command confirmation for one destructive controller reset.
+    ///
+    /// Opening, the scrim, and CANCEL send nothing. CONFIRM consumes the sheet
+    /// and hands exactly one `Command::System(SystemCommand::Reset(target))`
+    /// to the model's gate; the read-only refresh follows only after the
+    /// sender accepts the reset.
+    fn reset_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(target) = self.state.controller_reset.confirm_target() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let scrim_view = view;
+        let command = command_text(target);
+        let destructive = is_most_destructive(target);
+        let action_color = if destructive { p.danger } else { p.warning };
+        let backup_line = if self.state.controller_reset.export_succeeded_this_session() {
+            "BACKUP EXPORTED THIS SESSION"
+        } else {
+            "DATA LOSS ACKNOWLEDGED BY THE OPERATOR"
+        };
+        let confirm_button = Button::new("reset-confirm-send")
+            .label(format!("CONFIRM {command}"))
+            .h(px(48.0))
+            .flex_1()
+            .rounded_lg()
+            .text_size(px(11.0))
+            .on_click(move |_, _, cx| {
+                confirm_view.update(cx, |shell, cx| {
+                    shell.confirm_controller_reset(cx);
+                });
+            });
+        let confirm_button = if destructive {
+            confirm_button.danger()
+        } else {
+            confirm_button.warning()
+        };
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("reset-confirm-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| {
+                            shell.cancel_controller_reset(cx);
+                        });
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(640.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(action_color.opacity(0.70))
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(action_color)
+                                    .child(format!("RESET {command}")),
+                            )
+                            .child(chip("ONE COMMAND", p)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(t("EXACT COMMAND TO SEND")),
+                            )
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(command),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(if destructive { p.danger } else { p.text_dim })
+                            .child(t(consequence(target))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.warning)
+                            .child(t(LOCAL_PROFILE_NOTE)),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                        "The controller may reset or re-handshake after this command. The app does not reconnect, home, jog, or resume anything. CANCEL sends nothing.",
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.success)
+                            .child(backup_line),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("reset-confirm-cancel")
+                                    .label(t("CANCEL"))
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_controller_reset(cx);
+                                        });
+                                    }),
+                            )
+                            .child(confirm_button),
                     ),
             )
             .into_any_element()
@@ -19619,6 +20298,9 @@ impl Render for Shell {
         }
         if self.state.sleep_confirm_open {
             root = root.child(self.sleep_confirm_overlay(p, cx));
+        }
+        if self.state.controller_reset.is_confirm_open() {
+            root = root.child(self.reset_confirm_overlay(p, cx));
         }
         if self.state.pins.is_open() {
             root = root.child(self.pins_overlay(p, cx));
