@@ -632,8 +632,8 @@ mod tests {
     use super::*;
     use crate::backup::IdentityPolicy;
     use crate::controller::{
-        ControllerData, HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, ProbeOffsetRecord,
-        ToolRecord,
+        ControllerData, HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, ProbeDefaultsRecord,
+        ProbeOffsetRecord, ToolRecord,
     };
     use crate::error::ValidationError;
 
@@ -892,6 +892,42 @@ mod tests {
         assert_eq!(loaded_first, with_map);
         assert_eq!(loaded_first.height_maps, vec![sample_height_map()]);
         assert!(loaded_second.height_maps.is_empty());
+    }
+
+    #[test]
+    fn probe_defaults_are_stored_per_controller_profile() {
+        let (_dir, store) = store("probe-defaults-profile");
+        let first = ProfileKey::from_controller(&info());
+        let second = ProfileKey::from_controller(&other_info());
+        let defaults = ProbeDefaultsRecord {
+            safe_z_mm: 22.0,
+            search_distance_mm: 6.5,
+            feed_mm_min: 220.0,
+            retract_mm: 1.5,
+            probe_diameter_mm: 2.0,
+            edge_offset_mm: 0.25,
+            plate_thickness_mm: 9.5,
+        };
+        let mut with_defaults = sample_data();
+        with_defaults.probe_defaults = defaults;
+
+        store
+            .save_controller_data(&first, &with_defaults)
+            .expect("save first");
+        store
+            .save_controller_data(&second, &ControllerData::new())
+            .expect("save second");
+
+        let loaded_first = store
+            .load_controller_data(&first)
+            .expect("load first")
+            .expect("present");
+        let loaded_second = store
+            .load_controller_data(&second)
+            .expect("load second")
+            .expect("present");
+        assert_eq!(loaded_first.probe_defaults, defaults);
+        assert_eq!(loaded_second.probe_defaults, ProbeDefaultsRecord::default());
     }
 
     #[test]

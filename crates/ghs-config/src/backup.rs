@@ -45,8 +45,8 @@ pub struct BackupBundle {
     pub app: AppConfig,
     /// Controller the profile belongs to.
     pub controller: ControllerIdentity,
-    /// Per-controller settings, offsets, tools, macros, startup lines, and
-    /// keymap.
+    /// Per-controller settings, offsets, probe defaults, tools, macros, startup
+    /// lines, and keymap.
     pub data: ControllerData,
 }
 
@@ -253,7 +253,8 @@ mod tests {
 
     use super::*;
     use crate::controller::{
-        HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, Macro, ProbeOffsetRecord, ToolRecord,
+        HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, Macro, ProbeDefaultsRecord,
+        ProbeOffsetRecord, ToolRecord,
     };
 
     const FLEXIHAL: &[&str] = &[
@@ -309,6 +310,15 @@ mod tests {
             x_mm: 3.5,
             y_mm: -1.25,
         };
+        data.probe_defaults = ProbeDefaultsRecord {
+            safe_z_mm: 18.0,
+            search_distance_mm: 7.5,
+            feed_mm_min: 180.0,
+            retract_mm: 1.25,
+            probe_diameter_mm: 5.0,
+            edge_offset_mm: -0.75,
+            plate_thickness_mm: 11.5,
+        };
         data
     }
 
@@ -325,6 +335,17 @@ mod tests {
         assert_eq!(decoded.data.height_maps, original.data.height_maps);
         assert_eq!(decoded.data.probe_offset, original.data.probe_offset);
         assert!(json.contains("\"probe_offset\""));
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn bundle_round_trips_probe_defaults() {
+        let original = bundle();
+        let json = original.to_json_string().expect("encode");
+        assert!(json.contains("\"probe_defaults\""));
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded.data.probe_defaults, original.data.probe_defaults);
+        assert_eq!(decoded, original);
         decoded.validate().expect("valid");
     }
 

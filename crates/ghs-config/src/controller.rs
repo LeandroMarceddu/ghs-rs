@@ -46,6 +46,23 @@ const MAX_HEIGHT_MAP_NAME: usize = 128;
 /// repeated here and must stay in sync.
 pub const MAX_PROBE_OFFSET_MM: f64 = 100.0;
 
+/// Largest absolute safe-Z plane in persisted probe defaults, in millimetres.
+///
+/// This matches the machine coordinate bound in the probe crate.
+pub const MAX_PROBE_SAFE_Z_MM: f64 = 100_000.0;
+/// Largest search distance in persisted probe defaults, in millimetres.
+pub const MAX_PROBE_SEARCH_DISTANCE_MM: f64 = 100.0;
+/// Largest feed in persisted probe defaults, in millimetres per minute.
+pub const MAX_PROBE_FEED_MM_MIN: f64 = 2_000.0;
+/// Largest retract distance in persisted probe defaults, in millimetres.
+pub const MAX_PROBE_RETRACT_MM: f64 = 100.0;
+/// Largest probe tip diameter in persisted probe defaults, in millimetres.
+pub const MAX_PROBE_DIAMETER_MM: f64 = 50.0;
+/// Largest absolute edge offset in persisted probe defaults, in millimetres.
+pub const MAX_PROBE_EDGE_OFFSET_MM: f64 = 100.0;
+/// Largest touch-plate thickness in persisted probe defaults, in millimetres.
+pub const MAX_PROBE_PLATE_THICKNESS_MM: f64 = 100.0;
+
 /// Maximum length of a tool name in characters.
 const MAX_TOOL_NAME: usize = 128;
 /// Maximum length of a macro name in characters.
@@ -609,6 +626,183 @@ fn validate_probe_offset_axis(axis: &'static str, value: f64) -> Result<(), Vali
     Ok(())
 }
 
+const DEFAULT_PROBE_SAFE_Z_MM: f64 = 10.0;
+const DEFAULT_PROBE_SEARCH_DISTANCE_MM: f64 = 5.0;
+const DEFAULT_PROBE_FEED_MM_MIN: f64 = 100.0;
+const DEFAULT_PROBE_RETRACT_MM: f64 = 2.0;
+const DEFAULT_PROBE_DIAMETER_MM: f64 = 3.0;
+const DEFAULT_PROBE_EDGE_OFFSET_MM: f64 = 0.0;
+const DEFAULT_PROBE_PLATE_THICKNESS_MM: f64 = 10.0;
+
+const fn default_probe_safe_z_mm() -> f64 {
+    DEFAULT_PROBE_SAFE_Z_MM
+}
+
+const fn default_probe_search_distance_mm() -> f64 {
+    DEFAULT_PROBE_SEARCH_DISTANCE_MM
+}
+
+const fn default_probe_feed_mm_min() -> f64 {
+    DEFAULT_PROBE_FEED_MM_MIN
+}
+
+const fn default_probe_retract_mm() -> f64 {
+    DEFAULT_PROBE_RETRACT_MM
+}
+
+const fn default_probe_diameter_mm() -> f64 {
+    DEFAULT_PROBE_DIAMETER_MM
+}
+
+const fn default_probe_edge_offset_mm() -> f64 {
+    DEFAULT_PROBE_EDGE_OFFSET_MM
+}
+
+const fn default_probe_plate_thickness_mm() -> f64 {
+    DEFAULT_PROBE_PLATE_THICKNESS_MM
+}
+
+/// Per-profile starting values for the probe cycle parameter sheet.
+///
+/// The record stores operator-entered defaults only. It carries no retry
+/// policy and triggers no motion: the probe engine still validates every cycle
+/// and the engine's safety gateway still owns motion. Every length is in
+/// millimetres; [`ProbeDefaultsRecord::feed_mm_min`] is in millimetres per
+/// minute.
+///
+/// A profile written before this record existed loads
+/// [`ProbeDefaultsRecord::default`]. A record missing individual fields also
+/// falls back to their defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProbeDefaultsRecord {
+    /// Safe Z plane, in millimetres, within `+/-`[`MAX_PROBE_SAFE_Z_MM`].
+    #[serde(default = "default_probe_safe_z_mm")]
+    pub safe_z_mm: f64,
+    /// Search distance, in millimetres, positive and at most
+    /// [`MAX_PROBE_SEARCH_DISTANCE_MM`].
+    #[serde(default = "default_probe_search_distance_mm")]
+    pub search_distance_mm: f64,
+    /// Probe feed, in millimetres per minute, positive and at most
+    /// [`MAX_PROBE_FEED_MM_MIN`].
+    #[serde(default = "default_probe_feed_mm_min")]
+    pub feed_mm_min: f64,
+    /// Relative Z lift after a touch, in millimetres, `0..=`[`MAX_PROBE_RETRACT_MM`].
+    #[serde(default = "default_probe_retract_mm")]
+    pub retract_mm: f64,
+    /// Probe tip diameter, in millimetres, `0..=`[`MAX_PROBE_DIAMETER_MM`].
+    #[serde(default = "default_probe_diameter_mm")]
+    pub probe_diameter_mm: f64,
+    /// Distance from the measured edge to the new zero, in millimetres, within
+    /// `+/-`[`MAX_PROBE_EDGE_OFFSET_MM`].
+    #[serde(default = "default_probe_edge_offset_mm")]
+    pub edge_offset_mm: f64,
+    /// Touch-plate thickness, in millimetres,
+    /// `0..=`[`MAX_PROBE_PLATE_THICKNESS_MM`].
+    #[serde(default = "default_probe_plate_thickness_mm")]
+    pub plate_thickness_mm: f64,
+}
+
+impl Default for ProbeDefaultsRecord {
+    fn default() -> Self {
+        Self {
+            safe_z_mm: DEFAULT_PROBE_SAFE_Z_MM,
+            search_distance_mm: DEFAULT_PROBE_SEARCH_DISTANCE_MM,
+            feed_mm_min: DEFAULT_PROBE_FEED_MM_MIN,
+            retract_mm: DEFAULT_PROBE_RETRACT_MM,
+            probe_diameter_mm: DEFAULT_PROBE_DIAMETER_MM,
+            edge_offset_mm: DEFAULT_PROBE_EDGE_OFFSET_MM,
+            plate_thickness_mm: DEFAULT_PROBE_PLATE_THICKNESS_MM,
+        }
+    }
+}
+
+impl ProbeDefaultsRecord {
+    /// Validate every default against the probe engine's bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::NonFiniteProbeDefault`] when a value is NaN or
+    /// infinite, [`ValidationError::ProbeDefaultNotPositive`] when search or
+    /// feed is zero or negative, and
+    /// [`ValidationError::ProbeDefaultOutOfRange`] when a value is outside its
+    /// documented inclusive range.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_probe_default_range(
+            "safe_z_mm",
+            self.safe_z_mm,
+            -MAX_PROBE_SAFE_Z_MM,
+            MAX_PROBE_SAFE_Z_MM,
+        )?;
+        validate_probe_default_positive(
+            "search_distance_mm",
+            self.search_distance_mm,
+            MAX_PROBE_SEARCH_DISTANCE_MM,
+        )?;
+        validate_probe_default_positive("feed_mm_min", self.feed_mm_min, MAX_PROBE_FEED_MM_MIN)?;
+        validate_probe_default_range("retract_mm", self.retract_mm, 0.0, MAX_PROBE_RETRACT_MM)?;
+        validate_probe_default_range(
+            "probe_diameter_mm",
+            self.probe_diameter_mm,
+            0.0,
+            MAX_PROBE_DIAMETER_MM,
+        )?;
+        validate_probe_default_range(
+            "edge_offset_mm",
+            self.edge_offset_mm,
+            -MAX_PROBE_EDGE_OFFSET_MM,
+            MAX_PROBE_EDGE_OFFSET_MM,
+        )?;
+        validate_probe_default_range(
+            "plate_thickness_mm",
+            self.plate_thickness_mm,
+            0.0,
+            MAX_PROBE_PLATE_THICKNESS_MM,
+        )
+    }
+}
+
+fn validate_probe_default_range(
+    field: &'static str,
+    value: f64,
+    min: f64,
+    max: f64,
+) -> Result<(), ValidationError> {
+    if !value.is_finite() {
+        return Err(ValidationError::NonFiniteProbeDefault { field, value });
+    }
+    if value < min || value > max {
+        return Err(ValidationError::ProbeDefaultOutOfRange {
+            field,
+            value,
+            min,
+            max,
+        });
+    }
+    Ok(())
+}
+
+fn validate_probe_default_positive(
+    field: &'static str,
+    value: f64,
+    max: f64,
+) -> Result<(), ValidationError> {
+    if !value.is_finite() {
+        return Err(ValidationError::NonFiniteProbeDefault { field, value });
+    }
+    if value <= 0.0 {
+        return Err(ValidationError::ProbeDefaultNotPositive { field, value, max });
+    }
+    if value > max {
+        return Err(ValidationError::ProbeDefaultOutOfRange {
+            field,
+            value,
+            min: 0.0,
+            max,
+        });
+    }
+    Ok(())
+}
+
 /// Measurement frame a height map was captured in.
 ///
 /// The frame is stored beside the map so it is not reused after a work-offset
@@ -909,6 +1103,13 @@ pub struct ControllerData {
     /// Profiles written before this field existed load with a zero offset.
     #[serde(default)]
     pub probe_offset: ProbeOffsetRecord,
+    /// Starting values for the probe cycle parameter sheet.
+    ///
+    /// Profiles written before this field existed load
+    /// [`ProbeDefaultsRecord::default`]. These are defaults only; loading a
+    /// profile never starts a probe cycle.
+    #[serde(default)]
+    pub probe_defaults: ProbeDefaultsRecord,
     /// Application-owned tool table.
     #[serde(default)]
     pub tools: ToolTable,
@@ -936,6 +1137,7 @@ impl Default for ControllerData {
             settings: BTreeMap::new(),
             offsets: OffsetSnapshot::default(),
             probe_offset: ProbeOffsetRecord::default(),
+            probe_defaults: ProbeDefaultsRecord::default(),
             tools: ToolTable::default(),
             macros: Vec::new(),
             startup_lines: StartupLines::default(),
@@ -952,8 +1154,8 @@ impl ControllerData {
         Self::default()
     }
 
-    /// Validate the schema, settings, offsets, probe offset, tools, macros,
-    /// startup lines, keymap, and height maps.
+    /// Validate the schema, settings, offsets, probe offset, probe defaults,
+    /// tools, macros, startup lines, keymap, and height maps.
     ///
     /// # Errors
     ///
@@ -971,6 +1173,7 @@ impl ControllerData {
         }
         self.offsets.validate()?;
         self.probe_offset.validate()?;
+        self.probe_defaults.validate()?;
         self.tools.validate()?;
 
         let mut names = HashSet::with_capacity(self.macros.len());
@@ -1103,6 +1306,15 @@ mod tests {
         data.probe_offset = ProbeOffsetRecord {
             x_mm: -12.5,
             y_mm: 7.25,
+        };
+        data.probe_defaults = ProbeDefaultsRecord {
+            safe_z_mm: 15.0,
+            search_distance_mm: 8.0,
+            feed_mm_min: 150.0,
+            retract_mm: 2.5,
+            probe_diameter_mm: 4.0,
+            edge_offset_mm: -1.5,
+            plate_thickness_mm: 12.0,
         };
 
         data.tools = sample_tools();
@@ -1674,5 +1886,299 @@ mod tests {
 
         data.height_maps.pop();
         data.validate().expect("limit is accepted");
+    }
+
+    #[test]
+    fn probe_defaults_are_stable() {
+        let defaults = ProbeDefaultsRecord::default();
+        assert_eq!(defaults.safe_z_mm, 10.0);
+        assert_eq!(defaults.search_distance_mm, 5.0);
+        assert_eq!(defaults.feed_mm_min, 100.0);
+        assert_eq!(defaults.retract_mm, 2.0);
+        assert_eq!(defaults.probe_diameter_mm, 3.0);
+        assert_eq!(defaults.edge_offset_mm, 0.0);
+        assert_eq!(defaults.plate_thickness_mm, 10.0);
+        assert_eq!(ControllerData::new().probe_defaults, defaults);
+        defaults.validate().expect("defaults are valid");
+    }
+
+    #[test]
+    fn probe_defaults_round_trip_non_default_values() {
+        let defaults = ProbeDefaultsRecord {
+            safe_z_mm: 25.0,
+            search_distance_mm: 12.5,
+            feed_mm_min: 250.0,
+            retract_mm: 3.5,
+            probe_diameter_mm: 6.0,
+            edge_offset_mm: -2.5,
+            plate_thickness_mm: 12.0,
+        };
+        defaults.validate().expect("valid");
+        let json = serde_json::to_string(&defaults).expect("serialize");
+        let decoded: ProbeDefaultsRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, defaults);
+        decoded.validate().expect("valid after round trip");
+
+        let data = ControllerData {
+            probe_defaults: defaults,
+            ..ControllerData::new()
+        };
+        let json = serde_json::to_string(&data).expect("serialize profile");
+        assert!(json.contains("\"probe_defaults\""));
+        let decoded: ControllerData = serde_json::from_str(&json).expect("deserialize profile");
+        assert_eq!(decoded.probe_defaults, defaults);
+        decoded.validate().expect("valid after round trip");
+    }
+
+    #[test]
+    fn old_profiles_without_probe_defaults_load_the_defaults() {
+        let data: ControllerData =
+            serde_json::from_str(r#"{"schema_version":1}"#).expect("old profile");
+        assert_eq!(data.probe_defaults, ProbeDefaultsRecord::default());
+        data.validate().expect("valid");
+
+        let mut value = serde_json::to_value(sample_data()).expect("json");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("probe_defaults");
+        let decoded: ControllerData = serde_json::from_value(value).expect("decode");
+        assert_eq!(decoded.probe_defaults, ProbeDefaultsRecord::default());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn partial_probe_defaults_use_field_defaults() {
+        let partial: ProbeDefaultsRecord =
+            serde_json::from_str(r#"{"safe_z_mm":20.0}"#).expect("partial record");
+        assert_eq!(partial.safe_z_mm, 20.0);
+        assert_eq!(partial.search_distance_mm, 5.0);
+        assert_eq!(partial.feed_mm_min, 100.0);
+        assert_eq!(partial.retract_mm, 2.0);
+        assert_eq!(partial.probe_diameter_mm, 3.0);
+        assert_eq!(partial.edge_offset_mm, 0.0);
+        assert_eq!(partial.plate_thickness_mm, 10.0);
+        partial.validate().expect("partial record is valid");
+    }
+
+    #[test]
+    fn probe_defaults_accept_every_bound() {
+        type SetField = fn(&mut ProbeDefaultsRecord, f64);
+        let cases: [(&str, SetField, f64, f64); 7] = [
+            (
+                "safe_z_mm",
+                |record, value| record.safe_z_mm = value,
+                -MAX_PROBE_SAFE_Z_MM,
+                MAX_PROBE_SAFE_Z_MM,
+            ),
+            (
+                "search_distance_mm",
+                |record, value| record.search_distance_mm = value,
+                f64::MIN_POSITIVE,
+                MAX_PROBE_SEARCH_DISTANCE_MM,
+            ),
+            (
+                "feed_mm_min",
+                |record, value| record.feed_mm_min = value,
+                f64::MIN_POSITIVE,
+                MAX_PROBE_FEED_MM_MIN,
+            ),
+            (
+                "retract_mm",
+                |record, value| record.retract_mm = value,
+                0.0,
+                MAX_PROBE_RETRACT_MM,
+            ),
+            (
+                "probe_diameter_mm",
+                |record, value| record.probe_diameter_mm = value,
+                0.0,
+                MAX_PROBE_DIAMETER_MM,
+            ),
+            (
+                "edge_offset_mm",
+                |record, value| record.edge_offset_mm = value,
+                -MAX_PROBE_EDGE_OFFSET_MM,
+                MAX_PROBE_EDGE_OFFSET_MM,
+            ),
+            (
+                "plate_thickness_mm",
+                |record, value| record.plate_thickness_mm = value,
+                0.0,
+                MAX_PROBE_PLATE_THICKNESS_MM,
+            ),
+        ];
+        for (field, set, min, max) in cases {
+            for value in [min, max] {
+                let mut record = ProbeDefaultsRecord::default();
+                set(&mut record, value);
+                record
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{field}={value} rejected: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn probe_defaults_reject_zero_negative_and_over_max_values() {
+        type Mutation = fn(&mut ProbeDefaultsRecord);
+        let cases: [(&str, Mutation); 16] = [
+            ("safe_z_mm", |record| {
+                record.safe_z_mm = MAX_PROBE_SAFE_Z_MM + 1.0
+            }),
+            ("safe_z_mm", |record| {
+                record.safe_z_mm = -MAX_PROBE_SAFE_Z_MM - 1.0
+            }),
+            ("search_distance_mm", |record| {
+                record.search_distance_mm = 0.0
+            }),
+            ("search_distance_mm", |record| {
+                record.search_distance_mm = -1.0
+            }),
+            ("search_distance_mm", |record| {
+                record.search_distance_mm = MAX_PROBE_SEARCH_DISTANCE_MM + 0.5
+            }),
+            ("feed_mm_min", |record| record.feed_mm_min = 0.0),
+            ("feed_mm_min", |record| record.feed_mm_min = -1.0),
+            ("feed_mm_min", |record| {
+                record.feed_mm_min = MAX_PROBE_FEED_MM_MIN + 1.0
+            }),
+            ("retract_mm", |record| record.retract_mm = -1.0),
+            ("retract_mm", |record| {
+                record.retract_mm = MAX_PROBE_RETRACT_MM + 0.5
+            }),
+            ("probe_diameter_mm", |record| {
+                record.probe_diameter_mm = -1.0
+            }),
+            ("probe_diameter_mm", |record| {
+                record.probe_diameter_mm = MAX_PROBE_DIAMETER_MM + 0.5
+            }),
+            ("edge_offset_mm", |record| {
+                record.edge_offset_mm = -MAX_PROBE_EDGE_OFFSET_MM - 1.0
+            }),
+            ("edge_offset_mm", |record| {
+                record.edge_offset_mm = MAX_PROBE_EDGE_OFFSET_MM + 1.0
+            }),
+            ("plate_thickness_mm", |record| {
+                record.plate_thickness_mm = -1.0
+            }),
+            ("plate_thickness_mm", |record| {
+                record.plate_thickness_mm = MAX_PROBE_PLATE_THICKNESS_MM + 0.5
+            }),
+        ];
+        for (expected_field, mutate) in cases {
+            let mut record = ProbeDefaultsRecord::default();
+            mutate(&mut record);
+            match record.validate() {
+                Err(ValidationError::ProbeDefaultOutOfRange {
+                    field, min, max, ..
+                }) => {
+                    assert_eq!(field, expected_field);
+                    assert!(min < max);
+                }
+                Err(ValidationError::ProbeDefaultNotPositive { field, .. }) => {
+                    assert_eq!(field, expected_field);
+                }
+                other => panic!("expected {expected_field} to fail, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn probe_defaults_reject_non_finite_values() {
+        type SetField = fn(&mut ProbeDefaultsRecord, f64);
+        let fields: [(&str, SetField); 7] = [
+            ("safe_z_mm", |record, value| record.safe_z_mm = value),
+            ("search_distance_mm", |record, value| {
+                record.search_distance_mm = value
+            }),
+            ("feed_mm_min", |record, value| record.feed_mm_min = value),
+            ("retract_mm", |record, value| record.retract_mm = value),
+            ("probe_diameter_mm", |record, value| {
+                record.probe_diameter_mm = value
+            }),
+            ("edge_offset_mm", |record, value| {
+                record.edge_offset_mm = value
+            }),
+            ("plate_thickness_mm", |record, value| {
+                record.plate_thickness_mm = value
+            }),
+        ];
+        for (expected_field, set) in fields {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut record = ProbeDefaultsRecord::default();
+                set(&mut record, value);
+                match record.validate() {
+                    Err(ValidationError::NonFiniteProbeDefault {
+                        field,
+                        value: found,
+                    }) => {
+                        assert_eq!(field, expected_field);
+                        assert!(!found.is_finite());
+                    }
+                    other => panic!("expected {expected_field}={value} to fail, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn controller_data_rejects_invalid_probe_defaults() {
+        let mut not_positive = ControllerData::new();
+        not_positive.probe_defaults.feed_mm_min = 0.0;
+        assert!(matches!(
+            not_positive.validate(),
+            Err(ValidationError::ProbeDefaultNotPositive {
+                field: "feed_mm_min",
+                ..
+            })
+        ));
+
+        let mut out_of_range = ControllerData::new();
+        out_of_range.probe_defaults.search_distance_mm = MAX_PROBE_SEARCH_DISTANCE_MM + 1.0;
+        assert!(matches!(
+            out_of_range.validate(),
+            Err(ValidationError::ProbeDefaultOutOfRange {
+                field: "search_distance_mm",
+                ..
+            })
+        ));
+
+        let mut non_finite = ControllerData::new();
+        non_finite.probe_defaults.safe_z_mm = f64::NAN;
+        assert!(matches!(
+            non_finite.validate(),
+            Err(ValidationError::NonFiniteProbeDefault {
+                field: "safe_z_mm",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn probe_defaults_only_add_a_field_to_the_profile() {
+        assert_eq!(CONTROLLER_SCHEMA_VERSION, 1);
+        let data = sample_data();
+        let value = serde_json::to_value(&data).expect("json");
+        let object = value.as_object().expect("object");
+        assert_eq!(object["schema_version"], 1);
+        for field in [
+            "schema_version",
+            "settings",
+            "offsets",
+            "probe_offset",
+            "probe_defaults",
+            "tools",
+            "macros",
+            "startup_lines",
+            "keymap",
+            "height_maps",
+        ] {
+            assert!(object.contains_key(field), "profile is missing {field}");
+        }
+        assert_eq!(object.len(), 10);
+        let decoded: ControllerData = serde_json::from_value(value).expect("decode");
+        assert_eq!(decoded, data);
+        decoded.validate().expect("valid");
     }
 }

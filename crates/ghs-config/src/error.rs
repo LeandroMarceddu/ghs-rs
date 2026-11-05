@@ -102,6 +102,36 @@ pub enum ValidationError {
         /// Largest accepted value.
         max: f64,
     },
+    /// A persisted probe default is NaN or infinite.
+    #[error("probe default {field} must be finite (got {value})")]
+    NonFiniteProbeDefault {
+        /// Field name, for example `"safe_z_mm"` or `"feed_mm_min"`.
+        field: &'static str,
+        /// Rejected value.
+        value: f64,
+    },
+    /// A persisted probe default is outside its accepted range.
+    #[error("probe default {field} must be between {min} and {max} (got {value})")]
+    ProbeDefaultOutOfRange {
+        /// Field name, for example `"safe_z_mm"` or `"retract_mm"`.
+        field: &'static str,
+        /// Rejected value.
+        value: f64,
+        /// Smallest accepted value.
+        min: f64,
+        /// Largest accepted value.
+        max: f64,
+    },
+    /// A persisted probe default that must be positive is zero or negative.
+    #[error("probe default {field} must be greater than 0 and at most {max} (got {value})")]
+    ProbeDefaultNotPositive {
+        /// Field name, `"search_distance_mm"` or `"feed_mm_min"`.
+        field: &'static str,
+        /// Rejected value.
+        value: f64,
+        /// Largest accepted value.
+        max: f64,
+    },
     /// A setting value is NaN, infinite, or structurally invalid.
     #[error("setting ${number} is invalid: {reason}")]
     InvalidSetting {
