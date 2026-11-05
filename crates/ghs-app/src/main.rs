@@ -26,6 +26,12 @@
 //! keymap section. `--demo-surfacing` opens the material surfacing wizard and
 //! generates a preview without loading or starting it; `--demo-transform` opens
 //! the line-number transform preview for the loaded demo program.
+//! `--demo-calibration` fills the stepper-calibration fields and shows the
+//! proposal without applying it; `--demo-calibration-confirm` opens the write
+//! confirmation. `--demo-soft-limits` enables `$20` through the normal settings
+//! write/read-back path, and `--demo-over-travel` then loads a program whose
+//! bounds exceed the reported travel and presses START so the over-travel sheet
+//! is shown without sending a start.
 //! `--demo-tools` seeds the app-side tool table after the controller profile
 //! loads. `--macros` opens the Utility workspace with the
 //! user-macro section, while `--demo-macros` seeds two profile macros through

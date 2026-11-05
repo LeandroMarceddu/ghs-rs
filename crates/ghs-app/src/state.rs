@@ -1242,6 +1242,13 @@ pub enum RunToOutcome {
         /// Engine rejection text.
         message: String,
     },
+    /// The breakpoint was accepted and the start is held behind the
+    /// over-travel confirmation. A later confirm sends exactly one
+    /// `StartProgram`; cancelling leaves the breakpoint enabled.
+    StartHeld {
+        /// 1-based source line where the job would pause.
+        line: u32,
+    },
     /// The gate refused before any command was built.
     Refused(RunToRefusal),
     /// The breakpoint command was rejected; nothing else was sent.
@@ -1899,10 +1906,45 @@ pub enum CheckOutcome {
 pub enum StartOutcome {
     /// Exactly one `StartProgram { from_line: None }` was accepted.
     Sent,
+    /// The program exceeds reported travel; the confirmation sheet opened and
+    /// nothing was sent.
+    ConfirmationRequired,
     /// A check transition owns the runner; nothing was sent.
     Refused(CheckRefusal),
     /// The engine rejected the command.
     Rejected(String),
+    /// There was no open confirmation; nothing was sent.
+    NotConfirmed,
+    /// The open confirmation belonged to a changed program, link, machine
+    /// state, or limits report; it was discarded and nothing was sent.
+    Stale,
+}
+
+/// Program and travel snapshot captured by an over-travel START confirmation.
+///
+/// The exact parsed program is retained so a later confirmation can refuse to
+/// fire after the controller loaded or reloaded a program. Creating this value
+/// sends nothing; only [`AppState::confirm_start`] sends `StartProgram`.
+#[derive(Clone, Debug)]
+pub struct StartConfirmation {
+    limits: ProgramLimits,
+    program: Arc<Program>,
+    run_to_line: Option<u32>,
+}
+
+impl StartConfirmation {
+    /// Limits report shown by the confirmation sheet.
+    #[must_use]
+    pub fn limits(&self) -> &ProgramLimits {
+        &self.limits
+    }
+
+    /// Run-to line whose breakpoint is already set, when this held start came
+    /// from the run-to sheet rather than a normal START.
+    #[must_use]
+    pub fn run_to_line(&self) -> Option<u32> {
+        self.run_to_line
+    }
 }
 
 /// Short scope label for a successful console-log export.
@@ -2191,6 +2233,9 @@ pub struct AppState {
     pub run_options_error: Option<String>,
     /// The check-run confirmation sheet is open. Opening sends nothing.
     pub check_confirm_open: bool,
+    /// Over-travel START confirmation, with the exact program and limits it
+    /// was opened for. `Some` opens the sheet; opening sends nothing.
+    pub start_confirm: Option<StartConfirmation>,
     /// The sleep confirmation sheet is open. Opening sends nothing.
     pub sleep_confirm_open: bool,
     pub feed_override_active: bool,
@@ -2292,6 +2337,7 @@ impl AppState {
             run_options_open: false,
             run_options_error: None,
             check_confirm_open: false,
+            start_confirm: None,
             sleep_confirm_open: false,
             feed_override_active: false,
             spindle_override_active: false,
@@ -2390,6 +2436,7 @@ impl AppState {
         self.run_options_open = false;
         self.run_options_error = None;
         self.check_confirm_open = false;
+        self.start_confirm = None;
         self.sleep_confirm_open = false;
         self.mdi_history_index = None;
         self.feed_override_active = false;
@@ -3044,10 +3091,12 @@ impl AppState {
 
     /// Confirm the open run-to sheet.
     ///
-    /// Always sends exactly one `SetBreakpoint { enabled: true }`. It sends
-    /// exactly one `StartProgram { from_line: None }` only when no job is
-    /// active at confirmation time. The engine intentionally rejects
-    /// `from_line > 1`, so this never claims start-from-line.
+    /// Always sends exactly one `SetBreakpoint { enabled: true }`. When no job
+    /// is active it then uses the same normal-start gate as START: within
+    /// travel or unchecked sends exactly one `StartProgram { from_line: None }`,
+    /// while an over-travel report holds the start behind the confirmation
+    /// sheet. The engine intentionally rejects `from_line > 1`, so this never
+    /// claims start-from-line.
     pub fn confirm_run_to(
         &mut self,
         mut send: impl FnMut(Command) -> Result<(), String>,
@@ -3079,12 +3128,28 @@ impl AppState {
         if !will_start {
             return RunToOutcome::BreakpointOnly { line };
         }
-        if let Err(detail) = send(Command::StartProgram { from_line: None }) {
-            let message = format!("Breakpoint set at line {line}; start rejected: {detail}");
-            self.job.breakpoints.error = Some(message.clone());
-            return RunToOutcome::StartRejected { line, message };
+        // A run-to start is a real start, so it goes through the same gate as
+        // START instead of sending `StartProgram` directly. The breakpoint is
+        // already enabled when the gate holds the start.
+        match self.dispatch_start_after_run_to(Some(line), send) {
+            StartOutcome::Sent => RunToOutcome::Started { line },
+            StartOutcome::ConfirmationRequired => RunToOutcome::StartHeld { line },
+            StartOutcome::Rejected(detail) => {
+                let message = format!("Breakpoint set at line {line}; start rejected: {detail}");
+                self.job.breakpoints.error = Some(message.clone());
+                RunToOutcome::StartRejected { line, message }
+            }
+            StartOutcome::Refused(refusal) => RunToOutcome::StartRejected {
+                line,
+                message: refusal.message().to_string(),
+            },
+            // Neither outcome is reachable from a fresh dispatch, but treat
+            // one defensively as a refused start rather than claiming sent.
+            StartOutcome::NotConfirmed | StartOutcome::Stale => RunToOutcome::StartRejected {
+                line,
+                message: "the start gate no longer matches the loaded program".to_string(),
+            },
         }
-        RunToOutcome::Started { line }
     }
 
     /// Detail line for the current pause, including the breakpoint line.
@@ -3207,19 +3272,141 @@ impl AppState {
         }
     }
 
+    /// Whether an over-travel START confirmation is open.
+    #[must_use]
+    pub fn start_confirm_open(&self) -> bool {
+        self.start_confirm.is_some()
+    }
+
+    /// Limits report captured by the open START confirmation.
+    #[must_use]
+    pub fn pending_start_limits(&self) -> Option<&ProgramLimits> {
+        self.start_confirm.as_ref().map(StartConfirmation::limits)
+    }
+
+    /// Run-to line whose breakpoint is already set for the open START
+    /// confirmation, when the held start came from run-to.
+    #[must_use]
+    pub fn pending_start_run_to_line(&self) -> Option<u32> {
+        self.start_confirm
+            .as_ref()
+            .and_then(StartConfirmation::run_to_line)
+    }
+
+    /// Close the START confirmation without sending anything.
+    ///
+    /// Returns `true` when a sheet was open.
+    pub fn cancel_start_confirm(&mut self) -> bool {
+        self.start_confirm.take().is_some()
+    }
+
     /// Send exactly one normal `StartProgram { from_line: None }`.
     ///
     /// Check mode has its own `StartCheckRun`; this path never selects it. A
     /// pending or active check refuses the start without sending, and an
     /// accepted normal start clears the dry-run label at once (the engine's
     /// `check_run` accessor confirms it on the next poll).
+    ///
+    /// When `ProgramLimits` reports any overrun this opens the confirmation
+    /// sheet instead of sending. A program whose travel comparison was not
+    /// checked keeps the previous direct-start behavior; the comparison is
+    /// informational and never a controller soft-limit enforcement.
     pub fn dispatch_start(
         &mut self,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> StartOutcome {
+        self.dispatch_start_after_run_to(None, send)
+    }
+
+    /// Shared normal-start path for a direct START and a run-to start.
+    ///
+    /// `run_to_line` is `Some` only after `confirm_run_to` has set that line's
+    /// breakpoint. It is carried into the confirmation so the sheet can say
+    /// which breakpoint is already armed; it changes no command.
+    fn dispatch_start_after_run_to(
+        &mut self,
+        run_to_line: Option<u32>,
         send: impl FnOnce(Command) -> Result<(), String>,
     ) -> StartOutcome {
         if self.job.check_busy() {
             return StartOutcome::Refused(CheckRefusal::CheckActive);
         }
+        // A stale sheet must not hold a start after the link, program, or
+        // machine state changed. Discard it, then evaluate the current program.
+        self.sync_start_confirm();
+        if self.start_confirm.is_some() {
+            return StartOutcome::ConfirmationRequired;
+        }
+        let limits = self.program_limits();
+        if limits.is_over_travel()
+            && let Some(program) = self.job.program().cloned()
+        {
+            self.start_confirm = Some(StartConfirmation {
+                limits,
+                program,
+                run_to_line,
+            });
+            return StartOutcome::ConfirmationRequired;
+        }
+        self.send_normal_start(send)
+    }
+
+    /// Confirm the open over-travel sheet with exactly one `StartProgram`.
+    ///
+    /// The sheet is consumed before the gate is checked. A program, link,
+    /// machine-state, or limits change since the sheet opened returns
+    /// [`StartOutcome::Stale`] without sending, so a stale start can never fire
+    /// later. Cancelling and confirming with no open sheet send nothing.
+    pub fn confirm_start(
+        &mut self,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> StartOutcome {
+        let Some(pending) = self.start_confirm.take() else {
+            return StartOutcome::NotConfirmed;
+        };
+        if self.job.check_busy() {
+            return StartOutcome::Refused(CheckRefusal::CheckActive);
+        }
+        if !self.start_confirmation_is_current(&pending) {
+            return StartOutcome::Stale;
+        }
+        self.send_normal_start(send)
+    }
+
+    /// Clear the START confirmation when it no longer matches the live state.
+    ///
+    /// The shell calls this every poll so a program change, a dropped link, a
+    /// machine that leaves `Idle`, or a changed limits report closes the sheet
+    /// even when the operator never presses a button. Returns `true` when a
+    /// stale sheet was discarded.
+    pub fn sync_start_confirm(&mut self) -> bool {
+        let stale = self
+            .start_confirm
+            .as_ref()
+            .is_some_and(|pending| !self.start_confirmation_is_current(pending));
+        if !stale {
+            return false;
+        }
+        self.start_confirm = None;
+        true
+    }
+
+    fn start_confirmation_is_current(&self, pending: &StartConfirmation) -> bool {
+        self.live
+            && self.connection.is_ready_like()
+            && self.machine_state == "Idle"
+            && !self.job.is_active()
+            && self
+                .job
+                .program()
+                .is_some_and(|program| Arc::ptr_eq(program, &pending.program))
+            && self.program_limits() == pending.limits
+    }
+
+    fn send_normal_start(
+        &mut self,
+        send: impl FnOnce(Command) -> Result<(), String>,
+    ) -> StartOutcome {
         let command = Command::StartProgram { from_line: None };
         match send(command) {
             Ok(()) => {
@@ -4602,6 +4789,7 @@ mod tests {
 
     use super::*;
     use crate::probe::ProbeContext;
+    use crate::utilities::LimitsStatus;
 
     const FLEXIHAL: &[&str] = &[
         "[VER:1.1f.20240604:]",
@@ -7498,5 +7686,332 @@ mod tests {
         assert!(!state.job.check_pending());
         assert!(state.job.has_program());
         assert!(!state.job.is_check());
+    }
+
+    fn travel_start_state(over_travel: bool) -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("travel start test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.settings.apply_settings(&[
+            ghs_engine::Setting::new(20, SettingValue::Bool(true)),
+            ghs_engine::Setting::new(130, SettingValue::Int(100)),
+            ghs_engine::Setting::new(131, SettingValue::Int(100)),
+            ghs_engine::Setting::new(132, SettingValue::Int(100)),
+        ]);
+        let mut offsets = Offsets::default();
+        offsets.wcs[Wcs::G54.index()] = Some(Position::zero());
+        state.apply_offsets(&offsets);
+        let source = if over_travel {
+            "G21\nG0 X150 Y0 Z0\nM30\n"
+        } else {
+            "G21\nG0 X50 Y0 Z0\nM30\n"
+        };
+        let program =
+            Arc::new(ghs_gcode::parse_program(source).expect("travel test program parses"));
+        state.job.loaded("travel.nc".into(), program, 3);
+        state
+    }
+
+    #[test]
+    fn within_travel_start_sends_start_program_directly() {
+        let mut state = travel_start_state(false);
+        assert!(matches!(
+            state.program_limits().status,
+            LimitsStatus::WithinTravel
+        ));
+        let mut sent = Vec::new();
+
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::Sent
+        );
+        assert_eq!(sent, vec![Command::StartProgram { from_line: None }]);
+        assert!(!state.start_confirm_open());
+    }
+
+    #[test]
+    fn not_checked_start_sends_start_program_directly() {
+        let mut state = AppState::new();
+        state.begin_live("not checked start test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.job.loaded("unknown.nc".into(), sample_program(), 4);
+        assert!(matches!(
+            state.program_limits().status,
+            LimitsStatus::Unchecked(_)
+        ));
+        let mut sent = Vec::new();
+
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::Sent
+        );
+        assert_eq!(sent, vec![Command::StartProgram { from_line: None }]);
+        assert!(!state.start_confirm_open());
+
+        // An explicit soft-limits-off report is also NOT CHECKED, not an
+        // overrun, so it keeps the direct-start behavior.
+        let mut soft_off = travel_start_state(true);
+        soft_off
+            .settings
+            .apply_settings(&[ghs_engine::Setting::new(20, SettingValue::Bool(false))]);
+        assert!(matches!(
+            soft_off.program_limits().status,
+            LimitsStatus::SoftLimitsOff
+        ));
+        sent.clear();
+        assert_eq!(
+            soft_off.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::Sent
+        );
+        assert_eq!(sent, vec![Command::StartProgram { from_line: None }]);
+    }
+
+    #[test]
+    fn over_travel_start_opens_confirmation_and_sends_nothing() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired
+        );
+        assert!(sent.is_empty(), "opening the confirmation sends nothing");
+        assert!(state.start_confirm_open());
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired,
+            "pressing START again keeps the sheet open"
+        );
+        assert!(sent.is_empty(), "a second START still sends nothing");
+        let limits = state.pending_start_limits().expect("pending limits");
+        assert_eq!(
+            limits.overruns(),
+            vec!["X MAX 150.000 > $130 100.000".to_string()]
+        );
+        assert_eq!(
+            limits.bounds_text(),
+            "X 0.000 .. 150.000 | Y 0.000 .. 0.000 | Z 0.000 .. 0.000"
+        );
+        assert_eq!(
+            limits.travel_text(),
+            "X $130 100.000 | Y $131 100.000 | Z $132 100.000"
+        );
+    }
+
+    #[test]
+    fn confirming_over_travel_start_sends_exactly_one_start_program() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired
+        );
+
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::Sent
+        );
+        assert_eq!(sent, vec![Command::StartProgram { from_line: None }]);
+        assert!(!state.start_confirm_open(), "the sheet is consumed");
+
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::NotConfirmed
+        );
+        assert_eq!(sent.len(), 1, "only one StartProgram was sent");
+    }
+
+    #[test]
+    fn cancelling_over_travel_start_sends_nothing() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired
+        );
+        assert!(sent.is_empty());
+
+        assert!(state.cancel_start_confirm());
+        assert!(!state.start_confirm_open());
+        assert!(sent.is_empty(), "cancel sends nothing");
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty(), "a cancelled sheet cannot start later");
+    }
+
+    #[test]
+    fn program_change_clears_pending_over_travel_start() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired
+        );
+
+        let replacement = Arc::new(
+            ghs_gcode::parse_program("G21\nG0 X10\nM30\n").expect("replacement program parses"),
+        );
+        state.job.loaded("replacement.nc".into(), replacement, 3);
+        assert!(state.sync_start_confirm(), "a new program clears the sheet");
+        assert!(!state.start_confirm_open());
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty(), "the replaced program never starts");
+    }
+
+    #[test]
+    fn disconnect_clears_pending_over_travel_start() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired
+        );
+
+        state.connection = ConnectionState::Disconnected;
+        assert!(
+            state.sync_start_confirm(),
+            "a dropped link clears the sheet"
+        );
+        assert!(!state.start_confirm_open());
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty(), "the stale start never fires");
+    }
+
+    #[test]
+    fn machine_leaving_idle_clears_pending_over_travel_start() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired
+        );
+
+        state.machine_state = "Run";
+        assert!(state.sync_start_confirm(), "leaving Idle clears the sheet");
+        assert!(!state.start_confirm_open());
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty(), "a non-Idle machine never starts");
+
+        // Confirmation also re-checks the machine without waiting for a poll.
+        assert_eq!(
+            state.dispatch_start(recorded_send(&mut sent)),
+            StartOutcome::ConfirmationRequired,
+            "a fresh sheet opens only after the current limits report"
+        );
+        state.machine_state = "Run";
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::Stale
+        );
+        assert!(sent.is_empty(), "a stale confirmation sends nothing");
+    }
+
+    #[test]
+    fn run_to_is_gated_by_reported_travel_while_check_is_not() {
+        // A check run has its own sheet and command.
+        let mut check = travel_start_state(true);
+        let mut sent = Vec::new();
+        check.request_check().expect("check request");
+        assert_eq!(
+            check.confirm_check(recorded_send(&mut sent)),
+            CheckOutcome::Started
+        );
+        assert_eq!(sent, vec![Command::StartCheckRun]);
+        assert!(!check.start_confirm_open());
+
+        // Run-to starts the job, so it uses the same over-travel gate as
+        // START: the breakpoint is set, then the start is held.
+        let mut run_to = travel_start_state(true);
+        sent.clear();
+        run_to.request_run_to(2).expect("run-to request");
+        assert_eq!(
+            run_to.confirm_run_to(recorded_send(&mut sent)),
+            RunToOutcome::StartHeld { line: 2 }
+        );
+        assert_eq!(
+            sent,
+            vec![Command::SetBreakpoint {
+                line: 2,
+                enabled: true,
+            }],
+            "the held start must not send StartProgram"
+        );
+        assert!(run_to.start_confirm_open());
+        assert_eq!(run_to.pending_start_run_to_line(), Some(2));
+        assert!(run_to.job.breakpoints.contains(2));
+
+        // Confirming the held start sends exactly one normal StartProgram;
+        // the breakpoint is not sent twice.
+        assert_eq!(
+            run_to.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::Sent
+        );
+        assert_eq!(
+            sent,
+            vec![
+                Command::SetBreakpoint {
+                    line: 2,
+                    enabled: true,
+                },
+                Command::StartProgram { from_line: None },
+            ]
+        );
+        assert!(!run_to.start_confirm_open());
+        assert!(run_to.job.breakpoints.contains(2));
+    }
+
+    #[test]
+    fn cancelling_a_held_run_to_start_sends_nothing_and_keeps_the_breakpoint() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        state.request_run_to(2).expect("run-to request");
+        assert_eq!(
+            state.confirm_run_to(recorded_send(&mut sent)),
+            RunToOutcome::StartHeld { line: 2 }
+        );
+        sent.clear();
+
+        assert!(state.cancel_start_confirm());
+        assert!(sent.is_empty(), "cancel sends no command");
+        assert!(!state.start_confirm_open());
+        assert!(state.job.breakpoints.contains(2));
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::NotConfirmed
+        );
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn held_run_to_start_is_stale_after_the_program_changes() {
+        let mut state = travel_start_state(true);
+        let mut sent = Vec::new();
+        state.request_run_to(2).expect("run-to request");
+        assert_eq!(
+            state.confirm_run_to(recorded_send(&mut sent)),
+            RunToOutcome::StartHeld { line: 2 }
+        );
+        sent.clear();
+
+        let other = Arc::new(ghs_gcode::parse_program("G21\nG0 X10 Y0 Z0\nM30\n").expect("parses"));
+        state.job.loaded("other.nc".into(), other, 3);
+        assert_eq!(
+            state.confirm_start(recorded_send(&mut sent)),
+            StartOutcome::Stale
+        );
+        assert!(sent.is_empty(), "a stale held start must not send");
     }
 }

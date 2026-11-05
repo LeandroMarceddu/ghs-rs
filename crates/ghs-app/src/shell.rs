@@ -97,7 +97,9 @@ use crate::state::{
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
-use crate::utilities::{CalibrationAxis, CalibrationField, TransformKind, UtilityField};
+use crate::utilities::{
+    CalibrationAxis, CalibrationField, LimitsStatus, TransformKind, UtilityField,
+};
 use crate::viewer;
 
 const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -311,6 +313,14 @@ pub struct Shell {
     demo_program: DemoProgram,
     demo_start: bool,
     demo_start_sent: bool,
+    /// Screenshot switch: enable `$20` through the normal settings write path
+    /// before the over-travel capture.
+    demo_soft_limits: bool,
+    demo_soft_limits_done: bool,
+    /// Screenshot switch: press START once after an over-travel program's
+    /// travel report is available, leaving the confirmation sheet open.
+    demo_over_travel: bool,
+    demo_over_travel_done: bool,
     /// Screenshot switch: open the check-run confirmation without confirming.
     demo_check_confirm: bool,
     demo_check_confirm_done: bool,
@@ -590,6 +600,8 @@ impl Shell {
             DemoProgram::Pocket
         };
         let demo_start = std::env::args().any(|arg| arg == "--demo-start");
+        let demo_soft_limits = std::env::args().any(|arg| arg == "--demo-soft-limits");
+        let demo_over_travel = std::env::args().any(|arg| arg == "--demo-over-travel");
         let demo_check = std::env::args().any(|arg| arg == "--demo-check");
         let demo_check_confirm = std::env::args().any(|arg| arg == "--demo-check-confirm");
         let demo_pins = std::env::args().any(|arg| arg == "--pins");
@@ -727,6 +739,10 @@ impl Shell {
             demo_program,
             demo_start,
             demo_start_sent: false,
+            demo_soft_limits,
+            demo_soft_limits_done: false,
+            demo_over_travel,
+            demo_over_travel_done: false,
             demo_check_confirm,
             demo_check_confirm_done: false,
             demo_check,
@@ -892,6 +908,12 @@ impl Shell {
         // link is no longer ready it can never be sent.
         if self.state.macro_run_pending().is_some() && !self.ready() {
             self.state.cancel_macro_run();
+            changed = true;
+        }
+        // An over-travel START confirmation belongs to the exact program, link,
+        // and Idle machine state that opened it. Clear it as soon as any of
+        // them changes; a stale start must never fire from a later sheet.
+        if self.state.sync_start_confirm() {
             changed = true;
         }
         // A failed height-map point must stop the job once, even if the
@@ -1119,6 +1141,52 @@ impl Shell {
                 }
                 Err(message) => self.state.push_console(ConsoleLevel::Error, message),
             }
+            changed = true;
+        }
+        // Screenshot switch: turn on the simulator's soft-limit report through
+        // the normal settings draft + Apply + read-back path. This is demo
+        // setup, not part of the START gate; without it the simulator reports
+        // `$20=0` and the travel comparison is correctly NOT CHECKED.
+        if self.demo_soft_limits
+            && !self.demo_soft_limits_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.settings.row(20).is_some()
+        {
+            self.demo_soft_limits_done = true;
+            let already = self
+                .state
+                .settings
+                .row(20)
+                .and_then(|row| {
+                    row.current
+                        .as_bool()
+                        .or_else(|| row.current.as_f64().map(|value| value != 0.0))
+                })
+                .unwrap_or(false);
+            if !already {
+                self.state.settings.set_bool(20, true);
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    "Demo setup: enabling soft limits ($20=1) for the travel capture",
+                );
+                self.apply_settings(cx);
+                changed = true;
+            }
+        }
+        // Screenshot switch: wait for the loaded program's travel comparison,
+        // then press the same START action once. With an over-travel program
+        // this only opens the confirmation sheet; it never sends StartProgram.
+        if self.demo_over_travel
+            && !self.demo_over_travel_done
+            && self.state.live
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+            && self.state.program_limits().is_over_travel()
+            && self.job_start_allowed()
+        {
+            self.demo_over_travel_done = true;
+            self.state.mode = Mode::Job;
+            self.start_job(cx);
             changed = true;
         }
         // Screenshot switch: seed the app-side table once the controller
@@ -1904,6 +1972,7 @@ impl Shell {
         self.state.cancel_macro_run();
         self.state.cancel_sleep_confirm();
         self.state.cancel_check_confirm();
+        self.state.cancel_start_confirm();
         self.state.connection = ConnectionState::Disconnected;
         self.state.push_console(
             ConsoleLevel::Warn,
@@ -3278,6 +3347,7 @@ impl Shell {
             || self.state.keypad.is_some()
             || self.state.sleep_confirm_open
             || self.state.check_confirm_open
+            || self.state.start_confirm_open()
             || self.state.macro_run_pending().is_some()
             || self.state.run_options_open
             || self.state.job.breakpoints.pending_run_to().is_some()
@@ -4955,9 +5025,69 @@ impl Shell {
             Some(link) => link.send(command).map_err(|error| error.to_string()),
             None => Err("no engine connection".to_string()),
         });
-        if let StartOutcome::Rejected(error) = outcome {
-            self.state
-                .push_console(ConsoleLevel::Error, format!("Engine: {error}"));
+        match outcome {
+            StartOutcome::ConfirmationRequired => self.state.push_console(
+                ConsoleLevel::Warn,
+                "START HELD: program exceeds reported travel; review the confirmation",
+            ),
+            StartOutcome::Rejected(error) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("Engine: {error}")),
+            StartOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+            StartOutcome::Sent | StartOutcome::NotConfirmed | StartOutcome::Stale => {}
+        }
+        cx.notify();
+    }
+
+    /// Confirm the over-travel sheet with exactly one `StartProgram`.
+    ///
+    /// The gate is re-checked after the sheet is consumed. A changed program,
+    /// link, machine state, or limits report is reported and sends nothing.
+    fn confirm_start(&mut self, cx: &mut Context<Self>) {
+        let link = self.link.as_ref();
+        let outcome = self.state.confirm_start(|command| match link {
+            Some(link) => link.send(command).map_err(|error| error.to_string()),
+            None => Err("no engine connection".to_string()),
+        });
+        match outcome {
+            StartOutcome::Sent => self.state.push_console(
+                ConsoleLevel::Warn,
+                "START ANYWAY confirmed; the program was sent for a real run",
+            ),
+            StartOutcome::Rejected(error) => self
+                .state
+                .push_console(ConsoleLevel::Error, format!("START NOT SENT: {error}")),
+            StartOutcome::Refused(refusal) => self
+                .state
+                .push_console(ConsoleLevel::Warn, refusal.message()),
+            StartOutcome::Stale => self.state.push_console(
+                ConsoleLevel::Warn,
+                "START NOT SENT: the program, link, machine state, or limits changed; \
+                 press START again to re-check",
+            ),
+            StartOutcome::NotConfirmed | StartOutcome::ConfirmationRequired => {}
+        }
+        cx.notify();
+    }
+
+    /// Close the over-travel sheet without sending anything.
+    fn cancel_start_confirm(&mut self, cx: &mut Context<Self>) {
+        let run_to_line = self.state.pending_start_run_to_line();
+        if self.state.cancel_start_confirm() {
+            match run_to_line {
+                Some(line) => self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "START cancelled; the breakpoint at line {line} remains set, \
+                         nothing was sent"
+                    ),
+                ),
+                None => self
+                    .state
+                    .push_console(ConsoleLevel::Info, "START cancelled; nothing was sent"),
+            }
         }
         cx.notify();
     }
@@ -5122,6 +5252,12 @@ impl Shell {
             RunToOutcome::BreakpointOnly { line } => self.state.push_console(
                 ConsoleLevel::Info,
                 format!("Breakpoint set at line {line}; active job was not restarted"),
+            ),
+            RunToOutcome::StartHeld { line } => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!(
+                    "Run to line {line}: breakpoint set; START held for the travel confirmation"
+                ),
             ),
             RunToOutcome::StartRejected { message, .. } | RunToOutcome::Rejected(message) => self
                 .state
@@ -7026,6 +7162,279 @@ impl Shell {
                                     .on_click(move |_, _, cx| {
                                         confirm_view.update(cx, |shell, cx| {
                                             shell.confirm_check(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Confirmation held in front of a normal START when the loaded program's
+    /// estimated machine bounds leave the reported travel.
+    ///
+    /// This is informational: it uses the reported `$130`/`$131`/`$132` and
+    /// the active WCS plus `G92`, not the controller's soft-limit enforcement.
+    /// Opening or cancelling sends nothing. START ANYWAY sends exactly one
+    /// normal `StartProgram { from_line: None }`.
+    fn start_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(limits) = self.state.pending_start_limits().cloned() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view;
+        let name = self.state.job.name.clone();
+        let total = self.state.job.total;
+        let overruns = match &limits.status {
+            LimitsStatus::Exceeds(overruns) => overruns.clone(),
+            _ => Vec::new(),
+        };
+        let machine_bounds = limits
+            .machine_bounds
+            .map_or_else(|| "NOT REPORTED".to_string(), |bounds| bounds.format_all());
+        let run_to_line = self.state.pending_start_run_to_line();
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("start-confirm-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| shell.cancel_start_confirm(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(680.0))
+                    .max_w_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.warning)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.warning)
+                                    .child(t("PROGRAM EXCEEDS REPORTED TRAVEL")),
+                            )
+                            .child(chip("START HELD", p)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(15.0))
+                            .text_color(p.text)
+                            .child(t(
+                                "The loaded program's estimated machine bounds leave the travel reported by the controller. START is held until you confirm.",
+                            )),
+                    )
+                    .children(run_to_line.map(|line| {
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(15.0))
+                            .text_color(p.warning)
+                            .child(format!(
+                                "Run to line {line}: the breakpoint is already set. \
+                                 Confirming starts from line 1 and pauses there; \
+                                 cancelling leaves the breakpoint enabled."
+                            ))
+                    }))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel)
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(t("PROGRAM BOUNDS (WORK COORDINATES)")),
+                            )
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(10.0))
+                                    .text_color(p.text)
+                                    .child(limits.bounds_text()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(t("ESTIMATED MACHINE BOUNDS (WCS + G92)")),
+                            )
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(10.0))
+                                    .text_color(p.text)
+                                    .child(machine_bounds),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(t("REPORTED TRAVEL")),
+                            )
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(10.0))
+                                    .text_color(p.text)
+                                    .child(limits.travel_text()),
+                            ),
+                    )
+                    .when(!overruns.is_empty(), |this| {
+                        this.child(
+                            v_flex().gap_1().children(overruns.into_iter().map(|overrun| {
+                                let delta = if overrun.below_zero && overrun.above_travel {
+                                    format!(
+                                        "LOW {:.3} mm | HIGH {:.3} mm",
+                                        -overrun.min_mm,
+                                        overrun.max_mm - overrun.travel_mm
+                                    )
+                                } else if overrun.below_zero {
+                                    format!("LOW {:.3} mm", -overrun.min_mm)
+                                } else {
+                                    format!("HIGH {:.3} mm", overrun.max_mm - overrun.travel_mm)
+                                };
+                                v_flex()
+                                    .gap_0p5()
+                                    .p_2()
+                                    .rounded(px(6.0))
+                                    .bg(p.danger.opacity(0.12))
+                                    .border_1()
+                                    .border_color(p.danger.opacity(0.5))
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .w(px(22.0))
+                                                    .flex_shrink_0()
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(p.danger)
+                                                    .child(overrun.axis.to_string()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .font_family(self.mono.clone())
+                                                    .text_size(px(10.0))
+                                                    .text_color(p.text)
+                                                    .child(format!(
+                                                        "MACHINE {:.3} .. {:.3} mm",
+                                                        overrun.min_mm, overrun.max_mm
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(p.danger)
+                                                    .child(delta),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(self.mono.clone())
+                                            .text_size(px(9.0))
+                                            .text_color(p.text_faint)
+                                            .child(format!(
+                                                "REPORTED ${} MAXIMUM TRAVEL {:.3} mm",
+                                                overrun.setting, overrun.travel_mm
+                                            )),
+                                    )
+                            })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .line_height(px(13.0))
+                            .text_color(p.text_dim)
+                            .child(t(
+                                "INFORMATIONAL CHECK: WCS changes, G10 writes, G92 offsets, and tool-length offsets are not enforced here. Verify the setup and soft limits before cutting.",
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child(if name.is_empty() {
+                                        format!("{total} LINES")
+                                    } else {
+                                        format!("{name} / {total} LINES")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(t("CANCEL sends nothing.")),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("start-confirm-cancel")
+                                    .label(t("CANCEL"))
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_start_confirm(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("start-confirm-anyway")
+                                    .label(t("START ANYWAY"))
+                                    .danger()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |shell, cx| {
+                                            shell.confirm_start(cx);
                                         });
                                     }),
                             ),
@@ -18249,6 +18658,9 @@ impl Render for Shell {
         }
         if self.state.check_confirm_open {
             root = root.child(self.check_confirm_overlay(p, cx));
+        }
+        if self.state.start_confirm_open() {
+            root = root.child(self.start_confirm_overlay(p, cx));
         }
         if self.state.job.breakpoints.pending_run_to().is_some() {
             root = root.child(self.run_to_overlay(p, cx));
