@@ -43,8 +43,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   reset/stop/sleep, a filterable console with a saved log, a per-profile
   machine keymap, and read-only pins/limits diagnostics.
 - **Utilities** — first-run safety/setup wizard, bounded material-surfacing
-  wizard, program-limits check, non-destructive line-number/comment/source
-  rotation transforms, a confirmed stepper calibration wizard, a
+  wizard, program-limits check, non-destructive line-number/comment and
+  rotation/scale source transforms, a confirmed stepper calibration wizard, a
   gantry-squaring calculator, and a backup-gated `$RST` controller reset.
 - **Jobs** — in-app program file browser with recent files and one-file
   drag-and-drop, streaming, pause/resume/stop, tool-change sheet,

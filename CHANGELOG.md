@@ -20,6 +20,10 @@ until the next release is cut.
 - **3D stock mesh** — the 3D viewer draws an inferred translucent stock box
   from the program bounds, with a `STOCK ON/OFF` toggle and an explicit
   reminder that it is not a measured stock model.
+- **Source scaling** — a Utility transform applies a uniform positive factor
+  about a work-coordinate pivot, previews line/move/arc counts and `R`→`I`/`J`
+  warnings, and loads only after confirmation. Feeds, speeds, Z depths, and
+  dwells are unchanged.
 - **Source rotation** — a Utility transform rotates the loaded program about a
   work-coordinate pivot, previews line/move/arc counts and `R`→`I`/`J`
   warnings, and loads only after confirmation. It never starts the job, and a

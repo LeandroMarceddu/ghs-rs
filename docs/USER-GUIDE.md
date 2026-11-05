@@ -754,6 +754,12 @@ starts automatically.
   cycles, `G10`/`G92`, `G18`/`G19` arcs, helical arcs, `G93`, `G51`, checksums,
   and mid-program WCS switches. A completed rotation probe can copy its
   `-deviation` into the angle field; the pivot stays manual.
+- `SCALE PROGRAM` applies a uniform positive factor about a work-coordinate
+  pivot. Preview shows the stats, any `R` arc converted to `I`/`J`, and the
+  first lines. Feeds, speeds, Z depths, and dwells are unchanged; only XY
+  geometry is scaled. `LOAD AS PROGRAM` requires confirmation and never starts.
+  It refuses the same unsupported constructs as rotation, plus a non-positive
+  or out-of-range factor.
 - `STEPPER CALIBRATION` calculates a new `$100`/`$101`/`$102` steps/mm value
   from the current value, commanded distance, and measured distance
   (`new = old × commanded ÷ measured`). It does **not** move the machine: jog or

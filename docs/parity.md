@@ -176,7 +176,7 @@ implemented before its UI or hardware validation row is complete.
 | UTIL-02 | Gantry squaring and alignment | M7 | done | Guided calculator; manual adjustment; no motion |
 | UTIL-03 | Stepper and XY calibration | M7 | done | `$100`–`$102` wizard |
 | UTIL-04 | Program outline and limits check | M7 | done | Limits card; outline in viewer |
-| UTIL-05 | Add line numbers, strip comments, transform tools | M7 | partial | Numbering/comments/rotate; scale UI and translate open |
+| UTIL-05 | Add line numbers, strip comments, transform tools | M7 | partial | Numbering/comments/rotate/scale; translate open |
 | UTIL-06 | Utility macros and quick actions | M7 | done | Toolbar |
 | UTIL-07 | Machine setup wizard | M7 | done | First-run safety/setup; app-config flag |
 
