@@ -98,11 +98,11 @@ The default simulator is the same engine, handshake, streamer, and safety
 gateway used for a real controller; only the transport differs. `--mock` is a
 design-review shell and never sends commands.
 
-Useful layout and review flags: `--light`, `--keypad`, `--size WxH` (for
-example `--size 1920x1080`), `--fullscreen`, `--viewer-3d`, `--settings`,
-`--offsets`, `--tools`, `--utility`, `--startup-lines`, `--macros`,
-`--probe`, `--demo-gantry`, and `--demo-gantry-card`. Demo job switches
-`--demo-m0` and `--demo-toolchange` are described in section 6.
+Useful layout and review flags: `--light`, `--high-contrast`, `--keypad`,
+`--size WxH` (for example `--size 1920x1080`), `--fullscreen`, `--viewer-3d`,
+`--settings`, `--offsets`, `--tools`, `--utility`, `--startup-lines`,
+`--macros`, `--probe`, `--demo-gantry`, and `--demo-gantry-card`. Demo job
+switches `--demo-m0` and `--demo-toolchange` are described in section 6.
 
 ### Packaged builds
 
@@ -178,10 +178,20 @@ The shell has a fixed three-column layout at 1280×800 and wider. Below
   **Utility**, **Tools**, **Settings**.
 - Status pill: connection label plus axis count and machine state, for
   example `READY | 3 axes | Idle`. Click it to open the connection sheet.
-- `Light` switch for the theme.
+- Theme control: `DARK`, `LIGHT`, and `HIGH CONTRAST` on a wide window; a
+  single 48 px cycle button on a narrow one.
 - `CONNECT` / `DISCONNECT`.
 - `RESET` (soft reset) and `STOP` (controller stop). Both stay visible and are
   never disabled.
+
+### Themes and display
+
+The theme choice is saved in `app.json` and applied immediately. `HIGH
+CONTRAST` uses near-black surfaces, white text, stronger borders, and saturated
+status colors; normal text tiers meet WCAG AAA contrast. `--light` and
+`--high-contrast` override the saved mode for one session. GPUI logical-pixel
+scaling follows the operating system's display scale; there is no separate
+per-monitor DPI setting.
 
 ### Left column
 

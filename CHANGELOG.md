@@ -20,6 +20,10 @@ until the next release is cut.
 - **3D stock mesh** — the 3D viewer draws an inferred translucent stock box
   from the program bounds, with a `STOCK ON/OFF` toggle and an explicit
   reminder that it is not a measured stock model.
+- **High-contrast theme** — a third persisted theme with near-black surfaces,
+  white text, stronger borders, and contrast-tested status colors. The top bar
+  selects Dark/Light/High Contrast, with a compact cycle control on narrow
+  windows; `--high-contrast` overrides for a session.
 - **Recent files and drag-drop** — the load sheet lists up to ten recent
   programs with missing/stale handling, `REMOVE`, and `CLEAR`. One program file
   can be dropped onto the Job workspace. Both paths use the bounded reader and

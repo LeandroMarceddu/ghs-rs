@@ -95,7 +95,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-16 | Work offsets editor, G54–G59.3, G10 | M5 | done | Edit, zero, goto, G92 clear |
 | CTL-17 | App-side tool table and manual M6 workflow | M5 | done | Controller table read-only |
 | CTL-18 | Metric and imperial units | M2 | partial | mm canonical |
-| CTL-19 | Themes and DPI scaling | M5 | partial | Dark, light, high contrast |
+| CTL-19 | Themes and DPI scaling | M5 | done | Dark/light/high contrast; logical-pixel DPI |
 
 ## Jobs and program management
 
@@ -190,7 +190,7 @@ implemented before its UI or hardware validation row is complete.
 | UX-04 | In-app numeric and text keypad | M2 | done | No OS keyboard dependency |
 | UX-05 | 48 px targets, no hover-only actions | M2 | done | Touch audit |
 | UX-06 | Dockable Workbench layout | M7 | todo | Optional mode |
-| UX-07 | Dark, light, high-contrast themes | M5 | partial | Shop-floor default |
+| UX-07 | Dark, light, high-contrast themes | M5 | done | Persisted selector; contrast-tested palette |
 | UX-08 | Keyboard navigation and accessibility | M7 | partial | Machine keymap; full navigation/AccessKit open |
 | UX-09 | Localization, starting with en, it, de, nl | M7 | partial | Primary UI localized; long-form/secondary text English |
 | UX-10 | First-run safety onboarding | M7 | done | Safety checklist + setup flag |
