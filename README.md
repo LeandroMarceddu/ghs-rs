@@ -40,9 +40,9 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   rapid overrides with fine/reset actions, spindle and coolant controls,
   reset/stop/sleep, a filterable console with a saved log, a per-profile
   machine keymap, and read-only pins/limits diagnostics.
-- **Utilities** — bounded material-surfacing wizard, program-limits check,
-  non-destructive line-number/comment transforms, and a confirmed stepper
-  calibration wizard.
+- **Utilities** — first-run safety/setup wizard, bounded material-surfacing
+  wizard, program-limits check, non-destructive line-number/comment transforms,
+  and a confirmed stepper calibration wizard.
 - **Jobs** — in-app program file browser and loading, streaming, pause/resume/
   stop, tool-change sheet, optional-stop/single-block/block-delete run options,
   breakpoints and run-to-line, an over-travel START confirmation based on

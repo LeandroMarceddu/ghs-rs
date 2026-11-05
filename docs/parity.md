@@ -178,7 +178,7 @@ implemented before its UI or hardware validation row is complete.
 | UTIL-04 | Program outline and limits check | M7 | done | Limits card; outline in viewer |
 | UTIL-05 | Add line numbers, strip comments, transform tools | M7 | partial | Numbering/comments; rotate/scale/translate open |
 | UTIL-06 | Utility macros and quick actions | M7 | done | Toolbar |
-| UTIL-07 | Machine setup wizard | M7 | todo | First-run |
+| UTIL-07 | Machine setup wizard | M7 | done | First-run safety/setup; app-config flag |
 
 ## Touch UX and platform
 

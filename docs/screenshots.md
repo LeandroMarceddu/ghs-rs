@@ -17,7 +17,8 @@ report the path **and** verify its pixel size with `identify`.
   `--keypad`, `--connection-panel=serial`, `--demo-start`, `--demo-m0`,
   `--demo-toolchange`, `--demo-surfacing`, `--demo-transform`,
   `--demo-calibration`, `--demo-calibration-confirm`, `--demo-soft-limits`,
-  and `--demo-over-travel`.
+  `--demo-over-travel`, `--demo-setup`, `--demo-setup-units`, and
+  `--demo-setup-review`.
 - Always verify the PNG with `identify`; a capture command can exit 0 and write
   nothing.
 - Kill the app and the compositor in a `trap`/cleanup step. Check

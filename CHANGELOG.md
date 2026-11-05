@@ -22,8 +22,11 @@ until the next release is cut.
   an over-travel sheet when the program's estimated machine bounds leave the
   reported travel. `NOT CHECKED` and within-travel programs keep the direct
   start. The check is informational, not controller soft-limit enforcement.
-- **Setup state** — `AppConfig.setup_complete` persists first-run completion
-  with a backward-compatible default of `false`.
+- **First-run setup** — a four-page safety/setup wizard (safety checklist,
+  display units, connection guidance, review) opens on first launch and is
+  reopenable from Utility. `AppConfig.setup_complete` persists completion with
+  a backward-compatible default of `false`; setup never connects, moves, or
+  writes a controller setting.
 
 ## [0.5.0] - 2026-11-03
 

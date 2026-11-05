@@ -36,6 +36,26 @@ The non-negotiable motion rules are in [SAFETY.md](SAFETY.md). In particular:
 motion is refused in `Alarm` and `Door`, probing requires preflight and a safe
 Z, and the app never auto-resumes after an alarm, E-stop, or reconnect.
 
+### First-run setup
+
+On first launch, `MACHINE SETUP` opens over the workspace. It has four pages:
+
+1. `SAFETY` — five required acknowledgements: E-stop located and tested;
+   independent spindle stop; travel and soft limits verified; workholding and
+   tool clearance checked; simulator or spindle-off first connection. `NEXT`
+   stays disabled until every item is checked.
+2. `UNITS` — the default display units for the next session (mm or inch).
+3. `CONNECTION` — guidance only. The wizard never connects, homes, jogs,
+   probes, or writes controller settings.
+4. `REVIEW` — acknowledgement count and units, with `FINISH SETUP`.
+
+`FINISH SETUP` saves the unit preference and `setup_complete` in the app
+config, then closes. A failed save keeps the wizard open and shows the error.
+`REMIND ME LATER` closes without saving; the wizard is offered again next
+launch. Reopen it from Utility → `MACHINE SETUP`; the card shows `COMPLETE` or
+`NOT COMPLETED`. Setup records that you reviewed the checklist and chose a
+preference; it is not a machine certification.
+
 ## 2. Install and run
 
 ### From source
@@ -627,9 +647,13 @@ a job.
 
 ### Utilities
 
-**Utility** contains three source-preparation tools. Each produces a program
-preview and only loads it after confirmation; nothing starts automatically.
+**Utility** includes these setup and source-preparation tools. Generated or
+transformed programs are previewed and only loaded after confirmation; nothing
+starts automatically.
 
+- `MACHINE SETUP` reopens the first-run safety/setup wizard. The card shows
+  `COMPLETE` or `NOT COMPLETED`; opening it never clears the saved flag and
+  finishing again saves the current choices.
 - `MATERIAL SURFACING` generates a bounded back-and-forth raster in the active
   WCS. Fields are millimetres: stock origin/width/depth, cutter diameter,
   stepover, total depth, depth per pass, feed, plunge feed, safe Z, and spindle
@@ -640,7 +664,8 @@ preview and only loads it after confirmation; nothing starts automatically.
 - `PROGRAM LIMITS` is read-only: work-coordinate X/Y/Z bounds, lines, segments,
   arcs, and tool changes. If `$20` soft limits and `$130`–`$132` travel are
   available it reports overruns; otherwise it says `NOT CHECKED` rather than
-  implying safety. START is never blocked.
+  implying safety. The card itself never blocks START; the separate pre-run
+  confirmation can hold START when the loaded program exceeds reported travel.
 - `SOURCE TRANSFORMS` adds line numbers (`N10` step 10 by default) or strips
   `(...)`/`;` comments. Preview first, then `LOAD AS PROGRAM`. Loading replaces
   the current job source and clears any height-map Apply/Revert state for the
