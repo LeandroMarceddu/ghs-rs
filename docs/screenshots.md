@@ -14,8 +14,10 @@ report the path **and** verify its pixel size with `identify`.
   `XDG_RUNTIME_DIR` (mode 700) so the KWin script does not run inside the test
   compositor.
 - The app flags are `--size WxH`, `--fullscreen`, `--mock`, `--light`,
-  `--keypad`, `--connection-panel=serial`, `--demo-start`, `--demo-m0`, and
-  `--demo-toolchange`.
+  `--keypad`, `--connection-panel=serial`, `--demo-start`, `--demo-m0`,
+  `--demo-toolchange`, `--demo-surfacing`, `--demo-transform`,
+  `--demo-calibration`, `--demo-calibration-confirm`, `--demo-soft-limits`,
+  and `--demo-over-travel`.
 - Always verify the PNG with `identify`; a capture command can exit 0 and write
   nothing.
 - Kill the app and the compositor in a `trap`/cleanup step. Check

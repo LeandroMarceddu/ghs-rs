@@ -129,7 +129,7 @@ implemented before its UI or hardware validation row is complete.
 | VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | partial | 3D camera/grid/envelope/marker; stock mesh open |
 | VIEW-08 | Height map overlay | M6 | done | 2D cells and 3D projection |
 | VIEW-09 | 1M-line and 200k-segment performance | M4 | partial | Benchmarked; CI threshold open |
-| VIEW-10 | Program limits and outline display | M4 | partial | Confirmation before running |
+| VIEW-10 | Program limits and outline display | M4 | done | Bounds card; over-travel confirmation |
 
 ## Setup and persistence
 

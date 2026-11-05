@@ -11,7 +11,19 @@ until the next release is cut.
 
 ## [Unreleased]
 
-No changes yet after the first pre-release.
+### Added
+
+- **Utilities** — a bounded material-surfacing wizard, an informational
+  program-limits check, non-destructive line-number/comment transforms, and a
+  stepper/axis calibration wizard that writes `$100`–`$102` only after
+  confirmation and read-back. Generated/transformed programs are loaded for
+  review, never started automatically.
+- **Pre-run travel confirmation** — `START` and `RUN TO` hold the start behind
+  an over-travel sheet when the program's estimated machine bounds leave the
+  reported travel. `NOT CHECKED` and within-travel programs keep the direct
+  start. The check is informational, not controller soft-limit enforcement.
+- **Setup state** — `AppConfig.setup_complete` persists first-run completion
+  with a backward-compatible default of `false`.
 
 ## [0.5.0] - 2026-11-03
 
@@ -36,11 +48,6 @@ release section exists to diff against.
   filterable console with a bounded log snapshot, a per-profile machine keymap,
   and typed pins/limits diagnostics. All commands pass through one safety
   gateway.
-- **Utilities** — a bounded material-surfacing wizard, an informational
-  program-limits check, non-destructive line-number/comment transforms, and a
-  stepper/axis calibration wizard that writes `$100`–`$102` only after
-  confirmation and read-back. Generated/transformed programs are loaded for
-  review, never started automatically.
 - **Jobs** — in-app program file browser and loading with a 20 MiB UTF-8
   bound; character-counting streaming against the reported receive buffer;
   pause, resume, and stop; a tool-change sheet; optional-stop, single-block, and

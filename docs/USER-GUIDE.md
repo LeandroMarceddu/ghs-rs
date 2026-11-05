@@ -333,6 +333,8 @@ stop. A normal START still runs the program for real.
   confirmation.
 - `RUN TO` sets a breakpoint at the chosen line and starts the program from
   line 1. Every earlier line still runs; the job pauses before the target.
+  Like `START`, it holds the start behind the over-travel confirmation when
+  the program exceeds reported travel; cancelling leaves the breakpoint set.
 - Earlier breakpoints still pause first. The sheet lists them; use `RESUME`
   through each one to reach the target.
 - `START-FROM-LINE` is not supported: the engine cannot synthesize the modal
@@ -344,6 +346,14 @@ stop. A normal START still runs the program for real.
 
 - `START` is enabled for a loaded program when the link is ready, the machine
   is `Idle`, and no alarm/door is active.
+- When the loaded program's estimated machine bounds exceed the travel reported
+  by `$130`–`$132` with soft limits on, `START` (and `RUN TO`) opens an
+  over-travel confirmation showing the work bounds, estimated machine bounds,
+  and per-axis overrun. `START ANYWAY` sends one normal start; `CANCEL` sends
+  nothing. This check is informational: it uses the active WCS plus `G92` and
+  does not cover tool-length offset, in-program `G10`/`G92` changes, or the
+  controller's own soft-limit enforcement. `NOT CHECKED` keeps the direct
+  start.
 - `PAUSE` sends feed hold and freezes streaming.
 - `RESUME` sends cycle start. It is refused for a pending tool change and for
   a status-watchdog pause.
