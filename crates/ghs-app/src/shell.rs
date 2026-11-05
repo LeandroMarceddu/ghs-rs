@@ -47,9 +47,10 @@ use ghs_engine::{
     Signals as CoreSignals, SystemCommand, Wcs,
 };
 use ghs_i18n::{Locale, t};
+use ghs_probe::{MAX_PROBE_MACRO_BYTES, MAX_PROBE_MACRO_LINES};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
@@ -309,6 +310,53 @@ struct ProbeDefaultsStatus {
     text: String,
 }
 
+/// Last local result of the Probe `SAVE MACROS` action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProbeMacrosStatus {
+    saved: bool,
+    text: String,
+}
+
+/// Local macro-sheet draft. It never changes the model until SAVE MACROS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProbeMacroDraft {
+    pre: String,
+    post: String,
+}
+
+impl ProbeMacroDraft {
+    fn from_model(probe: &crate::probe::ProbeModel) -> Self {
+        Self {
+            pre: probe.pre_macro().to_string(),
+            post: probe.post_macro().to_string(),
+        }
+    }
+}
+
+/// Open pre/post probe macro editor. The draft lives here until SAVE.
+struct ProbeMacroEditor {
+    draft: ProbeMacroDraft,
+    error: Option<String>,
+    status: Option<ProbeMacrosStatus>,
+}
+
+impl ProbeMacroEditor {
+    fn new(probe: &crate::probe::ProbeModel) -> Self {
+        Self {
+            draft: ProbeMacroDraft::from_model(probe),
+            error: None,
+            status: None,
+        }
+    }
+}
+
+/// Reproducible pre/post text for `--demo-probe-macros`.
+pub(crate) const DEMO_PROBE_PRE_MACRO: &str = "(pre-probe)\nG4 P1\nM5";
+/// Reproducible post text for `--demo-probe-macros`.
+pub(crate) const DEMO_PROBE_POST_MACRO: &str = "(post-probe)\nG4 P1\nM9";
+/// Forbidden motion line that opens the validation-error capture.
+const DEMO_PROBE_INVALID_PRE_MACRO: &str = "(pre-probe)\nG4 P1\nG0 X0";
+
 pub struct Shell {
     pub state: AppState,
     feed_slider: Entity<SliderState>,
@@ -449,6 +497,25 @@ pub struct Shell {
     probe_card_demo_done: bool,
     /// Last `SAVE DEFAULTS` result shown in the Probe workspace.
     probe_defaults_status: Option<ProbeDefaultsStatus>,
+    /// Last `SAVE MACROS` result shown in the Probe workspace.
+    probe_macros_status: Option<ProbeMacrosStatus>,
+    /// Local pre/post macro editor, when the sheet is open.
+    probe_macro_editor: Option<ProbeMacroEditor>,
+    /// Multi-line state for the PRE macro field.
+    probe_macro_pre_input: Entity<TextareaState>,
+    /// Multi-line state for the POST macro field.
+    probe_macro_post_input: Entity<TextareaState>,
+    /// The textarea values must be copied from the draft on the next render.
+    probe_macro_inputs_dirty: bool,
+    /// Screenshot switch: fill valid sample macros and open the sheet unsaved.
+    demo_probe_macros: bool,
+    demo_probe_macros_done: bool,
+    /// Screenshot switch: save valid sample macros through the normal path.
+    demo_probe_macros_saved: bool,
+    demo_probe_macros_saved_done: bool,
+    /// Screenshot switch: open the sheet with a rejected motion line.
+    demo_probe_macros_error: bool,
+    demo_probe_macros_error_done: bool,
     /// Screenshot switch: press `SAVE DEFAULTS` once after the profile loads.
     demo_probe_defaults: bool,
     demo_probe_defaults_done: bool,
@@ -761,8 +828,16 @@ impl Shell {
             })
         };
         let demo_probe_defaults = std::env::args().any(|arg| arg == "--demo-probe-defaults");
+        let demo_probe_macros = std::env::args().any(|arg| arg == "--demo-probe-macros");
+        let demo_probe_macros_saved =
+            std::env::args().any(|arg| arg == "--demo-probe-macros-saved");
+        let demo_probe_macros_error =
+            std::env::args().any(|arg| arg == "--demo-probe-macros-error");
         if probe_card_demo.is_some()
             || demo_probe_defaults
+            || demo_probe_macros
+            || demo_probe_macros_saved
+            || demo_probe_macros_error
             || std::env::args().any(|arg| arg == "--probe")
         {
             state.mode = Mode::Probe;
@@ -827,6 +902,11 @@ impl Shell {
 
         let keymap = KeymapModel::default();
         let keymap_source = Keymap::default();
+
+        // The two multi-line fields live for the whole shell; opening the
+        // sheet resets their text from the model draft.
+        let probe_macro_pre_input = cx.new(|cx| TextareaState::new(window, cx).rows(8));
+        let probe_macro_post_input = cx.new(|cx| TextareaState::new(window, cx).rows(8));
 
         let mut shell = Self {
             state,
@@ -932,6 +1012,17 @@ impl Shell {
             probe_card_demo,
             probe_card_demo_done: false,
             probe_defaults_status: None,
+            probe_macros_status: None,
+            probe_macro_editor: None,
+            probe_macro_pre_input,
+            probe_macro_post_input,
+            probe_macro_inputs_dirty: false,
+            demo_probe_macros,
+            demo_probe_macros_done: false,
+            demo_probe_macros_saved,
+            demo_probe_macros_saved_done: false,
+            demo_probe_macros_error,
+            demo_probe_macros_error_done: false,
             demo_probe_defaults,
             demo_probe_defaults_done: false,
             demo_probe_run,
@@ -1735,6 +1826,36 @@ impl Shell {
             self.demo_probe_defaults_done = true;
             self.state.mode = Mode::Probe;
             self.save_probe_defaults(cx);
+            changed = true;
+        }
+        // Screenshot switches: fill the macro sheet with reproducible valid
+        // text and either leave it unsaved or save it through the same local
+        // profile path as SAVE MACROS. Neither switch sends a command.
+        if self.demo_probe_macros
+            && !self.demo_probe_macros_done
+            && self.state.probe_defaults_demo_ready()
+        {
+            self.demo_probe_macros_done = true;
+            self.state.mode = Mode::Probe;
+            self.open_demo_probe_macro_editor();
+            changed = true;
+        }
+        if self.demo_probe_macros_saved
+            && !self.demo_probe_macros_saved_done
+            && self.state.probe_defaults_demo_ready()
+        {
+            self.demo_probe_macros_saved_done = true;
+            self.state.mode = Mode::Probe;
+            self.seed_saved_demo_probe_macros(cx);
+            changed = true;
+        }
+        if self.demo_probe_macros_error
+            && !self.demo_probe_macros_error_done
+            && self.state.probe_defaults_demo_ready()
+        {
+            self.demo_probe_macros_error_done = true;
+            self.state.mode = Mode::Probe;
+            self.open_demo_probe_macro_error();
             changed = true;
         }
         // Screenshot switch: press the same RUN action after the preflight
@@ -4486,6 +4607,163 @@ impl Shell {
                 self.probe_defaults_status = Some(ProbeDefaultsStatus { saved: false, text });
             }
         }
+        cx.notify();
+    }
+
+    // ----------------------------------------------------- probe macros
+
+    /// Copy the open macro draft into its two multi-line editors.
+    ///
+    /// Called once when the sheet opens, including the demo path that has no
+    /// window in its poll. Editing afterwards lives in the textarea states
+    /// until SAVE MACROS reads them back.
+    fn sync_probe_macro_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.probe_macro_inputs_dirty {
+            return;
+        }
+        let Some(editor) = self.probe_macro_editor.as_ref() else {
+            self.probe_macro_inputs_dirty = false;
+            return;
+        };
+        let pre = editor.draft.pre.clone();
+        let post = editor.draft.post.clone();
+        self.probe_macro_pre_input
+            .update(cx, |state, cx| state.set_value(pre, window, cx));
+        self.probe_macro_post_input
+            .update(cx, |state, cx| state.set_value(post, window, cx));
+        self.probe_macro_inputs_dirty = false;
+    }
+
+    /// Open the local macro sheet from the model's stored text.
+    ///
+    /// The draft is copied; opening changes neither the model nor the profile
+    /// and sends no command.
+    fn open_probe_macro_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.probe_macro_editor = Some(ProbeMacroEditor::new(&self.state.probe));
+        self.probe_macro_inputs_dirty = true;
+        self.sync_probe_macro_inputs(window, cx);
+        cx.notify();
+    }
+
+    /// Fill valid sample text and open the sheet without saving.
+    fn open_demo_probe_macro_editor(&mut self) {
+        self.probe_macro_editor = Some(ProbeMacroEditor {
+            draft: ProbeMacroDraft {
+                pre: DEMO_PROBE_PRE_MACRO.to_string(),
+                post: DEMO_PROBE_POST_MACRO.to_string(),
+            },
+            error: None,
+            status: None,
+        });
+        self.probe_macro_inputs_dirty = true;
+    }
+
+    /// Open the sheet with a forbidden motion line and its validation error.
+    ///
+    /// This is the same model validation path SAVE MACROS uses; it cannot
+    /// write because the line is rejected before the model changes.
+    fn open_demo_probe_macro_error(&mut self) {
+        let error = match self
+            .state
+            .save_probe_macros(DEMO_PROBE_INVALID_PRE_MACRO, DEMO_PROBE_POST_MACRO)
+        {
+            Ok(_) => "the demo macro unexpectedly validated".to_string(),
+            Err(error) => error,
+        };
+        self.probe_macro_editor = Some(ProbeMacroEditor {
+            draft: ProbeMacroDraft {
+                pre: DEMO_PROBE_INVALID_PRE_MACRO.to_string(),
+                post: DEMO_PROBE_POST_MACRO.to_string(),
+            },
+            error: Some(error.clone()),
+            status: Some(ProbeMacrosStatus {
+                saved: false,
+                text: format!("NOT SAVED: {error}"),
+            }),
+        });
+        self.probe_macro_inputs_dirty = true;
+    }
+
+    /// Save the demo sample through the same model/local-profile path as
+    /// `SAVE MACROS`, leaving the sheet closed for the bar capture.
+    fn seed_saved_demo_probe_macros(&mut self, cx: &mut Context<Self>) {
+        match self
+            .state
+            .save_probe_macros(DEMO_PROBE_PRE_MACRO, DEMO_PROBE_POST_MACRO)
+        {
+            Ok(path) => {
+                let text = format!("SAVED: {}", path.display());
+                self.state.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Probe macros saved to {}", path.display()),
+                );
+                self.probe_macros_status = Some(ProbeMacrosStatus { saved: true, text });
+            }
+            Err(message) => {
+                let text = format!("NOT SAVED: {message}");
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Probe macros not saved: {message}"),
+                );
+                self.probe_macros_status = Some(ProbeMacrosStatus { saved: false, text });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Close the macro sheet without touching the model or the profile.
+    fn cancel_probe_macro_editor(&mut self, cx: &mut Context<Self>) {
+        self.probe_macro_editor = None;
+        self.probe_macro_inputs_dirty = false;
+        cx.notify();
+    }
+
+    /// Validate, store, and persist the two macro fields from the sheet.
+    ///
+    /// A validation refusal leaves the model untouched. A local profile write
+    /// failure rolls the model back to its previous macros, so the editor and
+    /// the stored record stay consistent. Nothing is sent to the controller.
+    fn save_probe_macro_editor(&mut self, cx: &mut Context<Self>) {
+        if self.probe_macro_editor.is_none() {
+            return;
+        }
+        let pre = self.probe_macro_pre_input.read(cx).value().to_string();
+        let post = self.probe_macro_post_input.read(cx).value().to_string();
+        let result = self.state.save_probe_macros(&pre, &post);
+        let (status, console, level) = match result {
+            Ok(path) => {
+                let text = format!("SAVED: {}", path.display());
+                (
+                    ProbeMacrosStatus { saved: true, text },
+                    format!("Probe macros saved to {}", path.display()),
+                    ConsoleLevel::Ok,
+                )
+            }
+            Err(message) => {
+                let text = format!("NOT SAVED: {message}");
+                (
+                    ProbeMacrosStatus {
+                        saved: false,
+                        text: text.clone(),
+                    },
+                    format!("Probe macros not saved: {message}"),
+                    ConsoleLevel::Warn,
+                )
+            }
+        };
+        let saved = status.saved;
+        if let Some(editor) = self.probe_macro_editor.as_mut() {
+            editor.error = (!saved).then(|| {
+                status
+                    .text
+                    .strip_prefix("NOT SAVED: ")
+                    .unwrap_or(&status.text)
+                    .to_string()
+            });
+            editor.status = Some(status.clone());
+        }
+        self.probe_macros_status = Some(status);
+        self.state.push_console(level, console);
         cx.notify();
     }
 
@@ -8868,6 +9146,7 @@ impl Shell {
             )
             .child(self.probe_offset_bar(p, cx))
             .child(self.probe_defaults_bar(p, cx))
+            .child(self.probe_macros_bar(p, cx))
             .child(banner)
             .child(grid)
     }
@@ -9015,6 +9294,252 @@ impl Shell {
             );
         }
         bar
+    }
+
+    /// Compact bar for the bounded pre/post probe macros.
+    ///
+    /// Opening the sheet is local; the summary reports the validated lines that
+    /// every generated probe plan will include.
+    fn probe_macros_bar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let summary = self.state.probe.probe_macro_summary();
+        let status = self.probe_macros_status.clone();
+        let mut bar = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(match &status {
+                Some(status) if !status.saved => p.danger,
+                Some(_) => p.success.opacity(0.55),
+                None => p.border,
+            })
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label(t("PROBE MACROS"), p))
+                    .child(chip(&summary, p))
+                    .child(
+                        Button::new("probe-macros-open")
+                            .label(t("OPEN MACROS"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .flex_shrink_0()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_probe_macro_editor(window, cx);
+                                });
+                            }),
+                    )
+                    .child(div().text_size(px(8.5)).text_color(p.text_faint).child(t(
+                        "bounded pre/post lines; local profile; still subject to preflight",
+                    ))),
+            );
+        if let Some(status) = status {
+            bar = bar.child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(if status.saved { p.success } else { p.danger })
+                    .child(status.text),
+            );
+        }
+        bar
+    }
+
+    /// Bounded PRE/POST macro editor.
+    ///
+    /// Both fields are multi-line textareas with eight visible rows. SAVE
+    /// validates and writes the local profile; CANCEL drops the draft without
+    /// touching the model. The sheet never sends a command.
+    fn probe_macro_editor_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.probe_macro_editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let cancel_view = view.clone();
+        let save_view = view.clone();
+        let scrim_view = view;
+        let error = editor.error.clone();
+        let status = editor.status.clone();
+        let has_error = error.is_some();
+        let border = if error.is_some() {
+            p.danger
+        } else {
+            p.border_strong
+        };
+        let allowlist = format!(
+            "ALLOWED: comments `(...)` or `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`. \
+             Max {MAX_PROBE_MACRO_BYTES} bytes and {MAX_PROBE_MACRO_LINES} lines per macro. \
+             No motion, probing, spindle-on, coolant-on, tool change, coordinate, or \
+             system commands."
+        );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("probe-macro-editor-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |shell, cx| {
+                            shell.cancel_probe_macro_editor(cx);
+                        });
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(760.0))
+                    .max_w_full()
+                    .max_h(px(700.0))
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(border)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text)
+                                    .child(t("PROBE MACROS")),
+                            )
+                            .child(chip(t("LOCAL PROFILE"), p)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .line_height(px(13.0))
+                            .text_color(p.text_dim)
+                            .child(allowlist),
+                    )
+                    .child(
+                        v_flex()
+                            .id("probe-macro-editor-fields")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .gap_2()
+                            .overflow_y_scroll()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text_dim)
+                                            .child(t("PRE MACRO - after the safety preamble")),
+                                    )
+                                    .child(Textarea::new(&self.probe_macro_pre_input).w_full()),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text_dim)
+                                            .child(t(
+                                                "POST MACRO - after the final safe-Z retract",
+                                            )),
+                                    )
+                                    .child(Textarea::new(&self.probe_macro_post_input).w_full()),
+                            ),
+                    )
+                    .when_some(error, |this, error| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .line_height(px(13.0))
+                                .text_color(p.danger)
+                                .child(error),
+                        )
+                    })
+                    .when_some(status, |this, status| {
+                        let text = if has_error && !status.saved {
+                            "NOT SAVED".to_string()
+                        } else {
+                            status.text
+                        };
+                        this.child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(if status.saved { p.success } else { p.danger })
+                                .child(text),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .line_height(px(12.0))
+                            .text_color(p.text_faint)
+                            .child(t(
+                                "These lines run inside the generated probe program and are \
+                                 still subject to every preflight gate. SAVE MACROS writes \
+                                 only the local controller profile: no controller command, \
+                                 setting, offset, or start.",
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("probe-macro-editor-cancel")
+                                    .label(t("CANCEL"))
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |shell, cx| {
+                                            shell.cancel_probe_macro_editor(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("probe-macro-editor-save")
+                                    .label(t("SAVE MACROS"))
+                                    .primary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        save_view.update(cx, |shell, cx| {
+                                            shell.save_probe_macro_editor(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn probe_offset_button(
@@ -9344,6 +9869,7 @@ impl Shell {
             )
             .child(self.probe_offset_bar(p, cx))
             .child(self.probe_defaults_bar(p, cx))
+            .child(self.probe_macros_bar(p, cx))
             .child(body)
             .child(footer)
     }
@@ -21178,6 +21704,13 @@ impl Render for Shell {
         let width = window.viewport_size().width;
         let compact = width < px(1120.0);
 
+        // A demo-opened sheet has no window in the poll that opened it; copy
+        // its draft into the two textareas here, once. This is a local text
+        // assignment, not a command.
+        if self.probe_macro_editor.is_some() {
+            self.sync_probe_macro_inputs(window, cx);
+        }
+
         let content = div()
             .flex_1()
             .min_h(px(0.0))
@@ -21239,6 +21772,9 @@ impl Render for Shell {
         }
         if self.macro_editor.is_some() {
             root = root.child(self.macro_editor_overlay(p, cx));
+        }
+        if self.probe_macro_editor.is_some() {
+            root = root.child(self.probe_macro_editor_overlay(p, cx));
         }
         if self.macro_delete.is_some() {
             root = root.child(self.macro_delete_overlay(p, cx));
@@ -23619,5 +24155,48 @@ mod tests {
         assert!(store.load_app_config().is_err());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_macro_cancel_discards_the_draft() {
+        let mut model = crate::probe::ProbeModel::default();
+        model
+            .set_probe_macros("(saved-pre)", "(saved-post)")
+            .expect("stored macros");
+
+        let mut editor = ProbeMacroEditor::new(&model);
+        editor.draft.pre = "(draft-pre)\nG0 X0".to_string();
+        editor.draft.post = "(draft-post)\nM3".to_string();
+        // CANCEL drops the sheet and its draft; the model is untouched.
+        let cancelled: Option<ProbeMacroEditor> = None;
+        drop(editor);
+        assert!(cancelled.is_none());
+        assert_eq!(model.pre_macro(), "(saved-pre)");
+        assert_eq!(model.post_macro(), "(saved-post)");
+        assert_eq!(model.probe_macro_summary(), "PRE 1 / POST 1 LINES");
+    }
+
+    #[test]
+    fn demo_probe_macro_text_is_valid_and_reproducible() {
+        let sample = || ProbeMacroDraft {
+            pre: DEMO_PROBE_PRE_MACRO.to_string(),
+            post: DEMO_PROBE_POST_MACRO.to_string(),
+        };
+        let first = sample();
+        assert_eq!(first, sample());
+        assert_eq!(
+            ghs_probe::validate_probe_macro(&first.pre).expect("valid pre"),
+            vec!["(pre-probe)", "G4 P1", "M5"]
+        );
+        assert_eq!(
+            ghs_probe::validate_probe_macro(&first.post).expect("valid post"),
+            vec!["(post-probe)", "G4 P1", "M9"]
+        );
+
+        let mut model = crate::probe::ProbeModel::default();
+        model
+            .set_probe_macros(&first.pre, &first.post)
+            .expect("demo macros");
+        assert_eq!(model.probe_macro_summary(), "PRE 3 / POST 3 LINES");
     }
 }

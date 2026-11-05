@@ -44,7 +44,7 @@ use ghs_probe::{
     MAX_PROBE_DIAMETER_MM, MAX_PROBE_FEED_MM_MIN, MAX_PROBE_OFFSET_MM, MAX_RADIUS_MM,
     MAX_RECTANGLE_MM, MAX_RETRACT_MM, MAX_SEARCH_DISTANCE_MM, MAX_SEPARATION_MM,
     MIN_CIRCLE_TOUCHES, ProbeAxis, ProbeCycle, ProbeOutcome, ProbeParams, ProbePlan, ProbeValue,
-    RotationProbe, Sign, XyPoint, validate_probe_offset,
+    RotationProbe, Sign, XyPoint, validate_probe_macro, validate_probe_offset,
 };
 use ghs_viewer::Point2;
 
@@ -1108,6 +1108,12 @@ pub struct ProbeModel {
     /// A controller profile supplied the shared fields, so opening another
     /// card must not replace them with pose-derived factory values.
     defaults_loaded: bool,
+    /// Validated operator lines inserted after the fixed safety preamble and
+    /// before the first probe move.
+    pre_macro: String,
+    /// Validated operator lines appended after the final retract and safe-Z
+    /// rapid.
+    post_macro: String,
 }
 
 impl Default for ProbeModel {
@@ -1132,6 +1138,8 @@ impl Default for ProbeModel {
             run: None,
             last_probe_program: None,
             defaults_loaded: false,
+            pre_macro: String::new(),
+            post_macro: String::new(),
         };
         for field in ProbeField::ALL {
             if let Some(slot) = model.fields.get_mut(field.index()) {
@@ -1158,6 +1166,62 @@ impl ProbeModel {
     /// Mutable run, if one was started.
     pub fn run_mut(&mut self) -> Option<&mut ProbeRun> {
         self.run.as_mut()
+    }
+
+    /// Validated pre-probe macro text, one cleaned line per `\n`.
+    #[must_use]
+    pub fn pre_macro(&self) -> &str {
+        &self.pre_macro
+    }
+
+    /// Validated post-probe macro text, one cleaned line per `\n`.
+    #[must_use]
+    pub fn post_macro(&self) -> &str {
+        &self.post_macro
+    }
+
+    /// Validate and store both operator macros.
+    ///
+    /// Each macro is trimmed line by line, blank lines are dropped, and the
+    /// accepted lines are joined with `\n`. The stored text is exactly what
+    /// [`ghs_probe::validate_probe_macro`] accepted, so a later
+    /// [`ProbePlan::with_macros`] cannot change it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged `ghs-probe` error text (including the one-based
+    /// line number and rejected text) for a forbidden line, an out-of-range
+    /// dwell, too many bytes, or too many lines. Neither macro changes when
+    /// either text is refused.
+    pub fn set_probe_macros(&mut self, pre: &str, post: &str) -> Result<(), String> {
+        let pre_lines = validate_probe_macro(pre).map_err(|error| error.to_string())?;
+        let post_lines = validate_probe_macro(post).map_err(|error| error.to_string())?;
+        self.pre_macro = pre_lines.join("\n");
+        self.post_macro = post_lines.join("\n");
+        Ok(())
+    }
+
+    /// Short summary for the Probe workspace bar.
+    ///
+    /// Reports the number of cleaned pre and post lines, or `EMPTY` when both
+    /// macros are empty.
+    #[must_use]
+    pub fn probe_macro_summary(&self) -> String {
+        let pre = self
+            .pre_macro
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        let post = self
+            .post_macro
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        if pre == 0 && post == 0 {
+            "EMPTY".to_string()
+        } else {
+            format!("PRE {pre} / POST {post} LINES")
+        }
     }
 
     /// A run is active and must not be replaced or navigated away from.
@@ -1292,14 +1356,22 @@ impl ProbeModel {
     ///
     /// Only [`ProbeField::PROFILE_DEFAULTS`] change, and their inline errors
     /// are cleared. Anchors, expected values, the probe mount offset, and the
-    /// map Z offset are left exactly as the operator entered them. An active
-    /// probe run is never overwritten.
+    /// map Z offset are left exactly as the operator entered them. Both probe
+    /// macros load with the numeric defaults; an invalid macro text refuses the
+    /// whole record and changes nothing. An active probe run is never
+    /// overwritten.
     ///
     /// Returns `false` when a run is active or the record is invalid.
     pub fn apply_defaults(&mut self, defaults: &ProbeDefaultsRecord) -> bool {
         if self.is_running() || defaults.validate().is_err() {
             return false;
         }
+        let Ok(pre_macro) = validate_probe_macro(&defaults.pre_probe_macro) else {
+            return false;
+        };
+        let Ok(post_macro) = validate_probe_macro(&defaults.post_probe_macro) else {
+            return false;
+        };
         for (field, value) in [
             (ProbeField::SafeZ, defaults.safe_z_mm),
             (ProbeField::Search, defaults.search_distance_mm),
@@ -1316,6 +1388,8 @@ impl ProbeModel {
                 *error = None;
             }
         }
+        self.pre_macro = pre_macro.join("\n");
+        self.post_macro = post_macro.join("\n");
         self.defaults_loaded = true;
         true
     }
@@ -1336,10 +1410,10 @@ impl ProbeModel {
             probe_diameter_mm: self.defaults_field(ProbeField::Diameter)?,
             edge_offset_mm: self.defaults_field(ProbeField::EdgeOffset)?,
             plate_thickness_mm: self.defaults_field(ProbeField::PlateThickness)?,
-            // The app probe model does not edit probe macros yet; preserve the
-            // empty defaults so this record never invents macro text.
-            pre_probe_macro: String::new(),
-            post_probe_macro: String::new(),
+            // The model stores only text accepted by the probe-crate
+            // allowlist, so the record carries the operator's exact macros.
+            pre_probe_macro: self.pre_macro.clone(),
+            post_probe_macro: self.post_macro.clone(),
         };
         record
             .validate()
@@ -1542,6 +1616,11 @@ impl ProbeModel {
         let plan = cycle
             .plan_with_offset(&params, probe_offset)
             .map_err(|error| error.to_string())?;
+        // The plan is validated, then the operator macros are inserted around
+        // its probe moves. An empty macro is the identity path.
+        let plan = plan
+            .with_macros(&self.pre_macro, &self.post_macro)
+            .map_err(|error| error.to_string())?;
         Ok(ProbeSetup {
             params,
             target: ProbeTarget::Cycle(cycle),
@@ -1742,6 +1821,9 @@ impl ProbeModel {
         let plan = draft
             .grid
             .plan_with_offset(&draft.params, probe_offset)
+            .map_err(|error| error.to_string())?;
+        let plan = plan
+            .with_macros(&self.pre_macro, &self.post_macro)
             .map_err(|error| error.to_string())?;
         Ok(ProbeSetup {
             params: draft.params,
@@ -3466,6 +3548,8 @@ pub fn position_text(position: Position) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ghs_probe::{MAX_PROBE_MACRO_BYTES, MAX_PROBE_MACRO_LINES};
+
     use super::*;
 
     fn context() -> ProbeContext {
@@ -5518,5 +5602,186 @@ mod tests {
         let error = infinite.defaults_record().expect_err("inf refused");
         assert!(error.contains("SAFE Z"), "{error}");
         assert_eq!(infinite.field_text(ProbeField::SafeZ), "inf");
+    }
+
+    // ------------------------------------------------------ probe macros
+
+    #[test]
+    fn apply_defaults_loads_both_probe_macros() {
+        let mut defaults = profile_defaults();
+        defaults.pre_probe_macro = "(pre-probe)\nG4 P1".to_string();
+        defaults.post_probe_macro = "; post-probe\nM5".to_string();
+
+        let mut model = ProbeModel::default();
+        assert!(model.apply_defaults(&defaults));
+        assert_eq!(model.pre_macro(), "(pre-probe)\nG4 P1");
+        assert_eq!(model.post_macro(), "; post-probe\nM5");
+
+        // An invalid macro text refuses the whole record and never clobbers
+        // the macros the model already holds.
+        let mut invalid = defaults.clone();
+        invalid.pre_probe_macro = "G0 X0".to_string();
+        assert!(!model.apply_defaults(&invalid));
+        assert_eq!(model.pre_macro(), "(pre-probe)\nG4 P1");
+        assert_eq!(model.post_macro(), "; post-probe\nM5");
+    }
+
+    #[test]
+    fn defaults_record_preserves_existing_probe_macros() {
+        let mut model = ProbeModel::default();
+        model
+            .set_probe_macros("(pre)\nG4 P2", "; post\nM9")
+            .expect("valid macros");
+        let record = model.defaults_record().expect("record");
+        assert_eq!(record.pre_probe_macro, "(pre)\nG4 P2");
+        assert_eq!(record.post_probe_macro, "; post\nM9");
+    }
+
+    #[test]
+    fn set_probe_macros_accepts_and_normalizes_multiline_text() {
+        let mut model = ProbeModel::default();
+        model
+            .set_probe_macros("  (pre-probe)  \n\n\tM5\t\n", "; post\r\n\r\n  G4 P1.5  \n")
+            .expect("multi-line macros");
+        assert_eq!(model.pre_macro(), "(pre-probe)\nM5");
+        assert_eq!(model.post_macro(), "; post\nG4 P1.5");
+        assert_eq!(model.probe_macro_summary(), "PRE 2 / POST 2 LINES");
+        assert_eq!(ProbeModel::default().probe_macro_summary(), "EMPTY");
+    }
+
+    #[test]
+    fn forbidden_probe_macro_lines_are_rejected_with_their_number() {
+        let mut model = ProbeModel::default();
+        model
+            .set_probe_macros("(pre)", "M9")
+            .expect("initial macros");
+        for forbidden in [
+            "G0 X0",
+            "G38.2 Z-1",
+            "M3 S1000",
+            "M6 T1",
+            "G10 L2 P1 X0",
+            "$H",
+        ] {
+            let error = model
+                .set_probe_macros(&format!("(pre)\n{forbidden}"), "M9")
+                .expect_err("forbidden line");
+            assert!(error.contains("line 2"), "{forbidden}: {error}");
+            assert!(error.contains(forbidden), "{forbidden}: {error}");
+            assert_eq!(model.pre_macro(), "(pre)");
+            assert_eq!(model.post_macro(), "M9");
+        }
+    }
+
+    #[test]
+    fn probe_macro_dwell_over_sixty_seconds_is_rejected() {
+        let mut model = ProbeModel::default();
+        let error = model
+            .set_probe_macros("G4 P61", "")
+            .expect_err("dwell bound");
+        assert!(error.contains("line 1"), "{error}");
+        assert!(error.contains("0..=60"), "{error}");
+        assert_eq!(model.pre_macro(), "");
+    }
+
+    #[test]
+    fn probe_macro_byte_and_line_bounds_are_rejected() {
+        let mut model = ProbeModel::default();
+        let too_long = format!("({})", "a".repeat(MAX_PROBE_MACRO_BYTES));
+        let error = model
+            .set_probe_macros(&too_long, "")
+            .expect_err("byte bound");
+        assert!(error.contains("limit"), "{error}");
+
+        let too_many_lines: String = (0..=MAX_PROBE_MACRO_LINES)
+            .map(|index| format!("(line {index})\n"))
+            .collect();
+        let error = model
+            .set_probe_macros("", &too_many_lines)
+            .expect_err("line bound");
+        assert!(error.contains("lines"), "{error}");
+        assert_eq!(model.pre_macro(), "");
+        assert_eq!(model.post_macro(), "");
+    }
+
+    #[test]
+    fn preflight_plan_places_pre_after_preamble_and_post_at_the_end() {
+        let ctx = context();
+        let mut macro_model = model(ProbeCard::ZTouchPlate);
+        macro_model
+            .set_probe_macros("(pre-probe)\nG4 P1", "(post-probe)\nM9")
+            .expect("valid macros");
+        let setup = macro_model.prepare(&ctx).expect("macro plan");
+
+        let lines: Vec<&str> = setup.plan.program.lines().collect();
+        assert_eq!(lines[0], "G21 G90 G17 G94", "{lines:?}");
+        assert_eq!(lines[1], "G54", "{lines:?}");
+        assert_eq!(lines[2], "M5", "{lines:?}");
+        assert_eq!(lines[3], "M9", "{lines:?}");
+        assert!(lines[4].starts_with("G0 Z"), "{lines:?}");
+        assert_eq!(lines[5], "(pre-probe)", "{lines:?}");
+        assert_eq!(lines[6], "G4 P1", "{lines:?}");
+        assert_eq!(lines[lines.len() - 2], "(post-probe)", "{lines:?}");
+        assert_eq!(lines[lines.len() - 1], "M9", "{lines:?}");
+
+        // The macros are text only: the expected probe count and probe list
+        // are exactly the plain plan's.
+        let plain = model(ProbeCard::ZTouchPlate);
+        let plain_setup = plain.prepare(&ctx).expect("plain plan");
+        assert_eq!(setup.plan.expected_probes, plain_setup.plan.expected_probes);
+        assert_eq!(setup.plan.probes, plain_setup.plan.probes);
+    }
+
+    #[test]
+    fn empty_probe_macros_are_the_identity_path() {
+        let ctx = context();
+        let mut blank = model(ProbeCard::EdgeX);
+        blank
+            .set_probe_macros(" \n\t\n", "\n")
+            .expect("blank macros");
+        let blank_setup = blank.prepare(&ctx).expect("blank plan");
+        let plain_setup = model(ProbeCard::EdgeX).prepare(&ctx).expect("plain plan");
+        assert_eq!(blank_setup.plan.program, plain_setup.plan.program);
+        assert_eq!(blank_setup.plan.probes, plain_setup.plan.probes);
+        assert_eq!(blank.probe_macro_summary(), "EMPTY");
+    }
+
+    #[test]
+    fn height_map_plan_includes_the_same_macros() {
+        let ctx = context();
+        let mut model = model(ProbeCard::HeightMap);
+        set_height_grid(&mut model, 2, 2);
+        model
+            .set_probe_macros("(pre-map)", "(post-map)")
+            .expect("valid macros");
+        let setup = model.prepare(&ctx).expect("height-map plan");
+        let lines: Vec<&str> = setup.plan.program.lines().collect();
+        assert_eq!(lines[5], "(pre-map)", "{lines:?}");
+        assert_eq!(lines[lines.len() - 1], "(post-map)", "{lines:?}");
+    }
+
+    #[test]
+    fn macro_plan_rejection_keeps_the_previous_plan_and_run() {
+        let ctx = context();
+        let mut model = model(ProbeCard::ZTouchPlate);
+        let setup = model.prepare(&ctx).expect("plain plan");
+        model.begin(setup);
+        let run_before = model
+            .run()
+            .map(|run| run.setup.plan.program.clone())
+            .expect("run");
+
+        // Bypass the editor guard to prove the plan boundary maps a
+        // `ProbeMacroError` to the preflight string and mutates nothing.
+        model.pre_macro = "G0 X0".to_string();
+        let error = model.prepare(&ctx).expect_err("plan refused");
+        assert!(error.contains("line 1"), "{error}");
+        assert!(error.contains("G0 X0"), "{error}");
+        assert_eq!(model.pre_macro(), "G0 X0");
+        assert_eq!(
+            model.run().map(|run| run.setup.plan.program.clone()),
+            Some(run_before)
+        );
+        assert!(model.is_running());
     }
 }

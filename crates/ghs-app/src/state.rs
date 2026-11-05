@@ -4552,6 +4552,31 @@ impl AppState {
         self.config.save_probe_defaults(record)
     }
 
+    /// Validate and save the two operator probe macros.
+    ///
+    /// The current model text is restored if the local profile write fails, so
+    /// a refused save leaves both the editor model and the stored profile on
+    /// their previous values. Nothing is sent to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged macro validation message (line number and text),
+    /// or the profile-save error. An invalid macro leaves the model untouched.
+    pub fn save_probe_macros(&mut self, pre: &str, post: &str) -> Result<PathBuf, String> {
+        let previous_pre = self.probe.pre_macro().to_string();
+        let previous_post = self.probe.post_macro().to_string();
+        self.probe.set_probe_macros(pre, post)?;
+        match self.save_probe_defaults() {
+            Ok(path) => Ok(path),
+            Err(message) => {
+                // The numeric defaults and macro fields were valid, so this
+                // restore cannot fail; keep the previous text anyway.
+                let _ = self.probe.set_probe_macros(&previous_pre, &previous_post);
+                Err(message)
+            }
+        }
+    }
+
     /// Save the editor's probe mount offset into the active profile.
     ///
     /// The value is local setup data (`probe tip - controlled point`). This
@@ -7142,6 +7167,147 @@ mod tests {
             "a failed save keeps the previous defaults"
         );
         assert!(path.is_dir(), "the failed write did not replace the path");
+    }
+
+    #[test]
+    fn probe_macros_save_writes_the_exact_record_and_reloads_it() {
+        let (mut state, _dir, info, store) =
+            state_with_probe_defaults("probe-macros-save", profile_probe_defaults());
+        let key = ProfileKey::from_controller(&info);
+        let pre = "(pre-probe)\nG4 P2";
+        let post = "; post-probe\nM9";
+
+        let path = state.save_probe_macros(pre, post).expect("save macros");
+        assert_eq!(path, store.profile_path(&key));
+        assert_eq!(state.probe.pre_macro(), pre);
+        assert_eq!(state.probe.post_macro(), post);
+        assert_eq!(state.probe.probe_macro_summary(), "PRE 2 / POST 2 LINES");
+        assert_eq!(state.config.probe_defaults().pre_probe_macro, pre);
+        assert_eq!(state.config.probe_defaults().post_probe_macro, post);
+
+        let stored = store
+            .load_controller_data(&key)
+            .expect("load controller data")
+            .expect("profile");
+        assert_eq!(stored.probe_defaults.pre_probe_macro, pre);
+        assert_eq!(stored.probe_defaults.post_probe_macro, post);
+
+        let mut reopened = AppState::new();
+        reopened.config = ConfigModel::from_store(store);
+        reopened.begin_live("reload macros");
+        reopened.apply_controller_info(&info);
+        assert_eq!(reopened.probe.pre_macro(), pre);
+        assert_eq!(reopened.probe.post_macro(), post);
+    }
+
+    #[test]
+    fn probe_macros_save_failure_keeps_the_model_text_and_record() {
+        let (mut state, _dir, _info, store) =
+            state_with_probe_defaults("probe-macros-failure", profile_probe_defaults());
+        let previous_pre = "(pre-one)\nM5";
+        let previous_post = "; post-one\nM9";
+        let path = state
+            .save_probe_macros(previous_pre, previous_post)
+            .expect("first save");
+        let previous_record = state.config.probe_defaults();
+
+        // Block the atomic replace without touching the in-memory record.
+        fs::remove_file(&path).expect("remove profile");
+        fs::create_dir_all(&path).expect("block profile path");
+        let error = state
+            .save_probe_macros("(pre-two)\nG4 P1", "; post-two\nM1")
+            .expect_err("blocked profile path");
+        assert!(!error.is_empty(), "{error}");
+        assert_eq!(state.probe.pre_macro(), previous_pre);
+        assert_eq!(state.probe.post_macro(), previous_post);
+        assert_eq!(state.config.probe_defaults(), previous_record);
+        assert!(path.is_dir(), "the failed write did not replace the path");
+        drop(store);
+    }
+
+    #[test]
+    fn probe_macros_validation_refusal_writes_nothing() {
+        let (mut state, _dir, _info, store) =
+            state_with_probe_defaults("probe-macros-invalid", profile_probe_defaults());
+        let previous_pre = "(pre)\nM5";
+        let previous_post = "(post)\nM9";
+        state
+            .save_probe_macros(previous_pre, previous_post)
+            .expect("initial save");
+        let key = ProfileKey::from_controller(&parse_controller_info(FLEXIHAL));
+        let previous_record = store
+            .load_controller_data(&key)
+            .expect("load")
+            .expect("profile")
+            .probe_defaults;
+
+        let error = state
+            .save_probe_macros("(pre)\nG0 X0", "(post)\nM9")
+            .expect_err("forbidden motion line");
+        assert!(error.contains("line 2"), "{error}");
+        assert!(error.contains("G0 X0"), "{error}");
+        assert_eq!(state.probe.pre_macro(), previous_pre);
+        assert_eq!(state.probe.post_macro(), previous_post);
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("profile")
+                .probe_defaults,
+            previous_record,
+            "a rejected macro must not rewrite the profile"
+        );
+    }
+
+    #[test]
+    fn probe_macros_save_emits_no_controller_command() {
+        let (mut state, _dir, _info, _store) =
+            state_with_probe_defaults("probe-macros-no-command", profile_probe_defaults());
+        let mut sent = Vec::new();
+        // Saving macros is a local profile write and takes no command sender.
+        // The recorder stays empty across the model and persistence path.
+        drop(recorded_send(&mut sent));
+        state
+            .save_probe_macros("(pre)\nM5", "(post)\nM9")
+            .expect("save macros");
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn demo_probe_macros_state_is_reproducible() {
+        let dir = TempRoot::new("probe-macros-demo");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut data = ControllerData::new();
+        data.probe_defaults = profile_probe_defaults();
+        store.save_controller_data(&key, &data).expect("profile");
+
+        let snapshot = || {
+            let mut state = AppState::new();
+            state.config = ConfigModel::from_store(store.clone());
+            state.begin_live("demo macros");
+            state.apply_controller_info(&info);
+            assert!(state.probe_defaults_demo_ready());
+            let path = state
+                .save_probe_macros(
+                    crate::shell::DEMO_PROBE_PRE_MACRO,
+                    crate::shell::DEMO_PROBE_POST_MACRO,
+                )
+                .expect("demo save");
+            (
+                state.probe.pre_macro().to_string(),
+                state.probe.post_macro().to_string(),
+                state.probe.probe_macro_summary(),
+                path,
+            )
+        };
+        let first = snapshot();
+        let second = snapshot();
+        assert_eq!(first, second);
+        assert_eq!(first.0, "(pre-probe)\nG4 P1\nM5");
+        assert_eq!(first.1, "(post-probe)\nG4 P1\nM9");
+        assert_eq!(first.2, "PRE 3 / POST 3 LINES");
     }
 
     #[test]

@@ -66,6 +66,13 @@
 //! for the confirmation screenshot. `--demo-probe-defaults` opens Probe, waits
 //! for the controller profile, and presses the same `SAVE DEFAULTS` action
 //! once; it writes only local profile JSON and sends no probe command.
+//! `--demo-probe-macros` fills the PRE/POST macro editor with valid sample
+//! text and opens the sheet without saving; `--demo-probe-macros-saved` saves
+//! the same sample through the normal SAVE MACROS path and leaves the sheet
+//! closed so the summary bar can be captured. Both write only local profile
+//! JSON on the saved path and send no probe command. `--demo-probe-macros-error`
+//! opens the same sheet with a forbidden `G0 X0` line and its validation error,
+//! using the normal model refusal; it writes nothing.
 //! `--demo-height-map-apply` and
 //! `--demo-height-map-revert` press the same explicit height-map Apply/Confirm
 //! and Revert actions after the 4x4 demo map completes.
