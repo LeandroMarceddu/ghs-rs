@@ -138,7 +138,7 @@ implemented before its UI or hardware validation row is complete.
 | SETUP-01 | Settings editor generated from `$ES`/`$EG`/`$SED` | M5 | done | Fallback for older builds |
 | SETUP-02 | Grouped, searchable, typed, validated settings | M5 | done | Axis arrays |
 | SETUP-03 | Setting write, read-back verification, backup and restore | M5 | done | EEPROM caution |
-| SETUP-04 | Stepper and axis calibration | M5 | done | Steps/mm wizard; squaring/backlash open |
+| SETUP-04 | Stepper and axis calibration | M5 | done | Steps/mm wizard; backlash open |
 | SETUP-05 | App settings and controller profiles | M5 | done | Keyed by `$I` identity |
 | SETUP-06 | Import and export settings, offsets, tools | M5 | partial | Backup bundle; offsets `.nc` open |
 | SETUP-07 | Controller reset (`$RST`) with backup prompt | M5 | done | Four targets; backup + two-step confirm |
@@ -173,7 +173,7 @@ implemented before its UI or hardware validation row is complete.
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
 | UTIL-01 | Material surfacing wizard | M7 | done | Bounded raster; load-only |
-| UTIL-02 | Gantry squaring and alignment | M7 | todo | Guided |
+| UTIL-02 | Gantry squaring and alignment | M7 | done | Guided calculator; manual adjustment; no motion |
 | UTIL-03 | Stepper and XY calibration | M7 | done | `$100`–`$102` wizard |
 | UTIL-04 | Program outline and limits check | M7 | done | Limits card; outline in viewer |
 | UTIL-05 | Add line numbers, strip comments, transform tools | M7 | partial | Numbering/comments; rotate/scale/translate open |

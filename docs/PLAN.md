@@ -24,8 +24,8 @@ implemented and persisted per profile.
 The remaining V1.0 gaps are hardware validation on the reference FlexiHAL;
 secondary localization (help, warnings, and other long-form text remain
 English); signed installers and notarization; the full release QA pass;
-start-from-line; the remaining utility/calibration set (gantry squaring and
-rotation/scale/translate transforms — surfacing, limits display and pre-run
+start-from-line; the remaining utility/calibration set (rotation/scale/translate
+transforms — surfacing, gantry-squaring calculator, limits display and pre-run
 travel confirmation, line-number/comment transforms, stepper calibration, and
 the first-run safety/setup wizard are implemented); and the probe remainder
 (work-rotation apply/straightness, pre/post probe macros, and retry strategy;

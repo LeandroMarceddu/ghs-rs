@@ -17,6 +17,9 @@ until the next release is cut.
   `$RST=&`, and `$RST=*`. Each target requires a backup prompt or explicit
   data-loss acknowledgement and a two-step confirmation; the reset is
   idle-only and never changes local profiles or backups.
+- **Gantry squaring** — a Utility calculator for span and left/right Y
+  readings. It reports the delta, angle, and pivot-centre per-side correction,
+  with explicit direction wording. It never moves or adjusts the gantry.
 - **Probe defaults** — safe Z, search, feed, retract, diameter, edge offset,
   and plate thickness are stored per controller profile with validation and
   backward-compatible defaults. The Probe `SAVE DEFAULTS` action writes only

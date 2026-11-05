@@ -100,17 +100,18 @@ design-review shell and never sends commands.
 
 Useful layout and review flags: `--light`, `--keypad`, `--size WxH` (for
 example `--size 1920x1080`), `--fullscreen`, `--viewer-3d`, `--settings`,
-`--offsets`, `--tools`, `--utility`, `--startup-lines`, `--macros`, and
-`--probe`. Demo job switches `--demo-m0` and `--demo-toolchange` are described
-in section 6.
+`--offsets`, `--tools`, `--utility`, `--startup-lines`, `--macros`,
+`--probe`, `--demo-gantry`, and `--demo-gantry-card`. Demo job switches
+`--demo-m0` and `--demo-toolchange` are described in section 6.
 
 ### Packaged builds
 
-Draft release archives exist for Linux x86_64, Windows x86_64, and macOS. They
-are **unsigned and not notarized**, and they are pre-alpha previews. macOS
-Gatekeeper and Windows SmartScreen will warn on first launch; use only a
-per-file override, never a system-wide disable. See [RELEASE.md](RELEASE.md)
-for the artifact names, checksums, and signing caveats.
+Release archives are published for Linux x86_64 (tar.gz, deb, AppImage),
+Windows x86_64, and macOS. They are **unsigned and not notarized**, and they
+are pre-alpha previews. macOS Gatekeeper and Windows SmartScreen will warn on
+first launch; use only a per-file override, never a system-wide disable. See
+[RELEASE.md](RELEASE.md) for the artifact names, checksums, and signing
+caveats.
 
 ## 3. First connection
 
@@ -702,6 +703,12 @@ starts automatically.
   run the test move separately. `REVIEW & APPLY` requires confirmation, is
   idle-only, and writes through the verified setting path. The proposal is
   bounded to 1–10,000 steps/mm and shown with its delta.
+- `GANTRY SQUARING` is a calculator only. Enter the span between the left and
+  right measurement points and the Y reading at each side;
+  `delta = right - left`, `angle = atan2(delta, span)`, and the pivot-centre
+  per-side correction is `delta / 2`. Positive means the right side is further
+  along +Y (forward). There is no APPLY, no motion, and no controller write:
+  follow the machine's squaring procedure, adjust by hand, and measure again.
 - `CONTROLLER RESET` sends one confirmed `$RST` target after a backup prompt:
   offsets/tool data (`#`), core settings (`$`), driver/plugin defaults (`&`),
   or everything (`*`). It is idle-only, never changes local profiles or
