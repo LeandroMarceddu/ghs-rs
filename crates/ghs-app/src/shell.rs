@@ -97,7 +97,7 @@ use crate::state::{
 };
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
-use crate::utilities::{TransformKind, UtilityField};
+use crate::utilities::{CalibrationAxis, CalibrationField, TransformKind, UtilityField};
 use crate::viewer;
 
 const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -344,6 +344,13 @@ pub struct Shell {
     startup_confirm: Option<StartupConfirm>,
     /// Material surfacing wizard sheet is open. Opening sends nothing.
     surfacing_open: bool,
+    /// Stepper-calibration confirmation sheet is open. Opening sends nothing.
+    calibration_confirm_open: bool,
+    /// Screenshot switch: fill and calculate the calibration card.
+    demo_calibration: bool,
+    demo_calibration_done: bool,
+    /// Screenshot switch: also open the calibration confirmation sheet.
+    demo_calibration_confirm: bool,
     /// Screenshot switch: open the surfacing wizard and generate a preview.
     demo_surfacing: bool,
     demo_surfacing_done: bool,
@@ -627,9 +634,12 @@ impl Shell {
             || demo_macro_edit
             || demo_macro_confirm;
         let demo_startup_write = std::env::args().any(|arg| arg == "--demo-startup-write");
+        let demo_calibration = std::env::args().any(|arg| arg == "--demo-calibration");
+        let demo_calibration_confirm =
+            std::env::args().any(|arg| arg == "--demo-calibration-confirm");
         let demo_surfacing = std::env::args().any(|arg| arg == "--demo-surfacing");
         let demo_transform = std::env::args().any(|arg| arg == "--demo-transform");
-        if demo_surfacing || demo_transform {
+        if demo_surfacing || demo_transform || demo_calibration || demo_calibration_confirm {
             state.mode = Mode::Utility;
         }
         let demo_offsets_write = std::env::args().any(|arg| arg == "--demo-offsets-write");
@@ -739,6 +749,10 @@ impl Shell {
             macro_delete: None,
             startup_confirm: None,
             surfacing_open: false,
+            calibration_confirm_open: false,
+            demo_calibration,
+            demo_calibration_done: false,
+            demo_calibration_confirm,
             demo_surfacing,
             demo_surfacing_done: false,
             demo_transform,
@@ -1183,6 +1197,32 @@ impl Shell {
                 self.confirm_startup_apply(cx);
                 changed = true;
             }
+        }
+        // Screenshot switch: fill the calibration wizard through the same
+        // model setters and calculation the operator uses. It never writes a
+        // setting; the confirmation sheet is only shown.
+        if (self.demo_calibration || self.demo_calibration_confirm)
+            && !self.demo_calibration_done
+            && self.state.connection == ConnectionState::Ready
+            && self
+                .state
+                .calibration_current_steps(CalibrationAxis::X)
+                .is_some()
+        {
+            self.demo_calibration_done = true;
+            self.state.mode = Mode::Utility;
+            let calibration = self.state.utilities.calibration_mut();
+            calibration.set_axis(CalibrationAxis::X);
+            let _ = calibration.set_field_text(CalibrationField::CommandedMm, "100");
+            let _ = calibration.set_field_text(CalibrationField::MeasuredMm, "98.5");
+            if let Err(message) = self.state.calculate_calibration() {
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Demo calibration: {message}"));
+            } else if self.demo_calibration_confirm {
+                self.state.utilities.calibration_mut().set_confirmed(true);
+                self.calibration_confirm_open = true;
+            }
+            changed = true;
         }
         // Screenshot switch: open the surfacing wizard with a generated
         // preview. Nothing is loaded or started by this switch.
@@ -4692,6 +4732,67 @@ impl Shell {
         cx.notify();
     }
 
+    /// Calculate the stepper-calibration proposal from reported `$10x`.
+    fn calculate_calibration(&mut self, cx: &mut Context<Self>) {
+        if let Err(message) = self.state.calculate_calibration() {
+            self.state
+                .push_console(ConsoleLevel::Warn, format!("Calibration: {message}"));
+        }
+        self.calibration_confirm_open = false;
+        cx.notify();
+    }
+
+    /// Open the explicit calibration confirmation sheet. Sends nothing.
+    fn open_calibration_confirm(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        if self.state.utilities.calibration().can_review() {
+            self.state.utilities.calibration_mut().set_confirmed(false);
+            self.calibration_confirm_open = true;
+        }
+        cx.notify();
+    }
+
+    /// Cancel the calibration review. Sends nothing and keeps the proposal.
+    fn cancel_calibration(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.state.utilities.calibration_mut().cancel_review();
+        self.calibration_confirm_open = false;
+        cx.notify();
+    }
+
+    /// Send the one confirmed `SetSetting` and wait for read-back.
+    fn apply_calibration(&mut self, cx: &mut Context<Self>) {
+        let write = match self.state.take_calibration_write() {
+            Ok(write) => write,
+            Err(message) => {
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Calibration not sent: {message}"),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let number = write.setting_number;
+        if self.send_command(write.command) {
+            self.calibration_confirm_open = false;
+            self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Calibration write ${number} sent; waiting for read-back"),
+            );
+        } else {
+            self.state
+                .utilities
+                .calibration_mut()
+                .write_failed("not sent: no engine connection");
+            self.state.push_console(
+                ConsoleLevel::Error,
+                format!("Calibration ${number} was not sent"),
+            );
+        }
+        cx.notify();
+    }
+
     /// Regenerate the surfacing preview from the current fields.
     fn generate_surfacing(&mut self, cx: &mut Context<Self>) {
         if let Err(message) = self
@@ -5129,8 +5230,10 @@ impl Shell {
                     // A settings value stays local until Apply; `AppState`
                     // already wrote it into the row draft. Utility fields are
                     // local wizard data and send nothing.
-                    KeypadTarget::Setting(_) | KeypadTarget::Tool(_) | KeypadTarget::Utility(_) => {
-                    }
+                    KeypadTarget::Setting(_)
+                    | KeypadTarget::Tool(_)
+                    | KeypadTarget::Utility(_)
+                    | KeypadTarget::Calibration(_) => {}
                     KeypadTarget::ProbeField(field) => {
                         // The mount offset is setup data owned by the profile.
                         // A failed save never blocks the local value, but the
@@ -12348,6 +12451,304 @@ impl Shell {
         cell
     }
 
+    /// One tap-to-edit calibration distance, backed by the shared keypad.
+    fn calibration_field_cell(
+        &self,
+        field: CalibrationField,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let view = cx.entity();
+        let model = self.state.utilities.calibration();
+        let value = model.field_text(field).to_string();
+        let busy = model.stage().is_busy();
+        let error = model
+            .field_error(field)
+            .map(std::string::ToString::to_string);
+        let mut cell = v_flex()
+            .w(px(190.0))
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(format!("{} ({})", t(field.label()), field.unit())),
+            )
+            .child(
+                Button::new(format!("calibration-field-{}", field.key()))
+                    .label(if value.is_empty() {
+                        "--".to_string()
+                    } else {
+                        value
+                    })
+                    .h(px(48.0))
+                    .w_full()
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(p.panel)
+                            .foreground(p.text)
+                            .hover(p.raised_hover)
+                            .active(p.accent_muted),
+                    )
+                    .border_1()
+                    .border_color(if error.is_some() { p.danger } else { p.border })
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.state.open_keypad(KeypadTarget::Calibration(field));
+                            cx.notify();
+                        });
+                    }),
+            );
+        if let Some(error) = error {
+            cell = cell.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+        cell
+    }
+
+    /// Stepper/axis calibration card. Calculation only; no motion command.
+    fn calibration_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let model = self.state.utilities.calibration();
+        let axis = model.axis();
+        let stage = model.stage();
+        let proposal = model.proposal().cloned();
+        let error = model.error().map(std::string::ToString::to_string);
+        let last_result = model.last_result().map(std::string::ToString::to_string);
+        let last_ok = model.last_result_ok();
+        let gate = self.state.calibration_gate();
+        let locked = gate.blocked_reason();
+        let available = self.state.profile.capabilities.axes.clone();
+        let axis_buttons = CalibrationAxis::ALL
+            .into_iter()
+            .map(|candidate| {
+                let button_view = view.clone();
+                let enabled = available
+                    .iter()
+                    .any(|axis| axis.index() == candidate.index());
+                let selected = candidate == axis;
+                Button::new(format!("calibration-axis-{}", candidate.label()))
+                    .label(candidate.label())
+                    .w(px(64.0))
+                    .h(px(48.0))
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .custom(mode_variant(cx, p, selected))
+                    .border_1()
+                    .border_color(if selected { p.accent } else { p.border })
+                    .disabled(!enabled || stage.is_busy())
+                    .on_click(move |_, _, cx| {
+                        button_view.update(cx, |this, cx| {
+                            this.cancel_calibration(cx);
+                            if this.state.utilities.calibration_mut().set_axis(candidate) {
+                                cx.notify();
+                            }
+                        });
+                    })
+            })
+            .collect::<Vec<_>>();
+        let steps_chips = CalibrationAxis::ALL.into_iter().map(|candidate| {
+            let value = self
+                .state
+                .calibration_current_steps(candidate)
+                .map_or_else(|| "--".to_string(), |value| format!("{value:.3}"));
+            chip(
+                &format!(
+                    "{} ${} {value}",
+                    candidate.label(),
+                    candidate.setting_number()
+                ),
+                p,
+            )
+        });
+        let fields = CalibrationField::ALL
+            .into_iter()
+            .map(|field| self.calibration_field_cell(field, p, cx))
+            .collect::<Vec<_>>();
+        let current_text = self.state.calibration_current_steps(axis).map_or_else(
+            || t("NOT REPORTED").to_string(),
+            |value| format!("{value:.3}"),
+        );
+        let proposal_text = proposal.as_ref().map_or_else(
+            || {
+                t("Calculate to preview the new steps/mm and the change before writing.")
+                    .to_string()
+            },
+            |proposal| {
+                format!(
+                    "${}  {:.3} -> {:.3} steps/mm   {:+.3} ({:+.2}%)",
+                    proposal.setting_number,
+                    proposal.current_steps_per_mm,
+                    proposal.new_steps_per_mm,
+                    proposal.delta_steps_per_mm,
+                    proposal.delta_percent
+                )
+            },
+        );
+        let calculate_view = view.clone();
+        let review_view = view.clone();
+        let can_review = model.can_review();
+        let stage_label = stage.label();
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("STEPPER CALIBRATION"), p))
+                    .child(chip(t("NO MOTION COMMANDED"), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Jog or run the test move separately, then enter the commanded distance and the measured travel. The wizard only calculates and writes the steps/mm setting; it never moves an axis.",
+            )))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_faint)
+                            .child(t("AXIS")),
+                    )
+                    .children(axis_buttons)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_dim)
+                            .child(format!(
+                                "{} ${} ({}) {current_text} steps/mm",
+                                t("CURRENT"),
+                                axis.setting_number(),
+                                axis.label()
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(steps_chips),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_end()
+                    .gap_2()
+                    .children(fields)
+                    .child(
+                        Button::new("calibration-calculate")
+                            .label(t("CALCULATE"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(stage.is_busy())
+                            .on_click(move |_, _, cx| {
+                                calculate_view.update(cx, |this, cx| {
+                                    this.calculate_calibration(cx);
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(if error.is_some() { p.danger } else { p.border })
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(section_label(t("PROPOSED STEPS/MM"), p))
+                            .when(!stage_label.is_empty(), |this| {
+                                this.child(chip(t(stage_label), p))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(p.text_dim)
+                            .child(proposal_text),
+                    )
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    }),
+            )
+            .when_some(locked, |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(format!(
+                            "{}: {}",
+                            t("CALIBRATION WRITES LOCKED"),
+                            reason.to_uppercase()
+                        )),
+                )
+            })
+            .when_some(last_result, |this, result| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(if last_ok { p.success } else { p.danger })
+                        .child(result),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("calibration-review")
+                            .label(t("REVIEW & APPLY"))
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(200.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(!can_review)
+                            .on_click(move |_, _, cx| {
+                                review_view.update(cx, |this, cx| {
+                                    this.open_calibration_confirm(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(p.text_faint)
+                            .child(t(
+                                "APPLY is a separate, confirmed step and is allowed only while the controller is Idle.",
+                            )),
+                    ),
+            )
+    }
+
     /// Material surfacing summary card in the Utility workspace.
     fn surfacing_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
@@ -12590,6 +12991,225 @@ impl Shell {
             .when_some(error, |this, error| {
                 this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
             })
+    }
+
+    /// Explicit old/new confirmation for one `$10x` calibration write.
+    fn calibration_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.calibration_confirm_open {
+            return div().into_any_element();
+        }
+        let Some(proposal) = self.state.utilities.calibration().proposal().cloned() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let apply_view = view;
+        let model = self.state.utilities.calibration();
+        let confirmed = model.confirmed();
+        let stage = model.stage();
+        let locked = self.state.calibration_gate().blocked_reason();
+        let last_result = model.last_result().map(std::string::ToString::to_string);
+        let last_ok = model.last_result_ok();
+        let can_apply = confirmed && locked.is_none() && !stage.is_busy();
+
+        let old_box = v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .gap_0()
+            .p_2()
+            .rounded(px(6.0))
+            .bg(p.panel)
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(t("OLD STEPS/MM")),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(24.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_dim)
+                    .child(format!("{:.3}", proposal.current_steps_per_mm)),
+            );
+        let new_box = v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .gap_0()
+            .p_2()
+            .rounded(px(6.0))
+            .bg(p.panel)
+            .border_1()
+            .border_color(p.accent)
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(t("NEW STEPS/MM")),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(24.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.accent)
+                    .child(format!("{:.3}", proposal.new_steps_per_mm)),
+            );
+
+        let sheet = v_flex()
+            .relative()
+            .w(px(760.0))
+            .max_w_full()
+            .max_h(px(700.0))
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.accent)
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(t("CALIBRATION CONFIRMATION")),
+                    )
+                    .child(chip(
+                        &format!("${} {}", proposal.setting_number, proposal.axis.label()),
+                        p,
+                    )),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                "This writes one controller setting. It does not move the machine: the test move is your separate jog or MDI command. The controller stores steps/mm in EEPROM; avoid unnecessary writes.",
+            )))
+            .child(h_flex().gap_2().child(old_box).child(new_box))
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(p.text_dim)
+                    .child(format!(
+                        "{:.3} x {:.3} mm / {:.3} mm = {:.3} steps/mm   ({:+.3}, {:+.2}%)",
+                        proposal.current_steps_per_mm,
+                        proposal.commanded_mm,
+                        proposal.measured_mm,
+                        proposal.new_steps_per_mm,
+                        proposal.delta_steps_per_mm,
+                        proposal.delta_percent
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(p.text_faint)
+                    .child(t(
+                        "APPLY sends exactly one Command::SetSetting through the engine. The engine writes the value, reads it back, and only then marks it APPLIED. CANCEL sends nothing.",
+                    )),
+            )
+            .when_some(locked, |this, reason| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.danger)
+                        .child(format!(
+                            "{}: {}",
+                            t("WRITE LOCKED"),
+                            reason.to_uppercase()
+                        )),
+                )
+            })
+            .when_some(last_result, |this, result| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(if last_ok { p.success } else { p.danger })
+                        .child(result),
+                )
+            })
+            .child(
+                div().h(px(48.0)).flex().items_center().child(
+                    Switch::new("calibration-confirm")
+                        .checked(confirmed)
+                        .label(t(
+                            "I measured the actual travel and want to write this steps/mm value",
+                        ))
+                        .text_size(px(11.0))
+                        .on_change(move |checked, _, cx| {
+                            confirm_view.update(cx, |this, cx| {
+                                this.state
+                                    .utilities
+                                    .calibration_mut()
+                                    .set_confirmed(*checked);
+                                cx.notify();
+                            });
+                        }),
+                ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("calibration-apply")
+                            .label(format!("{} ${}", t("APPLY"), proposal.setting_number))
+                            .primary()
+                            .h(px(48.0))
+                            .flex_1()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .disabled(!can_apply)
+                            .on_click(move |_, _, cx| {
+                                apply_view.update(cx, |this, cx| this.apply_calibration(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("calibration-cancel")
+                            .label(t("CANCEL"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(120.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                cancel_view.update(cx, |this, cx| this.cancel_calibration(cx));
+                            }),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("calibration-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.cancel_calibration(cx));
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
     }
 
     /// Material surfacing wizard sheet.
@@ -13512,6 +14132,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.calibration_card(p, cx))
             .child(self.surfacing_card(p, cx))
             .child(self.program_limits_card(p))
             .child(self.transform_card(p, cx))
@@ -17610,6 +18231,9 @@ impl Render for Shell {
         }
         if self.state.pins.is_open() {
             root = root.child(self.pins_overlay(p, cx));
+        }
+        if self.calibration_confirm_open {
+            root = root.child(self.calibration_confirm_overlay(p, cx));
         }
         if self.surfacing_open {
             root = root.child(self.surfacing_overlay(p, cx));

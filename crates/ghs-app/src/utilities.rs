@@ -1,8 +1,11 @@
-//! Utility models: material surfacing, program limits, and source transforms.
+//! Utility models: material surfacing, stepper calibration, program limits, and
+//! source transforms.
 //!
 //! Everything here is pure data and text handling. The models never send a
 //! controller command, and the surfacing/transform generators only produce
 //! `LoadProgram` payloads; starting a job stays a separate, explicit action.
+//! The calibration wizard only calculates and returns a `SetSetting` command;
+//! the operator's separate jog/test move is never generated here.
 //!
 //! The transform functions are non-destructive: they return a new source
 //! string and leave the loaded program untouched. When the app loads the
@@ -11,7 +14,7 @@
 //! program. Keep an external copy if the pre-transform original matters.
 
 use ghs_core::Wcs;
-use ghs_engine::Program;
+use ghs_engine::{Command, Program, SettingValue};
 
 /// Upper bound for one generated surfacing program.
 pub const MAX_SURFACING_LINES: usize = 10_000;
@@ -472,6 +475,683 @@ fn compact(value: f64) -> String {
     } else {
         let text = format!("{value:.3}");
         text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+// --------------------------------------------------------------- calibration
+
+/// Smallest steps-per-millimetre value the wizard accepts or writes.
+pub const CALIBRATION_MIN_STEPS_PER_MM: f64 = 1.0;
+/// Largest steps-per-millimetre value the wizard accepts or writes.
+pub const CALIBRATION_MAX_STEPS_PER_MM: f64 = 10_000.0;
+/// Smallest commanded or measured distance, in millimetres.
+pub const CALIBRATION_MIN_DISTANCE_MM: f64 = 0.001;
+/// Largest commanded or measured distance, in millimetres.
+pub const CALIBRATION_MAX_DISTANCE_MM: f64 = 1_000_000.0;
+/// Decimal places used by the controller's steps-per-millimetre format.
+pub const CALIBRATION_STEPS_DECIMALS: u32 = 3;
+
+/// One linear axis in the stepper-calibration wizard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CalibrationAxis {
+    /// X axis, setting `$100`.
+    #[default]
+    X,
+    /// Y axis, setting `$101`.
+    Y,
+    /// Z axis, setting `$102`.
+    Z,
+}
+
+impl CalibrationAxis {
+    /// Number of calibration axes.
+    pub const COUNT: usize = 3;
+
+    /// Every axis, in setting-number order.
+    pub const ALL: [CalibrationAxis; CalibrationAxis::COUNT] =
+        [CalibrationAxis::X, CalibrationAxis::Y, CalibrationAxis::Z];
+
+    /// Zero-based index used by capability and DRO arrays.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            CalibrationAxis::X => 0,
+            CalibrationAxis::Y => 1,
+            CalibrationAxis::Z => 2,
+        }
+    }
+
+    /// Upper-case axis letter.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            CalibrationAxis::X => "X",
+            CalibrationAxis::Y => "Y",
+            CalibrationAxis::Z => "Z",
+        }
+    }
+
+    /// Controller setting number: `$100`, `$101`, or `$102`.
+    #[must_use]
+    pub const fn setting_number(self) -> u16 {
+        100 + self.index() as u16
+    }
+}
+
+/// One editable numeric field in the calibration wizard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CalibrationField {
+    /// Operator-commanded move, in millimetres.
+    CommandedMm,
+    /// Measured actual travel, in millimetres.
+    MeasuredMm,
+}
+
+impl CalibrationField {
+    /// Number of editable calibration fields.
+    pub const COUNT: usize = 2;
+
+    /// Every field, in edit order.
+    pub const ALL: [CalibrationField; CalibrationField::COUNT] =
+        [CalibrationField::CommandedMm, CalibrationField::MeasuredMm];
+
+    /// Stable zero-based index for the field array.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            CalibrationField::CommandedMm => 0,
+            CalibrationField::MeasuredMm => 1,
+        }
+    }
+
+    /// Upper-case label for the field cell.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            CalibrationField::CommandedMm => "COMMANDED MOVE",
+            CalibrationField::MeasuredMm => "MEASURED MOVE",
+        }
+    }
+
+    /// Unit label.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        "mm"
+    }
+
+    /// Stable short key for element ids.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            CalibrationField::CommandedMm => "commanded",
+            CalibrationField::MeasuredMm => "measured",
+        }
+    }
+}
+
+/// Machine/connection gate for one `$100`/`$101`/`$102` write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CalibrationGate {
+    /// A live engine session (not `--mock`).
+    pub live: bool,
+    /// The engine handshake finished and the link is ready.
+    pub ready: bool,
+    /// The controller reports `Idle`.
+    pub idle: bool,
+    /// The controller reports `Alarm` or `Door`.
+    pub alarm_or_door: bool,
+    /// A job is running or paused.
+    pub job_active: bool,
+}
+
+impl CalibrationGate {
+    /// Why a calibration write is refused, or `None` when it is allowed.
+    #[must_use]
+    pub fn blocked_reason(&self) -> Option<&'static str> {
+        if !self.live {
+            Some("mock mode: no controller")
+        } else if !self.ready {
+            Some("not connected")
+        } else if self.alarm_or_door {
+            Some("alarm or door")
+        } else if self.job_active {
+            Some("job active")
+        } else if !self.idle {
+            Some("controller not Idle")
+        } else {
+            None
+        }
+    }
+}
+
+/// Write/read-back state of the calibration wizard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CalibrationStage {
+    /// No proposal calculated.
+    #[default]
+    Idle,
+    /// A proposal is ready for review.
+    Calculated,
+    /// The operator confirmed the proposal.
+    Confirmed,
+    /// The write command was handed to the shell.
+    Writing,
+    /// The controller read-back matched the requested value.
+    Applied,
+    /// The write or read-back failed; the previous value is kept.
+    Failed,
+}
+
+impl CalibrationStage {
+    /// Short status label for the card.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            CalibrationStage::Idle => "",
+            CalibrationStage::Calculated => "CALCULATED",
+            CalibrationStage::Confirmed => "CONFIRMED",
+            CalibrationStage::Writing => "WRITING",
+            CalibrationStage::Applied => "APPLIED",
+            CalibrationStage::Failed => "FAILED",
+        }
+    }
+
+    /// Whether a write is waiting for the controller.
+    #[must_use]
+    pub const fn is_busy(self) -> bool {
+        matches!(self, CalibrationStage::Writing)
+    }
+}
+
+/// One validated steps-per-millimetre proposal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalibrationProposal {
+    /// Selected axis.
+    pub axis: CalibrationAxis,
+    /// Controller setting number.
+    pub setting_number: u16,
+    /// Steps/mm reported before the change.
+    pub current_steps_per_mm: f64,
+    /// Operator-commanded move, in millimetres.
+    pub commanded_mm: f64,
+    /// Measured actual travel, in millimetres.
+    pub measured_mm: f64,
+    /// Proposed steps/mm, rounded to the controller format.
+    pub new_steps_per_mm: f64,
+    /// `new - current`, in steps/mm.
+    pub delta_steps_per_mm: f64,
+    /// Relative change, as a percentage of the current value.
+    pub delta_percent: f64,
+}
+
+impl CalibrationProposal {
+    /// The exact write command for this proposal.
+    ///
+    /// The command is `Command::SetSetting`; the engine writes the value,
+    /// reads it back, and emits `SettingWritten` for verification.
+    #[must_use]
+    pub fn command(&self) -> Command {
+        Command::SetSetting {
+            number: self.setting_number,
+            value: SettingValue::Float(self.new_steps_per_mm),
+        }
+    }
+}
+
+/// One confirmed write handed to the shell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalibrationWrite {
+    /// Selected axis.
+    pub axis: CalibrationAxis,
+    /// Controller setting number.
+    pub setting_number: u16,
+    /// Steps/mm reported before the change.
+    pub old_steps_per_mm: f64,
+    /// Steps/mm to write.
+    pub new_steps_per_mm: f64,
+    /// Operator-commanded move, in millimetres.
+    pub commanded_mm: f64,
+    /// Measured actual travel, in millimetres.
+    pub measured_mm: f64,
+    /// Exact command to send through the engine gateway.
+    pub command: Command,
+}
+
+/// Compute one bounded steps-per-millimetre proposal.
+///
+/// `new = current * commanded / measured`. The result is rounded to the
+/// controller's three-decimal format before it is compared with the accepted
+/// range, so the value that passes validation is exactly the value written and
+/// read back. The function never commands motion.
+///
+/// # Errors
+///
+/// Returns a clear message when the current value or either distance is not a
+/// positive finite number, a distance is outside the accepted bound, or the
+/// rounded result leaves `1..=10_000` steps/mm.
+pub fn compute_calibration(
+    axis: CalibrationAxis,
+    current_steps_per_mm: f64,
+    commanded_mm: f64,
+    measured_mm: f64,
+) -> Result<CalibrationProposal, String> {
+    if !current_steps_per_mm.is_finite() {
+        return Err(format!(
+            "{} current steps/mm must be finite",
+            axis.setting_number()
+        ));
+    }
+    if current_steps_per_mm < CALIBRATION_MIN_STEPS_PER_MM
+        || current_steps_per_mm > CALIBRATION_MAX_STEPS_PER_MM
+    {
+        return Err(format!(
+            "${} current steps/mm {current_steps_per_mm:.3} is outside {:.3} ..= {:.3}",
+            axis.setting_number(),
+            CALIBRATION_MIN_STEPS_PER_MM,
+            CALIBRATION_MAX_STEPS_PER_MM
+        ));
+    }
+    validate_calibration_distance("COMMANDED MOVE", commanded_mm)?;
+    validate_calibration_distance("MEASURED MOVE", measured_mm)?;
+
+    let new = round_calibration_steps(current_steps_per_mm * commanded_mm / measured_mm);
+    if !new.is_finite() {
+        return Err("PROPOSED steps/mm is not finite".to_string());
+    }
+    if new < CALIBRATION_MIN_STEPS_PER_MM || new > CALIBRATION_MAX_STEPS_PER_MM {
+        return Err(format!(
+            "PROPOSED steps/mm {new:.3} is outside {:.3} ..= {:.3}; check the measured distance",
+            CALIBRATION_MIN_STEPS_PER_MM, CALIBRATION_MAX_STEPS_PER_MM
+        ));
+    }
+    let delta_steps_per_mm = new - current_steps_per_mm;
+    Ok(CalibrationProposal {
+        axis,
+        setting_number: axis.setting_number(),
+        current_steps_per_mm,
+        commanded_mm,
+        measured_mm,
+        new_steps_per_mm: new,
+        delta_steps_per_mm,
+        delta_percent: delta_steps_per_mm / current_steps_per_mm * 100.0,
+    })
+}
+
+fn validate_calibration_distance(label: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{label} must be finite"));
+    }
+    if value < CALIBRATION_MIN_DISTANCE_MM || value > CALIBRATION_MAX_DISTANCE_MM {
+        return Err(format!(
+            "{label} must be within {:.3} ..= {:.0} mm",
+            CALIBRATION_MIN_DISTANCE_MM, CALIBRATION_MAX_DISTANCE_MM
+        ));
+    }
+    Ok(())
+}
+
+fn round_calibration_steps(value: f64) -> f64 {
+    let scale = 10_f64.powi(CALIBRATION_STEPS_DECIMALS as i32);
+    (value * scale).round() / scale
+}
+
+fn parse_calibration_distance(label: &str, text: &str) -> Result<f64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is empty"));
+    }
+    let value = trimmed
+        .parse::<f64>()
+        .map_err(|_| format!("{label} must be numeric"))?;
+    validate_calibration_distance(label, value)?;
+    Ok(value)
+}
+
+/// Local stepper-calibration wizard state.
+///
+/// The model only calculates and validates. It never commands motion: the
+/// operator jogs or runs a test move separately, measures the result, and
+/// explicitly applies the proposed value. The shell sends the returned
+/// `Command::SetSetting`, and the engine reads it back.
+#[derive(Clone, Debug)]
+pub struct CalibrationModel {
+    axis: CalibrationAxis,
+    fields: [String; CalibrationField::COUNT],
+    field_errors: [Option<String>; CalibrationField::COUNT],
+    proposal: Option<CalibrationProposal>,
+    error: Option<String>,
+    confirmed: bool,
+    stage: CalibrationStage,
+    inflight: Option<CalibrationWrite>,
+    last_result: Option<String>,
+    last_result_ok: bool,
+}
+
+impl Default for CalibrationModel {
+    fn default() -> Self {
+        let mut fields = std::array::from_fn(|_| String::new());
+        if let Some(commanded) = fields.get_mut(CalibrationField::CommandedMm.index()) {
+            *commanded = "100".to_string();
+        }
+        Self {
+            axis: CalibrationAxis::X,
+            fields,
+            field_errors: std::array::from_fn(|_| None),
+            proposal: None,
+            error: None,
+            confirmed: false,
+            stage: CalibrationStage::Idle,
+            inflight: None,
+            last_result: None,
+            last_result_ok: false,
+        }
+    }
+}
+
+impl CalibrationModel {
+    /// Selected axis.
+    #[must_use]
+    pub fn axis(&self) -> CalibrationAxis {
+        self.axis
+    }
+
+    /// Select another axis and discard the previous proposal.
+    ///
+    /// Returns `false` while a write is in flight.
+    pub fn set_axis(&mut self, axis: CalibrationAxis) -> bool {
+        if self.stage.is_busy() || self.axis == axis {
+            return !self.stage.is_busy();
+        }
+        self.axis = axis;
+        self.clear_proposal();
+        self.last_result = None;
+        self.last_result_ok = false;
+        true
+    }
+
+    /// Field text for the editor.
+    #[must_use]
+    pub fn field_text(&self, field: CalibrationField) -> &str {
+        self.fields.get(field.index()).map_or("", String::as_str)
+    }
+
+    /// Last inline validation error for a field, if any.
+    #[must_use]
+    pub fn field_error(&self, field: CalibrationField) -> Option<&str> {
+        self.field_errors
+            .get(field.index())
+            .and_then(Option::as_deref)
+    }
+
+    /// Validate and store one distance from the shared keypad.
+    ///
+    /// The stored text is left unchanged on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an empty, non-numeric, non-finite, non-positive,
+    /// or out-of-range distance.
+    pub fn set_field_text(
+        &mut self,
+        field: CalibrationField,
+        text: impl Into<String>,
+    ) -> Result<(), String> {
+        if self.stage.is_busy() {
+            return Err("wait for the calibration read-back before editing".to_string());
+        }
+        let trimmed = text.into().trim().to_string();
+        let result = parse_calibration_distance(field.label(), &trimmed);
+        if let Some(slot) = self.field_errors.get_mut(field.index()) {
+            *slot = result.as_ref().err().cloned();
+        }
+        if result.is_ok() {
+            if let Some(slot) = self.fields.get_mut(field.index()) {
+                *slot = trimmed;
+            }
+            self.clear_proposal();
+            self.error = None;
+        }
+        result.map(|_| ())
+    }
+
+    /// Current validated proposal, if one was calculated.
+    #[must_use]
+    pub fn proposal(&self) -> Option<&CalibrationProposal> {
+        self.proposal.as_ref()
+    }
+
+    /// Last calculation error.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Current stage.
+    #[must_use]
+    pub fn stage(&self) -> CalibrationStage {
+        self.stage
+    }
+
+    /// Whether the operator confirmed the proposal in the confirmation sheet.
+    #[must_use]
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    /// Whether the proposal can be opened for another explicit review.
+    ///
+    /// An applied proposal is excluded: the operator must recalculate against
+    /// the newly reported value before writing again.
+    #[must_use]
+    pub fn can_review(&self) -> bool {
+        self.proposal.is_some() && !self.stage.is_busy() && self.stage != CalibrationStage::Applied
+    }
+
+    /// Set the explicit confirmation. It can only turn on with a proposal.
+    pub fn set_confirmed(&mut self, confirmed: bool) {
+        if self.stage.is_busy() {
+            return;
+        }
+        if confirmed && self.can_review() {
+            self.confirmed = true;
+            self.stage = CalibrationStage::Confirmed;
+        } else {
+            self.confirmed = false;
+            if self.stage == CalibrationStage::Confirmed {
+                self.stage = CalibrationStage::Calculated;
+            }
+        }
+    }
+
+    /// Last write/read-back result for the card.
+    #[must_use]
+    pub fn last_result(&self) -> Option<&str> {
+        self.last_result.as_deref()
+    }
+
+    /// Whether the last write/read-back result was a success.
+    #[must_use]
+    pub fn last_result_ok(&self) -> bool {
+        self.last_result_ok
+    }
+
+    /// Validate the stored distances and cache one proposal.
+    ///
+    /// `current_steps_per_mm` is the controller's reported value for the
+    /// selected axis. `None` means `$100`/`$101`/`$102` was not reported, so the
+    /// wizard refuses to invent a baseline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the current value is missing or invalid, a
+    /// distance is empty or invalid, or the result leaves the accepted range.
+    pub fn calculate(&mut self, current_steps_per_mm: Option<f64>) -> Result<(), String> {
+        if self.stage.is_busy() {
+            return Err("wait for the calibration read-back before recalculating".to_string());
+        }
+        self.confirmed = false;
+        let result = (|| {
+            let Some(current) = current_steps_per_mm else {
+                return Err(format!(
+                    "${} steps/mm is not reported by the controller",
+                    self.axis.setting_number()
+                ));
+            };
+            let commanded = parse_calibration_distance(
+                CalibrationField::CommandedMm.label(),
+                self.field_text(CalibrationField::CommandedMm),
+            )?;
+            let measured = parse_calibration_distance(
+                CalibrationField::MeasuredMm.label(),
+                self.field_text(CalibrationField::MeasuredMm),
+            )?;
+            compute_calibration(self.axis, current, commanded, measured)
+        })();
+        match result {
+            Ok(proposal) => {
+                self.proposal = Some(proposal);
+                self.error = None;
+                self.stage = CalibrationStage::Calculated;
+                self.last_result = None;
+                self.last_result_ok = false;
+                Ok(())
+            }
+            Err(message) => {
+                self.proposal = None;
+                self.error = Some(message.clone());
+                self.stage = CalibrationStage::Idle;
+                self.last_result = None;
+                self.last_result_ok = false;
+                Err(message)
+            }
+        }
+    }
+
+    /// Build the one confirmed write and mark it in flight.
+    ///
+    /// The caller is responsible for the live/ready/Idle/job gate and for
+    /// sending the returned command through the engine gateway.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the proposal is missing, confirmation is not
+    /// checked, a write is already in flight, or the controller's current value
+    /// changed since the proposal was calculated.
+    pub fn take_write(
+        &mut self,
+        current_steps_per_mm: Option<f64>,
+    ) -> Result<CalibrationWrite, String> {
+        if self.stage.is_busy() {
+            return Err("a calibration write is already in progress".to_string());
+        }
+        if !self.confirmed {
+            return Err("a calibration write requires explicit confirmation".to_string());
+        }
+        let Some(proposal) = self.proposal.clone() else {
+            return Err("calculate a calibration proposal before applying".to_string());
+        };
+        let Some(current) = current_steps_per_mm else {
+            return Err(format!(
+                "${} steps/mm is not reported by the controller",
+                proposal.setting_number
+            ));
+        };
+        if !current.is_finite() || (current - proposal.current_steps_per_mm).abs() > 0.0005 {
+            return Err(format!(
+                "${} is now {current:.3} steps/mm; recalculate before applying",
+                proposal.setting_number
+            ));
+        }
+        let write = CalibrationWrite {
+            axis: proposal.axis,
+            setting_number: proposal.setting_number,
+            old_steps_per_mm: proposal.current_steps_per_mm,
+            new_steps_per_mm: proposal.new_steps_per_mm,
+            commanded_mm: proposal.commanded_mm,
+            measured_mm: proposal.measured_mm,
+            command: proposal.command(),
+        };
+        self.stage = CalibrationStage::Writing;
+        self.confirmed = false;
+        self.inflight = Some(write.clone());
+        Ok(write)
+    }
+
+    /// Record a send failure before anything reached the controller.
+    pub fn write_failed(&mut self, reason: impl Into<String>) {
+        let number = self
+            .inflight
+            .as_ref()
+            .map_or_else(|| self.axis.setting_number(), |write| write.setting_number);
+        self.inflight = None;
+        self.confirmed = false;
+        self.stage = CalibrationStage::Failed;
+        self.last_result = Some(format!("FAILED ${number}: {}", reason.into()));
+        self.last_result_ok = false;
+    }
+
+    /// Apply a `SettingWritten` event for the in-flight write.
+    pub fn written(&mut self, number: u16, value: &SettingValue, verified: bool) {
+        let Some(write) = self
+            .inflight
+            .clone()
+            .filter(|write| write.setting_number == number)
+        else {
+            return;
+        };
+        self.inflight = None;
+        self.confirmed = false;
+        if verified {
+            self.stage = CalibrationStage::Applied;
+            self.last_result = Some(format!(
+                "APPLIED ${number}: {:.3} -> {:.3} steps/mm (read-back {value})",
+                write.old_steps_per_mm, write.new_steps_per_mm
+            ));
+            self.last_result_ok = true;
+        } else {
+            self.stage = CalibrationStage::Failed;
+            self.last_result = Some(format!(
+                "FAILED ${number}: read-back {value}; previous {:.3} steps/mm kept",
+                write.old_steps_per_mm
+            ));
+            self.last_result_ok = false;
+        }
+    }
+
+    /// Record an alarm, controller error, or disconnect during a write.
+    pub fn on_failure(&mut self, reason: impl Into<String>) {
+        if self.inflight.is_some() {
+            self.write_failed(reason);
+        }
+    }
+
+    /// Discard the confirmation without sending anything.
+    ///
+    /// A calculated proposal stays visible for review; a write that already
+    /// reached the shell cannot be cancelled.
+    pub fn cancel_review(&mut self) {
+        if self.stage.is_busy() {
+            return;
+        }
+        self.confirmed = false;
+        if self.stage == CalibrationStage::Confirmed {
+            self.stage = CalibrationStage::Calculated;
+        }
+    }
+
+    /// Clear session-bound proposal and result state. Field text is kept.
+    pub fn reset_session(&mut self) {
+        self.clear_proposal();
+        self.inflight = None;
+        self.last_result = None;
+        self.last_result_ok = false;
+    }
+
+    fn clear_proposal(&mut self) {
+        self.proposal = None;
+        self.error = None;
+        self.confirmed = false;
+        self.stage = CalibrationStage::Idle;
     }
 }
 
@@ -1145,6 +1825,7 @@ pub struct UtilityModel {
     transform_preview: Option<TransformPreview>,
     transform_error: Option<String>,
     transform_confirmed: bool,
+    calibration: CalibrationModel,
 }
 
 impl Default for UtilityModel {
@@ -1163,6 +1844,7 @@ impl Default for UtilityModel {
             transform_preview: None,
             transform_error: None,
             transform_confirmed: false,
+            calibration: CalibrationModel::default(),
         }
     }
 }
@@ -1178,6 +1860,18 @@ impl UtilityModel {
         self.transform_preview = None;
         self.transform_error = None;
         self.transform_confirmed = false;
+        self.calibration.reset_session();
+    }
+
+    /// Stepper-calibration wizard state.
+    #[must_use]
+    pub fn calibration(&self) -> &CalibrationModel {
+        &self.calibration
+    }
+
+    /// Mutable stepper-calibration wizard state.
+    pub fn calibration_mut(&mut self) -> &mut CalibrationModel {
+        &mut self.calibration
     }
 
     /// Field text for the editor.
@@ -1495,6 +2189,252 @@ fn validate_field_text(field: UtilityField, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn calibration_draft(
+        axis: CalibrationAxis,
+        commanded: &str,
+        measured: &str,
+    ) -> CalibrationModel {
+        let mut model = CalibrationModel::default();
+        assert!(model.set_axis(axis));
+        model
+            .set_field_text(CalibrationField::CommandedMm, commanded)
+            .expect("commanded distance");
+        model
+            .set_field_text(CalibrationField::MeasuredMm, measured)
+            .expect("measured distance");
+        model
+    }
+
+    fn calibration_for(
+        axis: CalibrationAxis,
+        current: f64,
+        commanded: &str,
+        measured: &str,
+    ) -> CalibrationModel {
+        let mut model = calibration_draft(axis, commanded, measured);
+        model
+            .calculate(Some(current))
+            .expect("calibration proposal");
+        model
+    }
+
+    #[test]
+    fn calibration_formula_covers_every_axis_and_proportional_direction() {
+        for axis in CalibrationAxis::ALL {
+            let longer = calibration_for(axis, 250.0, "100", "98.5");
+            let proposal = longer.proposal().expect("proposal");
+            assert_eq!(proposal.axis, axis);
+            assert_eq!(proposal.setting_number, axis.setting_number());
+            assert!((proposal.new_steps_per_mm - 253.807).abs() < 1.0e-9);
+            assert!((proposal.delta_steps_per_mm - 3.807).abs() < 1.0e-9);
+            assert!(proposal.delta_percent > 0.0);
+            assert!(proposal.new_steps_per_mm > proposal.current_steps_per_mm);
+
+            let shorter = calibration_for(axis, 250.0, "90", "95");
+            let proposal = shorter.proposal().expect("proposal");
+            assert!((proposal.new_steps_per_mm - 236.842).abs() < 1.0e-9);
+            assert!(proposal.new_steps_per_mm < proposal.current_steps_per_mm);
+            assert!(proposal.delta_percent < 0.0);
+        }
+    }
+
+    #[test]
+    fn calibration_rejects_zero_negative_non_finite_and_out_of_range_inputs() {
+        let cases = [
+            (CalibrationField::CommandedMm, "0", "COMMANDED MOVE"),
+            (CalibrationField::CommandedMm, "-5", "COMMANDED MOVE"),
+            (CalibrationField::CommandedMm, "NaN", "finite"),
+            (CalibrationField::CommandedMm, "inf", "finite"),
+            (CalibrationField::CommandedMm, "0.0001", "within"),
+            (CalibrationField::MeasuredMm, "0", "MEASURED MOVE"),
+            (CalibrationField::MeasuredMm, "-1", "MEASURED MOVE"),
+            (CalibrationField::MeasuredMm, "NaN", "finite"),
+            (CalibrationField::MeasuredMm, "1000000.1", "within"),
+        ];
+        for (field, text, needle) in cases {
+            let mut model = CalibrationModel::default();
+            let error = model
+                .set_field_text(field, text)
+                .expect_err("invalid distance");
+            assert!(
+                error
+                    .to_ascii_uppercase()
+                    .contains(&needle.to_ascii_uppercase()),
+                "{field:?} {text}: {error}"
+            );
+        }
+
+        let mut model = calibration_for(CalibrationAxis::X, 250.0, "100", "98.5");
+        for current in [None, Some(0.0), Some(-1.0), Some(f64::NAN), Some(0.5)] {
+            let error = model.calculate(current).expect_err("invalid current");
+            assert!(
+                error.contains("current") || error.contains("not reported"),
+                "{current:?}: {error}"
+            );
+        }
+
+        let mut too_large = calibration_draft(CalibrationAxis::X, "100", "0.1");
+        let error = too_large
+            .calculate(Some(250.0))
+            .expect_err("out-of-range result");
+        assert!(error.contains("PROPOSED"), "{error}");
+
+        let mut too_small = calibration_draft(CalibrationAxis::X, "1", "2000");
+        let error = too_small
+            .calculate(Some(1.0))
+            .expect_err("out-of-range result");
+        assert!(error.contains("PROPOSED"), "{error}");
+    }
+
+    #[test]
+    fn calibration_apply_command_is_exactly_set_setting_for_each_axis() {
+        for axis in CalibrationAxis::ALL {
+            let mut model = calibration_for(axis, 250.0, "100", "98.5");
+            model.set_confirmed(true);
+            let write = model.take_write(Some(250.0)).expect("confirmed write");
+            assert_eq!(write.setting_number, axis.setting_number());
+            assert_eq!(
+                write.command,
+                Command::SetSetting {
+                    number: axis.setting_number(),
+                    value: SettingValue::Float(253.807),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_never_produces_motion_or_start_commands() {
+        let mut model = calibration_for(CalibrationAxis::Y, 250.0, "100", "98.5");
+        model.set_confirmed(true);
+        let write = model.take_write(Some(250.0)).expect("confirmed write");
+        assert!(matches!(write.command, Command::SetSetting { .. }));
+        assert!(!matches!(
+            write.command,
+            Command::Jog(_)
+                | Command::Mdi(_)
+                | Command::LoadProgram { .. }
+                | Command::StartProgram { .. }
+                | Command::Home
+                | Command::Unlock
+                | Command::Reset
+                | Command::Sleep
+        ));
+    }
+
+    #[test]
+    fn calibration_requires_confirmation_and_cancel_sends_nothing() {
+        let mut model = calibration_for(CalibrationAxis::X, 250.0, "100", "98.5");
+        let error = model.take_write(Some(250.0)).expect_err("not confirmed");
+        assert!(error.contains("confirmation"), "{error}");
+        model.set_confirmed(true);
+        assert!(model.confirmed());
+        model.cancel_review();
+        assert!(!model.confirmed());
+        assert_eq!(model.stage(), CalibrationStage::Calculated);
+        let error = model
+            .take_write(Some(250.0))
+            .expect_err("cancelled write must not send");
+        assert!(error.contains("confirmation"), "{error}");
+    }
+
+    #[test]
+    fn calibration_read_back_marks_applied_then_failed() {
+        let mut applied = calibration_for(CalibrationAxis::X, 250.0, "100", "98.5");
+        applied.set_confirmed(true);
+        let write = applied.take_write(Some(250.0)).expect("confirmed write");
+        assert_eq!(applied.stage(), CalibrationStage::Writing);
+        applied.written(
+            write.setting_number,
+            &SettingValue::Float(write.new_steps_per_mm),
+            true,
+        );
+        assert_eq!(applied.stage(), CalibrationStage::Applied);
+        assert!(applied.last_result_ok());
+        assert!(
+            applied
+                .last_result()
+                .is_some_and(|text| text.contains("APPLIED $100"))
+        );
+
+        let mut failed = calibration_for(CalibrationAxis::Y, 250.0, "100", "98.5");
+        failed.set_confirmed(true);
+        let write = failed.take_write(Some(250.0)).expect("confirmed write");
+        failed.written(write.setting_number, &SettingValue::Float(251.0), false);
+        assert_eq!(failed.stage(), CalibrationStage::Failed);
+        assert!(!failed.last_result_ok());
+        assert!(
+            failed
+                .last_result()
+                .is_some_and(|text| text.contains("previous 250.000"))
+        );
+    }
+
+    #[test]
+    fn calibration_refuses_a_changed_current_value_or_a_second_write() {
+        let mut model = calibration_for(CalibrationAxis::X, 250.0, "100", "98.5");
+        model.set_confirmed(true);
+        let error = model.take_write(Some(240.0)).expect_err("changed current");
+        assert!(error.contains("recalculate"), "{error}");
+        model.set_confirmed(true);
+        model.take_write(Some(250.0)).expect("first write");
+        let error = model.take_write(Some(250.0)).expect_err("second write");
+        assert!(error.contains("in progress"), "{error}");
+    }
+
+    #[test]
+    fn calibration_gate_lists_every_refusal_and_allows_idle() {
+        let allowed = CalibrationGate {
+            live: true,
+            ready: true,
+            idle: true,
+            alarm_or_door: false,
+            job_active: false,
+        };
+        assert_eq!(allowed.blocked_reason(), None);
+        let cases = [
+            (
+                CalibrationGate {
+                    live: false,
+                    ..allowed
+                },
+                "mock mode",
+            ),
+            (
+                CalibrationGate {
+                    ready: false,
+                    ..allowed
+                },
+                "not connected",
+            ),
+            (
+                CalibrationGate {
+                    alarm_or_door: true,
+                    ..allowed
+                },
+                "alarm or door",
+            ),
+            (
+                CalibrationGate {
+                    job_active: true,
+                    ..allowed
+                },
+                "job active",
+            ),
+            (
+                CalibrationGate {
+                    idle: false,
+                    ..allowed
+                },
+                "not Idle",
+            ),
+        ];
+        for (gate, needle) in cases {
+            let reason = gate.blocked_reason().expect("refusal");
+            assert!(reason.contains(needle), "{reason}");
+        }
+    }
 
     fn params() -> SurfacingParams {
         SurfacingParams {

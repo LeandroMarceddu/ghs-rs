@@ -36,7 +36,10 @@ use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
-use crate::utilities::{ProgramLimits, TravelSettings, UtilityField, UtilityModel};
+use crate::utilities::{
+    CalibrationAxis, CalibrationField, CalibrationGate, CalibrationWrite, ProgramLimits,
+    TravelSettings, UtilityField, UtilityModel,
+};
 
 /// Connection state shown in the top-bar status pill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -408,6 +411,8 @@ pub enum KeypadTarget {
     ProbeField(ProbeField),
     /// One numeric utility (surfacing or transform) field.
     Utility(UtilityField),
+    /// One stepper-calibration distance field.
+    Calibration(CalibrationField),
 }
 
 impl KeypadTarget {
@@ -428,6 +433,7 @@ impl KeypadTarget {
             KeypadTarget::Tool(field) => t(field.title()).to_string(),
             KeypadTarget::ProbeField(field) => t(field.label()).to_string(),
             KeypadTarget::Utility(field) => t(field.label()).to_string(),
+            KeypadTarget::Calibration(field) => t(field.label()).to_string(),
         }
     }
 }
@@ -3311,6 +3317,68 @@ impl AppState {
         Ok(UtilityLoad { name, command })
     }
 
+    /// Reported steps/mm for one calibration axis.
+    ///
+    /// Only a finite value inside the wizard's accepted range is returned, so a
+    /// malformed `$100`/`$101`/`$102` report becomes "not reported" instead of
+    /// an unsafe baseline.
+    #[must_use]
+    pub fn calibration_current_steps(&self, axis: CalibrationAxis) -> Option<f64> {
+        self.settings
+            .row(axis.setting_number())
+            .and_then(|row| row.current.as_f64())
+            .filter(|value| {
+                value.is_finite()
+                    && *value >= crate::utilities::CALIBRATION_MIN_STEPS_PER_MM
+                    && *value <= crate::utilities::CALIBRATION_MAX_STEPS_PER_MM
+            })
+    }
+
+    /// Machine/connection gate for a `$100`/`$101`/`$102` calibration write.
+    #[must_use]
+    pub fn calibration_gate(&self) -> CalibrationGate {
+        CalibrationGate {
+            live: self.live,
+            ready: self.connection.is_ready_like(),
+            idle: self.machine_state == "Idle",
+            alarm_or_door: matches!(self.machine_state, "Alarm" | "Door"),
+            job_active: self.job.is_active(),
+        }
+    }
+
+    /// Recalculate the calibration proposal from the reported `$10x` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wizard's field or range message.
+    pub fn calculate_calibration(&mut self) -> Result<(), String> {
+        let axis = self.utilities.calibration().axis();
+        let current = self.calibration_current_steps(axis);
+        self.utilities.calibration_mut().calculate(current)
+    }
+
+    /// Build the one confirmed calibration write after every safety gate.
+    ///
+    /// The returned command is always `Command::SetSetting`; it never jogs,
+    /// moves, or starts a program. The engine writes the value and verifies the
+    /// read-back before the model shows `APPLIED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate refusal, a missing/invalid `$10x` value, missing
+    /// confirmation, or a changed current value.
+    pub fn take_calibration_write(&mut self) -> Result<CalibrationWrite, String> {
+        if let Some(reason) = self.calibration_gate().blocked_reason() {
+            return Err(reason.to_string());
+        }
+        if self.settings.inflight_number().is_some() || self.settings.has_queued_write() {
+            return Err("a settings write is already in progress".to_string());
+        }
+        let axis = self.utilities.calibration().axis();
+        let current = self.calibration_current_steps(axis);
+        self.utilities.calibration_mut().take_write(current)
+    }
+
     /// Read-only program limits for the Utility card.
     ///
     /// Travel values come from `$20` and `$130`/`$131`/`$132` as last reported
@@ -4236,6 +4304,14 @@ impl AppState {
                 };
                 (value, true, Some(hint))
             }
+            KeypadTarget::Calibration(field) => {
+                let value = self.utilities.calibration().field_text(field).to_string();
+                (
+                    value,
+                    true,
+                    Some(format!("{} ({})", field.label(), field.unit())),
+                )
+            }
         };
         self.keypad = Some(KeypadState {
             target,
@@ -4386,6 +4462,15 @@ impl AppState {
             }
             KeypadTarget::Utility(field) => {
                 if let Err(message) = self.utilities.set_field_text(field, keypad.buffer.clone()) {
+                    self.push_console(ConsoleLevel::Warn, message);
+                }
+            }
+            KeypadTarget::Calibration(field) => {
+                if let Err(message) = self
+                    .utilities
+                    .calibration_mut()
+                    .set_field_text(field, keypad.buffer.clone())
+                {
                     self.push_console(ConsoleLevel::Warn, message);
                 }
             }
@@ -4754,6 +4839,168 @@ mod tests {
             state.job.program().expect("program remains loaded"),
             &program
         ));
+    }
+
+    fn calibration_ready_state() -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        state.settings.apply_settings(&[
+            ghs_engine::Setting::new(100, SettingValue::Float(250.0)),
+            ghs_engine::Setting::new(101, SettingValue::Float(250.0)),
+            ghs_engine::Setting::new(102, SettingValue::Float(250.0)),
+        ]);
+        {
+            let calibration = state.utilities.calibration_mut();
+            assert!(calibration.set_axis(CalibrationAxis::X));
+            calibration
+                .set_field_text(CalibrationField::CommandedMm, "100")
+                .expect("commanded distance");
+            calibration
+                .set_field_text(CalibrationField::MeasuredMm, "98.5")
+                .expect("measured distance");
+        }
+        state.calculate_calibration().expect("calibration proposal");
+        state.utilities.calibration_mut().set_confirmed(true);
+        state
+    }
+
+    #[test]
+    fn calibration_refuses_unsafe_gates_and_sends_only_set_setting() {
+        let mut mock = AppState::new();
+        mock.settings
+            .apply_settings(&[ghs_engine::Setting::new(100, SettingValue::Float(250.0))]);
+        {
+            let calibration = mock.utilities.calibration_mut();
+            calibration
+                .set_field_text(CalibrationField::CommandedMm, "100")
+                .expect("commanded");
+            calibration
+                .set_field_text(CalibrationField::MeasuredMm, "98.5")
+                .expect("measured");
+        }
+        mock.calculate_calibration().expect("proposal");
+        mock.utilities.calibration_mut().set_confirmed(true);
+        assert_eq!(
+            mock.take_calibration_write().expect_err("mock mode"),
+            "mock mode: no controller"
+        );
+
+        let mut state = calibration_ready_state();
+        state.connection = ConnectionState::Connecting;
+        assert_eq!(
+            state.take_calibration_write().expect_err("not ready"),
+            "not connected"
+        );
+
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Alarm";
+        assert_eq!(
+            state.take_calibration_write().expect_err("alarm"),
+            "alarm or door"
+        );
+
+        state.machine_state = "Door";
+        assert_eq!(
+            state.take_calibration_write().expect_err("door"),
+            "alarm or door"
+        );
+
+        state.machine_state = "Idle";
+        let program = Arc::new(ghs_gcode::parse_program("G21\nM30\n").expect("program"));
+        state.job.loaded("job.nc".into(), program, 2);
+        state.job.started(1, 2);
+        assert_eq!(
+            state.take_calibration_write().expect_err("job active"),
+            "job active"
+        );
+
+        state.job.completed(Duration::from_secs(1));
+        state.machine_state = "Run";
+        assert_eq!(
+            state.take_calibration_write().expect_err("not idle"),
+            "controller not Idle"
+        );
+
+        state.machine_state = "Idle";
+        let write = state.take_calibration_write().expect("idle write");
+        assert_eq!(write.setting_number, 100);
+        assert_eq!(
+            write.command,
+            Command::SetSetting {
+                number: 100,
+                value: SettingValue::Float(253.807),
+            }
+        );
+        assert!(!matches!(
+            write.command,
+            Command::Jog(_)
+                | Command::Mdi(_)
+                | Command::LoadProgram { .. }
+                | Command::StartProgram { .. }
+                | Command::Home
+                | Command::Unlock
+                | Command::Reset
+                | Command::Sleep
+        ));
+    }
+
+    #[test]
+    fn calibration_read_back_refreshes_applied_and_failed_state() {
+        let mut state = calibration_ready_state();
+        let write = state.take_calibration_write().expect("idle write");
+        let value = match &write.command {
+            Command::SetSetting { value, .. } => value.clone(),
+            other => panic!("calibration must send SetSetting, got {other:?}"),
+        };
+        state
+            .utilities
+            .calibration_mut()
+            .written(write.setting_number, &value, true);
+        assert_eq!(
+            state.utilities.calibration().stage(),
+            crate::utilities::CalibrationStage::Applied
+        );
+        assert!(
+            state
+                .utilities
+                .calibration()
+                .last_result()
+                .is_some_and(|text| text.contains("APPLIED $100"))
+        );
+
+        // The engine emits a fresh Settings snapshot after a verified write.
+        state
+            .settings
+            .apply_settings(&[ghs_engine::Setting::new(100, SettingValue::Float(253.807))]);
+        assert_eq!(
+            state.calibration_current_steps(CalibrationAxis::X),
+            Some(253.807)
+        );
+
+        let mut failed = calibration_ready_state();
+        let write = failed.take_calibration_write().expect("idle write");
+        failed.utilities.calibration_mut().written(
+            write.setting_number,
+            &SettingValue::Float(250.5),
+            false,
+        );
+        assert_eq!(
+            failed.utilities.calibration().stage(),
+            crate::utilities::CalibrationStage::Failed
+        );
+        assert!(
+            failed
+                .utilities
+                .calibration()
+                .last_result()
+                .is_some_and(|text| text.contains("previous 250.000"))
+        );
+        assert_eq!(
+            failed.calibration_current_steps(CalibrationAxis::X),
+            Some(250.0)
+        );
     }
 
     #[test]

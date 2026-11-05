@@ -546,6 +546,7 @@ impl LiveLink {
                 // Never leave a tool-change sheet behind a dead link.
                 state.job.interrupted();
                 state.settings.cancel_writes("disconnected");
+                state.utilities.calibration_mut().on_failure("disconnected");
                 state.startup_lines.on_disconnected();
                 state.pins.on_disconnected();
                 state.cancel_sleep_confirm();
@@ -588,6 +589,10 @@ impl LiveLink {
                         .settings
                         .mark_send_error(number, format!("ALARM:{code}"));
                 }
+                state
+                    .utilities
+                    .calibration_mut()
+                    .on_failure(format!("ALARM:{code}"));
                 state.push_console(ConsoleLevel::Error, format!("ALARM:{code}"));
                 true
             }
@@ -604,6 +609,10 @@ impl LiveLink {
                         format!("Setting ${number} rejected: {message}"),
                     );
                 }
+                state
+                    .utilities
+                    .calibration_mut()
+                    .on_failure(format!("controller error:{code}"));
                 state.push_console(ConsoleLevel::Error, format!("error:{code}"));
                 true
             }
@@ -643,6 +652,10 @@ impl LiveLink {
                 verified,
             } => {
                 state.settings.written(number, &value, verified);
+                state
+                    .utilities
+                    .calibration_mut()
+                    .written(number, &value, verified);
                 if verified {
                     state.push_console(
                         ConsoleLevel::Ok,
@@ -1397,6 +1410,75 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("$N0 VERIFIED")),
             "the verified read-back was not mapped to the console"
+        );
+        link.disconnect();
+    }
+
+    #[test]
+    fn demo_link_verifies_a_calibration_steps_write() {
+        use crate::utilities::{CalibrationAxis, CalibrationField, CalibrationStage};
+
+        let mut link = LiveLink::start_demo_with(DemoProgram::Pocket).expect("start demo engine");
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.calibration_gate().blocked_reason().is_none()
+                        && state
+                            .calibration_current_steps(CalibrationAxis::X)
+                            .is_some()
+                },
+                Duration::from_secs(10)
+            ),
+            "the demo controller did not report $100: {:?}",
+            state.settings.row(100).map(|row| row.current.clone())
+        );
+
+        {
+            let calibration = state.utilities.calibration_mut();
+            calibration
+                .set_field_text(CalibrationField::CommandedMm, "100")
+                .expect("commanded distance");
+            calibration
+                .set_field_text(CalibrationField::MeasuredMm, "98.5")
+                .expect("measured distance");
+        }
+        state.calculate_calibration().expect("proposal");
+        state.utilities.calibration_mut().set_confirmed(true);
+        let write = state.take_calibration_write().expect("idle write");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match link.send(write.command.clone()) {
+                Ok(()) => break,
+                Err(EngineError::Busy) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("calibration write failed: {error}"),
+            }
+        }
+
+        assert!(
+            wait_until(
+                || {
+                    link.poll(&mut state);
+                    state.utilities.calibration().stage() == CalibrationStage::Applied
+                        && state.calibration_current_steps(CalibrationAxis::X) == Some(253.807)
+                },
+                Duration::from_secs(10)
+            ),
+            "the calibration write was not verified: {:?} / {:?}",
+            state.utilities.calibration().stage(),
+            state.settings.row(100).map(|row| row.current.clone())
+        );
+        assert!(
+            state
+                .utilities
+                .calibration()
+                .last_result()
+                .is_some_and(|text| text.contains("APPLIED $100"))
         );
         link.disconnect();
     }

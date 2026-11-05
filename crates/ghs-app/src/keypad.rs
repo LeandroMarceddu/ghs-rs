@@ -115,6 +115,10 @@ pub fn overlay(
                         .hint
                         .clone()
                         .unwrap_or_else(|| t("UTILITY FIELD").to_string()),
+                    KeypadTarget::Calibration(_) => keypad
+                        .hint
+                        .clone()
+                        .unwrap_or_else(|| t("CALIBRATION DISTANCE (mm)").to_string()),
                 }),
         );
 
