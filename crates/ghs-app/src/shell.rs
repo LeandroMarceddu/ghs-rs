@@ -1004,6 +1004,11 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--viewer-3d") {
             shell.viewer.set_mode(viewer::ViewerMode::ThreeD);
         }
+        // Screenshot switch: hide the inferred stock box so the STOCK chip's
+        // off state can be captured. Viewer-only; it sends nothing.
+        if std::env::args().any(|arg| arg == "--viewer-stock-off") && shell.viewer.stock_visible() {
+            shell.viewer.toggle_stock();
+        }
         if shell.demo_probe_run
             || shell.demo_height_map
             || std::env::args().any(|arg| arg == "--demo-probe-check")
@@ -8271,6 +8276,7 @@ impl Shell {
         let marker = viewer::marker_mm3(self.state.profile.capabilities.units, &self.state.dro);
         let zoom = format!("{}%", self.viewer.zoom_percent());
         let mode = self.viewer.mode();
+        let stock_on = self.viewer.stock_visible();
 
         let fit_view = cx.entity();
         let fit = chip_button("viewer-fit", t("FIT"), p, move |_, cx| {
@@ -8311,6 +8317,9 @@ impl Shell {
                         p,
                         cx.entity(),
                     ))
+                    .when(mode.is_three_d(), |this| {
+                        this.child(stock_chip(stock_on, p, cx.entity()))
+                    })
                     .child(chip(path_label, p))
                     .when_some(segments, |this, segments| this.child(chip(&segments, p))),
             )
@@ -8327,32 +8336,40 @@ impl Shell {
                     .child(fit),
             )
             .child(
-                div()
+                v_flex()
                     .absolute()
                     .bottom(px(8.0))
                     .left(px(8.0))
-                    .flex()
-                    .items_center()
-                    .gap_3()
+                    .gap_1()
                     .px_2()
                     .py_1()
                     .rounded_lg()
                     .bg(p.panel.opacity(0.9))
                     .border_1()
                     .border_color(p.border)
-                    .child(legend(p.path_cut, t("Cut"), p))
-                    .child(legend(p.path_rapid, t("Rapid"), p))
-                    .child(legend(p.path_plunge, t("Plunge"), p))
-                    .when(mode.is_three_d(), |this| {
-                        this.child(
-                            div()
-                                .pl_3()
-                                .border_l_1()
-                                .border_color(p.border)
-                                .text_size(px(9.0))
-                                .text_color(p.text_faint)
-                                .child(t("DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM")),
-                        )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(legend(p.path_cut, t("Cut"), p))
+                            .child(legend(p.path_rapid, t("Rapid"), p))
+                            .child(legend(p.path_plunge, t("Plunge"), p))
+                            .when(mode.is_three_d(), |this| {
+                                this.child(
+                                    div()
+                                        .pl_3()
+                                        .border_l_1()
+                                        .border_color(p.border)
+                                        .text_size(px(9.0))
+                                        .text_color(p.text_faint)
+                                        .child(t("DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM")),
+                                )
+                            }),
+                    )
+                    .when(mode.is_three_d() && stock_on, |this| {
+                        this.child(div().text_size(px(9.0)).text_color(p.text_faint).child(t(
+                            "STOCK INFERRED FROM PROGRAM BOUNDS | NOT A MEASURED MODEL",
+                        )))
                     }),
             )
             .child(
@@ -21759,6 +21776,8 @@ fn demo_initial_screen_arg(arg: &str) -> bool {
                 | "--keymap"
                 | "--keypad"
                 | "--console-tab"
+                | "--viewer-3d"
+                | "--viewer-stock-off"
         )
 }
 
@@ -22380,6 +22399,37 @@ fn viewer_mode_chip(
             });
         })
         .child(candidate.label())
+}
+
+/// Stock-box toggle chip in the 3D viewer toolbar.
+///
+/// On is tinted with the accent, off stays subdued, and the label carries the
+/// state in text as well as colour. The click flips one viewer flag only: the
+/// chip never sends a controller command.
+fn stock_chip(on: bool, p: Palette, view: Entity<Shell>) -> impl IntoElement {
+    div()
+        .id("viewer-stock")
+        .px_2()
+        .h(px(22.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .rounded(px(5.0))
+        .bg(if on { p.accent_muted } else { p.panel_alt })
+        .border_1()
+        .border_color(if on { p.accent } else { p.border })
+        .text_size(px(10.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(if on { p.accent } else { p.text_dim })
+        .hover(|style| style.bg(p.raised_hover).text_color(p.text))
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                if this.viewer.toggle_stock() {
+                    cx.notify();
+                }
+            });
+        })
+        .child(if on { t("STOCK ON") } else { t("STOCK OFF") })
 }
 
 /// A chip-sized action button, used for the viewer FIT control.

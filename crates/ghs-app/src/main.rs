@@ -14,8 +14,10 @@
 //! loads (screenshot switch: it exercises the same path as the toolbar
 //! button). `--demo-check-confirm` opens the check-run confirmation without
 //! confirming it, and `--demo-check` presses CHECK then START CHECK through
-//! the same model actions for a dry-run status capture. `--viewer-3d` starts the job viewer in the orbit view; 2D top is
-//! the default. `--settings` opens the generated settings workspace directly;
+//! the same model actions for a dry-run status capture. `--viewer-3d` starts
+//! the job viewer in the orbit view; 2D top is the default.
+//! `--viewer-stock-off` hides the inferred stock box for a capture; it changes
+//! no controller state. `--settings` opens the generated settings workspace directly;
 //! `--settings-group=NAME` selects a reported group in that workspace;
 //! `--demo-settings-write` changes one safe integer through the normal
 //! pending/Apply/read-back path for the applied screenshot. `--offsets`,

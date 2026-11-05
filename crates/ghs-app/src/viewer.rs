@@ -6,8 +6,10 @@
 //! - [`ViewerMode::Top2D`] (the default) uses a [`Camera2D`] fitted to the
 //!   program bounds, a cached 2D [`RenderPlan`], and a world-space grid.
 //! - [`ViewerMode::ThreeD`] uses an orbit [`Camera3D`] with Z up, a cached 3D
-//!   [`RenderPlan`] painted far-to-near, and a ground grid plus work-envelope
-//!   box on the Z=0 plane.
+//!   [`RenderPlan`] painted far-to-near, a ground grid on Z=0, an inferred
+//!   translucent stock box, and a dashed work-envelope box. The stock is
+//!   inferred from the program bounds, never machine-measured, and the `STOCK`
+//!   chip toggles it.
 //!
 //! Both modes paint the live tool marker from the DRO work position. In 3D the
 //! marker is projected with [`Camera3D::project`], so it is hidden when it is
@@ -30,7 +32,7 @@ use std::sync::Arc;
 use ghs_gcode::Program;
 use ghs_viewer::{
     Bounds2, Bounds3, Camera2D, Camera3D, Point2, Point3, RenderOptions, RenderPlan, SegmentKind,
-    Toolpath, Viewport,
+    StockBox, Toolpath, Viewport,
 };
 use gpui_kit::{
     Bounds, Entity, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
@@ -64,6 +66,24 @@ const SYNTHETIC_SEGMENTS: usize = 6_000;
 
 /// Guard against a pathological camera producing an unbounded grid loop.
 const MAX_GRID_LINES: i64 = 512;
+
+/// Stock-footprint margin as a fraction of the larger XY path extent.
+const STOCK_MARGIN_FRACTION: f32 = 0.02;
+
+/// Minimum stock-footprint margin per side, in millimetres.
+///
+/// A zero-width or zero-depth path still gets a visible box.
+const STOCK_MARGIN_MIN_MM: f32 = 1.0;
+
+/// Clearance below the lowest path Z, in millimetres.
+const STOCK_BOTTOM_MARGIN_MM: f64 = 2.0;
+
+/// Clearance above the highest path Z when the whole path is at or above 0.
+const STOCK_ABOVE_TOP_MM: f64 = 2.0;
+
+/// Fallback stock height for a flat path entirely above the work plane, in
+/// millimetres.
+const STOCK_FLAT_HEIGHT_MM: f64 = 10.0;
 
 /// Which projection the viewer shows.
 ///
@@ -274,6 +294,22 @@ impl ViewerHandle {
     #[must_use]
     pub fn mode(&self) -> ViewerMode {
         self.inner.borrow().mode
+    }
+
+    /// Whether the inferred stock box is painted in the 3D view.
+    #[must_use]
+    pub fn stock_visible(&self) -> bool {
+        self.inner.borrow().stock_visible
+    }
+
+    /// Shows or hides the inferred stock box.
+    ///
+    /// This is a viewer-only toggle: it never sends a controller command.
+    /// Returns `true` when the state changed, so the caller can redraw.
+    pub fn toggle_stock(&self) -> bool {
+        let mut viewer = self.inner.borrow_mut();
+        viewer.stock_visible = !viewer.stock_visible;
+        true
     }
 
     /// Current zoom relative to the fitted scale, as a whole percentage.
@@ -547,6 +583,63 @@ pub fn grid_step_mm(scale_px_per_mm: f32) -> f32 {
     (decade * multiple).max(MIN_STEP_MM)
 }
 
+/// Infers a rectangular stock block from a program's world bounds.
+///
+/// This is a **viewer inference**, not machine-measured stock and not a
+/// digital twin of the material on the table. The footprint is the toolpath XY
+/// bounds expanded by 2% of the larger XY extent per side, with a 1 mm
+/// minimum so a zero-width or zero-depth path still gets a visible box.
+///
+/// The top follows the usual work-zero convention:
+///
+/// - any path Z below 0 puts the top at Z=0;
+/// - a path entirely at or above 0 puts the top 2 mm above its highest point;
+/// - an entirely above-zero **flat** path falls back to a 10 mm block beneath
+///   that top, so the box is always thick enough to read.
+///
+/// The bottom is 2 mm below the lowest path Z. Returns `None` for empty or
+/// non-finite bounds, and when [`StockBox::from_bounds`] rejects the result.
+#[must_use]
+pub fn stock_for_bounds(world: Bounds3) -> Option<StockBox> {
+    if world.is_empty() {
+        return None;
+    }
+    let min = world.min();
+    let max = world.max();
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+
+    let larger_xy_extent = (max.x - min.x).max(max.y - min.y);
+    let margin = (larger_xy_extent * STOCK_MARGIN_FRACTION).max(STOCK_MARGIN_MIN_MM);
+    if !margin.is_finite() {
+        return None;
+    }
+    // Keep the path Z values in the bounds so the margin arithmetic is
+    // checked by `Bounds3::new`; `from_bounds` only reads X and Y.
+    let footprint = Bounds3::new(
+        Point3::new(min.x - margin, min.y - margin, min.z),
+        Point3::new(max.x + margin, max.y + margin, max.z),
+    );
+    if footprint.is_empty() {
+        return None;
+    }
+
+    let entirely_above_zero = min.z >= 0.0;
+    let flat = max.z - min.z <= 1.0e-6;
+    let top_z_mm = if entirely_above_zero {
+        f64::from(max.z) + STOCK_ABOVE_TOP_MM
+    } else {
+        0.0
+    };
+    let height_mm = if entirely_above_zero && flat {
+        STOCK_FLAT_HEIGHT_MM
+    } else {
+        top_z_mm - (f64::from(min.z) - STOCK_BOTTOM_MARGIN_MM)
+    };
+    StockBox::from_bounds(footprint, top_z_mm, height_mm)
+}
+
 /// Converts a window-space pointer position into canvas-local coordinates.
 fn local_point(rect: Bounds<Pixels>, at: Point<Pixels>) -> Point2 {
     Point2::new(
@@ -647,7 +740,6 @@ impl PlanKey3D {
 }
 
 /// Mutable viewer state shared through [`ViewerHandle`].
-#[derive(Default)]
 struct Viewer {
     /// Active projection; 2D is the default.
     mode: ViewerMode,
@@ -657,6 +749,8 @@ struct Viewer {
     path_bounds: Bounds2,
     /// World bounds of the current toolpath, for the 3D envelope box.
     path_bounds3: Bounds3,
+    /// Whether the inferred stock box is painted in 3D; on by default.
+    stock_visible: bool,
     /// Identity of the program the camera is fitted to; `0` is synthetic.
     identity: usize,
     /// Camera scale produced by the last 2D fit, for the zoom readout.
@@ -681,6 +775,33 @@ struct Viewer {
     /// Number of 3D plans built; a test seam for the caching contract.
     #[cfg(test)]
     plan_builds_3d: u32,
+}
+
+impl Default for Viewer {
+    fn default() -> Self {
+        Self {
+            mode: ViewerMode::default(),
+            camera: Camera2D::default(),
+            camera3d: Camera3D::default(),
+            path_bounds: Bounds2::default(),
+            path_bounds3: Bounds3::default(),
+            stock_visible: true,
+            identity: 0,
+            fit_scale: 0.0,
+            fit_distance3d: 0.0,
+            pending_fit: false,
+            pending_fit_3d: false,
+            rect: None,
+            drag: None,
+            synthetic: None,
+            cache: PlanCache::default(),
+            cache3d: PlanCache3D::default(),
+            #[cfg(test)]
+            plan_builds: 0,
+            #[cfg(test)]
+            plan_builds_3d: 0,
+        }
+    }
 }
 
 impl Viewer {
@@ -774,6 +895,12 @@ fn paint(
     if viewer.mode.is_three_d() {
         let camera3d = viewer.camera3d;
         paint_ground_grid_3d(&camera3d, viewer.path_bounds3, bounds, palette, window);
+        if viewer.stock_visible
+            && program.is_some()
+            && let Some(stock) = stock_for_bounds(viewer.path_bounds3)
+        {
+            paint_stock_3d(&camera3d, &stock, bounds, palette, window);
+        }
         if !viewer.path_bounds3.is_empty() {
             paint_envelope_3d(&camera3d, viewer.path_bounds3, bounds, palette, window);
         }
@@ -1053,6 +1180,77 @@ fn paint_ground_grid_3d(
         );
     }
     paint_path(axes, palette.border_strong.alpha(0.9), window);
+}
+
+/// Paints the inferred stock box as translucent faces.
+///
+/// Only faces whose outward normal points toward the camera eye are painted,
+/// far-to-near, so the box reads as a solid volume without a depth buffer.
+/// The stock is painted after the ground grid and before the envelope and
+/// toolpath, and its low-alpha fill never hides those later layers. One corner
+/// behind the near plane skips the whole box: a partial box would read as a
+/// smaller stock block.
+fn paint_stock_3d(
+    camera: &Camera3D,
+    stock: &StockBox,
+    bounds: Bounds<Pixels>,
+    palette: Palette,
+    window: &mut Window,
+) {
+    let corners = stock.corners();
+    let mut screen = [Point2::ZERO; 8];
+    for (slot, corner) in screen.iter_mut().zip(corners) {
+        let Some((x, y)) = project_window(camera, bounds, corner) else {
+            return;
+        };
+        *slot = Point2::new(x, y);
+    }
+
+    for face in visible_stock_faces(stock, camera) {
+        let mut fill_path = PathBuilder::fill();
+        fill_path.move_to(point(px(screen[face[0]].x), px(screen[face[0]].y)));
+        for &index in &face[1..] {
+            fill_path.line_to(point(px(screen[index].x), px(screen[index].y)));
+        }
+        fill_path.close();
+        paint_path(fill_path, palette.text_faint.alpha(0.10), window);
+
+        let mut outline = PathBuilder::stroke(px(1.0));
+        outline.move_to(point(px(screen[face[0]].x), px(screen[face[0]].y)));
+        for &index in &face[1..] {
+            outline.line_to(point(px(screen[index].x), px(screen[index].y)));
+        }
+        outline.close();
+        paint_path(outline, palette.border_strong.alpha(0.42), window);
+    }
+}
+
+/// Face indices of `stock` whose outward normal points toward the camera eye,
+/// sorted far-to-near by camera-space depth.
+///
+/// The indices refer to [`StockBox::faces`]. A face exactly edge-on is omitted,
+/// which is invisible at one pixel anyway and keeps the count bounded at three
+/// for a camera outside the box.
+fn visible_stock_faces(stock: &StockBox, camera: &Camera3D) -> Vec<[usize; 4]> {
+    let eye = camera.eye();
+    let forward = camera.forward();
+    let corners = stock.corners();
+    let mut visible: Vec<([usize; 4], f32)> = Vec::with_capacity(3);
+    for face in stock.faces() {
+        let points = face.map(|index| corners[index]);
+        let normal = (points[1] - points[0]).cross(points[2] - points[0]);
+        let center = Point3::new(
+            (points[0].x + points[1].x + points[2].x + points[3].x) * 0.25,
+            (points[0].y + points[1].y + points[2].y + points[3].y) * 0.25,
+            (points[0].z + points[1].z + points[2].z + points[3].z) * 0.25,
+        );
+        if normal.dot(eye - center) <= 0.0 {
+            continue;
+        }
+        visible.push((face, (center - eye).dot(forward)));
+    }
+    visible.sort_by(|a, b| b.1.total_cmp(&a.1));
+    visible.into_iter().map(|(face, _)| face).collect()
 }
 
 /// Paints the toolpath bounds as a dashed 3D box.
@@ -2024,5 +2222,186 @@ mod tests {
         // Switching back keeps the 2D zoom, and its readout.
         assert!(handle.set_mode(ViewerMode::Top2D));
         assert_eq!(handle.zoom_percent(), zoomed_2d);
+    }
+
+    // ------------------------------------------------------------ stock box
+
+    #[test]
+    fn stock_below_zero_sits_on_the_work_plane() {
+        let world = Bounds3::new(Point3::new(0.0, 0.0, -5.0), Point3::new(40.0, 20.0, -1.0));
+        let stock = stock_for_bounds(world).expect("inferred stock");
+        assert_eq!(stock.max.z, 0.0, "the top must follow work zero");
+        assert_eq!(stock.min.z, -7.0, "the bottom must clear the deepest cut");
+        assert_eq!(stock.height_mm(), 7.0);
+        // The larger XY extent is 40 mm, so 2% is below the 1 mm minimum.
+        assert_eq!(stock.min.x, -1.0);
+        assert_eq!(stock.max.x, 41.0);
+        assert_eq!(stock.min.y, -1.0);
+        assert_eq!(stock.max.y, 21.0);
+        for corner in corners(world) {
+            assert!(stock.contains(corner), "path corner {corner:?} is outside");
+        }
+    }
+
+    #[test]
+    fn stock_above_zero_caps_the_highest_path_point() {
+        let world = Bounds3::new(Point3::new(-10.0, -5.0, 5.0), Point3::new(30.0, 15.0, 10.0));
+        let stock = stock_for_bounds(world).expect("inferred stock");
+        assert_eq!(stock.max.z, 12.0, "top must clear the path by 2 mm");
+        assert_eq!(stock.min.z, 3.0, "bottom must clear the path by 2 mm");
+        assert_eq!(stock.height_mm(), 9.0);
+        for corner in corners(world) {
+            assert!(stock.contains(corner), "path corner {corner:?} is outside");
+        }
+    }
+
+    #[test]
+    fn flat_and_zero_extent_paths_still_make_a_visible_box() {
+        // A single-point path has zero X, Y, and Z extent.
+        let point = Bounds3::from_point(Point3::new(7.0, -3.0, 5.0));
+        let stock = stock_for_bounds(point).expect("single-point stock");
+        assert_eq!(stock.xy_bounds().width(), 2.0);
+        assert_eq!(stock.xy_bounds().height(), 2.0);
+        assert_eq!(stock.max.z, 7.0);
+        assert_eq!(stock.min.z, -3.0, "flat above zero uses the 10 mm block");
+        assert_eq!(stock.height_mm(), 10.0);
+        assert!(stock.contains(Point3::new(7.0, -3.0, 5.0)));
+
+        // A long straight line has zero depth but still gets a visible width.
+        let line = Bounds3::new(Point3::new(-50.0, 0.0, -2.0), Point3::new(50.0, 0.0, -2.0));
+        let stock = stock_for_bounds(line).expect("line stock");
+        // The 100 mm extent sets a 2 mm per-side margin; depth stays visible.
+        assert_eq!(stock.xy_bounds().height(), 4.0);
+        assert_eq!(stock.xy_bounds().width(), 104.0);
+    }
+
+    #[test]
+    fn empty_non_finite_and_overflowing_bounds_infer_no_stock() {
+        assert!(stock_for_bounds(Bounds3::empty()).is_none());
+        for (min, max) in [
+            (Point3::new(f32::NAN, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0)),
+            (
+                Point3::new(0.0, f32::INFINITY, 0.0),
+                Point3::new(1.0, 1.0, 1.0),
+            ),
+            (
+                Point3::new(0.0, 0.0, f32::NEG_INFINITY),
+                Point3::new(1.0, 1.0, 1.0),
+            ),
+            (
+                Point3::new(f32::MIN, 0.0, 0.0),
+                Point3::new(f32::MAX, 1.0, 1.0),
+            ),
+        ] {
+            assert!(
+                stock_for_bounds(Bounds3::new(min, max)).is_none(),
+                "inferred stock from {min:?}..{max:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stock_top_bottom_and_height_follow_the_work_zero_rule() {
+        let cases = [
+            // (min_z, max_z, top_z, bottom_z, height_mm)
+            (-5.0, -1.0, 0.0, -7.0, 7.0),
+            (-5.0, 0.0, 0.0, -7.0, 7.0),
+            (0.0, 0.0, 2.0, -8.0, 10.0),
+            (0.0, 10.0, 12.0, -2.0, 14.0),
+            (5.0, 10.0, 12.0, 3.0, 9.0),
+            (5.0, 5.0, 7.0, -3.0, 10.0),
+        ];
+        for (min_z, max_z, top_z, bottom_z, height_mm) in cases {
+            let world = Bounds3::new(Point3::new(0.0, 0.0, min_z), Point3::new(40.0, 20.0, max_z));
+            let stock = stock_for_bounds(world)
+                .unwrap_or_else(|| panic!("no stock for z {min_z}..{max_z}"));
+            assert_eq!(stock.max.z, top_z, "top for z {min_z}..{max_z}");
+            assert_eq!(stock.min.z, bottom_z, "bottom for z {min_z}..{max_z}");
+            assert_eq!(
+                stock.height_mm(),
+                height_mm,
+                "height for z {min_z}..{max_z}"
+            );
+            assert!(stock.height_mm() > 0.0);
+        }
+    }
+
+    #[test]
+    fn stock_toggle_defaults_on_and_flips_both_ways() {
+        let handle = ViewerHandle::new();
+        assert!(handle.stock_visible(), "stock must default to visible");
+        assert!(handle.toggle_stock());
+        assert!(!handle.stock_visible());
+        assert!(handle.toggle_stock());
+        assert!(handle.stock_visible());
+    }
+
+    #[test]
+    fn visible_stock_faces_are_the_top_and_two_sides_never_back_faces() {
+        let world = Bounds3::new(
+            Point3::new(-20.0, -10.0, -5.0),
+            Point3::new(20.0, 10.0, 0.0),
+        );
+        let stock = stock_for_bounds(world).expect("inferred stock");
+        let camera = Camera3D::fitted(Viewport::new(800.0, 600.0), stock.bounds(), VIEW_PADDING_PX);
+        let faces = visible_stock_faces(&stock, &camera);
+        let table = stock.faces();
+        assert_eq!(
+            faces,
+            vec![table[1], table[2], table[3]],
+            "expected top, -Y, and +X far-to-near"
+        );
+
+        let points = stock.corners();
+        let center = stock.bounds().center();
+        for face in &faces {
+            let quad = face.map(|index| points[index]);
+            let normal = (quad[1] - quad[0]).cross(quad[2] - quad[0]);
+            let face_center = (quad[0] + quad[1] + quad[2] + quad[3]) * 0.25;
+            assert!(
+                normal.dot(face_center - center) > 0.0,
+                "selected face {face:?} is not outward-facing"
+            );
+            assert!(
+                normal.dot(camera.eye() - face_center) > 0.0,
+                "selected face {face:?} points away from the camera"
+            );
+        }
+        for back in [table[0], table[4], table[5]] {
+            assert!(!faces.contains(&back), "back face {back:?} was selected");
+        }
+    }
+
+    #[test]
+    fn stock_toggle_is_viewer_only_and_leaves_camera_and_plan_alone() {
+        let handle = ViewerHandle::new();
+        assert!(handle.set_mode(ViewerMode::ThreeD));
+        let program = program("G0 X0 Y0 Z5\nG1 Z-2 F200\nG1 X40 F800\nG1 Y20\n");
+        let bounds = test_bounds(800.0, 600.0);
+        let (camera, key, builds, mode) = {
+            let mut viewer = handle.inner.borrow_mut();
+            viewer.prepare(bounds.size, Some(&program));
+            (
+                viewer.camera3d,
+                viewer.cache3d.key,
+                viewer.plan_builds_3d,
+                viewer.mode,
+            )
+        };
+
+        // The toggle owns one viewer flag only: no camera, plan, program, or
+        // controller action is involved (the viewer has no engine handle).
+        assert!(handle.toggle_stock());
+        assert!(!handle.stock_visible());
+        {
+            let mut viewer = handle.inner.borrow_mut();
+            viewer.prepare(bounds.size, Some(&program));
+            assert_eq!(viewer.camera3d, camera);
+            assert_eq!(viewer.cache3d.key, key);
+            assert_eq!(viewer.plan_builds_3d, builds);
+            assert_eq!(viewer.mode, mode);
+        }
+        assert!(handle.toggle_stock());
+        assert!(handle.stock_visible());
     }
 }
