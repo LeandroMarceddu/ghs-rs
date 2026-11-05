@@ -531,6 +531,11 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
         "Eén stap per druk; uit tijdens typen. STANDAARD HERSTELLEN zet terug.",
     ),
     (
+        "Tap for one step; hold a mapped jog key to jog continuously. Off while typing.",
+        "Tik voor één stap; houd een toegewezen jogtoets ingedrukt om continu te joggen. \
+        Uit tijdens typen.",
+    ),
+    (
         "Named single-line MDI commands, saved in this controller profile. RUN sends only \
         after a click; CONFIRM macros require a second explicit confirmation.",
         "Benoemde MDI-opdrachten van één regel, opgeslagen in dit controllerprofiel. \

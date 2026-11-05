@@ -521,6 +521,10 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
         "One step per press; off while typing. RESET DEFAULTS restores.",
     ),
     (
+        "Tap for one step; hold a mapped jog key to jog continuously. Off while typing.",
+        "Tap for one step; hold a mapped jog key to jog continuously. Off while typing.",
+    ),
+    (
         "Named single-line MDI commands, saved in this controller profile. RUN sends only \
         after a click; CONFIRM macros require a second explicit confirmation.",
         "Named single-line MDI commands, saved in this controller profile. RUN sends only \

@@ -543,6 +543,11 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
         ripristina.",
     ),
     (
+        "Tap for one step; hold a mapped jog key to jog continuously. Off while typing.",
+        "Tocca per un passo; tieni premuto un tasto di jog mappato per jog continuo. \
+        Disattivato durante la digitazione.",
+    ),
+    (
         "Named single-line MDI commands, saved in this controller profile. RUN sends only \
         after a click; CONFIRM macros require a second explicit confirmation.",
         "Comandi MDI a riga singola con nome, salvati in questo profilo controller. ESEGUI \
