@@ -316,7 +316,7 @@ mod tests {
             feed_mm_min: 180.0,
             retract_mm: 1.25,
             probe_diameter_mm: 5.0,
-            edge_offset_mm: -0.75,
+            edge_offset_mm: 0.75,
             plate_thickness_mm: 11.5,
         };
         data

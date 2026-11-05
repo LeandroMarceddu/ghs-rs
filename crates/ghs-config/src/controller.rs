@@ -722,10 +722,12 @@ impl ProbeDefaultsRecord {
     /// # Errors
     ///
     /// Returns [`ValidationError::NonFiniteProbeDefault`] when a value is NaN or
-    /// infinite, [`ValidationError::ProbeDefaultNotPositive`] when search or
-    /// feed is zero or negative, and
+    /// infinite, [`ValidationError::ProbeDefaultNotPositive`] when search,
+    /// feed, or retract is zero or negative, and
     /// [`ValidationError::ProbeDefaultOutOfRange`] when a value is outside its
     /// documented inclusive range.
+    /// Only a zero probe diameter and zero plate thickness are accepted as
+    /// non-positive values, matching the probe engine.
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_probe_default_range(
             "safe_z_mm",
@@ -739,7 +741,7 @@ impl ProbeDefaultsRecord {
             MAX_PROBE_SEARCH_DISTANCE_MM,
         )?;
         validate_probe_default_positive("feed_mm_min", self.feed_mm_min, MAX_PROBE_FEED_MM_MIN)?;
-        validate_probe_default_range("retract_mm", self.retract_mm, 0.0, MAX_PROBE_RETRACT_MM)?;
+        validate_probe_default_positive("retract_mm", self.retract_mm, MAX_PROBE_RETRACT_MM)?;
         validate_probe_default_range(
             "probe_diameter_mm",
             self.probe_diameter_mm,
@@ -749,7 +751,7 @@ impl ProbeDefaultsRecord {
         validate_probe_default_range(
             "edge_offset_mm",
             self.edge_offset_mm,
-            -MAX_PROBE_EDGE_OFFSET_MM,
+            0.0,
             MAX_PROBE_EDGE_OFFSET_MM,
         )?;
         validate_probe_default_range(
@@ -1313,7 +1315,7 @@ mod tests {
             feed_mm_min: 150.0,
             retract_mm: 2.5,
             probe_diameter_mm: 4.0,
-            edge_offset_mm: -1.5,
+            edge_offset_mm: 1.5,
             plate_thickness_mm: 12.0,
         };
 
@@ -1910,7 +1912,7 @@ mod tests {
             feed_mm_min: 250.0,
             retract_mm: 3.5,
             probe_diameter_mm: 6.0,
-            edge_offset_mm: -2.5,
+            edge_offset_mm: 2.5,
             plate_thickness_mm: 12.0,
         };
         defaults.validate().expect("valid");
@@ -1986,7 +1988,7 @@ mod tests {
             (
                 "retract_mm",
                 |record, value| record.retract_mm = value,
-                0.0,
+                f64::MIN_POSITIVE,
                 MAX_PROBE_RETRACT_MM,
             ),
             (
@@ -1998,7 +2000,7 @@ mod tests {
             (
                 "edge_offset_mm",
                 |record, value| record.edge_offset_mm = value,
-                -MAX_PROBE_EDGE_OFFSET_MM,
+                0.0,
                 MAX_PROBE_EDGE_OFFSET_MM,
             ),
             (
@@ -2022,7 +2024,7 @@ mod tests {
     #[test]
     fn probe_defaults_reject_zero_negative_and_over_max_values() {
         type Mutation = fn(&mut ProbeDefaultsRecord);
-        let cases: [(&str, Mutation); 16] = [
+        let cases: [(&str, Mutation); 18] = [
             ("safe_z_mm", |record| {
                 record.safe_z_mm = MAX_PROBE_SAFE_Z_MM + 1.0
             }),
@@ -2043,6 +2045,7 @@ mod tests {
             ("feed_mm_min", |record| {
                 record.feed_mm_min = MAX_PROBE_FEED_MM_MIN + 1.0
             }),
+            ("retract_mm", |record| record.retract_mm = 0.0),
             ("retract_mm", |record| record.retract_mm = -1.0),
             ("retract_mm", |record| {
                 record.retract_mm = MAX_PROBE_RETRACT_MM + 0.5
@@ -2053,6 +2056,7 @@ mod tests {
             ("probe_diameter_mm", |record| {
                 record.probe_diameter_mm = MAX_PROBE_DIAMETER_MM + 0.5
             }),
+            ("edge_offset_mm", |record| record.edge_offset_mm = -0.001),
             ("edge_offset_mm", |record| {
                 record.edge_offset_mm = -MAX_PROBE_EDGE_OFFSET_MM - 1.0
             }),
