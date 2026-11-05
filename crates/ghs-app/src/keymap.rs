@@ -19,6 +19,9 @@
 //! Binding a profile keymap only adds GPUI bindings. It never dispatches an
 //! action, starts a job, or jogs an axis by itself. Every key press still goes
 //! through the same gates and commands as the on-screen buttons.
+//!
+//! Mapped jog keys are press-and-hold: the first key-down sends one step, the
+//! hold repeats at [`JOG_REPEAT`], and a genuine release sends `JogCancel`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -218,6 +221,194 @@ pub enum MachineIntent {
     Resume,
     /// Stop the active job.
     Stop,
+}
+
+/// How often a held continuous jog re-issues its step.
+///
+/// Shared by the pointer jog button and the mapped keyboard hold.
+pub const JOG_REPEAT: Duration = Duration::from_millis(120);
+
+/// A release earlier than this is a click, not a hold: keep the one-step jog
+/// instead of cancelling it.
+///
+/// This also keeps a touch tap working, because GPUI delivers a touch tap's
+/// mouse down and up together.
+pub const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
+
+/// One incremental jog step requested by a keyboard hold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JogStep {
+    /// Axis addressed by the mapped action, never the jog panel selection.
+    pub axis: JogAxis,
+    /// `-1.0` or `1.0`.
+    pub sign: f64,
+}
+
+/// A motion command produced by a keyboard jog gesture.
+///
+/// The keyboard path can only ask for one incremental step or a jog cancel; it
+/// never produces a start, resume, or program load.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyboardJogMotion {
+    /// Send one incremental `$J` step.
+    Step(JogStep),
+    /// Send `JogCancel` (0x85).
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KeyboardJogHold {
+    action: MachineAction,
+    step: JogStep,
+    started: Instant,
+    last_step: Instant,
+}
+
+/// Keyboard press-and-hold jog state.
+///
+/// One mapped jog key owns the hold at a time. OS key repeat for the same key
+/// is ignored; pressing another jog key ends the previous hold first. The
+/// caller sends the returned motions; this type never talks to the engine.
+#[derive(Clone, Debug, Default)]
+pub struct KeyboardJog {
+    hold: Option<KeyboardJogHold>,
+}
+
+impl KeyboardJog {
+    /// Whether a mapped jog key is currently held.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    /// Action that owns the hold, when one is active.
+    #[must_use]
+    pub fn action(&self) -> Option<MachineAction> {
+        self.hold.map(|hold| hold.action)
+    }
+
+    /// Mapped axis/sign that repeats while the key is held.
+    #[must_use]
+    pub fn step(&self) -> Option<JogStep> {
+        self.hold.map(|hold| hold.step)
+    }
+
+    /// Record one keyboard jog press.
+    ///
+    /// Returns the motions to send, or `None` for a non-jog action or an OS
+    /// key repeat of the key already held. A different jog key ends the old
+    /// hold; its cancel is the first motion when that hold was long enough to
+    /// be a genuine hold.
+    #[must_use]
+    pub fn press(&mut self, action: MachineAction, now: Instant) -> Option<Vec<KeyboardJogMotion>> {
+        let MachineIntent::Jog { axis, sign } = action.intent() else {
+            return None;
+        };
+        if self.hold.is_some_and(|hold| hold.action == action) {
+            return None;
+        }
+        let mut motions = Vec::with_capacity(2);
+        if let Some(previous) = self.hold.take()
+            && jog_release_cancels(true, now.saturating_duration_since(previous.started))
+        {
+            motions.push(KeyboardJogMotion::Cancel);
+        }
+        let step = JogStep { axis, sign };
+        self.hold = Some(KeyboardJogHold {
+            action,
+            step,
+            started: now,
+            last_step: now,
+        });
+        motions.push(KeyboardJogMotion::Step(step));
+        Some(motions)
+    }
+
+    /// Release one action-specific hold.
+    ///
+    /// Returns `None` when another action owns the hold. An empty vector is a
+    /// quick tap: its single step stands.
+    fn release(&mut self, action: MachineAction, now: Instant) -> Option<Vec<KeyboardJogMotion>> {
+        let hold = self.hold?;
+        if hold.action != action {
+            return None;
+        }
+        self.hold = None;
+        Some(release_motions(hold, now))
+    }
+
+    /// Release the hold when its physical key went up.
+    ///
+    /// Matching ignores modifiers because the key-up order may release Ctrl or
+    /// Shift first. Only the action bound to that physical key is released.
+    #[must_use]
+    pub fn release_key(
+        &mut self,
+        key: &str,
+        active: &[(MachineAction, String)],
+        now: Instant,
+    ) -> Option<Vec<KeyboardJogMotion>> {
+        let action = self.action()?;
+        if !key_matches_action(action, key, active) {
+            return None;
+        }
+        self.release(action, now)
+    }
+
+    /// Release whatever is held, for focus loss, disconnect, or a gate change.
+    #[must_use]
+    pub fn release_any(&mut self, now: Instant) -> Option<Vec<KeyboardJogMotion>> {
+        let action = self.action()?;
+        self.release(action, now)
+    }
+
+    /// Whether the next repeat step is due at `now`.
+    #[must_use]
+    pub fn repeat_due(&self, now: Instant) -> bool {
+        self.hold
+            .is_some_and(|hold| now.saturating_duration_since(hold.last_step) >= JOG_REPEAT)
+    }
+
+    /// Record that the repeat step was sent at `now`.
+    pub fn note_repeat(&mut self, now: Instant) {
+        if let Some(hold) = self.hold.as_mut() {
+            hold.last_step = now;
+        }
+    }
+}
+
+fn release_motions(hold: KeyboardJogHold, now: Instant) -> Vec<KeyboardJogMotion> {
+    if jog_release_cancels(true, now.saturating_duration_since(hold.started)) {
+        vec![KeyboardJogMotion::Cancel]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether a released gesture should cancel motion.
+///
+/// A quick tap keeps its single step; a continuous gesture held for at least
+/// [`JOG_CANCEL_AFTER`] sends `JogCancel` (0x85).
+#[must_use]
+pub fn jog_release_cancels(continuous: bool, held_for: Duration) -> bool {
+    continuous && held_for >= JOG_CANCEL_AFTER
+}
+
+/// Start a keyboard jog hold only when the same gates as a button pass.
+///
+/// Returns the motions to send, or `None` when the gate refuses. A refused key
+/// press never starts a hold and never produces motion.
+#[must_use]
+pub fn press_keyboard_jog(
+    jog: &mut KeyboardJog,
+    action: MachineAction,
+    gate: &KeyboardGate,
+    now: Instant,
+) -> Option<Vec<KeyboardJogMotion>> {
+    if refusal(action.intent(), gate).is_some() {
+        return None;
+    }
+    jog.press(action, now)
 }
 
 /// A snapshot of the gates that decide whether a hotkey may act.
@@ -746,6 +937,21 @@ fn key_name(keys: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Whether `key` is the physical key bound to `action`.
+///
+/// Only the key name is compared. A key-up may be delivered after Ctrl or
+/// Shift was released, so the modifier set cannot be required to match.
+fn key_matches_action(
+    action: MachineAction,
+    key: &str,
+    active: &[(MachineAction, String)],
+) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    active
+        .iter()
+        .any(|(candidate, keys)| *candidate == action && key_name(keys) == key)
+}
+
 /// Map a key-down event to one active machine action, if any.
 #[must_use]
 pub fn action_for_keystroke(
@@ -1113,5 +1319,289 @@ mod tests {
                 .map(|(_, keys)| keys.as_str()),
             Some("f6")
         );
+    }
+
+    // ------------------------------------------------------ keyboard jog hold
+
+    fn jog_step(axis: JogAxis, sign: f64) -> KeyboardJogMotion {
+        KeyboardJogMotion::Step(JogStep { axis, sign })
+    }
+
+    fn active_bindings() -> Vec<(MachineAction, String)> {
+        KeymapModel::default().effective_bindings(LINUX)
+    }
+
+    #[test]
+    fn keyboard_tap_sends_one_step_and_no_cancel() {
+        let active = active_bindings();
+        let mut jog = KeyboardJog::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            jog.press(MachineAction::JogXPlus, start),
+            Some(vec![jog_step(JogAxis::X, 1.0)])
+        );
+        assert_eq!(
+            jog.release_key("right", &active, start + Duration::from_millis(100)),
+            Some(Vec::new()),
+            "a quick tap keeps its single step"
+        );
+        assert!(!jog.is_active());
+    }
+
+    #[test]
+    fn keyboard_hold_repeats_at_the_interval_and_releases_one_cancel() {
+        let active = active_bindings();
+        let mut jog = KeyboardJog::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            jog.press(MachineAction::JogYMinus, start),
+            Some(vec![jog_step(JogAxis::Y, -1.0)])
+        );
+        assert!(!jog.repeat_due(start + JOG_REPEAT - Duration::from_millis(1)));
+        let first_repeat = start + JOG_REPEAT;
+        assert!(jog.repeat_due(first_repeat));
+        assert_eq!(
+            jog.step(),
+            Some(JogStep {
+                axis: JogAxis::Y,
+                sign: -1.0,
+            })
+        );
+        jog.note_repeat(first_repeat);
+        assert!(!jog.repeat_due(first_repeat + JOG_REPEAT - Duration::from_millis(1)));
+        assert!(jog.repeat_due(first_repeat + JOG_REPEAT));
+
+        let release = jog.release_key(
+            "down",
+            &active,
+            first_repeat + JOG_REPEAT + Duration::from_millis(60),
+        );
+        assert_eq!(release, Some(vec![KeyboardJogMotion::Cancel]));
+        assert!(!jog.is_active());
+    }
+
+    #[test]
+    fn duplicate_keyboard_press_keeps_one_hold() {
+        let mut jog = KeyboardJog::default();
+        let start = Instant::now();
+
+        assert!(jog.press(MachineAction::JogXMinus, start).is_some());
+        let held = jog.step();
+        assert_eq!(
+            jog.press(MachineAction::JogXMinus, start + Duration::from_millis(40)),
+            None,
+            "OS key repeat never starts a second hold or step"
+        );
+        assert_eq!(jog.step(), held);
+        assert_eq!(jog.action(), Some(MachineAction::JogXMinus));
+        assert!(jog.is_active());
+    }
+
+    #[test]
+    fn switching_jog_keys_ends_the_previous_hold() {
+        let start = Instant::now();
+        let mut jog = KeyboardJog::default();
+
+        assert!(jog.press(MachineAction::JogXPlus, start).is_some());
+        let switch = start + JOG_CANCEL_AFTER + Duration::from_millis(50);
+        assert_eq!(
+            jog.press(MachineAction::JogZPlus, switch),
+            Some(vec![KeyboardJogMotion::Cancel, jog_step(JogAxis::Z, 1.0)]),
+            "the genuine old hold is cancelled before the new step"
+        );
+        assert_eq!(jog.action(), Some(MachineAction::JogZPlus));
+        assert_eq!(
+            jog.step(),
+            Some(JogStep {
+                axis: JogAxis::Z,
+                sign: 1.0,
+            })
+        );
+
+        let quick = start + JOG_CANCEL_AFTER + Duration::from_millis(60);
+        assert_eq!(
+            jog.press(MachineAction::JogXMinus, quick),
+            Some(vec![jog_step(JogAxis::X, -1.0)]),
+            "a quick switch ends the old hold without a cancel"
+        );
+        assert_eq!(jog.action(), Some(MachineAction::JogXMinus));
+    }
+
+    #[test]
+    fn key_up_releases_only_the_matching_action() {
+        let active = active_bindings();
+        let mut jog = KeyboardJog::default();
+        let start = Instant::now();
+
+        assert!(jog.press(MachineAction::JogYPlus, start).is_some());
+        assert_eq!(
+            jog.release_key("right", &active, start + Duration::from_secs(1)),
+            None,
+            "the X key does not release a held Y key"
+        );
+        assert_eq!(jog.action(), Some(MachineAction::JogYPlus));
+        assert_eq!(
+            jog.release_key("up", &active, start + Duration::from_secs(1)),
+            Some(vec![KeyboardJogMotion::Cancel])
+        );
+        assert!(!jog.is_active());
+    }
+
+    #[test]
+    fn focus_loss_releases_a_genuine_hold_with_one_cancel() {
+        let mut jog = KeyboardJog::default();
+        let start = Instant::now();
+
+        assert!(jog.press(MachineAction::JogXMinus, start).is_some());
+        assert_eq!(
+            jog.release_any(start + JOG_CANCEL_AFTER),
+            Some(vec![KeyboardJogMotion::Cancel])
+        );
+        assert!(!jog.is_active());
+        assert_eq!(
+            jog.release_any(start + Duration::from_secs(2)),
+            None,
+            "a second release is a no-op"
+        );
+    }
+
+    #[test]
+    fn refused_keyboard_jog_starts_nothing() {
+        let now = Instant::now();
+        let action = MachineAction::JogXPlus;
+
+        let mut mock = gate();
+        mock.live = false;
+        let mut not_ready = gate();
+        not_ready.ready = false;
+        let mut alarm = gate();
+        alarm.machine = MachineState::Alarm;
+        let mut door = gate();
+        door.machine = MachineState::Door;
+        let mut running = gate();
+        running.job = JobState::Running;
+
+        for refused in [mock, not_ready, alarm, door, running] {
+            let mut jog = KeyboardJog::default();
+            assert_eq!(
+                press_keyboard_jog(&mut jog, action, &refused, now),
+                None,
+                "a refused gate returns no motion"
+            );
+            assert!(!jog.is_active(), "a refused gate starts no hold");
+        }
+
+        let mut allowed = gate();
+        allowed.machine = MachineState::Hold;
+        // Jog does not need a loaded program, only the machine gates.
+        allowed.program_loaded = false;
+        let mut jog = KeyboardJog::default();
+        assert!(press_keyboard_jog(&mut jog, action, &allowed, now).is_some());
+    }
+
+    #[test]
+    fn keyboard_jog_uses_the_mapped_axis_not_a_panel_axis() {
+        let now = Instant::now();
+        let cases = [
+            (MachineAction::JogXMinus, JogAxis::X, -1.0),
+            (MachineAction::JogXPlus, JogAxis::X, 1.0),
+            (MachineAction::JogYMinus, JogAxis::Y, -1.0),
+            (MachineAction::JogYPlus, JogAxis::Y, 1.0),
+            (MachineAction::JogZMinus, JogAxis::Z, -1.0),
+            (MachineAction::JogZPlus, JogAxis::Z, 1.0),
+        ];
+        for (action, axis, sign) in cases {
+            let mut jog = KeyboardJog::default();
+            let motions = jog.press(action, now).expect("a mapped jog starts");
+            assert_eq!(motions, vec![jog_step(axis, sign)], "{}", action.label());
+            assert_eq!(jog.step(), Some(JogStep { axis, sign }));
+        }
+    }
+
+    #[test]
+    fn pointer_hold_timing_is_unchanged() {
+        assert_eq!(JOG_REPEAT, Duration::from_millis(120));
+        assert_eq!(JOG_CANCEL_AFTER, Duration::from_millis(250));
+        assert!(!jog_release_cancels(
+            true,
+            JOG_CANCEL_AFTER - Duration::from_millis(1)
+        ));
+        assert!(jog_release_cancels(true, JOG_CANCEL_AFTER));
+        assert!(
+            !jog_release_cancels(false, Duration::from_secs(60)),
+            "a step jog never cancels, however long it is held"
+        );
+    }
+
+    #[test]
+    fn keyboard_jog_never_plans_start_resume_or_load() {
+        let now = Instant::now();
+        let allowed = gate();
+
+        for action in [
+            MachineAction::Start,
+            MachineAction::Pause,
+            MachineAction::Resume,
+            MachineAction::Stop,
+        ] {
+            let mut jog = KeyboardJog::default();
+            assert_eq!(
+                press_keyboard_jog(&mut jog, action, &allowed, now),
+                None,
+                "{} is not a jog action",
+                action.label()
+            );
+            assert!(!jog.is_active());
+        }
+
+        for action in [
+            MachineAction::JogXMinus,
+            MachineAction::JogXPlus,
+            MachineAction::JogYMinus,
+            MachineAction::JogYPlus,
+            MachineAction::JogZMinus,
+            MachineAction::JogZPlus,
+        ] {
+            let mut jog = KeyboardJog::default();
+            let press = press_keyboard_jog(&mut jog, action, &allowed, now).expect("jog starts");
+            assert!(
+                press
+                    .iter()
+                    .all(|motion| matches!(motion, KeyboardJogMotion::Step(_))),
+                "{} only produces a step",
+                action.label()
+            );
+            let release = jog
+                .release_any(now + Duration::from_secs(1))
+                .expect("jog releases");
+            assert!(
+                release
+                    .iter()
+                    .all(|motion| matches!(motion, KeyboardJogMotion::Cancel)),
+                "{} only produces a cancel on release",
+                action.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_tap_starts_a_fresh_hold() {
+        let active = active_bindings();
+        let mut jog = KeyboardJog::default();
+        let start = Instant::now();
+
+        assert!(jog.press(MachineAction::JogXPlus, start).is_some());
+        assert_eq!(
+            jog.release_key("right", &active, start + Duration::from_millis(80)),
+            Some(Vec::new())
+        );
+        assert!(!jog.is_active());
+        assert_eq!(
+            jog.press(MachineAction::JogXPlus, start + Duration::from_millis(120)),
+            Some(vec![jog_step(JogAxis::X, 1.0)])
+        );
+        assert!(jog.is_active());
     }
 }

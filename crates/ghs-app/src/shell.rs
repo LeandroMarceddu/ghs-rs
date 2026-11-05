@@ -81,9 +81,10 @@ use crate::height_map_library::{
     LoadedSavedMap, SavedMapSummary, default_map_name, format_unix_utc,
 };
 use crate::keymap::{
-    BindingPlan, JogAxis, JogXMinus, JogXPlus, JogYMinus, JogYPlus, JogZMinus, JogZPlus,
-    KeyHoldGuard, KeyboardGate, KeymapModel, MachineAction, MachineIntent, MachinePause,
-    MachineResume, MachineStart, MachineStop, binding_for, note_key_down, pretty_keys, refusal,
+    BindingPlan, JOG_REPEAT, JogAxis, JogXMinus, JogXPlus, JogYMinus, JogYPlus, JogZMinus,
+    JogZPlus, KeyHoldGuard, KeyboardGate, KeyboardJog, KeyboardJogMotion, KeymapModel,
+    MachineAction, MachineIntent, MachinePause, MachineResume, MachineStart, MachineStop,
+    binding_for, jog_release_cancels, note_key_down, press_keyboard_jog, pretty_keys, refusal,
     unbind_for,
 };
 use crate::keypad;
@@ -123,8 +124,6 @@ const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
 const ROW_H: f32 = 112.0;
 /// Gap between cards and between columns.
 const GAP: f32 = 12.0;
-/// How often a held continuous jog re-issues its step.
-const JOG_REPEAT: Duration = Duration::from_millis(120);
 /// Fixed column widths for the local job-history rows.
 const JOB_HISTORY_TIME_W: f32 = 118.0;
 const JOB_HISTORY_RESULT_W: f32 = 70.0;
@@ -132,7 +131,7 @@ const JOB_HISTORY_ELAPSED_W: f32 = 50.0;
 const JOB_HISTORY_LINES_W: f32 = 36.0;
 const JOB_HISTORY_CHECK_W: f32 = 40.0;
 
-/// One press-and-hold jog gesture.
+/// One press-and-hold jog gesture from the pointer.
 #[derive(Clone, Copy, Debug)]
 struct JogHold {
     axis: Axis,
@@ -141,10 +140,21 @@ struct JogHold {
     started: std::time::Instant,
 }
 
-/// A release earlier than this is a click, not a hold: keep the one-step jog
-/// instead of cancelling it. This also keeps a touch tap working, because GPUI
-/// delivers a touch tap's mouse down and up together.
-const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
+impl JogHold {
+    /// Whether releasing now must stop the controller's queued jog.
+    fn cancel_on_release(&self, now: Instant) -> bool {
+        jog_release_cancels(self.continuous, now.saturating_duration_since(self.started))
+    }
+}
+
+/// Map a keymap axis to the shell's axis type.
+fn axis_from_jog(axis: JogAxis) -> Axis {
+    match axis {
+        JogAxis::X => Axis::X,
+        JogAxis::Y => Axis::Y,
+        JogAxis::Z => Axis::Z,
+    }
+}
 
 /// Index of the gantry-squaring card in the utility scroll list.
 ///
@@ -372,6 +382,8 @@ pub struct Shell {
     panel: ConnectionPanel,
     panel_scroll: ScrollHandle,
     jog_hold: Option<JogHold>,
+    /// Mapped-key press-and-hold jog state, owned by the keymap module.
+    keyboard_jog: KeyboardJog,
     jog_generation: u64,
     jog_task: Option<Task<()>>,
     feed_slider_active: bool,
@@ -960,6 +972,7 @@ impl Shell {
             panel: ConnectionPanel::new(),
             panel_scroll: ScrollHandle::new(),
             jog_hold: None,
+            keyboard_jog: KeyboardJog::default(),
             jog_generation: 0,
             jog_task: None,
             feed_slider_active: false,
@@ -1118,12 +1131,13 @@ impl Shell {
         shell.apply_binding_plan(plan, cx);
         shell.active_bindings = defaults;
         // A key-up can be missed while the window is inactive. Release the
-        // repeat latch on every activation change so the first press after
-        // returning to the app is never swallowed.
+        // repeat latch and any keyboard jog hold on every activation change so
+        // a held key never keeps moving after focus returns.
         shell
             ._subscriptions
             .push(cx.observe_window_activation(window, |this, _, cx| {
                 this.held_machine_keys.clear();
+                this.end_keyboard_jog(cx);
                 cx.notify();
             }));
         if !mock {
@@ -1386,9 +1400,11 @@ impl Shell {
         {
             changed = true;
         }
-        // A transport drop, alarm or mode change must not leave a jog running.
-        if self.jog_hold.is_some() && !self.jog_allowed() {
+        // A transport drop, alarm, door, job start or non-jog mode must not
+        // leave a pointer or keyboard jog running.
+        if (self.jog_hold.is_some() || self.keyboard_jog.is_active()) && !self.jog_allowed() {
             self.end_jog(cx);
+            self.end_keyboard_jog(cx);
             changed = true;
         }
         if self.panel.poll() {
@@ -2541,6 +2557,7 @@ impl Shell {
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.end_jog(cx);
+        self.end_keyboard_jog(cx);
         if let Some(link) = &self.link {
             link.disconnect();
         }
@@ -3924,6 +3941,8 @@ impl Shell {
         self.keymap_source = source;
         self.keymap_editor = None;
         self.held_machine_keys.clear();
+        // The old binding no longer owns the key; never leave its jog running.
+        self.end_keyboard_jog(cx);
         true
     }
 
@@ -3991,7 +4010,7 @@ impl Shell {
                 format!("KEY {} refused: {reason}", action.label()),
             );
         } else {
-            self.run_keyboard_intent(intent, cx);
+            self.run_keyboard_intent(action, cx);
         }
         cx.notify();
         // Let the root key listener latch this physical key for repeat
@@ -3999,20 +4018,9 @@ impl Shell {
         cx.propagate();
     }
 
-    fn run_keyboard_intent(&mut self, intent: MachineIntent, cx: &mut Context<Self>) {
-        match intent {
-            MachineIntent::Jog { axis, sign } => {
-                let axis = match axis {
-                    JogAxis::X => Axis::X,
-                    JogAxis::Y => Axis::Y,
-                    JogAxis::Z => Axis::Z,
-                };
-                if self.jog_allowed() && self.state.live {
-                    // One step per press. CONT/hold-to-jog stays pointer-only
-                    // because a keyboard has no release event for the action.
-                    self.send_jog(axis, sign, false);
-                }
-            }
+    fn run_keyboard_intent(&mut self, action: MachineAction, cx: &mut Context<Self>) {
+        match action.intent() {
+            MachineIntent::Jog { .. } => self.begin_keyboard_jog(action, cx),
             MachineIntent::Start => self.start_job(cx),
             MachineIntent::Pause => self.pause_job(cx),
             MachineIntent::Resume => self.resume_job(cx),
@@ -4030,9 +4038,20 @@ impl Shell {
         );
     }
 
-    fn note_machine_key_up(&mut self, event: &KeyUpEvent) {
+    fn note_machine_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
         self.held_machine_keys
             .end_key(&event.keystroke.key, &self.active_bindings);
+        let Some(motions) = self.keyboard_jog.release_key(
+            &event.keystroke.key,
+            &self.active_bindings,
+            Instant::now(),
+        ) else {
+            return;
+        };
+        // The repeat task observes the generation and exits on its next tick;
+        // dropping a task from inside its own callback would be unsafe.
+        self.jog_generation = self.jog_generation.wrapping_add(1);
+        self.apply_keyboard_motions(&motions, cx);
     }
 
     fn aux_allowed(&self) -> bool {
@@ -4133,11 +4152,68 @@ impl Shell {
         cx.notify();
     }
 
+    /// Press half of a mapped-key jog gesture.
+    ///
+    /// The first key-down sends one step and starts a hold; OS key repeat is
+    /// ignored until key-up. A different jog key ends the old hold first. The
+    /// axis and sign come from the mapped action, never the jog panel.
+    fn begin_keyboard_jog(&mut self, action: MachineAction, cx: &mut Context<Self>) {
+        if !self.jog_allowed() || !self.state.live {
+            return;
+        }
+        let now = Instant::now();
+        let gate = self.keyboard_gate();
+        let Some(motions) = press_keyboard_jog(&mut self.keyboard_jog, action, &gate, now) else {
+            return;
+        };
+        // The pointer and the keyboard share one machine. Ending the pointer
+        // hold first mirrors a release without changing pointer semantics.
+        if self.jog_hold.is_some() {
+            self.end_jog(cx);
+        }
+        self.jog_generation = self.jog_generation.wrapping_add(1);
+        let generation = self.jog_generation;
+        self.apply_keyboard_motions(&motions, cx);
+        self.spawn_jog_repeat(generation, cx);
+        cx.notify();
+    }
+
+    /// Release a mapped-key hold: stop the repeat loop and cancel motion after
+    /// a genuine hold. A quick tap keeps its one step.
+    fn end_keyboard_jog(&mut self, cx: &mut Context<Self>) {
+        let Some(motions) = self.keyboard_jog.release_any(Instant::now()) else {
+            return;
+        };
+        self.jog_generation = self.jog_generation.wrapping_add(1);
+        self.apply_keyboard_motions(&motions, cx);
+    }
+
+    /// Send the only commands a keyboard jog can produce: one incremental step
+    /// or `JogCancel`. It never starts a job or loads a program.
+    fn apply_keyboard_motions(&mut self, motions: &[KeyboardJogMotion], cx: &mut Context<Self>) {
+        for motion in motions {
+            match *motion {
+                KeyboardJogMotion::Step(step) => {
+                    if self.state.live {
+                        self.send_jog(axis_from_jog(step.axis), step.sign, false);
+                    }
+                }
+                KeyboardJogMotion::Cancel => {
+                    if self.state.live {
+                        let _ =
+                            self.send_command_quiet(Command::Realtime(RealtimeCommand::JogCancel));
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Press half of a jog gesture.
     ///
     /// A step jog sends one command. A continuous jog sends one command on
     /// press and re-issues it at [`JOG_REPEAT`] while the pointer stays down;
-    /// a release after [`JOG_CANCEL_AFTER`] sends `JogCancel` (0x85) so the
+    /// a release after [`crate::keymap::JOG_CANCEL_AFTER`] sends `JogCancel` (0x85) so the
     /// controller stops at once.
     fn jog_press(&mut self, sign: f64, cx: &mut Context<Self>) {
         if !self.jog_allowed() {
@@ -4147,6 +4223,11 @@ impl Shell {
             self.state.jog(sign);
             cx.notify();
             return;
+        }
+        // A mapped key and the pointer share one machine; the key hold ends
+        // before the pointer gesture takes over.
+        if self.keyboard_jog.is_active() {
+            self.end_keyboard_jog(cx);
         }
         self.jog_generation = self.jog_generation.wrapping_add(1);
         let generation = self.jog_generation;
@@ -4174,7 +4255,7 @@ impl Shell {
         // The repeat task observes the generation and exits on its next tick;
         // dropping a task from inside its own callback would be unsafe.
         self.jog_generation = self.jog_generation.wrapping_add(1);
-        if hold.continuous && hold.started.elapsed() >= JOG_CANCEL_AFTER && self.state.live {
+        if hold.cancel_on_release(Instant::now()) && self.state.live {
             let _ = self.send_command_quiet(Command::Realtime(RealtimeCommand::JogCancel));
         }
         cx.notify();
@@ -4227,14 +4308,31 @@ impl Shell {
                         if shell.jog_generation != generation {
                             return false;
                         }
-                        let Some(hold) = shell.jog_hold else {
+                        // A pointer hold owns the panel axis/sign.
+                        if let Some(hold) = shell.jog_hold {
+                            if !shell.jog_allowed() {
+                                shell.end_jog(cx);
+                                return false;
+                            }
+                            shell.send_jog(hold.axis, hold.sign, true);
+                            return true;
+                        }
+                        // A mapped key owns its own axis/sign until key-up.
+                        let Some(step) = shell.keyboard_jog.step() else {
                             return false;
                         };
                         if !shell.jog_allowed() {
-                            shell.end_jog(cx);
+                            shell.end_keyboard_jog(cx);
                             return false;
                         }
-                        shell.send_jog(hold.axis, hold.sign, true);
+                        let now = Instant::now();
+                        if !shell.keyboard_jog.repeat_due(now) {
+                            return true;
+                        }
+                        if shell.state.live {
+                            shell.send_jog(axis_from_jog(step.axis), step.sign, true);
+                        }
+                        shell.keyboard_jog.note_repeat(now);
                         true
                     })
                     .unwrap_or(false);
@@ -14678,9 +14776,8 @@ impl Shell {
                                     .truncate()
                                     .text_size(px(9.0))
                                     .text_color(p.text_faint)
-                                    .child(t(
-                                        "One step per press; off while typing. RESET DEFAULTS restores.",
-                                    )),
+                                    .child(t("Tap for one step; hold a mapped jog key to jog \
+                                         continuously. Off while typing.")),
                             ),
                     )
                     .child(chip(
@@ -23087,8 +23184,8 @@ impl Render for Shell {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.note_machine_key_down(event, cx)
             }))
-            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
-                this.note_machine_key_up(event);
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, cx| {
+                this.note_machine_key_up(event, cx);
             }))
             .on_action(cx.listener(|this, _: &JogXMinus, window, cx| {
                 this.keyboard_action(MachineAction::JogXMinus, window, cx);
@@ -25494,6 +25591,8 @@ fn radio_span(row: &SettingRow) -> Option<(i64, i64)> {
 mod tests {
     use ghs_engine::EngineEvent;
 
+    use crate::keymap::JOG_CANCEL_AFTER;
+
     use super::*;
 
     #[test]
@@ -25919,5 +26018,34 @@ mod tests {
             .set_probe_macros(&first.pre, &first.post)
             .expect("demo macros");
         assert_eq!(model.probe_macro_summary(), "PRE 3 / POST 3 LINES");
+    }
+
+    #[test]
+    fn jog_axis_from_keymap_covers_x_y_z() {
+        assert_eq!(axis_from_jog(JogAxis::X), Axis::X);
+        assert_eq!(axis_from_jog(JogAxis::Y), Axis::Y);
+        assert_eq!(axis_from_jog(JogAxis::Z), Axis::Z);
+    }
+
+    #[test]
+    fn pointer_jog_hold_keeps_the_pointer_cancel_window() {
+        let start = Instant::now();
+        let hold = JogHold {
+            axis: Axis::X,
+            sign: 1.0,
+            continuous: true,
+            started: start,
+        };
+        assert!(!hold.cancel_on_release(start + JOG_CANCEL_AFTER - Duration::from_millis(1)));
+        assert!(hold.cancel_on_release(start + JOG_CANCEL_AFTER));
+
+        let step = JogHold {
+            continuous: false,
+            ..hold
+        };
+        assert!(
+            !step.cancel_on_release(start + Duration::from_secs(60)),
+            "a pointer step jog never cancels"
+        );
     }
 }
