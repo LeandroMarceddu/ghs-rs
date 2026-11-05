@@ -1937,6 +1937,7 @@ dependencies = [
 name = "ghs-app"
 version = "0.6.0"
 dependencies = [
+ "chrono",
  "ghs-config",
  "ghs-core",
  "ghs-demo",
@@ -1947,6 +1948,7 @@ dependencies = [
  "ghs-serial",
  "ghs-viewer",
  "gpui-kit",
+ "tracing",
 ]
 
 [[package]]

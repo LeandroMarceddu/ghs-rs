@@ -1336,6 +1336,10 @@ impl ProbeModel {
             probe_diameter_mm: self.defaults_field(ProbeField::Diameter)?,
             edge_offset_mm: self.defaults_field(ProbeField::EdgeOffset)?,
             plate_thickness_mm: self.defaults_field(ProbeField::PlateThickness)?,
+            // The app probe model does not edit probe macros yet; preserve the
+            // empty defaults so this record never invents macro text.
+            pre_probe_macro: String::new(),
+            post_probe_macro: String::new(),
         };
         record
             .validate()
@@ -5365,6 +5369,7 @@ mod tests {
             probe_diameter_mm: 2.0,
             edge_offset_mm: 0.25,
             plate_thickness_mm: 9.5,
+            ..ProbeDefaultsRecord::default()
         }
     }
 

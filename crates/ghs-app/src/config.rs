@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use ghs_config::{
     AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
-    IdentityPolicy, ImportOutcome, Keymap, MAX_HEIGHT_MAPS, Macro, OffsetSnapshot,
-    ProbeDefaultsRecord, ProbeOffsetRecord, ProfileKey, ThemeMode, ToolTable,
+    IdentityPolicy, ImportOutcome, JobHistoryRecord, JobHistoryResult, Keymap, MAX_HEIGHT_MAPS,
+    Macro, OffsetSnapshot, ProbeDefaultsRecord, ProbeOffsetRecord, ProfileKey, ThemeMode,
+    ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -176,6 +177,118 @@ impl ConfigModel {
     #[must_use]
     pub fn app(&self) -> &AppConfig {
         &self.app
+    }
+
+    /// Bounded local job history, oldest record first.
+    ///
+    /// The slice is empty before the first finished job or after
+    /// [`Self::clear_job_history`]. New records are appended with
+    /// [`Self::record_job_history`]; the UI reverses the order for display.
+    #[must_use]
+    pub fn job_history(&self) -> &[JobHistoryRecord] {
+        &self.app.job_history
+    }
+
+    /// Append one finished job and persist `app.json`.
+    ///
+    /// The previous history is kept in memory until the atomic app-config
+    /// write succeeds. A validation refusal or write error restores the
+    /// previous history, so the displayed history never claims a record was
+    /// saved when it was not. This method only writes local JSON: it builds
+    /// no command and never sends anything to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation message for an invalid record, or the
+    /// [`Self::save_app`] message when the store is unavailable, `app.json`
+    /// is corrupt, or the write fails.
+    pub fn record_job_history(&mut self, record: JobHistoryRecord) -> Result<PathBuf, String> {
+        let previous_history = self.app.job_history.clone();
+        let previous_result = self.last_result.clone();
+        self.app
+            .push_job_history(record)
+            .map_err(|error| format!("job history record is invalid: {error}"))?;
+        match self.save_app() {
+            Ok(path) => {
+                // A routine history append must not replace the operator's
+                // current Utility status line.
+                self.last_result = previous_result;
+                Ok(path)
+            }
+            Err(error) => {
+                self.app.job_history = previous_history;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Job history not saved: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove every local job-history record and persist `app.json`.
+    ///
+    /// The empty list is written atomically through [`Self::save_app`]. On a
+    /// refused write the previous list is restored in memory. No controller
+    /// command is built or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::save_app`] message when the store is unavailable,
+    /// `app.json` is corrupt, or the write fails.
+    pub fn clear_job_history(&mut self) -> Result<PathBuf, String> {
+        let previous_history = std::mem::take(&mut self.app.job_history);
+        let previous_result = self.last_result.clone();
+        match self.save_app() {
+            Ok(path) => {
+                self.last_result = previous_result;
+                Ok(path)
+            }
+            Err(error) => {
+                self.app.job_history = previous_history;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Job history was not cleared: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Replace the local history with fixed sample records for screenshots.
+    ///
+    /// This is the `--demo-job-history` seeding path. It uses the same
+    /// validation and `app.json` save/rollback path as
+    /// [`Self::record_job_history`], replaces any previous history so a
+    /// repeated flag is reproducible, and never sends a controller command.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same messages as [`Self::record_job_history`].
+    pub fn seed_demo_job_history(&mut self) -> Result<PathBuf, String> {
+        let previous_history = self.app.job_history.clone();
+        let previous_result = self.last_result.clone();
+        self.app.job_history.clear();
+        for record in demo_job_history_records() {
+            if let Err(error) = self.app.push_job_history(record) {
+                self.app.job_history = previous_history;
+                return Err(format!("demo job history is invalid: {error}"));
+            }
+        }
+        match self.save_app() {
+            Ok(path) => {
+                self.last_result = previous_result;
+                Ok(path)
+            }
+            Err(error) => {
+                self.app.job_history = previous_history;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Demo job history was not saved: {error}"),
+                });
+                Err(error)
+            }
+        }
     }
 
     /// Whether the first-run safety/setup wizard has been completed.
@@ -669,7 +782,7 @@ impl ConfigModel {
     /// defaults. This is local setup data only.
     #[must_use]
     pub fn probe_defaults(&self) -> ProbeDefaultsRecord {
-        self.data.probe_defaults
+        self.data.probe_defaults.clone()
     }
 
     /// Save the probe mount offset into the current controller profile.
@@ -1241,6 +1354,40 @@ impl ConfigModel {
         };
         format!("{state} | {}", key.display_name())
     }
+}
+
+/// Fixed sample records for the `--demo-job-history` review switch.
+///
+/// Values are deliberately fixed so the same flag renders the same card on
+/// every run. Names, elapsed times, and line counts are local demo data only;
+/// they are never sent to a controller.
+fn demo_job_history_records() -> [JobHistoryRecord; 3] {
+    [
+        JobHistoryRecord {
+            name: "demo-pocket.nc".to_string(),
+            started_unix_s: 1_700_000_000,
+            elapsed_s: 142,
+            lines: 120,
+            result: JobHistoryResult::Completed,
+            check_run: false,
+        },
+        JobHistoryRecord {
+            name: "demo-toolchange.nc".to_string(),
+            started_unix_s: 1_700_003_600,
+            elapsed_s: 63,
+            lines: 240,
+            result: JobHistoryResult::Stopped,
+            check_run: false,
+        },
+        JobHistoryRecord {
+            name: "demo-check.nc".to_string(),
+            started_unix_s: 1_700_007_200,
+            elapsed_s: 54,
+            lines: 240,
+            result: JobHistoryResult::Completed,
+            check_run: true,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -1946,5 +2093,118 @@ mod tests {
         assert_eq!(stored.tools, table);
         assert_eq!(stored.offsets, offsets());
         assert_eq!(stored.keymap, test_keymap("f10"));
+    }
+
+    fn history_record(name: &str, elapsed_s: u64) -> JobHistoryRecord {
+        JobHistoryRecord {
+            name: name.to_string(),
+            started_unix_s: 1_700_000_000,
+            elapsed_s,
+            lines: 120,
+            result: JobHistoryResult::Completed,
+            check_run: false,
+        }
+    }
+
+    #[test]
+    fn job_history_records_persist_and_clear_through_app_json() {
+        let dir = TempDir::new("job-history");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        assert!(model.job_history().is_empty());
+
+        let record = history_record("part.nc", 42);
+        let path = model
+            .record_job_history(record.clone())
+            .expect("record history");
+        assert_eq!(path, store.app_config_path());
+        assert_eq!(model.job_history(), std::slice::from_ref(&record));
+        assert_eq!(
+            ConfigModel::from_store(store.clone()).job_history(),
+            std::slice::from_ref(&record)
+        );
+
+        let path = model.clear_job_history().expect("clear history");
+        assert_eq!(path, store.app_config_path());
+        assert!(model.job_history().is_empty());
+        assert!(
+            ConfigModel::from_store(store).job_history().is_empty(),
+            "the cleared list is persisted, not only removed in memory"
+        );
+    }
+
+    #[test]
+    fn job_history_record_rolls_back_when_the_store_is_unavailable() {
+        let mut model = ConfigModel::empty();
+        let error = model
+            .record_job_history(history_record("part.nc", 3))
+            .expect_err("no store");
+        assert!(
+            error.contains("no platform configuration directory"),
+            "{error}"
+        );
+        assert!(
+            model.job_history().is_empty(),
+            "a failed save must not keep the appended record"
+        );
+    }
+
+    #[test]
+    fn job_history_clear_rolls_back_when_the_store_is_unavailable() {
+        let mut model = ConfigModel::empty();
+        model.app.job_history.push(history_record("part.nc", 3));
+        let error = model
+            .clear_job_history()
+            .expect_err("no store for the clear");
+        assert!(
+            error.contains("no platform configuration directory"),
+            "{error}"
+        );
+        assert_eq!(
+            model.job_history().len(),
+            1,
+            "a failed clear restores the previous list"
+        );
+    }
+
+    #[test]
+    fn job_history_rejects_an_invalid_record_without_changing_history() {
+        let dir = TempDir::new("job-history-invalid");
+        let mut model = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        model
+            .record_job_history(history_record("part.nc", 3))
+            .expect("first record");
+
+        let mut invalid = history_record("", 3);
+        invalid.name = "   ".to_string();
+        let error = model
+            .record_job_history(invalid)
+            .expect_err("empty name refused");
+        assert!(error.contains("invalid"), "{error}");
+        assert_eq!(model.job_history().len(), 1);
+    }
+
+    #[test]
+    fn demo_job_history_seed_is_reproducible() {
+        let dir = TempDir::new("job-history-demo");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        model
+            .record_job_history(history_record("old.nc", 1))
+            .expect("existing record");
+
+        model.seed_demo_job_history().expect("seed demo history");
+        let expected = demo_job_history_records();
+        assert_eq!(model.job_history(), expected.as_slice());
+        assert_eq!(
+            ConfigModel::from_store(store.clone()).job_history(),
+            expected.as_slice(),
+            "the demo records are stored in app.json"
+        );
+
+        // Repeating the flag replaces the samples instead of appending them.
+        model.seed_demo_job_history().expect("seed again");
+        assert_eq!(model.job_history(), expected.as_slice());
+        assert_eq!(model.job_history().len(), 3);
     }
 }

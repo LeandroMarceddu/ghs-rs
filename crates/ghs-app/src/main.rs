@@ -98,6 +98,12 @@
 //! reveals the Console after the demo program loads (a load normally shows the
 //! Program tab); `--console-filter` implies it. Normal startup filters nothing,
 //! writes no log file, and keeps the load behaviour unchanged.
+//! `--demo-job-history` seeds three fixed records through the normal local
+//! `app.json` save path and opens Utility at the `JOB HISTORY` card;
+//! `--demo-job-history-clear` seeds the same records and opens the inline
+//! `CLEAR ALL HISTORY` / `CANCEL` confirmation without clearing;
+//! `--demo-job-history-sheet` opens the all-records history sheet. All three
+//! flags write only the app config and never send a controller command.
 //! `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
 //! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.

@@ -20,6 +20,12 @@ ghs-config.workspace = true
 ghs-i18n.workspace = true
 ghs-probe.workspace = true
 
+# Local wall-clock formatting for the local-only job history.
+chrono.workspace = true
+
+# Non-fatal diagnostics for local persistence failures.
+tracing.workspace = true
+
 # Pinned by the workspace. Keep GPUI behind this facade so a future `ghs-ui`
 # crate can own the version churn (see docs/adr/0004-gpui-ui-layer.md).
 gpui-kit.workspace = true

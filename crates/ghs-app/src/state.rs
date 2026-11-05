@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ghs_config::{HeightMapRecord, Macro as ConfigMacro, ProbeOffsetRecord};
+use ghs_config::{
+    HeightMapRecord, JobHistoryRecord, JobHistoryResult, MAX_JOB_HISTORY_ELAPSED_S,
+    MAX_JOB_HISTORY_NAME_BYTES, Macro as ConfigMacro, ProbeOffsetRecord,
+};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, Command, ControllerInfo, EngineEvent, JobAbortReason, JobInfo,
@@ -1806,6 +1809,60 @@ pub fn abort_reason_label(reason: JobAbortReason) -> &'static str {
     }
 }
 
+/// Map one engine abort reason to the local history result.
+///
+/// Operator stop, lost link, and program error have distinct history labels;
+/// alarms, the safety door, resets, E-stop, and controller sleep all remain
+/// generic aborts.
+pub fn job_history_result(reason: JobAbortReason) -> JobHistoryResult {
+    match reason {
+        JobAbortReason::OperatorStop => JobHistoryResult::Stopped,
+        JobAbortReason::Disconnected => JobHistoryResult::Interrupted,
+        JobAbortReason::ProgramError => JobHistoryResult::Failed,
+        JobAbortReason::Alarm
+        | JobAbortReason::Door
+        | JobAbortReason::SoftReset
+        | JobAbortReason::EmergencyStop
+        | JobAbortReason::ControllerSleep => JobHistoryResult::Aborted,
+    }
+}
+
+/// Current wall-clock time as Unix seconds.
+///
+/// A clock before the Unix epoch maps to zero; the history label then renders
+/// the epoch rather than inventing a start time.
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Trim a job name and truncate it at a UTF-8 character boundary.
+///
+/// Returns `None` for an empty or whitespace-only name. The result is at most
+/// [`MAX_JOB_HISTORY_NAME_BYTES`] bytes, so it passes
+/// [`JobHistoryRecord::validate`] without splitting a multi-byte character.
+pub fn job_history_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= MAX_JOB_HISTORY_NAME_BYTES {
+        return Some(trimmed.to_string());
+    }
+    let mut end = MAX_JOB_HISTORY_NAME_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = trimmed[..end].trim_end();
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated.to_string())
+    }
+}
+
 /// One confirmed utility program ready for the shell to send.
 ///
 /// The command is always [`Command::LoadProgram`]; the utility load path never
@@ -2312,6 +2369,14 @@ pub struct AppState {
     pub setup: SetupModel,
     /// Local app preferences, controller profile, and backup helpers.
     pub config: ConfigModel,
+    /// Wall-clock start of the current run, captured from `JobStarted`.
+    job_started_unix_s: Option<u64>,
+    /// Whether the current run already produced one history record.
+    job_recorded: bool,
+    /// Finished record waiting for the shell poll to persist it.
+    pending_job_history: Option<JobHistoryRecord>,
+    /// The Utility `CLEAR HISTORY` inline confirmation is armed.
+    job_history_clear_armed: bool,
     /// Whether this app run already offered the first-run wizard once.
     setup_auto_prompted: bool,
 }
@@ -2410,6 +2475,10 @@ impl AppState {
             utilities: UtilityModel::default(),
             setup: SetupModel::new(config.app().units),
             config,
+            job_started_unix_s: None,
+            job_recorded: false,
+            pending_job_history: None,
+            job_history_clear_armed: false,
             setup_auto_prompted: false,
         };
         state.sync_offset_context();
@@ -2430,6 +2499,8 @@ impl AppState {
         // bundled source once the controller is ready; a serial reconnect has
         // to send its program again (there is no program-read command).
         self.job = JobView::default();
+        self.job_started_unix_s = None;
+        self.job_recorded = false;
         self.active_line = 0;
         self.progress = 0.0;
         self.console.clear();
@@ -2493,6 +2564,123 @@ impl AppState {
         self.height_map_library.reset();
         self.config.begin_connection();
         self.push_console(ConsoleLevel::Info, message);
+    }
+
+    /// Apply one engine event to the job view and capture local job history.
+    ///
+    /// `JobStarted` captures the wall-clock start time. `JobCompleted`,
+    /// `JobAborted`, and a later link-loss interruption build at most one
+    /// [`JobHistoryRecord`] for the run. The record waits in
+    /// [`Self::take_job_history_record`]; this method never touches the config
+    /// store.
+    ///
+    /// Returns `true` when the job view changed.
+    pub fn apply_job_event(&mut self, event: &EngineEvent) -> bool {
+        let changed = self.job.apply_event(event);
+        match event {
+            EngineEvent::JobLoaded { .. } => {
+                self.job_started_unix_s = None;
+                self.job_recorded = false;
+            }
+            EngineEvent::JobStarted { .. } => {
+                self.job_started_unix_s = Some(now_unix_seconds());
+                self.job_recorded = false;
+            }
+            EngineEvent::JobCompleted { .. } => {
+                self.record_finished_job(JobHistoryResult::Completed);
+            }
+            EngineEvent::JobAborted { reason, .. } => {
+                self.record_finished_job(job_history_result(*reason));
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    /// Mark the loaded job interrupted after the link closed.
+    ///
+    /// The engine normally emits `JobAborted { reason: Disconnected }` first,
+    /// which already records the run. This covers a dropped terminal event and
+    /// never creates a second record for the same start.
+    pub fn mark_job_interrupted(&mut self) {
+        self.job.interrupted();
+        self.record_finished_job(JobHistoryResult::Interrupted);
+    }
+
+    /// Take the finished-job record waiting for the shell poll.
+    ///
+    /// At most one record is pending; the poll persists it through
+    /// [`ConfigModel::record_job_history`].
+    pub fn take_job_history_record(&mut self) -> Option<JobHistoryRecord> {
+        self.pending_job_history.take()
+    }
+
+    /// Whether the Utility `CLEAR HISTORY` confirmation is armed.
+    #[must_use]
+    pub fn job_history_clear_armed(&self) -> bool {
+        self.job_history_clear_armed
+    }
+
+    /// Arm the inline clear confirmation. An empty history cannot be cleared.
+    ///
+    /// Returns `true` when the confirmation is now armed. Opening it writes
+    /// nothing and sends nothing.
+    pub fn arm_job_history_clear(&mut self) -> bool {
+        if self.config.job_history().is_empty() {
+            return false;
+        }
+        self.job_history_clear_armed = true;
+        true
+    }
+
+    /// Disarm the inline clear confirmation without writing anything.
+    pub fn cancel_job_history_clear(&mut self) {
+        self.job_history_clear_armed = false;
+    }
+
+    /// Clear every local job-history record after the inline confirmation.
+    ///
+    /// A successful clear also drops a record still waiting for the poll, so
+    /// the card cannot repopulate after `CLEAR ALL HISTORY`. No controller
+    /// command is built or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the confirmation is not armed, or the
+    /// [`ConfigModel::clear_job_history`] error when the write fails.
+    pub fn confirm_clear_job_history(&mut self) -> Result<PathBuf, String> {
+        if !self.job_history_clear_armed {
+            return Err("no job-history clear confirmation is open".to_string());
+        }
+        let result = self.config.clear_job_history();
+        if result.is_ok() {
+            self.job_history_clear_armed = false;
+            self.pending_job_history = None;
+        }
+        result
+    }
+
+    fn record_finished_job(&mut self, result: JobHistoryResult) {
+        if self.job_recorded {
+            return;
+        }
+        let Some(started_unix_s) = self.job_started_unix_s else {
+            return;
+        };
+        // A terminal event closes the run even when its name is unusable;
+        // repeated terminal events must not try again.
+        self.job_recorded = true;
+        let Some(name) = job_history_name(&self.job.name) else {
+            return;
+        };
+        self.pending_job_history = Some(JobHistoryRecord {
+            name,
+            started_unix_s,
+            elapsed_s: self.job.elapsed.as_secs().min(MAX_JOB_HISTORY_ELAPSED_S),
+            lines: self.job.total,
+            result,
+            check_run: self.job.is_check(),
+        });
     }
 
     /// Rebuild capabilities and axis rows from the engine's `$I+` record.
@@ -5174,6 +5362,7 @@ mod tests {
             probe_diameter_mm: 2.0,
             edge_offset_mm: 0.25,
             plate_thickness_mm: 9.5,
+            ..ProbeDefaultsRecord::default()
         }
     }
 
@@ -5186,6 +5375,7 @@ mod tests {
             probe_diameter_mm: 4.0,
             edge_offset_mm: 1.5,
             plate_thickness_mm: 12.0,
+            ..ProbeDefaultsRecord::default()
         }
     }
 
@@ -9484,5 +9674,330 @@ mod tests {
                     | Command::SetSetting { .. }
             )));
         }
+    }
+
+    // ---------------------------------------------------------- job history
+
+    fn history_state() -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("job history test");
+        state.job.name = "part.nc".to_string();
+        state
+    }
+
+    fn start_history_run(state: &mut AppState) {
+        assert!(state.apply_job_event(&EngineEvent::JobStarted {
+            from_line: 1,
+            total_lines: 120,
+        }));
+    }
+
+    fn complete_history_run(state: &mut AppState, elapsed_s: u64) {
+        assert!(state.apply_job_event(&EngineEvent::JobCompleted {
+            elapsed: Duration::from_secs(elapsed_s),
+        }));
+    }
+
+    fn abort_history_run(reason: JobAbortReason) -> JobHistoryRecord {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        state.apply_job_event(&EngineEvent::JobAborted { line: 12, reason });
+        state
+            .take_job_history_record()
+            .expect("an interrupted run records once")
+    }
+
+    fn config_history_record(name: &str) -> JobHistoryRecord {
+        JobHistoryRecord {
+            name: name.to_string(),
+            started_unix_s: 1_700_000_000,
+            elapsed_s: 12,
+            lines: 120,
+            result: JobHistoryResult::Completed,
+            check_run: false,
+        }
+    }
+
+    fn state_with_history_store(label: &str) -> (AppState, TempRoot, ConfigStore) {
+        let dir = TempRoot::new(label);
+        let store = ConfigStore::new(&dir.path);
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store.clone());
+        state.begin_live("job history store test");
+        state.job.name = "part.nc".to_string();
+        (state, dir, store)
+    }
+
+    #[test]
+    fn completed_job_records_once_with_the_expected_fields() {
+        let mut state = history_state();
+        let before = now_unix_seconds();
+        start_history_run(&mut state);
+        let after = now_unix_seconds();
+        complete_history_run(&mut state, 42);
+
+        let record = state
+            .take_job_history_record()
+            .expect("completed run records once");
+        assert_eq!(record.name, "part.nc");
+        assert_eq!(record.elapsed_s, 42);
+        assert_eq!(record.lines, 120);
+        assert_eq!(record.result, JobHistoryResult::Completed);
+        assert!(!record.check_run);
+        assert!(
+            record.started_unix_s >= before && record.started_unix_s <= after,
+            "start time came from the system clock: {}",
+            record.started_unix_s
+        );
+        assert!(
+            state.take_job_history_record().is_none(),
+            "taking the record consumes it"
+        );
+    }
+
+    #[test]
+    fn a_check_run_sets_check_run_on_the_history_record() {
+        let mut state = history_state();
+        state.apply_job_event(&EngineEvent::CheckStarted { total_lines: 120 });
+        start_history_run(&mut state);
+        complete_history_run(&mut state, 30);
+
+        let record = state.take_job_history_record().expect("check record");
+        assert!(record.check_run);
+        assert_eq!(record.result, JobHistoryResult::Completed);
+    }
+
+    #[test]
+    fn operator_stop_and_disconnect_map_to_stopped_and_interrupted() {
+        for (reason, expected) in [
+            (JobAbortReason::OperatorStop, JobHistoryResult::Stopped),
+            (JobAbortReason::Disconnected, JobHistoryResult::Interrupted),
+        ] {
+            assert_eq!(
+                abort_history_run(reason).result,
+                expected,
+                "wrong mapping for {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn program_error_and_alarm_door_map_to_failed_and_aborted() {
+        assert_eq!(
+            abort_history_run(JobAbortReason::ProgramError).result,
+            JobHistoryResult::Failed
+        );
+        for reason in [
+            JobAbortReason::Alarm,
+            JobAbortReason::Door,
+            JobAbortReason::EmergencyStop,
+            JobAbortReason::SoftReset,
+            JobAbortReason::ControllerSleep,
+        ] {
+            assert_eq!(
+                abort_history_run(reason).result,
+                JobHistoryResult::Aborted,
+                "wrong mapping for {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn link_loss_without_a_terminal_event_records_an_interruption() {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        state.job.elapsed = Duration::from_secs(9);
+        state.mark_job_interrupted();
+
+        let record = state.take_job_history_record().expect("interrupted record");
+        assert_eq!(record.result, JobHistoryResult::Interrupted);
+        assert_eq!(record.elapsed_s, 9);
+
+        // The engine's own `JobAborted { Disconnected }` first, then the
+        // disconnected fallback, still produces exactly one record.
+        let mut state = history_state();
+        start_history_run(&mut state);
+        state.apply_job_event(&EngineEvent::JobAborted {
+            line: 4,
+            reason: JobAbortReason::Disconnected,
+        });
+        state.mark_job_interrupted();
+        assert_eq!(
+            state
+                .take_job_history_record()
+                .expect("one disconnected record")
+                .result,
+            JobHistoryResult::Interrupted
+        );
+        assert!(state.take_job_history_record().is_none());
+    }
+
+    #[test]
+    fn repeated_terminal_events_do_not_duplicate_the_record() {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        complete_history_run(&mut state, 10);
+        complete_history_run(&mut state, 10);
+        state.apply_job_event(&EngineEvent::JobAborted {
+            line: 2,
+            reason: JobAbortReason::Alarm,
+        });
+        assert!(state.take_job_history_record().is_some());
+
+        complete_history_run(&mut state, 10);
+        assert!(
+            state.take_job_history_record().is_none(),
+            "a late terminal event after the poll must not add a record"
+        );
+    }
+
+    #[test]
+    fn a_terminal_event_without_a_captured_start_records_nothing() {
+        let mut state = history_state();
+        complete_history_run(&mut state, 10);
+        assert!(state.take_job_history_record().is_none());
+
+        let mut state = history_state();
+        state.apply_job_event(&EngineEvent::JobAborted {
+            line: 2,
+            reason: JobAbortReason::OperatorStop,
+        });
+        assert!(state.take_job_history_record().is_none());
+    }
+
+    #[test]
+    fn a_long_job_name_is_truncated_at_a_utf8_boundary() {
+        let mut state = history_state();
+        state.job.name = format!("{}{}", "a".repeat(255), "\u{00e9}");
+        assert!(state.job.name.len() > MAX_JOB_HISTORY_NAME_BYTES);
+        start_history_run(&mut state);
+        complete_history_run(&mut state, 2);
+
+        let record = state.take_job_history_record().expect("truncated record");
+        assert_eq!(record.name.len(), 255);
+        assert!(record.name.bytes().all(|byte| byte == b'a'));
+        assert!(record.validate().is_ok(), "the stored name is valid");
+    }
+
+    #[test]
+    fn an_empty_job_name_is_skipped() {
+        let mut state = history_state();
+        state.job.name = "   ".to_string();
+        start_history_run(&mut state);
+        complete_history_run(&mut state, 2);
+        assert!(state.take_job_history_record().is_none());
+    }
+
+    #[test]
+    fn elapsed_is_clamped_to_the_config_limit() {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        complete_history_run(&mut state, MAX_JOB_HISTORY_ELAPSED_S + 3_600);
+
+        let record = state.take_job_history_record().expect("clamped record");
+        assert_eq!(record.elapsed_s, MAX_JOB_HISTORY_ELAPSED_S);
+        assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn a_new_load_resets_the_captured_start() {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        state.apply_job_event(&EngineEvent::JobLoaded {
+            name: "next.nc".to_string(),
+            total_lines: 4,
+            program: sample_program(),
+        });
+        complete_history_run(&mut state, 5);
+        assert!(
+            state.take_job_history_record().is_none(),
+            "a load clears the previous run's start"
+        );
+    }
+
+    #[test]
+    fn a_new_live_session_resets_the_captured_start() {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        state.begin_live("next session");
+        complete_history_run(&mut state, 5);
+        assert!(state.take_job_history_record().is_none());
+    }
+
+    #[test]
+    fn a_new_start_clears_the_recorded_flag_for_the_next_run() {
+        let mut state = history_state();
+        start_history_run(&mut state);
+        complete_history_run(&mut state, 5);
+        assert!(state.take_job_history_record().is_some());
+
+        start_history_run(&mut state);
+        complete_history_run(&mut state, 7);
+        let record = state
+            .take_job_history_record()
+            .expect("the second run records independently");
+        assert_eq!(record.elapsed_s, 7);
+    }
+
+    #[test]
+    fn clear_history_requires_the_inline_confirmation_and_cancel_writes_nothing() {
+        let (mut state, dir, store) = state_with_history_store("history-clear-confirm");
+        state
+            .config
+            .record_job_history(config_history_record("part.nc"))
+            .expect("stored record");
+        let path = store.app_config_path();
+        let before = fs::read(&path).expect("read app config");
+
+        let error = state
+            .confirm_clear_job_history()
+            .expect_err("the confirmation is closed");
+        assert!(error.contains("confirmation"), "{error}");
+        assert_eq!(state.config.job_history().len(), 1);
+
+        assert!(state.arm_job_history_clear());
+        state.cancel_job_history_clear();
+        assert!(!state.job_history_clear_armed());
+        assert!(state.confirm_clear_job_history().is_err());
+        assert_eq!(fs::read(&path).expect("read app config"), before);
+        assert_eq!(state.config.job_history().len(), 1);
+
+        // A recorder is never handed to the history path; these actions
+        // cannot send a controller command.
+        let mut sent = Vec::new();
+        let send = recorded_send(&mut sent);
+        drop(send);
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(!dir.path.join("profiles").exists());
+    }
+
+    #[test]
+    fn confirmed_clear_writes_an_empty_history_and_no_controller_command() {
+        let (mut state, _dir, store) = state_with_history_store("history-clear");
+        state
+            .config
+            .record_job_history(config_history_record("one.nc"))
+            .expect("first record");
+        state
+            .config
+            .record_job_history(config_history_record("two.nc"))
+            .expect("second record");
+        assert_eq!(state.config.job_history().len(), 2);
+
+        let mut sent = Vec::new();
+        let send = recorded_send(&mut sent);
+        assert!(state.arm_job_history_clear());
+        let path = state.confirm_clear_job_history().expect("confirmed clear");
+        drop(send);
+        assert_eq!(path, store.app_config_path());
+        assert!(state.config.job_history().is_empty());
+        assert!(!state.job_history_clear_armed());
+        assert!(sent.is_empty(), "clear sent {sent:?}");
+
+        let reopened = ConfigModel::from_store(store);
+        assert!(
+            reopened.job_history().is_empty(),
+            "the empty list is persisted"
+        );
     }
 }

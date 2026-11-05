@@ -34,7 +34,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ghs_config::{Keymap, MAX_HEIGHT_MAPS, Macro as ConfigMacro, ToolRecord};
+use chrono::TimeZone as _;
+
+use ghs_config::{
+    JobHistoryRecord, JobHistoryResult, Keymap, MAX_HEIGHT_MAPS, MAX_JOB_HISTORY,
+    Macro as ConfigMacro, ToolRecord,
+};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
@@ -117,6 +122,12 @@ const ROW_H: f32 = 112.0;
 const GAP: f32 = 12.0;
 /// How often a held continuous jog re-issues its step.
 const JOG_REPEAT: Duration = Duration::from_millis(120);
+/// Fixed column widths for the local job-history rows.
+const JOB_HISTORY_TIME_W: f32 = 118.0;
+const JOB_HISTORY_RESULT_W: f32 = 70.0;
+const JOB_HISTORY_ELAPSED_W: f32 = 50.0;
+const JOB_HISTORY_LINES_W: f32 = 36.0;
+const JOB_HISTORY_CHECK_W: f32 = 40.0;
 
 /// One press-and-hold jog gesture.
 #[derive(Clone, Copy, Debug)]
@@ -136,7 +147,9 @@ const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
 ///
 /// The list starts with `CONTROLLER RESET`, then `MACHINE SETUP`, then this
 /// card. The demo capture scrolls it to the top.
-const GANTRY_CARD_INDEX: usize = 2;
+const GANTRY_CARD_INDEX: usize = 3;
+/// Position of the local job-history card in the Utility scroll list.
+const JOB_HISTORY_CARD_INDEX: usize = 2;
 
 /// What the shared settings text sheet is editing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +325,12 @@ pub struct Shell {
     console_scroll: ScrollHandle,
     /// Utility workspace scroll position, used by the gantry card capture.
     utility_scroll: ScrollHandle,
+    /// All-records `JOB HISTORY` sheet is open. Opening writes nothing.
+    job_history_open: bool,
+    /// Vertical scroll position of the all-records history sheet.
+    job_history_scroll: ScrollHandle,
+    /// Screenshot switch: seed and reveal the Utility job-history card.
+    demo_job_history_card: bool,
     /// Screenshot switch: save the console log once after the demo handshake.
     demo_console_save: bool,
     demo_console_save_done: bool,
@@ -787,6 +806,24 @@ impl Shell {
         if std::env::args().any(|arg| arg == "--keymap" || arg == "--demo-keymap") {
             state.mode = Mode::Utility;
         }
+        // Screenshot switches: seed three fixed records through the normal
+        // app-config save path and reveal the Utility card. The clear switch
+        // additionally arms the inline confirmation without clearing; the
+        // sheet switch opens the all-records list.
+        let demo_job_history = std::env::args().any(|arg| arg == "--demo-job-history");
+        let demo_job_history_clear = std::env::args().any(|arg| arg == "--demo-job-history-clear");
+        let demo_job_history_sheet = std::env::args().any(|arg| arg == "--demo-job-history-sheet");
+        let demo_job_history_card =
+            demo_job_history || demo_job_history_clear || demo_job_history_sheet;
+        if demo_job_history_card {
+            state.mode = Mode::Utility;
+            if let Err(error) = state.config.seed_demo_job_history() {
+                tracing::warn!(%error, "demo job history was not seeded");
+            }
+            if demo_job_history_clear && !state.arm_job_history_clear() {
+                tracing::warn!("demo job history has no records to clear");
+            }
+        }
 
         let keymap = KeymapModel::default();
         let keymap_source = Keymap::default();
@@ -806,6 +843,9 @@ impl Shell {
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
             utility_scroll: ScrollHandle::new(),
+            job_history_open: demo_job_history_sheet,
+            job_history_scroll: ScrollHandle::new(),
+            demo_job_history_card,
             demo_console_save: std::env::args().any(|arg| arg == "--demo-console-save"),
             demo_console_save_done: false,
             demo_console_tab: std::env::args().any(|arg| arg == "--console-tab")
@@ -1017,6 +1057,15 @@ impl Shell {
         }
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
+        }
+        // At most one finished-job record is persisted per poll. A refused or
+        // failed local write is logged once and dropped; never retry it in a
+        // loop and never overwrite a corrupt `app.json`.
+        if let Some(result) = flush_job_history_record(&mut self.state) {
+            match result {
+                Ok(_) => changed = true,
+                Err(error) => tracing::warn!(%error, "job history was not saved"),
+            }
         }
         // Adopt a profile keymap after the handshake, a pending-profile
         // confirmation, or a backup import. This only binds keys; it never
@@ -5184,6 +5233,43 @@ impl Shell {
                 .state
                 .push_console(ConsoleLevel::Warn, refusal.message()),
             SleepOutcome::NotConfirmed => {}
+        }
+        cx.notify();
+    }
+
+    /// Open the full local job-history sheet. Opening writes nothing.
+    fn open_job_history(&mut self, cx: &mut Context<Self>) {
+        self.job_history_open = true;
+        cx.notify();
+    }
+
+    /// Close the full local job-history sheet. Closing writes nothing.
+    fn close_job_history(&mut self, cx: &mut Context<Self>) {
+        self.job_history_open = false;
+        cx.notify();
+    }
+
+    /// Arm the inline `CLEAR HISTORY` confirmation. Arming writes nothing.
+    fn arm_job_history_clear(&mut self, cx: &mut Context<Self>) {
+        self.state.arm_job_history_clear();
+        cx.notify();
+    }
+
+    /// Disarm the inline `CLEAR HISTORY` confirmation. CANCEL writes nothing.
+    fn cancel_job_history_clear(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_job_history_clear();
+        cx.notify();
+    }
+
+    /// Clear every local record after the inline confirmation.
+    ///
+    /// This writes only `app.json`; it never builds or sends a controller
+    /// command.
+    fn confirm_clear_job_history(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.state.confirm_clear_job_history() {
+            tracing::warn!(%error, "job history was not cleared");
+            self.state
+                .push_console(ConsoleLevel::Warn, format!("HISTORY NOT CLEARED: {error}"));
         }
         cx.notify();
     }
@@ -16131,11 +16217,307 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Local job-history card in Utility.
+    ///
+    /// The records come from `app.json` through [`ConfigModel`]; the card only
+    /// reads them. Newest first, at most ten rows, with a count and a sheet for
+    /// every stored entry. Opening the sheet and arming the inline clear
+    /// confirmation write nothing.
+    fn job_history_card(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let records = self.state.config.job_history();
+        let total = records.len();
+        let armed = self.state.job_history_clear_armed();
+        let open_view = cx.entity();
+        let clear_view = cx.entity();
+        let cancel_view = cx.entity();
+        let confirm_view = cx.entity();
+
+        let mut rows = v_flex().gap_1();
+        for record in records.iter().rev().take(10) {
+            rows = rows.child(job_history_row(record, &self.mono, p, false));
+        }
+        let shown = total.min(10);
+
+        let mut card = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(section_label(t("JOB HISTORY"), p))
+                            .child(chip(&format!("{total} STORED"), p))
+                            .child(chip(t("LOCAL ONLY"), p))
+                            .child(chip(&format!("MAX {MAX_JOB_HISTORY}"), p)),
+                    )
+                    .when(total > 0, |this| {
+                        this.child(chip(&format!("SHOWING {shown} OF {total}"), p))
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_dim)
+                    .child(t("LOCAL ONLY - NOT SENT TO THE CONTROLLER")),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Finished jobs are stored in app.json on this computer. The newest 100 records are kept; the card shows the newest 10.",
+            )));
+
+        if total == 0 {
+            card = card.child(
+                div()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(t("NO JOBS RECORDED")),
+            );
+        } else {
+            card = card
+                .child(job_history_column_header(p, &self.mono))
+                .child(rows);
+        }
+
+        if armed {
+            card = card.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.danger.opacity(0.60))
+                    .bg(p.danger.opacity(0.08))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.danger)
+                            .child(t("CLEAR ALL HISTORY?")),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                        "This removes every stored job record from app.json on this computer. It does not change the loaded program or send anything to the controller.",
+                    )))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("job-history-clear-cancel")
+                                    .label(t("CANCEL"))
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.cancel_job_history_clear(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("job-history-clear-confirm")
+                                    .label(t("CLEAR ALL HISTORY"))
+                                    .danger()
+                                    .h(px(48.0))
+                                    .flex_1()
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view.update(cx, |this, cx| {
+                                            this.confirm_clear_job_history(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            );
+        } else {
+            card = card.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("job-history-open")
+                            .label(t("OPEN HISTORY"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                open_view.update(cx, |this, cx| this.open_job_history(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("job-history-clear")
+                            .label(t("CLEAR HISTORY"))
+                            .danger()
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .disabled(total == 0)
+                            .on_click(move |_, _, cx| {
+                                clear_view.update(cx, |this, cx| {
+                                    this.arm_job_history_clear(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(t("CLEAR ASKS FOR CONFIRMATION FIRST")),
+                    ),
+            );
+        }
+
+        card.into_any_element()
+    }
+
+    /// All-records job-history sheet. Opening and closing write nothing.
+    fn job_history_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.job_history_open {
+            return div().into_any_element();
+        }
+        let records = self.state.config.job_history();
+        let total = records.len();
+        let view = cx.entity();
+        let close_view = view.clone();
+        let scrim_view = view;
+
+        let mut list = v_flex().gap_1();
+        if total == 0 {
+            list = list.child(
+                div()
+                    .p_3()
+                    .rounded(px(6.0))
+                    .bg(p.panel)
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(t("NO JOBS RECORDED")),
+            );
+        } else {
+            for record in records.iter().rev() {
+                list = list.child(job_history_row(record, &self.mono, p, true));
+            }
+        }
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .id("job-history-sheet-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_job_history(cx));
+                    }),
+            )
+            .child(
+                v_flex()
+                    .relative()
+                    .w(px(820.0))
+                    .max_w_full()
+                    .h(px(620.0))
+                    .max_h_full()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(p.border_strong)
+                    .bg(p.raised)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(p.text)
+                                            .child(t("JOB HISTORY")),
+                                    )
+                                    .child(chip(&format!("{total} STORED"), p))
+                                    .child(chip(t("LOCAL ONLY"), p)),
+                            )
+                            .child(chip(&format!("MAX {MAX_JOB_HISTORY}"), p)),
+                    )
+                    .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                        "LOCAL ONLY - NOT SENT TO THE CONTROLLER. Records are kept in app.json on this computer, newest first.",
+                    )))
+                    .child(job_history_column_header(p, &self.mono))
+                    .child(
+                        v_flex()
+                            .id("job-history-sheet-list")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .gap_1()
+                            .track_scroll(&self.job_history_scroll)
+                            .overflow_y_scroll()
+                            .vertical_scrollbar(&self.job_history_scroll)
+                            .child(list),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .child(
+                                Button::new("job-history-sheet-close")
+                                    .label(t("CLOSE"))
+                                    .secondary()
+                                    .h(px(48.0))
+                                    .w(px(120.0))
+                                    .rounded_lg()
+                                    .text_size(px(11.0))
+                                    .on_click(move |_, _, cx| {
+                                        close_view.update(cx, |this, cx| {
+                                            this.close_job_history(cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         if self.demo_gantry_card {
             // Screenshot switch: keep the gantry card at the top of the list so
             // the 1280x800 card capture does not depend on a manual scroll.
             self.utility_scroll.scroll_to_top_of_item(GANTRY_CARD_INDEX);
+        }
+        if self.demo_job_history_card {
+            // Screenshot switch: the local job-history card is below the
+            // reset/setup cards at 1280x800; scroll it to the top.
+            self.utility_scroll
+                .scroll_to_top_of_item(JOB_HISTORY_CARD_INDEX);
         }
         let view = cx.entity();
         let config = &self.state.config;
@@ -16612,6 +16994,7 @@ impl Shell {
             .overflow_y_scroll()
             .child(self.controller_reset_card(p, cx))
             .child(self.machine_setup_card(p, cx))
+            .child(self.job_history_card(p, cx))
             .child(self.gantry_card(p, cx))
             .child(self.calibration_card(p, cx))
             .child(self.surfacing_card(p, cx))
@@ -20865,6 +21248,9 @@ impl Render for Shell {
         if self.state.sleep_confirm_open {
             root = root.child(self.sleep_confirm_overlay(p, cx));
         }
+        if self.job_history_open {
+            root = root.child(self.job_history_overlay(p, cx));
+        }
         if self.state.controller_reset.is_confirm_open() {
             root = root.child(self.reset_confirm_overlay(p, cx));
         }
@@ -21314,6 +21700,17 @@ fn job_status_color(job: &JobView, p: Palette) -> Hsla {
     }
 }
 
+/// Persist at most one finished-job record from the shell poll.
+///
+/// Returns `Some(Ok(path))` when one record was written, `Some(Err(_))` when
+/// one was taken but the local write failed, and `None` when nothing was
+/// pending. The record is consumed before the write, so a failure is dropped
+/// rather than retried on the next poll.
+fn flush_job_history_record(state: &mut AppState) -> Option<Result<PathBuf, String>> {
+    let record = state.take_job_history_record()?;
+    Some(state.config.record_job_history(record))
+}
+
 /// Read the demo `--connection-panel[=serial]` switch.
 ///
 /// A bare flag opens the dialog on the demo transport; `=serial` also selects
@@ -21717,6 +22114,191 @@ fn card(p: &Palette) -> Div {
         .border_1()
         .border_color(p.border)
         .bg(p.panel)
+}
+
+/// Header row shared by the job-history card and sheet.
+fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
+    h_flex()
+        .h(px(18.0))
+        .w_full()
+        .flex_shrink_0()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .child(
+            div()
+                .w(px(JOB_HISTORY_TIME_W))
+                .flex_shrink_0()
+                .font_family(mono.clone())
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("LOCAL TIME"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("PROGRAM"),
+        )
+        .child(
+            div()
+                .w(px(JOB_HISTORY_RESULT_W))
+                .flex_shrink_0()
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("RESULT"),
+        )
+        .child(
+            h_flex()
+                .w(px(JOB_HISTORY_ELAPSED_W))
+                .flex_shrink_0()
+                .justify_end()
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("ACTIVE"),
+        )
+        .child(
+            h_flex()
+                .w(px(JOB_HISTORY_LINES_W))
+                .flex_shrink_0()
+                .justify_end()
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("LINES"),
+        )
+        .child(
+            div()
+                .w(px(JOB_HISTORY_CHECK_W))
+                .flex_shrink_0()
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(p.text_faint)
+                .child("CHECK"),
+        )
+}
+
+/// One read-only history row: local time, name, result, active time, lines.
+fn job_history_row(record: &JobHistoryRecord, mono: &SharedString, p: Palette, tall: bool) -> Div {
+    h_flex()
+        .h(px(if tall { 36.0 } else { 32.0 }))
+        .w_full()
+        .flex_shrink_0()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .rounded(px(5.0))
+        .bg(p.panel)
+        .child(
+            div()
+                .w(px(JOB_HISTORY_TIME_W))
+                .flex_shrink_0()
+                .font_family(mono.clone())
+                .text_size(px(9.0))
+                .text_color(p.text_dim)
+                .child(format_job_history_local_time(record.started_unix_s)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(p.text)
+                .child(record.name.clone()),
+        )
+        .child(
+            div()
+                .w(px(JOB_HISTORY_RESULT_W))
+                .flex_shrink_0()
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(job_history_result_color(record.result, p))
+                .child(job_history_result_label(record.result)),
+        )
+        .child(
+            h_flex()
+                .w(px(JOB_HISTORY_ELAPSED_W))
+                .flex_shrink_0()
+                .justify_end()
+                .font_family(mono.clone())
+                .text_size(px(9.0))
+                .text_color(p.text_dim)
+                .child(format_elapsed(Duration::from_secs(record.elapsed_s))),
+        )
+        .child(
+            h_flex()
+                .w(px(JOB_HISTORY_LINES_W))
+                .flex_shrink_0()
+                .justify_end()
+                .font_family(mono.clone())
+                .text_size(px(9.0))
+                .text_color(p.text_dim)
+                .child(record.lines.to_string()),
+        )
+        .child(
+            div()
+                .w(px(JOB_HISTORY_CHECK_W))
+                .flex_shrink_0()
+                .when(record.check_run, |this| {
+                    this.child(
+                        div()
+                            .px_1()
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(p.accent_muted)
+                            .text_size(px(8.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.accent)
+                            .child("CHECK"),
+                    )
+                }),
+        )
+}
+
+/// Short result label for the local history.
+fn job_history_result_label(result: JobHistoryResult) -> &'static str {
+    match result {
+        JobHistoryResult::Completed => "COMPLETED",
+        JobHistoryResult::Aborted => "ABORTED",
+        JobHistoryResult::Stopped => "STOPPED",
+        JobHistoryResult::Interrupted => "INTERRUPTED",
+        JobHistoryResult::Failed => "FAILED",
+    }
+}
+
+/// Result colour for the local history.
+fn job_history_result_color(result: JobHistoryResult, p: Palette) -> Hsla {
+    match result {
+        JobHistoryResult::Completed => p.success,
+        JobHistoryResult::Stopped | JobHistoryResult::Interrupted => p.warning,
+        JobHistoryResult::Aborted | JobHistoryResult::Failed => p.danger,
+    }
+}
+
+/// Render a stored Unix start time in the operator's local time zone.
+///
+/// A time that cannot be represented maps to `--`; the record itself is never
+/// changed.
+fn format_job_history_local_time(started_unix_s: u64) -> String {
+    let Ok(seconds) = i64::try_from(started_unix_s) else {
+        return "--".to_string();
+    };
+    chrono::Local
+        .timestamp_opt(seconds, 0)
+        .single()
+        .map_or_else(
+            || "--".to_string(),
+            |time| time.format("%Y-%m-%d %H:%M").to_string(),
+        )
 }
 
 fn section_label(text: &'static str, p: Palette) -> Div {
@@ -22797,6 +23379,8 @@ fn radio_span(row: &SettingRow) -> Option<(i64, i64)> {
 
 #[cfg(test)]
 mod tests {
+    use ghs_engine::EngineEvent;
+
     use super::*;
 
     #[test]
@@ -22903,5 +23487,87 @@ mod tests {
             .expect("highlight row");
         assert!(selected.selected);
         assert!(selected.breakpoint);
+    }
+
+    // ---------------------------------------------------------- job history
+
+    fn shell_temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "ghs-app-shell-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn history_flush_state(root: &Path) -> (AppState, ghs_config::ConfigStore) {
+        let store = ghs_config::ConfigStore::new(root);
+        let mut state = AppState::new();
+        state.config = crate::config::ConfigModel::from_store(store.clone());
+        state.begin_live("shell history flush");
+        state.job.name = "part.nc".to_string();
+        state.apply_job_event(&EngineEvent::JobStarted {
+            from_line: 1,
+            total_lines: 120,
+        });
+        state.apply_job_event(&EngineEvent::JobCompleted {
+            elapsed: Duration::from_secs(12),
+        });
+        (state, store)
+    }
+
+    #[test]
+    fn shell_flush_persists_exactly_one_pending_record() {
+        let root = shell_temp_root("job-history-flush");
+        let (mut state, store) = history_flush_state(&root);
+
+        let first = flush_job_history_record(&mut state).expect("one pending record");
+        assert!(first.is_ok(), "{first:?}");
+        assert!(
+            flush_job_history_record(&mut state).is_none(),
+            "the poll consumes at most one record and never repeats it"
+        );
+
+        let stored = store
+            .load_app_config()
+            .expect("load app config")
+            .expect("written app config");
+        assert_eq!(stored.job_history.len(), 1);
+        assert_eq!(stored.job_history[0].name, "part.nc");
+        assert_eq!(stored.job_history[0].elapsed_s, 12);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shell_flush_save_failure_keeps_the_corrupt_config_file() {
+        let root = shell_temp_root("job-history-flush-fail");
+        let store = ghs_config::ConfigStore::new(&root);
+        let app_path = store.app_config_path();
+        fs::create_dir_all(app_path.parent().expect("parent")).expect("mkdir");
+        let corrupt = b"{ this is not json";
+        fs::write(&app_path, corrupt).expect("write corrupt config");
+
+        let (mut state, store) = history_flush_state(&root);
+        let result = flush_job_history_record(&mut state).expect("record was taken");
+        let error = result.expect_err("the corrupt app file refuses the save");
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(
+            fs::read(&app_path).expect("read app config"),
+            corrupt,
+            "a failed history save never rewrites the corrupt file"
+        );
+        assert!(state.config.job_history().is_empty());
+        assert!(
+            flush_job_history_record(&mut state).is_none(),
+            "a failed record is dropped, not retried"
+        );
+        assert!(store.load_app_config().is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

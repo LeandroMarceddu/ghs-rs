@@ -531,7 +531,7 @@ impl LiveLink {
         // The job view model owns its event state machine; this function adds
         // the console lines and the tab switch. Never fabricate an `ok` line:
         // the engine streams the real command and acknowledgement.
-        let job_changed = state.job.apply_event(&event);
+        let job_changed = state.apply_job_event(&event);
         match event {
             EngineEvent::Connected => {
                 state.connection = ConnectionState::Ready;
@@ -543,8 +543,10 @@ impl LiveLink {
             }
             EngineEvent::Disconnected => {
                 state.connection = ConnectionState::Disconnected;
-                // Never leave a tool-change sheet behind a dead link.
-                state.job.interrupted();
+                // Never leave a tool-change sheet behind a dead link, and
+                // record the interrupted run if the engine's terminal event
+                // was dropped.
+                state.mark_job_interrupted();
                 state.settings.cancel_writes("disconnected");
                 state.utilities.calibration_mut().on_failure("disconnected");
                 state.startup_lines.on_disconnected();
