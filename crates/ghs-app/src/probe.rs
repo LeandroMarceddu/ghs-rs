@@ -32,6 +32,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use ghs_config::ProbeDefaultsRecord;
 use ghs_core::Units;
 use ghs_engine::{
     Axis as CoreAxis, Command, MachineState, Position, ProbeResult, SystemCommand, Wcs,
@@ -166,6 +167,20 @@ impl ProbeField {
         ProbeField::RectangleHeight,
         ProbeField::PlateX,
         ProbeField::PlateY,
+    ];
+
+    /// Shared fields persisted as per-controller probe defaults.
+    ///
+    /// Loading a profile prefills exactly these cells; every anchor and
+    /// expected value stays per run.
+    pub const PROFILE_DEFAULTS: [ProbeField; 7] = [
+        ProbeField::SafeZ,
+        ProbeField::Search,
+        ProbeField::Feed,
+        ProbeField::Retract,
+        ProbeField::Diameter,
+        ProbeField::EdgeOffset,
+        ProbeField::PlateThickness,
     ];
 
     /// Stable zero-based index for the input array.
@@ -1090,6 +1105,9 @@ pub struct ProbeModel {
     run: Option<ProbeRun>,
     /// Name of the most recent probe program loaded into the job runner.
     last_probe_program: Option<String>,
+    /// A controller profile supplied the shared fields, so opening another
+    /// card must not replace them with pose-derived factory values.
+    defaults_loaded: bool,
 }
 
 impl Default for ProbeModel {
@@ -1113,6 +1131,7 @@ impl Default for ProbeModel {
             plate_y_approach: Sign::Positive,
             run: None,
             last_probe_program: None,
+            defaults_loaded: false,
         };
         for field in ProbeField::ALL {
             if let Some(slot) = model.fields.get_mut(field.index()) {
@@ -1269,6 +1288,80 @@ impl ProbeModel {
         self.set_field_text(ProbeField::ProbeOffsetY, format!("{:.3}", offset.y_mm))
     }
 
+    /// Prefill the shared fields from one controller profile's defaults.
+    ///
+    /// Only [`ProbeField::PROFILE_DEFAULTS`] change, and their inline errors
+    /// are cleared. Anchors, expected values, the probe mount offset, and the
+    /// map Z offset are left exactly as the operator entered them. An active
+    /// probe run is never overwritten.
+    ///
+    /// Returns `false` when a run is active or the record is invalid.
+    pub fn apply_defaults(&mut self, defaults: &ProbeDefaultsRecord) -> bool {
+        if self.is_running() || defaults.validate().is_err() {
+            return false;
+        }
+        for (field, value) in [
+            (ProbeField::SafeZ, defaults.safe_z_mm),
+            (ProbeField::Search, defaults.search_distance_mm),
+            (ProbeField::Feed, defaults.feed_mm_min),
+            (ProbeField::Retract, defaults.retract_mm),
+            (ProbeField::Diameter, defaults.probe_diameter_mm),
+            (ProbeField::EdgeOffset, defaults.edge_offset_mm),
+            (ProbeField::PlateThickness, defaults.plate_thickness_mm),
+        ] {
+            if let Some(slot) = self.fields.get_mut(field.index()) {
+                *slot = format_mm(value);
+            }
+            if let Some(error) = self.field_errors.get_mut(field.index()) {
+                *error = None;
+            }
+        }
+        self.defaults_loaded = true;
+        true
+    }
+
+    /// Parse and validate the current shared field text as a defaults record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field-named message for an empty, non-numeric, non-finite,
+    /// out-of-range, or non-positive search/feed/retract value. The stored
+    /// field text is never changed.
+    pub fn defaults_record(&self) -> Result<ProbeDefaultsRecord, String> {
+        let record = ProbeDefaultsRecord {
+            safe_z_mm: self.defaults_field(ProbeField::SafeZ)?,
+            search_distance_mm: self.defaults_positive_field(ProbeField::Search)?,
+            feed_mm_min: self.defaults_positive_field(ProbeField::Feed)?,
+            retract_mm: self.defaults_positive_field(ProbeField::Retract)?,
+            probe_diameter_mm: self.defaults_field(ProbeField::Diameter)?,
+            edge_offset_mm: self.defaults_field(ProbeField::EdgeOffset)?,
+            plate_thickness_mm: self.defaults_field(ProbeField::PlateThickness)?,
+        };
+        record
+            .validate()
+            .map_err(|error| format!("probe defaults are invalid: {error}"))?;
+        Ok(record)
+    }
+
+    fn defaults_field(&self, field: ProbeField) -> Result<f64, String> {
+        let text = self.field_text(field).trim();
+        // Validate first so syntax/range errors name the operator field.
+        self.validate_field_text(field, text)?;
+        self.field_value(field)
+    }
+
+    fn defaults_positive_field(&self, field: ProbeField) -> Result<f64, String> {
+        let value = self.defaults_field(field)?;
+        if value <= 0.0 {
+            return Err(format!(
+                "{} must be greater than 0.000 {}",
+                field.label(),
+                field.unit()
+            ));
+        }
+        Ok(value)
+    }
+
     /// Validated constant datum shift added to every measured height.
     ///
     /// This value is captured in [`ProbeSetup`] and applied to the map only;
@@ -1303,6 +1396,15 @@ impl ProbeModel {
         }
         let work_x_mm = ctx.work_pos_mm.get(CoreAxis::X);
         let work_y_mm = ctx.work_pos_mm.get(CoreAxis::Y);
+        // With a loaded profile the safe-Z default is authoritative, so keep
+        // the nominal height-map surface at least five millimetres below it.
+        // The pose-derived seed still wins when it is already lower.
+        let surface_z_mm = if self.defaults_loaded {
+            let safe_z_mm = self.field_value(ProbeField::SafeZ).unwrap_or(z_mm + 10.0);
+            (z_mm + 5.0).min(safe_z_mm - 5.0)
+        } else {
+            z_mm + 5.0
+        };
         let seeds = [
             (ProbeField::SafeZ, z_mm + 10.0),
             (ProbeField::Search, 5.0),
@@ -1332,10 +1434,15 @@ impl ProbeModel {
             // A conservative, self-consistent starting grid: safe Z is ten
             // millimetres up, the nominal surface is five below safe Z, and
             // the default search covers exactly that travel.
-            (ProbeField::SurfaceZ, z_mm + 5.0),
+            (ProbeField::SurfaceZ, surface_z_mm),
         ];
         self.field_errors = std::array::from_fn(|_| None);
         for (field, value) in seeds {
+            // A loaded controller profile owns the shared search/feed/retract
+            // values. Opening a card only reseeds the per-run anchors.
+            if self.defaults_loaded && ProbeField::PROFILE_DEFAULTS.contains(&field) {
+                continue;
+            }
             if let Some(slot) = self.fields.get_mut(field.index()) {
                 *slot = format!("{value:.3}");
             }
@@ -5245,5 +5352,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------- per-profile probe defaults
+
+    fn profile_defaults() -> ProbeDefaultsRecord {
+        ProbeDefaultsRecord {
+            safe_z_mm: 22.5,
+            search_distance_mm: 6.5,
+            feed_mm_min: 220.25,
+            retract_mm: 1.5,
+            probe_diameter_mm: 2.0,
+            edge_offset_mm: 0.25,
+            plate_thickness_mm: 9.5,
+        }
+    }
+
+    fn shared_text(model: &ProbeModel) -> Vec<String> {
+        ProbeField::PROFILE_DEFAULTS
+            .iter()
+            .map(|field| model.field_text(*field).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn apply_defaults_sets_every_shared_field_with_three_decimals() {
+        let mut model = ProbeModel::default();
+        // A stale inline error on a shared field is cleared by the load.
+        assert!(model.set_field_text(ProbeField::Search, "bad").is_err());
+        assert!(model.field_error(ProbeField::Search).is_some());
+
+        assert!(model.apply_defaults(&profile_defaults()));
+        assert_eq!(
+            shared_text(&model),
+            vec![
+                "22.500".to_string(),
+                "6.500".to_string(),
+                "220.250".to_string(),
+                "1.500".to_string(),
+                "2.000".to_string(),
+                "0.250".to_string(),
+                "9.500".to_string(),
+            ]
+        );
+        for field in ProbeField::PROFILE_DEFAULTS {
+            assert_eq!(model.field_error(field), None, "{field:?}");
+        }
+    }
+
+    #[test]
+    fn apply_defaults_leaves_every_anchor_and_expected_value_alone() {
+        let mut model = ProbeModel::default();
+        for (field, text) in [
+            (ProbeField::ExpectedZ, "-5.000"),
+            (ProbeField::ProbingHeight, "1.000"),
+            (ProbeField::ExpectedX, "20.000"),
+            (ProbeField::ExpectedY, "21.000"),
+            (ProbeField::CenterX, "2.000"),
+            (ProbeField::CenterY, "3.000"),
+            (ProbeField::Radius, "25.000"),
+            (ProbeField::Touches, "6"),
+            (ProbeField::Separation, "55.000"),
+            (ProbeField::ReferenceZ, "-4.000"),
+            (ProbeField::OriginX, "1.000"),
+            (ProbeField::OriginY, "2.000"),
+            (ProbeField::StepX, "11.000"),
+            (ProbeField::StepY, "12.000"),
+            (ProbeField::Columns, "5"),
+            (ProbeField::Rows, "6"),
+            (ProbeField::SurfaceZ, "4.000"),
+            (ProbeField::ProbeOffsetX, "1.500"),
+            (ProbeField::ProbeOffsetY, "-2.500"),
+            (ProbeField::MapZOffset, "0.250"),
+            (ProbeField::RectangleWidth, "65.000"),
+            (ProbeField::RectangleHeight, "45.000"),
+            (ProbeField::PlateX, "30.000"),
+            (ProbeField::PlateY, "31.000"),
+        ] {
+            model
+                .set_field_text(field, text)
+                .unwrap_or_else(|error| panic!("{field:?}: {error}"));
+        }
+        let anchors: Vec<String> = ProbeField::ALL
+            .iter()
+            .filter(|field| !ProbeField::PROFILE_DEFAULTS.contains(field))
+            .map(|field| model.field_text(*field).to_string())
+            .collect();
+
+        assert!(model.apply_defaults(&profile_defaults()));
+        let after: Vec<String> = ProbeField::ALL
+            .iter()
+            .filter(|field| !ProbeField::PROFILE_DEFAULTS.contains(field))
+            .map(|field| model.field_text(*field).to_string())
+            .collect();
+        assert_eq!(after, anchors);
+    }
+
+    #[test]
+    fn apply_defaults_is_refused_while_a_probe_run_is_active() {
+        let ctx = context();
+        let mut model = model(ProbeCard::ZTouchPlate);
+        let setup = model.prepare(&ctx).expect("z plan");
+        model.begin(setup);
+        assert!(model.is_running());
+        let before = shared_text(&model);
+
+        assert!(!model.apply_defaults(&profile_defaults()));
+        assert_eq!(shared_text(&model), before);
+    }
+
+    #[test]
+    fn opening_a_card_after_a_profile_load_keeps_the_shared_defaults() {
+        let ctx = context();
+        let mut model = ProbeModel::default();
+        assert!(model.apply_defaults(&profile_defaults()));
+        assert!(model.select_card(ProbeCard::EdgeX, &ctx));
+        assert_eq!(
+            shared_text(&model),
+            vec![
+                "22.500".to_string(),
+                "6.500".to_string(),
+                "220.250".to_string(),
+                "1.500".to_string(),
+                "2.000".to_string(),
+                "0.250".to_string(),
+                "9.500".to_string(),
+            ],
+            "card selection reseeds anchors, not profile-owned shared values"
+        );
+    }
+
+    #[test]
+    fn defaults_record_parses_the_shared_fields_and_validates_the_record() {
+        let mut model = ProbeModel::default();
+        assert!(model.apply_defaults(&profile_defaults()));
+        assert_eq!(model.defaults_record().expect("record"), profile_defaults());
+
+        // The probe record requires positive search/feed/retract even though
+        // the generic field editor allows zero as an intermediate value.
+        model
+            .set_field_text(ProbeField::Search, "0")
+            .expect("zero stores");
+        let error = model.defaults_record().expect_err("zero search refused");
+        assert!(error.contains("SEARCH"), "{error}");
+        assert_eq!(model.field_text(ProbeField::Search), "0");
+    }
+
+    #[test]
+    fn defaults_record_names_a_non_finite_field_and_keeps_the_text() {
+        let model = ProbeModel::default();
+        let index = ProbeField::SafeZ.index();
+        let mut broken = model.clone();
+        broken.fields[index] = "NaN".to_string();
+        let error = broken.defaults_record().expect_err("NaN refused");
+        assert!(error.contains("SAFE Z"), "{error}");
+        assert_eq!(broken.field_text(ProbeField::SafeZ), "NaN");
+
+        let mut infinite = ProbeModel::default();
+        infinite.fields[index] = "inf".to_string();
+        let error = infinite.defaults_record().expect_err("inf refused");
+        assert!(error.contains("SAFE Z"), "{error}");
+        assert_eq!(infinite.field_text(ProbeField::SafeZ), "inf");
     }
 }

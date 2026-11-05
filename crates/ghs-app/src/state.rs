@@ -2558,8 +2558,10 @@ impl AppState {
             {
                 self.push_console(ConsoleLevel::Warn, error.to_string());
             }
-            // The profile owns the physical mount offset.
+            // The profile owns the physical mount offset and the shared probe
+            // defaults. Neither is sent to the controller.
             self.load_probe_offset();
+            self.load_probe_defaults();
         }
     }
 
@@ -4303,6 +4305,49 @@ impl AppState {
             .set_probe_offset(XyPoint::new(offset.x_mm, offset.y_mm));
     }
 
+    /// Copy the profile's shared probe defaults into the editor fields.
+    ///
+    /// Only safe Z, search, feed, retract, diameter, edge offset, and plate
+    /// thickness change. An active probe run is never overwritten. This is
+    /// local setup data only; nothing is sent to the controller.
+    pub fn load_probe_defaults(&mut self) {
+        let defaults = self.config.probe_defaults();
+        let _ = self.probe.apply_defaults(&defaults);
+    }
+
+    /// Whether the `--demo-probe-defaults` switch may press SAVE DEFAULTS.
+    ///
+    /// The controller profile must have loaded and no probe run may be active.
+    #[must_use]
+    pub fn probe_defaults_demo_ready(&self) -> bool {
+        self.config.key().is_some() && !self.probe.is_running()
+    }
+
+    /// Save the editor's shared probe defaults into the active profile.
+    ///
+    /// This writes local setup data only. It never sends a command, setting,
+    /// offset, or profile replacement to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no controller profile is active, a probe run is
+    /// active, a shared field is invalid, or the profile write fails. A failed
+    /// save keeps the previous stored record.
+    pub fn save_probe_defaults(&mut self) -> Result<PathBuf, String> {
+        if self.config.key().is_none() {
+            return Err(
+                "no controller profile is active; connect and finish the handshake".to_string(),
+            );
+        }
+        if self.probe.is_running() {
+            return Err(
+                "a probe run is active; finish or stop it before saving probe defaults".to_string(),
+            );
+        }
+        let record = self.probe.defaults_record()?;
+        self.config.save_probe_defaults(record)
+    }
+
     /// Save the editor's probe mount offset into the active profile.
     ///
     /// The value is local setup data (`probe tip - controlled point`). This
@@ -4995,7 +5040,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ghs_config::{
-        ConfigStore, ControllerData, HeightMapFrame, HeightMapRecord, ProbeOffsetRecord, ProfileKey,
+        ConfigStore, ControllerData, HeightMapFrame, HeightMapRecord, ProbeDefaultsRecord,
+        ProbeOffsetRecord, ProfileKey,
     };
     use ghs_core::{
         FeedSpindle, MachineState, Overrides, Position, Signals, Wcs, parse_controller_info,
@@ -5007,7 +5053,7 @@ mod tests {
         RESET_TARGETS, ResetGate, ResetOutcome, ResetRefusal, ResetResult, command_text,
         refresh_commands, reset_command,
     };
-    use crate::probe::ProbeContext;
+    use crate::probe::{ProbeCard, ProbeContext};
     use crate::setup::{SafetyItem, SetupStep};
     use crate::utilities::LimitsStatus;
 
@@ -5084,6 +5130,78 @@ mod tests {
         state.begin_live("test transport");
         state.apply_controller_info(&info);
         (state, dir, info)
+    }
+
+    fn profile_probe_defaults() -> ProbeDefaultsRecord {
+        ProbeDefaultsRecord {
+            safe_z_mm: 22.5,
+            search_distance_mm: 6.5,
+            feed_mm_min: 220.25,
+            retract_mm: 1.5,
+            probe_diameter_mm: 2.0,
+            edge_offset_mm: 0.25,
+            plate_thickness_mm: 9.5,
+        }
+    }
+
+    fn second_probe_defaults() -> ProbeDefaultsRecord {
+        ProbeDefaultsRecord {
+            safe_z_mm: 30.0,
+            search_distance_mm: 8.0,
+            feed_mm_min: 150.0,
+            retract_mm: 2.5,
+            probe_diameter_mm: 4.0,
+            edge_offset_mm: 1.5,
+            plate_thickness_mm: 12.0,
+        }
+    }
+
+    fn probe_default_context() -> ProbeContext {
+        ProbeContext {
+            live: true,
+            ready: true,
+            machine_state: MachineState::Idle,
+            job_active: false,
+            machine_pos_mm: Position::xyz(0.0, 0.0, 0.0),
+            work_pos_mm: Position::xyz(0.0, 0.0, 0.0),
+            wcs: Wcs::G54,
+            wcs_value_mm: Position::zero(),
+            g92_mm: Position::zero(),
+            tlo_z_mm: 0.0,
+            spindle_on: false,
+            coolant_on: false,
+            has_probe: true,
+            has_probe_connected_signal: false,
+            probe_disconnected: false,
+            probe_triggered: false,
+            offsets_reported: true,
+            units: Units::Millimetre,
+        }
+    }
+
+    fn shared_probe_text(state: &AppState) -> Vec<String> {
+        ProbeField::PROFILE_DEFAULTS
+            .iter()
+            .map(|field| state.probe.field_text(*field).to_string())
+            .collect()
+    }
+
+    fn state_with_probe_defaults(
+        label: &str,
+        defaults: ProbeDefaultsRecord,
+    ) -> (AppState, TempRoot, ControllerInfo, ConfigStore) {
+        let dir = TempRoot::new(label);
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut data = ControllerData::new();
+        data.probe_defaults = defaults;
+        store.save_controller_data(&key, &data).expect("profile");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store.clone());
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+        (state, dir, info, store)
     }
 
     fn ready_state_with_macro(label: &str, confirm: bool) -> (AppState, TempRoot, ControllerInfo) {
@@ -6548,6 +6666,309 @@ mod tests {
                 x_mm: 9.0,
                 y_mm: 1.25
             }
+        );
+    }
+
+    #[test]
+    fn profile_probe_defaults_load_all_shared_fields_with_three_decimals() {
+        let (state, _dir, _info, _store) =
+            state_with_probe_defaults("probe-defaults-load", profile_probe_defaults());
+        assert_eq!(
+            shared_probe_text(&state),
+            vec![
+                "22.500".to_string(),
+                "6.500".to_string(),
+                "220.250".to_string(),
+                "1.500".to_string(),
+                "2.000".to_string(),
+                "0.250".to_string(),
+                "9.500".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_profile_without_probe_defaults_loads_the_factory_record() {
+        let dir = TempRoot::new("probe-defaults-old");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let path = store.profile_path(&key);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        // A profile written before `probe_defaults` existed: the controller
+        // data carries only the schema version, so every newer field defaults.
+        fs::write(
+            &path,
+            format!(
+                r#"{{"profile":"{}","data":{{"schema_version":1}}}}"#,
+                key.id()
+            ),
+        )
+        .expect("write old profile");
+
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store);
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+        assert_eq!(
+            shared_probe_text(&state),
+            vec![
+                "10.000".to_string(),
+                "5.000".to_string(),
+                "100.000".to_string(),
+                "2.000".to_string(),
+                "3.000".to_string(),
+                "0.000".to_string(),
+                "10.000".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_defaults_save_writes_the_exact_record_and_reloads_it() {
+        let dir = TempRoot::new("probe-defaults-save");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store.clone());
+        state.begin_live("test transport");
+        state.apply_controller_info(&info);
+        assert!(state.probe.apply_defaults(&profile_probe_defaults()));
+
+        let path = state.save_probe_defaults().expect("save defaults");
+        assert_eq!(path, store.profile_path(&key));
+        assert_eq!(state.config.probe_defaults(), profile_probe_defaults());
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("data")
+                .probe_defaults,
+            profile_probe_defaults()
+        );
+
+        let mut reopened = AppState::new();
+        reopened.config = ConfigModel::from_store(store);
+        reopened.begin_live("reload");
+        reopened.apply_controller_info(&info);
+        assert_eq!(
+            shared_probe_text(&reopened),
+            vec![
+                "22.500".to_string(),
+                "6.500".to_string(),
+                "220.250".to_string(),
+                "1.500".to_string(),
+                "2.000".to_string(),
+                "0.250".to_string(),
+                "9.500".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_defaults_load_and_save_are_refused_during_a_probe_run() {
+        let (mut state, _dir, _info, _store) =
+            state_with_probe_defaults("probe-defaults-active", profile_probe_defaults());
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        let ctx = probe_default_context();
+        assert!(state.probe.select_card(ProbeCard::ZTouchPlate, &ctx));
+        let setup = state.probe.prepare(&ctx).expect("z plan");
+        state.probe.begin(setup);
+        assert!(state.probe.is_running());
+
+        let before = shared_probe_text(&state);
+        let error = state
+            .save_probe_defaults()
+            .expect_err("an active run blocks save");
+        assert!(error.contains("probe run"), "{error}");
+        assert_eq!(shared_probe_text(&state), before, "save left fields alone");
+
+        state
+            .probe
+            .set_field_text(ProbeField::SafeZ, "99.000")
+            .expect("local edit");
+        let edited = shared_probe_text(&state);
+        state.load_probe_defaults();
+        assert_eq!(
+            shared_probe_text(&state),
+            edited,
+            "a profile load must not overwrite a run"
+        );
+    }
+
+    #[test]
+    fn probe_defaults_save_without_an_active_profile_is_refused() {
+        let mut state = AppState::new();
+        assert!(state.config.key().is_none());
+        let error = state
+            .save_probe_defaults()
+            .expect_err("no controller profile");
+        assert!(error.contains("no controller profile"), "{error}");
+    }
+
+    #[test]
+    fn invalid_probe_default_field_is_named_and_writes_nothing() {
+        let (mut state, _dir, _info, store) =
+            state_with_probe_defaults("probe-defaults-invalid", profile_probe_defaults());
+        let key = ProfileKey::from_controller(&parse_controller_info(FLEXIHAL));
+        state
+            .probe
+            .set_field_text(ProbeField::Search, "0")
+            .expect("zero is valid for the editor");
+        let before = store
+            .load_controller_data(&key)
+            .expect("load")
+            .expect("data")
+            .probe_defaults;
+
+        let error = state
+            .save_probe_defaults()
+            .expect_err("zero search is not a valid default");
+        assert!(error.contains("SEARCH"), "{error}");
+        assert_eq!(state.probe.field_text(ProbeField::Search), "0");
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("data")
+                .probe_defaults,
+            before,
+            "an invalid record must not be written"
+        );
+    }
+
+    #[test]
+    fn probe_defaults_load_and_save_emit_no_controller_command() {
+        let (mut state, _dir, _info, _store) =
+            state_with_probe_defaults("probe-defaults-no-command", profile_probe_defaults());
+        let mut sent = Vec::new();
+        // These are local profile operations and take no command sender. The
+        // recorder stays empty across both paths.
+        drop(recorded_send(&mut sent));
+        state.load_probe_defaults();
+        assert!(state.probe.apply_defaults(&second_probe_defaults()));
+        let _ = state.save_probe_defaults().expect("save defaults");
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn probe_defaults_save_failure_keeps_the_previous_record() {
+        let (mut state, _dir, _info, store) =
+            state_with_probe_defaults("probe-defaults-failure", profile_probe_defaults());
+        let key = ProfileKey::from_controller(&parse_controller_info(FLEXIHAL));
+        assert!(state.probe.apply_defaults(&second_probe_defaults()));
+        let path = state.save_probe_defaults().expect("first save");
+        assert_eq!(
+            store
+                .load_controller_data(&key)
+                .expect("load")
+                .expect("data")
+                .probe_defaults,
+            second_probe_defaults()
+        );
+
+        // Make the atomic replace fail without touching the in-memory record.
+        fs::remove_file(&path).expect("remove profile");
+        fs::create_dir_all(&path).expect("block profile path");
+        assert!(state.probe.apply_defaults(&profile_probe_defaults()));
+        state
+            .save_probe_defaults()
+            .expect_err("a blocked profile path fails the write");
+        assert_eq!(
+            state.config.probe_defaults(),
+            second_probe_defaults(),
+            "a failed save keeps the previous defaults"
+        );
+        assert!(path.is_dir(), "the failed write did not replace the path");
+    }
+
+    #[test]
+    fn probe_defaults_are_stored_per_controller_profile() {
+        let dir = TempRoot::new("probe-defaults-separation");
+        let store = ConfigStore::new(&dir.path);
+        let first = parse_controller_info(FLEXIHAL);
+        let mut second = parse_controller_info(FLEXIHAL);
+        second.board = Some("OtherBoard".into());
+        assert_ne!(
+            ProfileKey::from_controller(&first),
+            ProfileKey::from_controller(&second)
+        );
+
+        let mut first_state = AppState::new();
+        first_state.config = ConfigModel::from_store(store.clone());
+        first_state.begin_live("first transport");
+        first_state.apply_controller_info(&first);
+        assert!(first_state.probe.apply_defaults(&profile_probe_defaults()));
+        first_state
+            .save_probe_defaults()
+            .expect("save first defaults");
+
+        let mut second_state = AppState::new();
+        second_state.config = ConfigModel::from_store(store.clone());
+        second_state.begin_live("second transport");
+        second_state.apply_controller_info(&second);
+        assert!(second_state.probe.apply_defaults(&second_probe_defaults()));
+        second_state
+            .save_probe_defaults()
+            .expect("save second defaults");
+
+        let first_data = store
+            .load_controller_data(&ProfileKey::from_controller(&first))
+            .expect("load first")
+            .expect("first profile");
+        let second_data = store
+            .load_controller_data(&ProfileKey::from_controller(&second))
+            .expect("load second")
+            .expect("second profile");
+        assert_eq!(first_data.probe_defaults, profile_probe_defaults());
+        assert_eq!(second_data.probe_defaults, second_probe_defaults());
+
+        let mut reopened = AppState::new();
+        reopened.config = ConfigModel::from_store(store);
+        reopened.begin_live("first again");
+        reopened.apply_controller_info(&first);
+        assert_eq!(
+            reopened.probe.field_text(ProbeField::SafeZ),
+            "22.500",
+            "the first profile keeps its own defaults"
+        );
+    }
+
+    #[test]
+    fn demo_probe_defaults_state_is_reproducible() {
+        let dir = TempRoot::new("probe-defaults-demo");
+        let store = ConfigStore::new(&dir.path);
+        let info = parse_controller_info(FLEXIHAL);
+        let key = ProfileKey::from_controller(&info);
+        let mut data = ControllerData::new();
+        data.probe_defaults = profile_probe_defaults();
+        store.save_controller_data(&key, &data).expect("profile");
+
+        let snapshot = || {
+            let mut state = AppState::new();
+            state.config = ConfigModel::from_store(store.clone());
+            state.begin_live("demo");
+            state.apply_controller_info(&info);
+            assert!(state.probe_defaults_demo_ready());
+            let path = state.save_probe_defaults().expect("demo save");
+            (shared_probe_text(&state), path)
+        };
+        let first = snapshot();
+        let second = snapshot();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.0,
+            vec![
+                "22.500".to_string(),
+                "6.500".to_string(),
+                "220.250".to_string(),
+                "1.500".to_string(),
+                "2.000".to_string(),
+                "0.250".to_string(),
+                "9.500".to_string(),
+            ]
         );
     }
 

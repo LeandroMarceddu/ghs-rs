@@ -56,7 +56,10 @@
 //! computed current/delta/proposed values, and presses the same confirm action
 //! once; the applied state comes only from a real `$#` read-back.
 //! `--demo-probe-tlo-confirm` stops at that confirmation without confirming it,
-//! for the confirmation screenshot. `--demo-height-map-apply` and
+//! for the confirmation screenshot. `--demo-probe-defaults` opens Probe, waits
+//! for the controller profile, and presses the same `SAVE DEFAULTS` action
+//! once; it writes only local profile JSON and sends no probe command.
+//! `--demo-height-map-apply` and
 //! `--demo-height-map-revert` press the same explicit height-map Apply/Confirm
 //! and Revert actions after the 4x4 demo map completes.
 //! `--demo-height-map-confirm` opens the confirmation step without confirming;

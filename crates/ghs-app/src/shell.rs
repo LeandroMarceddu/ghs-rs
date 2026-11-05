@@ -282,6 +282,13 @@ impl MacroEditor {
     }
 }
 
+/// Last local result of the Probe `SAVE DEFAULTS` action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProbeDefaultsStatus {
+    saved: bool,
+    text: String,
+}
+
 pub struct Shell {
     pub state: AppState,
     feed_slider: Entity<SliderState>,
@@ -405,6 +412,11 @@ pub struct Shell {
     demo_offsets_restore_done: bool,
     probe_card_demo: Option<String>,
     probe_card_demo_done: bool,
+    /// Last `SAVE DEFAULTS` result shown in the Probe workspace.
+    probe_defaults_status: Option<ProbeDefaultsStatus>,
+    /// Screenshot switch: press `SAVE DEFAULTS` once after the profile loads.
+    demo_probe_defaults: bool,
+    demo_probe_defaults_done: bool,
     demo_probe_run: bool,
     demo_probe_run_done: bool,
     demo_probe_apply: bool,
@@ -710,7 +722,11 @@ impl Shell {
                     .map(std::string::ToString::to_string)
             })
         };
-        if probe_card_demo.is_some() || std::env::args().any(|arg| arg == "--probe") {
+        let demo_probe_defaults = std::env::args().any(|arg| arg == "--demo-probe-defaults");
+        if probe_card_demo.is_some()
+            || demo_probe_defaults
+            || std::env::args().any(|arg| arg == "--probe")
+        {
             state.mode = Mode::Probe;
         }
         let demo_probe_apply = std::env::args().any(|arg| arg == "--demo-probe-apply");
@@ -851,6 +867,9 @@ impl Shell {
             demo_offsets_restore_done: false,
             probe_card_demo,
             probe_card_demo_done: false,
+            probe_defaults_status: None,
+            demo_probe_defaults,
+            demo_probe_defaults_done: false,
             demo_probe_run,
             demo_probe_run_done: false,
             demo_probe_apply,
@@ -1611,6 +1630,18 @@ impl Shell {
                     format!("--probe-card: unknown cycle '{name}'"),
                 );
             }
+            changed = true;
+        }
+        // Screenshot switch: press the same SAVE DEFAULTS action after the
+        // controller profile has loaded. It writes local profile JSON only and
+        // never sends a probe command or motion.
+        if self.demo_probe_defaults
+            && !self.demo_probe_defaults_done
+            && self.state.probe_defaults_demo_ready()
+        {
+            self.demo_probe_defaults_done = true;
+            self.state.mode = Mode::Probe;
+            self.save_probe_defaults(cx);
             changed = true;
         }
         // Screenshot switch: press the same RUN action after the preflight
@@ -4336,6 +4367,33 @@ impl Shell {
             );
             cx.notify();
         }
+    }
+
+    /// Save the current shared probe fields into the active controller profile.
+    ///
+    /// This is local setup data; no command, setting, offset, or motion is sent.
+    /// The bar shows the exact path or refusal, and a failure keeps the
+    /// previous stored defaults.
+    fn save_probe_defaults(&mut self, cx: &mut Context<Self>) {
+        match self.state.save_probe_defaults() {
+            Ok(path) => {
+                let text = format!("SAVED: {}", path.display());
+                self.state.push_console(
+                    ConsoleLevel::Ok,
+                    format!("Probe defaults saved to {}", path.display()),
+                );
+                self.probe_defaults_status = Some(ProbeDefaultsStatus { saved: true, text });
+            }
+            Err(message) => {
+                let text = format!("NOT SAVED: {message}");
+                self.state.push_console(
+                    ConsoleLevel::Warn,
+                    format!("Probe defaults not saved: {message}"),
+                );
+                self.probe_defaults_status = Some(ProbeDefaultsStatus { saved: false, text });
+            }
+        }
+        cx.notify();
     }
 
     /// Load and start a generated probe program after a passing preflight.
@@ -8641,6 +8699,7 @@ impl Shell {
                     .child(chip(if ctx.ready { t("LIVE") } else { t("OFFLINE") }, p)),
             )
             .child(self.probe_offset_bar(p, cx))
+            .child(self.probe_defaults_bar(p, cx))
             .child(banner)
             .child(grid)
     }
@@ -8712,6 +8771,80 @@ impl Shell {
             );
         if let Some(error) = error {
             bar = bar.child(div().text_size(px(9.0)).text_color(p.danger).child(error));
+        }
+        bar
+    }
+
+    /// Compact local-save bar for the per-controller shared probe defaults.
+    ///
+    /// It never sends a command: the button only writes the active profile's
+    /// JSON through the same atomic save path as tools and maps.
+    fn probe_defaults_bar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let status = self.probe_defaults_status.clone();
+        let mut bar = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(match &status {
+                Some(status) if !status.saved => p.danger,
+                Some(_) => p.success.opacity(0.55),
+                None => p.border,
+            })
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label(t("PROBE DEFAULTS"), p))
+                    .child(
+                        Button::new("probe-defaults-save")
+                            .label(t("SAVE DEFAULTS"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(160.0))
+                            .flex_shrink_0()
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| this.save_probe_defaults(cx));
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_dim)
+                            .child(t("SAVED PER CONTROLLER PROFILE")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(p.text_faint)
+                            .child(t("local JSON only; nothing is sent to the controller")),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.text_faint)
+                    .child(
+                        "A newly loaded profile prefills SAFE Z, SEARCH, FEED, RETRACT, PROBE DIA, \
+                         EDGE OFFSET, and PLATE THICK. Per-cycle anchors, expected values, centre, \
+                         radius, touches, separation, reference Z, and the height grid stay per run.",
+                    ),
+            );
+        if let Some(status) = status {
+            bar = bar.child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(if status.saved { p.success } else { p.danger })
+                    .child(status.text),
+            );
         }
         bar
     }
@@ -9042,6 +9175,7 @@ impl Shell {
                     .child(chip(self.state.unit(), p)),
             )
             .child(self.probe_offset_bar(p, cx))
+            .child(self.probe_defaults_bar(p, cx))
             .child(body)
             .child(footer)
     }

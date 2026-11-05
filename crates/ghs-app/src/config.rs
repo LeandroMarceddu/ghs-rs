@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use ghs_config::{
     AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
     IdentityPolicy, ImportOutcome, Keymap, MAX_HEIGHT_MAPS, Macro, OffsetSnapshot,
-    ProbeOffsetRecord, ProfileKey, ThemeMode, ToolTable,
+    ProbeDefaultsRecord, ProbeOffsetRecord, ProfileKey, ThemeMode, ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -663,6 +663,15 @@ impl ConfigModel {
         self.data.probe_offset
     }
 
+    /// Persisted shared probe defaults for the active profile.
+    ///
+    /// A profile written before the record existed returns the factory
+    /// defaults. This is local setup data only.
+    #[must_use]
+    pub fn probe_defaults(&self) -> ProbeDefaultsRecord {
+        self.data.probe_defaults
+    }
+
     /// Save the probe mount offset into the current controller profile.
     ///
     /// The value is `probe tip - controlled point`, in millimetres. It is a
@@ -725,6 +734,76 @@ impl ConfigModel {
         self.last_result = Some(ConfigStatus {
             ok: true,
             text: format!("Probe offset saved to {}", path.display()),
+        });
+        Ok(path)
+    }
+
+    /// Save the shared probe defaults into the current controller profile.
+    ///
+    /// Only `probe_defaults` changes in a cloned profile document. The write
+    /// goes through the same atomic `ConfigStore` path as tools and maps and
+    /// never sends a command, setting, offset, or profile replacement to the
+    /// controller. In-memory data changes only after the write succeeds, so a
+    /// failure keeps the previous record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no identified controller profile is active, the
+    /// stored profile is corrupt, the record is invalid, or writing fails.
+    pub fn save_probe_defaults(
+        &mut self,
+        defaults: ProbeDefaultsRecord,
+    ) -> Result<PathBuf, String> {
+        if self.corrupt_profile {
+            return Err(
+                "the stored profile is corrupt; it was not overwritten. Repair or remove it first"
+                    .to_string(),
+            );
+        }
+        if self.store.is_none() {
+            return Err("no platform configuration directory".to_string());
+        }
+        let Some(key) = self.key.clone() else {
+            return Err("connect a controller before saving probe defaults".to_string());
+        };
+        if !key.is_identified() {
+            return Err(
+                "the controller identity is not verified; probe defaults are saved only for a \
+                 known controller"
+                    .to_string(),
+            );
+        }
+        defaults
+            .validate()
+            .map_err(|error| format!("probe defaults are invalid: {error}"))?;
+        let mut data = self.data.clone();
+        data.probe_defaults = defaults;
+        let path = self
+            .store
+            .as_ref()
+            .map(|store| store.profile_path(&key))
+            .ok_or_else(|| "no platform configuration directory".to_string())?;
+        if let Err(error) = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "no platform configuration directory".to_string())
+            .and_then(|store| {
+                store
+                    .save_controller_data(&key, &data)
+                    .map_err(|error| error.to_string())
+            })
+        {
+            self.last_result = Some(ConfigStatus {
+                ok: false,
+                text: format!("Probe defaults save failed: {error}"),
+            });
+            return Err(error);
+        }
+        self.data = data;
+        self.profile_error = None;
+        self.last_result = Some(ConfigStatus {
+            ok: true,
+            text: format!("Probe defaults saved to {}", path.display()),
         });
         Ok(path)
     }
