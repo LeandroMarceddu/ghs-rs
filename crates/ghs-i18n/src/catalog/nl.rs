@@ -950,4 +950,272 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
         "TASTPROGRAMMA: een gegenereerd tastplan kan niet via de taakbalk worden \
         gecontroleerd",
     ),
+    (
+        "1. Confirm the physical E-stop and independent spindle stop. 2. Open \
+        CONNECTION and select the serial port. 3. Wait for READY and Idle. 4. Check \
+        the DRO with one small jog. 5. Verify units, WCS, and soft limits before \
+        loading a program.",
+        "1. Bevestig de fysieke noodstop en de onafhankelijke spindelstop. 2. Open \
+        VERBINDING en selecteer de seriële poort. 3. Wacht op GEREED en inactief. 4. \
+        Controleer de DRO met een kleine jog. 5. Controleer eenheden, WCS en \
+        soft-limieten voordat je een programma laadt.",
+    ),
+    ("ADD LINE NUMBERS", "REGELNUMMERS TOEVOEGEN"),
+    ("APP PREFERENCE ONLY", "ALLEEN APP-VOORKEUR"),
+    (
+        "APPLY is a separate, confirmed step and is allowed only while the controller \
+        is Idle.",
+        "TOEPASSEN is een aparte, bevestigde stap en mag alleen terwijl de controller \
+        inactief is.",
+    ),
+    (
+        "APPLY sends exactly one Command::SetSetting through the engine. The engine \
+        writes the value, reads it back, and only then marks it APPLIED. CANCEL sends \
+        nothing.",
+        "TOEPASSEN stuurt precies één Command::SetSetting via de engine. De engine \
+        schrijft de waarde, leest die terug en markeert die pas dan als TOEGEPAST. \
+        ANNULEREN stuurt niets.",
+    ),
+    ("AXIS", "AS"),
+    (
+        "After setup, use the normal Connection panel. Start with the simulator or with \
+        the spindle off, then run only status, DRO, and small jogs.",
+        "Gebruik na de configuratie het normale Verbindingsvenster. Start met de \
+        simulator of met de spindel uit en voer alleen status, DRO en kleine jogs uit.",
+    ),
+    ("BACK", "TERUG"),
+    (
+        "Back-and-forth raster at each depth, with a safe-Z retract between passes. The \
+        wizard validates every field and caps the program before LOAD AS PROGRAM; it \
+        never starts the job.",
+        "Heen-en-weer-raster op elke diepte, met terugtrekken naar veilige Z tussen de \
+        passes. De wizard valideert elk veld en begrenst het programma vóór ALS \
+        PROGRAMMA LADEN; hij start de taak nooit.",
+    ),
+    ("CALCULATE", "BEREKENEN"),
+    ("CALIBRATION CONFIRMATION", "KALIBRATIE BEVESTIGEN"),
+    ("CALIBRATION DISTANCE (mm)", "KALIBRATIEAFSTAND (mm)"),
+    (
+        "CALIBRATION WRITES LOCKED",
+        "KALIBRATIESCHRIJVEN VERGRENDELD",
+    ),
+    (
+        "Calculate to preview the new steps/mm and the change before writing.",
+        "Bereken om de nieuwe steps/mm en de wijziging vóór het schrijven te bekijken.",
+    ),
+    ("DEFAULT DISPLAY UNITS", "STANDAARD WEERGAVEEENHEDEN"),
+    ("DISPLAY UNITS", "WEERGAVEEENHEDEN"),
+    (
+        "ESTIMATED MACHINE BOUNDS (WCS + G92)",
+        "GESCHATTE MACHINEGRENZEN (WCS + G92)",
+    ),
+    (
+        "EVERY ITEM IS REQUIRED BEFORE NEXT",
+        "ELK ITEM IS VEREIST VOOR VOLGENDE",
+    ),
+    ("FINISH SETUP", "CONFIGURATIE VOLTOOIEN"),
+    ("FIRST CONNECTION ORDER", "VOLGORDE VAN EERSTE VERBINDING"),
+    ("GENERATE PREVIEW", "VOORBEELD GENEREREN"),
+    (
+        "GENERATE PREVIEW to validate the fields and compute passes, path length, and \
+        time.",
+        "VOORBEELD GENEREREN om de velden te valideren en passes, padlengte en tijd te \
+        berekenen.",
+    ),
+    (
+        "GENERATED / NOT CHECKED",
+        "GEGENEREERD / NIET GECONTROLEERD",
+    ),
+    (
+        "HEIGHT MAP / COMPENSATED: loading a transform replaces the compensated program \
+        and its Revert original. Keep an external copy if needed.",
+        "HOOGTEKAART / GECOMPENSEERD: een transformatie laden vervangt het \
+        gecompenseerde programma en de oorspronkelijke versie voor terugzetten. Bewaar \
+        indien nodig een externe kopie.",
+    ),
+    (
+        "I measured the actual travel and want to write this steps/mm value",
+        "Ik heb de werkelijke verplaatsing gemeten en wil deze steps/mm-waarde \
+        schrijven",
+    ),
+    (
+        "I understand this loads the previewed source and does not start it",
+        "Ik begrijp dat dit de voorbeeldbron laadt en niet start",
+    ),
+    (
+        "I understand this program is generated, not checked against the machine",
+        "Ik begrijp dat dit programma is gegenereerd en niet tegen de machine is \
+        gecontroleerd",
+    ),
+    ("INCHES (IN)", "INCH (IN)"),
+    (
+        "INFORMATIONAL CHECK: WCS changes, G10 writes, G92 offsets, and tool-length \
+        offsets are not enforced here. Verify the setup and soft limits before \
+        cutting.",
+        "INFORMATIEVE CONTROLE: WCS-wijzigingen, G10-schrijfacties, G92-offsets en \
+        gereedschaplengte-offsets worden hier niet afgedwongen. Controleer de \
+        opstelling en soft-limieten vóór het snijden.",
+    ),
+    ("INFORMATIONAL ONLY", "ALLEEN INFORMATIEF"),
+    (
+        "Informational only: START is never blocked. The machine estimate adds the \
+        reported active WCS plus G92; TLO is not included. Missing travel or offset \
+        data shows NOT CHECKED, never a safety claim. No controller writes.",
+        "Alleen informatief: START wordt nooit geblokkeerd. De machineschatting telt \
+        het gerapporteerde actieve WCS plus G92 op; TLO is niet inbegrepen. Ontbreken \
+        verplaatsings- of offsetgegevens, dan verschijnt NIET GECONTROLEERD, nooit een \
+        veiligheidsclaim. Geen schrijfacties naar de controller.",
+    ),
+    (
+        "Jog or run the test move separately, then enter the commanded distance and the \
+        measured travel. The wizard only calculates and writes the steps/mm setting; \
+        it never moves an axis.",
+        "Voer de testbeweging apart uit met jog of MDI en voer daarna de opgedragen \
+        afstand en de gemeten verplaatsing in. De wizard berekent en schrijft alleen \
+        de steps/mm-instelling; hij verplaatst nooit een as.",
+    ),
+    ("MACHINE SETUP", "MACHINECONFIGURATIE"),
+    ("MATERIAL SURFACING", "MATERIAAL VLAKMAKEN"),
+    ("MATERIAL SURFACING WIZARD", "WIZARD MATERIAAL VLAKMAKEN"),
+    ("MILLIMETRES (MM)", "MILLIMETERS (MM)"),
+    ("NEW STEPS/MM", "NIEUWE STEPS/MM"),
+    ("NO MOTION COMMANDED", "GEEN BEWEGING GESTUURD"),
+    (
+        "NO PROGRAM: load a program before transforming its source",
+        "GEEN PROGRAMMA: laad een programma voordat je de bron transformeert",
+    ),
+    ("NOT COMPLETED", "NIET VOLTOOID"),
+    (
+        "No generated program yet. Open the wizard, validate the fields, and preview.",
+        "Nog geen gegenereerd programma. Open de wizard, valideer de velden en bekijk \
+        het voorbeeld.",
+    ),
+    (
+        "No tools in the app table. Add one so the M6 sheet can show a name, diameter, \
+        and length instead of only the number.",
+        "Geen gereedschappen in de app-tabel. Voeg er een toe zodat het M6-venster een \
+        naam, diameter en lengte kan tonen in plaats van alleen het nummer.",
+    ),
+    ("OFF omits both M3 and M5", "UIT laat zowel M3 als M5 weg"),
+    ("OLD STEPS/MM", "OUDE STEPS/MM"),
+    ("OPEN SETUP", "CONFIGURATIE OPENEN"),
+    ("OPEN WIZARD", "WIZARD OPENEN"),
+    ("PREVIEW", "VOORBEELD"),
+    ("PREVIEW FIRST", "EERST VOORBEELD"),
+    ("PREVIEW SUMMARY", "VOORBEELDOVERZICHT"),
+    (
+        "PROGRAM BOUNDS (WORK COORDINATES)",
+        "PROGRAMMAGRENZEN (WERKSTUKCOÖRDINATEN)",
+    ),
+    (
+        "PROGRAM EXCEEDS REPORTED TRAVEL",
+        "PROGRAMMA OVERSCHRIJDT DE GERAPPORTEERDE VERPLAATSING",
+    ),
+    ("PROGRAM LIMITS", "PROGRAMMAGRENZEN"),
+    ("PROPOSED STEPS/MM", "VOORGESTELDE STEPS/MM"),
+    ("REMIND ME LATER", "HERINNER MIJ LATER"),
+    (
+        "REOPENS AT SAFETY TO REVIEW OR UPDATE THE CHOICES",
+        "OPENT BIJ VEILIGHEID OM DE KEUZES TE CONTROLEREN OF BIJWERKEN",
+    ),
+    ("REPORTED TRAVEL", "GERAPPORTEERDE VERPLAATSING"),
+    ("REVIEW & APPLY", "CONTROLEREN EN TOEPASSEN"),
+    ("SAFETY ITEMS ACKNOWLEDGED", "VEILIGHEIDSITEMS BEVESTIGD"),
+    (
+        "SETUP IS NOT A MACHINE CERTIFICATION",
+        "DE CONFIGURATIE IS GEEN MACHINECERTIFICERING",
+    ),
+    ("SOURCE TRANSFORMS", "BRONTRANSFORMATIES"),
+    ("SPINDLE ON (M3 S... / M5)", "SPINDEL AAN (M3 S... / M5)"),
+    ("START ANYWAY", "TOCH STARTEN"),
+    (
+        "START HERE BEFORE THE FIRST COMMANDED MOVE",
+        "BEGIN HIER VOOR DE EERSTE OPDRACHTBEWEGING",
+    ),
+    ("STEPPER CALIBRATION", "STAPMOTOR-KALIBRATIE"),
+    ("STRIP COMMENTS", "COMMENTAAR VERWIJDEREN"),
+    (
+        "THIS WIZARD DOES NOT TEST THE MACHINE",
+        "DEZE WIZARD TEST DE MACHINE NIET",
+    ),
+    ("TRANSFORM PREVIEW", "TRANSFORMATIEVOORBEELD"),
+    (
+        "The controller, its firmware, and the physical safety wiring remain \
+        authoritative. Acknowledge only what you have checked on this machine.",
+        "De controller, de firmware en de fysieke veiligheidsbedrading blijven \
+        bepalend. Bevestig alleen wat je op deze machine hebt gecontroleerd.",
+    ),
+    (
+        "The loaded program's estimated machine bounds leave the travel reported by the \
+        controller. START is held until you confirm.",
+        "De geschatte machinegrenzen van het geladen programma vallen buiten de door de \
+        controller gerapporteerde verplaatsing. START wordt tegengehouden tot je \
+        bevestigt.",
+    ),
+    (
+        "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new \
+        program and never starts it.",
+        "De geladen bron blijft ongewijzigd tot ALS PROGRAMMA LADEN. Dit laadt één \
+        nieuw programma en start het nooit.",
+    ),
+    (
+        "The program is generated from these fields. It is not checked against this \
+        machine's travel, offsets, tool, or stock. LOAD AS PROGRAM does not start it.",
+        "Het programma wordt uit deze velden gegenereerd. Het is niet gecontroleerd \
+        tegen de verplaatsing, offsets, gereedschap of het materiaal van deze machine. \
+        ALS PROGRAMMA LADEN start het niet.",
+    ),
+    (
+        "The wizard never connects, homes, jogs, probes, or writes controller settings.",
+        "De wizard maakt nooit verbinding, referentieert niet, jogt niet, tast niet en \
+        schrijft geen controllerinstellingen.",
+    ),
+    (
+        "The wizard reviews the physical safety checklist, the app display unit \
+        preference, and what the first connection should look like. It never connects, \
+        homes, jogs, probes, or writes controller settings.",
+        "De wizard behandelt de fysieke veiligheidschecklist, de weergave-eenheid van \
+        de app en hoe de eerste verbinding eruit moet zien. Hij maakt nooit \
+        verbinding, referentieert niet, jogt niet, tast niet en schrijft geen \
+        controllerinstellingen.",
+    ),
+    (
+        "This choice is saved for the next session. The wizard does not send G20 or G21 \
+        and does not change the controller's units. The live controller parser state \
+        still controls the current session.",
+        "Deze keuze wordt voor de volgende sessie opgeslagen. De wizard stuurt geen G20 \
+        of G21 en wijzigt de eenheden van de controller niet. De parserstatus van de \
+        actieve controller bepaalt nog steeds de huidige sessie.",
+    ),
+    (
+        "This records that you reviewed the checklist and chose an app preference. It \
+        does not test, certify, or configure the machine. Verify every motion, limit, \
+        and safety device yourself.",
+        "Dit registreert dat je de checklist hebt doorgenomen en een app-voorkeur hebt \
+        gekozen. Het test, certificeert of configureert de machine niet. Controleer \
+        elke beweging, limiet en veiligheidsvoorziening zelf.",
+    ),
+    (
+        "This writes one controller setting. It does not move the machine: the test \
+        move is your separate jog or MDI command. The controller stores steps/mm in \
+        EEPROM; avoid unnecessary writes.",
+        "Dit schrijft één controllerinstelling. Het verplaatst de machine niet: de \
+        testbeweging is je aparte jog- of MDI-opdracht. De controller bewaart steps/mm \
+        in EEPROM; vermijd onnodige schrijfacties.",
+    ),
+    ("UTILITY FIELD", "HULPPROGRAMMAVELD"),
+    ("WRITE LOCKED", "SCHRIJVEN VERGRENDELD"),
+    ("STOCK WIDTH", "MATERIAALBREEDTE"),
+    ("STOCK DEPTH", "MATERIAALDIEPTE"),
+    ("CUTTER DIA", "FREESDIAM."),
+    ("STEPOVER", "STAPOVER"),
+    ("TOTAL DEPTH", "TOTALE DIEPTE"),
+    ("DEPTH/PASS", "DIEPTE/PAS"),
+    ("PLUNGE FEED", "INZETVOEDING"),
+    ("LINE START", "STARTREGEL"),
+    ("LINE STEP", "REGELSTAP"),
+    ("COMMANDED MOVE", "OPGEDRAGEN BEWEGING"),
+    ("MEASURED MOVE", "GEMETEN BEWEGING"),
+    ("CALCULATED", "BEREKEND"),
+    ("CONFIRMED", "BEVESTIGD"),
 ];

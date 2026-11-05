@@ -966,4 +966,275 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
         "PROGRAMMA SONDA: un piano sonda generato non può essere controllato dalla barra \
         lavoro",
     ),
+    (
+        "1. Confirm the physical E-stop and independent spindle stop. 2. Open \
+        CONNECTION and select the serial port. 3. Wait for READY and Idle. 4. Check \
+        the DRO with one small jog. 5. Verify units, WCS, and soft limits before \
+        loading a program.",
+        "1. Conferma l'E-stop fisico e l'arresto indipendente del mandrino. 2. Apri \
+        CONNESSIONE e seleziona la porta seriale. 3. Attendi PRONTO e Inattivo. 4. \
+        Controlla il DRO con un piccolo jog. 5. Verifica unità, WCS e limiti software \
+        prima di caricare un programma.",
+    ),
+    ("ADD LINE NUMBERS", "AGGIUNGI NUMERI DI RIGA"),
+    ("APP PREFERENCE ONLY", "SOLO PREFERENZA APP"),
+    (
+        "APPLY is a separate, confirmed step and is allowed only while the controller \
+        is Idle.",
+        "APPLICA è un passaggio separato e confermato, consentito solo mentre il \
+        controller è Inattivo.",
+    ),
+    (
+        "APPLY sends exactly one Command::SetSetting through the engine. The engine \
+        writes the value, reads it back, and only then marks it APPLIED. CANCEL sends \
+        nothing.",
+        "APPLICA invia esattamente un Command::SetSetting tramite il motore. Il motore \
+        scrive il valore, lo rilegge e solo allora lo contrassegna come APPLICATO. \
+        ANNULLA non invia nulla.",
+    ),
+    ("AXIS", "ASSE"),
+    (
+        "After setup, use the normal Connection panel. Start with the simulator or with \
+        the spindle off, then run only status, DRO, and small jogs.",
+        "Dopo la configurazione, usa il normale pannello Connessione. Inizia con il \
+        simulatore o con il mandrino spento, poi esegui solo stato, DRO e piccoli jog.",
+    ),
+    ("BACK", "INDIETRO"),
+    (
+        "Back-and-forth raster at each depth, with a safe-Z retract between passes. The \
+        wizard validates every field and caps the program before LOAD AS PROGRAM; it \
+        never starts the job.",
+        "Raster avanti e indietro a ogni profondità, con ritiro in Z sicura tra le \
+        passate. La procedura guidata convalida ogni campo e limita il programma prima \
+        di CARICA COME PROGRAMMA; non avvia mai il lavoro.",
+    ),
+    ("CALCULATE", "CALCOLA"),
+    ("CALIBRATION CONFIRMATION", "CONFERMA CALIBRAZIONE"),
+    ("CALIBRATION DISTANCE (mm)", "DISTANZA DI CALIBRAZIONE (mm)"),
+    (
+        "CALIBRATION WRITES LOCKED",
+        "SCRITTURE DI CALIBRAZIONE BLOCCATE",
+    ),
+    (
+        "Calculate to preview the new steps/mm and the change before writing.",
+        "Calcola per visualizzare in anteprima i nuovi steps/mm e la variazione prima \
+        di scrivere.",
+    ),
+    (
+        "DEFAULT DISPLAY UNITS",
+        "UNITÀ DI VISUALIZZAZIONE PREDEFINITE",
+    ),
+    ("DISPLAY UNITS", "UNITÀ DI VISUALIZZAZIONE"),
+    (
+        "ESTIMATED MACHINE BOUNDS (WCS + G92)",
+        "LIMITI MACCHINA STIMATI (WCS + G92)",
+    ),
+    (
+        "EVERY ITEM IS REQUIRED BEFORE NEXT",
+        "OGNI VOCE È OBBLIGATORIA PRIMA DI SUCCESSIVO",
+    ),
+    ("FINISH SETUP", "TERMINA CONFIGURAZIONE"),
+    ("FIRST CONNECTION ORDER", "ORDINE DELLA PRIMA CONNESSIONE"),
+    ("GENERATE PREVIEW", "GENERA ANTEPRIMA"),
+    (
+        "GENERATE PREVIEW to validate the fields and compute passes, path length, and \
+        time.",
+        "GENERA ANTEPRIMA per convalidare i campi e calcolare passate, lunghezza \
+        percorso e tempo.",
+    ),
+    ("GENERATED / NOT CHECKED", "GENERATO / NON CONTROLLATO"),
+    (
+        "HEIGHT MAP / COMPENSATED: loading a transform replaces the compensated program \
+        and its Revert original. Keep an external copy if needed.",
+        "MAPPA DELLE ALTEZZE / COMPENSATA: caricare una trasformazione sostituisce il \
+        programma compensato e il suo originale di ripristino. Conserva una copia \
+        esterna se necessario.",
+    ),
+    (
+        "I measured the actual travel and want to write this steps/mm value",
+        "Ho misurato la corsa effettiva e voglio scrivere questo valore steps/mm",
+    ),
+    (
+        "I understand this loads the previewed source and does not start it",
+        "Comprendo che questo carica il sorgente visualizzato in anteprima e non lo \
+        avvia",
+    ),
+    (
+        "I understand this program is generated, not checked against the machine",
+        "Comprendo che questo programma è generato e non controllato rispetto alla \
+        macchina",
+    ),
+    ("INCHES (IN)", "POLLICI (IN)"),
+    (
+        "INFORMATIONAL CHECK: WCS changes, G10 writes, G92 offsets, and tool-length \
+        offsets are not enforced here. Verify the setup and soft limits before \
+        cutting.",
+        "CONTROLLO INFORMATIVO: modifiche WCS, scritture G10, offset G92 e offset \
+        lunghezza utensile non vengono applicati qui. Verifica il setup e i limiti \
+        software prima di tagliare.",
+    ),
+    ("INFORMATIONAL ONLY", "SOLO INFORMATIVO"),
+    (
+        "Informational only: START is never blocked. The machine estimate adds the \
+        reported active WCS plus G92; TLO is not included. Missing travel or offset \
+        data shows NOT CHECKED, never a safety claim. No controller writes.",
+        "Solo informativo: AVVIA non viene mai bloccato. La stima della macchina somma \
+        il WCS attivo riportato e G92; il TLO non è incluso. Se mancano dati di corsa \
+        o offset, viene mostrato NON CONTROLLATO, mai un'affermazione di sicurezza. \
+        Nessuna scrittura al controller.",
+    ),
+    (
+        "Jog or run the test move separately, then enter the commanded distance and the \
+        measured travel. The wizard only calculates and writes the steps/mm setting; \
+        it never moves an axis.",
+        "Esegui il movimento di prova separatamente con jog o MDI, poi inserisci la \
+        distanza comandata e la corsa misurata. La procedura guidata calcola e scrive \
+        solo l'impostazione steps/mm; non muove mai un asse.",
+    ),
+    ("MACHINE SETUP", "CONFIGURAZIONE MACCHINA"),
+    ("MATERIAL SURFACING", "SPIANATURA MATERIALE"),
+    (
+        "MATERIAL SURFACING WIZARD",
+        "PROCEDURA GUIDATA SPIANATURA MATERIALE",
+    ),
+    ("MILLIMETRES (MM)", "MILLIMETRI (MM)"),
+    ("NEW STEPS/MM", "NUOVI STEPS/MM"),
+    ("NO MOTION COMMANDED", "NESSUN MOVIMENTO COMANDATO"),
+    (
+        "NO PROGRAM: load a program before transforming its source",
+        "NESSUN PROGRAMMA: carica un programma prima di trasformarne il sorgente",
+    ),
+    ("NOT COMPLETED", "NON COMPLETATA"),
+    (
+        "No generated program yet. Open the wizard, validate the fields, and preview.",
+        "Nessun programma generato. Apri la procedura guidata, convalida i campi e \
+        visualizza l'anteprima.",
+    ),
+    (
+        "No tools in the app table. Add one so the M6 sheet can show a name, diameter, \
+        and length instead of only the number.",
+        "Nessun utensile nella tabella dell'app. Aggiungine uno così la finestra M6 può \
+        mostrare nome, diametro e lunghezza invece del solo numero.",
+    ),
+    ("OFF omits both M3 and M5", "SPENTO omette sia M3 sia M5"),
+    ("OLD STEPS/MM", "VECCHI STEPS/MM"),
+    ("OPEN SETUP", "APRI CONFIGURAZIONE"),
+    ("OPEN WIZARD", "APRI PROCEDURA GUIDATA"),
+    ("PREVIEW", "ANTEPRIMA"),
+    ("PREVIEW FIRST", "PRIMA L'ANTEPRIMA"),
+    ("PREVIEW SUMMARY", "RIEPILOGO ANTEPRIMA"),
+    (
+        "PROGRAM BOUNDS (WORK COORDINATES)",
+        "LIMITI PROGRAMMA (COORDINATE PEZZO)",
+    ),
+    (
+        "PROGRAM EXCEEDS REPORTED TRAVEL",
+        "IL PROGRAMMA SUPERA LA CORSA RIPORTATA",
+    ),
+    ("PROGRAM LIMITS", "LIMITI PROGRAMMA"),
+    ("PROPOSED STEPS/MM", "STEPS/MM PROPOSTI"),
+    ("REMIND ME LATER", "RICORDAMELO PIÙ TARDI"),
+    (
+        "REOPENS AT SAFETY TO REVIEW OR UPDATE THE CHOICES",
+        "SI RIAPRE SU SICUREZZA PER RIVEDERE O AGGIORNARE LE SCELTE",
+    ),
+    ("REPORTED TRAVEL", "CORSA RIPORTATA"),
+    ("REVIEW & APPLY", "RIVEDI E APPLICA"),
+    ("SAFETY ITEMS ACKNOWLEDGED", "VOCI DI SICUREZZA CONFERMATE"),
+    (
+        "SETUP IS NOT A MACHINE CERTIFICATION",
+        "LA CONFIGURAZIONE NON È UNA CERTIFICAZIONE DELLA MACCHINA",
+    ),
+    ("SOURCE TRANSFORMS", "TRASFORMAZIONI SORGENTE"),
+    ("SPINDLE ON (M3 S... / M5)", "MANDRINO ON (M3 S... / M5)"),
+    ("START ANYWAY", "AVVIA COMUNQUE"),
+    (
+        "START HERE BEFORE THE FIRST COMMANDED MOVE",
+        "INIZIA QUI PRIMA DEL PRIMO MOVIMENTO COMANDATO",
+    ),
+    ("STEPPER CALIBRATION", "CALIBRAZIONE PASSO-PASSO"),
+    ("STRIP COMMENTS", "RIMUOVI COMMENTI"),
+    (
+        "THIS WIZARD DOES NOT TEST THE MACHINE",
+        "QUESTA PROCEDURA GUIDATA NON TESTA LA MACCHINA",
+    ),
+    ("TRANSFORM PREVIEW", "ANTEPRIMA TRASFORMAZIONE"),
+    (
+        "The controller, its firmware, and the physical safety wiring remain \
+        authoritative. Acknowledge only what you have checked on this machine.",
+        "Il controller, il suo firmware e il cablaggio di sicurezza fisico restano \
+        autorevoli. Conferma solo ciò che hai verificato su questa macchina.",
+    ),
+    (
+        "The loaded program's estimated machine bounds leave the travel reported by the \
+        controller. START is held until you confirm.",
+        "I limiti macchina stimati del programma caricato escono dalla corsa riportata \
+        dal controller. AVVIA resta in attesa finché non confermi.",
+    ),
+    (
+        "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new \
+        program and never starts it.",
+        "Il sorgente caricato resta invariato fino a CARICA COME PROGRAMMA. Questo \
+        carica un nuovo programma e non lo avvia mai.",
+    ),
+    (
+        "The program is generated from these fields. It is not checked against this \
+        machine's travel, offsets, tool, or stock. LOAD AS PROGRAM does not start it.",
+        "Il programma è generato da questi campi. Non è controllato rispetto a corsa, \
+        offset, utensile o materiale di questa macchina. CARICA COME PROGRAMMA non lo \
+        avvia.",
+    ),
+    (
+        "The wizard never connects, homes, jogs, probes, or writes controller settings.",
+        "La procedura guidata non si connette, non referenzia, non esegue jog, non \
+        sonda e non scrive impostazioni del controller.",
+    ),
+    (
+        "The wizard reviews the physical safety checklist, the app display unit \
+        preference, and what the first connection should look like. It never connects, \
+        homes, jogs, probes, or writes controller settings.",
+        "La procedura guidata illustra la lista di controllo di sicurezza fisica, la \
+        preferenza delle unità di visualizzazione dell'app e come dovrebbe avvenire la \
+        prima connessione. Non si connette, non referenzia, non esegue jog, non sonda \
+        e non scrive impostazioni del controller.",
+    ),
+    (
+        "This choice is saved for the next session. The wizard does not send G20 or G21 \
+        and does not change the controller's units. The live controller parser state \
+        still controls the current session.",
+        "Questa scelta viene salvata per la sessione successiva. La procedura guidata \
+        non invia G20 o G21 e non cambia le unità del controller. Lo stato del parser \
+        del controller attivo controlla ancora la sessione corrente.",
+    ),
+    (
+        "This records that you reviewed the checklist and chose an app preference. It \
+        does not test, certify, or configure the machine. Verify every motion, limit, \
+        and safety device yourself.",
+        "Questo registra che hai esaminato la lista di controllo e scelto una \
+        preferenza dell'app. Non testa, certifica o configura la macchina. Verifica \
+        personalmente ogni movimento, limite e dispositivo di sicurezza.",
+    ),
+    (
+        "This writes one controller setting. It does not move the machine: the test \
+        move is your separate jog or MDI command. The controller stores steps/mm in \
+        EEPROM; avoid unnecessary writes.",
+        "Questo scrive un'impostazione del controller. Non muove la macchina: il \
+        movimento di prova è il tuo comando jog o MDI separato. Il controller \
+        memorizza steps/mm in EEPROM; evita scritture inutili.",
+    ),
+    ("UTILITY FIELD", "CAMPO UTILITÀ"),
+    ("WRITE LOCKED", "SCRITTURA BLOCCATA"),
+    ("STOCK WIDTH", "LARGHEZZA MATERIALE"),
+    ("STOCK DEPTH", "PROFONDITÀ MATERIALE"),
+    ("CUTTER DIA", "DIA FRESA"),
+    ("STEPOVER", "PASSO TRASVERSALE"),
+    ("TOTAL DEPTH", "PROFONDITÀ TOTALE"),
+    ("DEPTH/PASS", "PROFONDITÀ/PASSATA"),
+    ("PLUNGE FEED", "AVANZAMENTO ENTRATA"),
+    ("LINE START", "RIGA INIZIALE"),
+    ("LINE STEP", "PASSO RIGA"),
+    ("COMMANDED MOVE", "MOVIMENTO COMANDATO"),
+    ("MEASURED MOVE", "MOVIMENTO MISURATO"),
+    ("CALCULATED", "CALCOLATO"),
+    ("CONFIRMED", "CONFERMATO"),
 ];

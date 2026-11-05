@@ -918,4 +918,257 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
         "PROBE PROGRAM: a generated probe plan cannot be checked from the job toolbar",
         "PROBE PROGRAM: a generated probe plan cannot be checked from the job toolbar",
     ),
+    (
+        "1. Confirm the physical E-stop and independent spindle stop. 2. Open \
+        CONNECTION and select the serial port. 3. Wait for READY and Idle. 4. Check \
+        the DRO with one small jog. 5. Verify units, WCS, and soft limits before \
+        loading a program.",
+        "1. Confirm the physical E-stop and independent spindle stop. 2. Open \
+        CONNECTION and select the serial port. 3. Wait for READY and Idle. 4. Check \
+        the DRO with one small jog. 5. Verify units, WCS, and soft limits before \
+        loading a program.",
+    ),
+    ("ADD LINE NUMBERS", "ADD LINE NUMBERS"),
+    ("APP PREFERENCE ONLY", "APP PREFERENCE ONLY"),
+    (
+        "APPLY is a separate, confirmed step and is allowed only while the controller \
+        is Idle.",
+        "APPLY is a separate, confirmed step and is allowed only while the controller \
+        is Idle.",
+    ),
+    (
+        "APPLY sends exactly one Command::SetSetting through the engine. The engine \
+        writes the value, reads it back, and only then marks it APPLIED. CANCEL sends \
+        nothing.",
+        "APPLY sends exactly one Command::SetSetting through the engine. The engine \
+        writes the value, reads it back, and only then marks it APPLIED. CANCEL sends \
+        nothing.",
+    ),
+    ("AXIS", "AXIS"),
+    (
+        "After setup, use the normal Connection panel. Start with the simulator or with \
+        the spindle off, then run only status, DRO, and small jogs.",
+        "After setup, use the normal Connection panel. Start with the simulator or with \
+        the spindle off, then run only status, DRO, and small jogs.",
+    ),
+    ("BACK", "BACK"),
+    (
+        "Back-and-forth raster at each depth, with a safe-Z retract between passes. The \
+        wizard validates every field and caps the program before LOAD AS PROGRAM; it \
+        never starts the job.",
+        "Back-and-forth raster at each depth, with a safe-Z retract between passes. The \
+        wizard validates every field and caps the program before LOAD AS PROGRAM; it \
+        never starts the job.",
+    ),
+    ("CALCULATE", "CALCULATE"),
+    ("CALIBRATION CONFIRMATION", "CALIBRATION CONFIRMATION"),
+    ("CALIBRATION DISTANCE (mm)", "CALIBRATION DISTANCE (mm)"),
+    ("CALIBRATION WRITES LOCKED", "CALIBRATION WRITES LOCKED"),
+    (
+        "Calculate to preview the new steps/mm and the change before writing.",
+        "Calculate to preview the new steps/mm and the change before writing.",
+    ),
+    ("DEFAULT DISPLAY UNITS", "DEFAULT DISPLAY UNITS"),
+    ("DISPLAY UNITS", "DISPLAY UNITS"),
+    (
+        "ESTIMATED MACHINE BOUNDS (WCS + G92)",
+        "ESTIMATED MACHINE BOUNDS (WCS + G92)",
+    ),
+    (
+        "EVERY ITEM IS REQUIRED BEFORE NEXT",
+        "EVERY ITEM IS REQUIRED BEFORE NEXT",
+    ),
+    ("FINISH SETUP", "FINISH SETUP"),
+    ("FIRST CONNECTION ORDER", "FIRST CONNECTION ORDER"),
+    ("GENERATE PREVIEW", "GENERATE PREVIEW"),
+    (
+        "GENERATE PREVIEW to validate the fields and compute passes, path length, and \
+        time.",
+        "GENERATE PREVIEW to validate the fields and compute passes, path length, and \
+        time.",
+    ),
+    ("GENERATED / NOT CHECKED", "GENERATED / NOT CHECKED"),
+    (
+        "HEIGHT MAP / COMPENSATED: loading a transform replaces the compensated program \
+        and its Revert original. Keep an external copy if needed.",
+        "HEIGHT MAP / COMPENSATED: loading a transform replaces the compensated program \
+        and its Revert original. Keep an external copy if needed.",
+    ),
+    (
+        "I measured the actual travel and want to write this steps/mm value",
+        "I measured the actual travel and want to write this steps/mm value",
+    ),
+    (
+        "I understand this loads the previewed source and does not start it",
+        "I understand this loads the previewed source and does not start it",
+    ),
+    (
+        "I understand this program is generated, not checked against the machine",
+        "I understand this program is generated, not checked against the machine",
+    ),
+    ("INCHES (IN)", "INCHES (IN)"),
+    (
+        "INFORMATIONAL CHECK: WCS changes, G10 writes, G92 offsets, and tool-length \
+        offsets are not enforced here. Verify the setup and soft limits before \
+        cutting.",
+        "INFORMATIONAL CHECK: WCS changes, G10 writes, G92 offsets, and tool-length \
+        offsets are not enforced here. Verify the setup and soft limits before \
+        cutting.",
+    ),
+    ("INFORMATIONAL ONLY", "INFORMATIONAL ONLY"),
+    (
+        "Informational only: START is never blocked. The machine estimate adds the \
+        reported active WCS plus G92; TLO is not included. Missing travel or offset \
+        data shows NOT CHECKED, never a safety claim. No controller writes.",
+        "Informational only: START is never blocked. The machine estimate adds the \
+        reported active WCS plus G92; TLO is not included. Missing travel or offset \
+        data shows NOT CHECKED, never a safety claim. No controller writes.",
+    ),
+    (
+        "Jog or run the test move separately, then enter the commanded distance and the \
+        measured travel. The wizard only calculates and writes the steps/mm setting; \
+        it never moves an axis.",
+        "Jog or run the test move separately, then enter the commanded distance and the \
+        measured travel. The wizard only calculates and writes the steps/mm setting; \
+        it never moves an axis.",
+    ),
+    ("MACHINE SETUP", "MACHINE SETUP"),
+    ("MATERIAL SURFACING", "MATERIAL SURFACING"),
+    ("MATERIAL SURFACING WIZARD", "MATERIAL SURFACING WIZARD"),
+    ("MILLIMETRES (MM)", "MILLIMETRES (MM)"),
+    ("NEW STEPS/MM", "NEW STEPS/MM"),
+    ("NO MOTION COMMANDED", "NO MOTION COMMANDED"),
+    (
+        "NO PROGRAM: load a program before transforming its source",
+        "NO PROGRAM: load a program before transforming its source",
+    ),
+    ("NOT COMPLETED", "NOT COMPLETED"),
+    (
+        "No generated program yet. Open the wizard, validate the fields, and preview.",
+        "No generated program yet. Open the wizard, validate the fields, and preview.",
+    ),
+    (
+        "No tools in the app table. Add one so the M6 sheet can show a name, diameter, \
+        and length instead of only the number.",
+        "No tools in the app table. Add one so the M6 sheet can show a name, diameter, \
+        and length instead of only the number.",
+    ),
+    ("OFF omits both M3 and M5", "OFF omits both M3 and M5"),
+    ("OLD STEPS/MM", "OLD STEPS/MM"),
+    ("OPEN SETUP", "OPEN SETUP"),
+    ("OPEN WIZARD", "OPEN WIZARD"),
+    ("PREVIEW", "PREVIEW"),
+    ("PREVIEW FIRST", "PREVIEW FIRST"),
+    ("PREVIEW SUMMARY", "PREVIEW SUMMARY"),
+    (
+        "PROGRAM BOUNDS (WORK COORDINATES)",
+        "PROGRAM BOUNDS (WORK COORDINATES)",
+    ),
+    (
+        "PROGRAM EXCEEDS REPORTED TRAVEL",
+        "PROGRAM EXCEEDS REPORTED TRAVEL",
+    ),
+    ("PROGRAM LIMITS", "PROGRAM LIMITS"),
+    ("PROPOSED STEPS/MM", "PROPOSED STEPS/MM"),
+    ("REMIND ME LATER", "REMIND ME LATER"),
+    (
+        "REOPENS AT SAFETY TO REVIEW OR UPDATE THE CHOICES",
+        "REOPENS AT SAFETY TO REVIEW OR UPDATE THE CHOICES",
+    ),
+    ("REPORTED TRAVEL", "REPORTED TRAVEL"),
+    ("REVIEW & APPLY", "REVIEW & APPLY"),
+    ("SAFETY ITEMS ACKNOWLEDGED", "SAFETY ITEMS ACKNOWLEDGED"),
+    (
+        "SETUP IS NOT A MACHINE CERTIFICATION",
+        "SETUP IS NOT A MACHINE CERTIFICATION",
+    ),
+    ("SOURCE TRANSFORMS", "SOURCE TRANSFORMS"),
+    ("SPINDLE ON (M3 S... / M5)", "SPINDLE ON (M3 S... / M5)"),
+    ("START ANYWAY", "START ANYWAY"),
+    (
+        "START HERE BEFORE THE FIRST COMMANDED MOVE",
+        "START HERE BEFORE THE FIRST COMMANDED MOVE",
+    ),
+    ("STEPPER CALIBRATION", "STEPPER CALIBRATION"),
+    ("STRIP COMMENTS", "STRIP COMMENTS"),
+    (
+        "THIS WIZARD DOES NOT TEST THE MACHINE",
+        "THIS WIZARD DOES NOT TEST THE MACHINE",
+    ),
+    ("TRANSFORM PREVIEW", "TRANSFORM PREVIEW"),
+    (
+        "The controller, its firmware, and the physical safety wiring remain \
+        authoritative. Acknowledge only what you have checked on this machine.",
+        "The controller, its firmware, and the physical safety wiring remain \
+        authoritative. Acknowledge only what you have checked on this machine.",
+    ),
+    (
+        "The loaded program's estimated machine bounds leave the travel reported by the \
+        controller. START is held until you confirm.",
+        "The loaded program's estimated machine bounds leave the travel reported by the \
+        controller. START is held until you confirm.",
+    ),
+    (
+        "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new \
+        program and never starts it.",
+        "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new \
+        program and never starts it.",
+    ),
+    (
+        "The program is generated from these fields. It is not checked against this \
+        machine's travel, offsets, tool, or stock. LOAD AS PROGRAM does not start it.",
+        "The program is generated from these fields. It is not checked against this \
+        machine's travel, offsets, tool, or stock. LOAD AS PROGRAM does not start it.",
+    ),
+    (
+        "The wizard never connects, homes, jogs, probes, or writes controller settings.",
+        "The wizard never connects, homes, jogs, probes, or writes controller settings.",
+    ),
+    (
+        "The wizard reviews the physical safety checklist, the app display unit \
+        preference, and what the first connection should look like. It never connects, \
+        homes, jogs, probes, or writes controller settings.",
+        "The wizard reviews the physical safety checklist, the app display unit \
+        preference, and what the first connection should look like. It never connects, \
+        homes, jogs, probes, or writes controller settings.",
+    ),
+    (
+        "This choice is saved for the next session. The wizard does not send G20 or G21 \
+        and does not change the controller's units. The live controller parser state \
+        still controls the current session.",
+        "This choice is saved for the next session. The wizard does not send G20 or G21 \
+        and does not change the controller's units. The live controller parser state \
+        still controls the current session.",
+    ),
+    (
+        "This records that you reviewed the checklist and chose an app preference. It \
+        does not test, certify, or configure the machine. Verify every motion, limit, \
+        and safety device yourself.",
+        "This records that you reviewed the checklist and chose an app preference. It \
+        does not test, certify, or configure the machine. Verify every motion, limit, \
+        and safety device yourself.",
+    ),
+    (
+        "This writes one controller setting. It does not move the machine: the test \
+        move is your separate jog or MDI command. The controller stores steps/mm in \
+        EEPROM; avoid unnecessary writes.",
+        "This writes one controller setting. It does not move the machine: the test \
+        move is your separate jog or MDI command. The controller stores steps/mm in \
+        EEPROM; avoid unnecessary writes.",
+    ),
+    ("UTILITY FIELD", "UTILITY FIELD"),
+    ("WRITE LOCKED", "WRITE LOCKED"),
+    ("STOCK WIDTH", "STOCK WIDTH"),
+    ("STOCK DEPTH", "STOCK DEPTH"),
+    ("CUTTER DIA", "CUTTER DIA"),
+    ("STEPOVER", "STEPOVER"),
+    ("TOTAL DEPTH", "TOTAL DEPTH"),
+    ("DEPTH/PASS", "DEPTH/PASS"),
+    ("PLUNGE FEED", "PLUNGE FEED"),
+    ("LINE START", "LINE START"),
+    ("LINE STEP", "LINE STEP"),
+    ("COMMANDED MOVE", "COMMANDED MOVE"),
+    ("MEASURED MOVE", "MEASURED MOVE"),
+    ("CALCULATED", "CALCULATED"),
+    ("CONFIRMED", "CONFIRMED"),
 ];
