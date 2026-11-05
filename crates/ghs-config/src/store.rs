@@ -630,6 +630,7 @@ mod tests {
     use ghs_core::{Position, Wcs, parse_controller_info};
 
     use super::*;
+    use crate::app::{JobHistoryRecord, JobHistoryResult};
     use crate::backup::IdentityPolicy;
     use crate::controller::{
         ControllerData, HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, ProbeDefaultsRecord,
@@ -805,6 +806,68 @@ mod tests {
         store.save_app_config(&config).expect("save");
         assert_eq!(store.load_app_config().expect("load"), Some(config.clone()));
         assert_eq!(store.load_or_default().expect("load"), config);
+    }
+
+    #[test]
+    fn app_config_job_history_round_trips_through_the_store() {
+        let (_dir, store) = store("app-job-history");
+        let mut config = AppConfig::default();
+        config
+            .push_job_history(JobHistoryRecord {
+                name: " fixture.nc ".into(),
+                started_unix_s: 1_700_000_100,
+                elapsed_s: 90,
+                lines: 42,
+                result: JobHistoryResult::Completed,
+                check_run: false,
+            })
+            .expect("append");
+        config
+            .push_job_history(JobHistoryRecord {
+                name: "check.nc".into(),
+                started_unix_s: 1_700_000_200,
+                elapsed_s: 3,
+                lines: 12,
+                result: JobHistoryResult::Failed,
+                check_run: true,
+            })
+            .expect("append");
+
+        store.save_app_config(&config).expect("save");
+        let loaded = store.load_app_config().expect("load").expect("present");
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.job_history.len(), 2);
+        assert_eq!(loaded.job_history[0].name, "fixture.nc");
+        assert!(loaded.job_history[1].check_run);
+    }
+
+    #[test]
+    fn old_app_config_without_job_history_loads_empty_from_disk() {
+        let (_dir, store) = store("app-old-job-history");
+        let path = store.app_config_path();
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "theme": "dark",
+            "units": "Mm",
+            "locale": "en",
+            "last_profile": null,
+            "setup_complete": true,
+            "window": {
+                "width": 1280,
+                "height": 800,
+                "x": null,
+                "y": null,
+                "maximized": false,
+                "left_panel_width": 360,
+                "bottom_panel_height": 240
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("write");
+
+        let loaded = store.load_or_default().expect("load");
+        assert!(loaded.job_history.is_empty());
+        loaded.validate().expect("valid");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Application-wide preferences: theme, units, locale, last profile, and layout.
+//! Application-wide preferences: theme, units, locale, last profile, layout,
+//! and a bounded local job history.
 
 use ghs_core::Units;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,13 @@ use crate::profile::ProfileKey;
 
 /// Schema version written by this build.
 pub const APP_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum number of finished-job records kept in [`AppConfig::job_history`].
+pub const MAX_JOB_HISTORY: usize = 100;
+/// Maximum accepted length of a job-history name, in UTF-8 bytes.
+pub const MAX_JOB_HISTORY_NAME_BYTES: usize = 256;
+/// Maximum accepted job runtime in a history record: 30 days in seconds.
+pub const MAX_JOB_HISTORY_ELAPSED_S: u64 = 30 * 24 * 60 * 60;
 
 /// Default window width in logical pixels.
 const DEFAULT_WIDTH: u32 = 1280;
@@ -41,6 +49,89 @@ pub enum ThemeMode {
     Dark,
     /// Always use the light theme.
     Light,
+}
+
+/// How a finished job ended, as stored in [`JobHistoryRecord`].
+///
+/// The variants are persisted with `snake_case` names. The application maps
+/// its live job state and abort reason to one of them when it appends a
+/// record; this crate does not infer the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobHistoryResult {
+    /// The job reached the end of the streamed program.
+    Completed,
+    /// The job was aborted before completion, for example by an alarm, a
+    /// safety door, an E-stop, or a reset.
+    Aborted,
+    /// The operator stopped the job.
+    Stopped,
+    /// The link was lost or the controller interrupted the job.
+    Interrupted,
+    /// The job could not be streamed or failed with a program error.
+    Failed,
+}
+
+/// One finished job in the bounded local history.
+///
+/// Records are appended with [`AppConfig::push_job_history`], which validates
+/// the fields, trims the name, and keeps the newest [`MAX_JOB_HISTORY`]
+/// entries. [`started_unix_s`](Self::started_unix_s) is supplied by the
+/// caller; this crate never reads the clock for a history record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobHistoryRecord {
+    /// Loaded program name or path.
+    ///
+    /// The stored value is trimmed, non-empty, and at most
+    /// [`MAX_JOB_HISTORY_NAME_BYTES`] UTF-8 bytes.
+    pub name: String,
+    /// Job start time as Unix seconds.
+    pub started_unix_s: u64,
+    /// Active job runtime in seconds, paused intervals excluded.
+    ///
+    /// At most [`MAX_JOB_HISTORY_ELAPSED_S`] (30 days).
+    pub elapsed_s: u64,
+    /// Number of streamed or loaded source lines.
+    pub lines: u32,
+    /// How the job ended.
+    pub result: JobHistoryResult,
+    /// Whether the run was a `$C` dry run.
+    pub check_run: bool,
+}
+
+impl JobHistoryRecord {
+    /// Validate the name and runtime bounds.
+    ///
+    /// The name is trimmed before it is checked, so surrounding whitespace is
+    /// not significant; the byte limit applies to the trimmed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidJobHistoryEntry`] when the trimmed
+    /// name is empty or longer than [`MAX_JOB_HISTORY_NAME_BYTES`], or when
+    /// `elapsed_s` exceeds [`MAX_JOB_HISTORY_ELAPSED_S`].
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(ValidationError::InvalidJobHistoryEntry {
+                field: "name",
+                reason: "must not be empty",
+            });
+        }
+        if name.len() > MAX_JOB_HISTORY_NAME_BYTES {
+            return Err(ValidationError::InvalidJobHistoryEntry {
+                field: "name",
+                reason: "exceeds the 256-byte limit",
+            });
+        }
+        if self.elapsed_s > MAX_JOB_HISTORY_ELAPSED_S {
+            return Err(ValidationError::InvalidJobHistoryEntry {
+                field: "elapsed_s",
+                reason: "must not exceed 30 days",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Last known main-window geometry and panel sizes.
@@ -137,6 +228,13 @@ pub struct AppConfig {
     /// Window geometry and panel sizes.
     #[serde(default)]
     pub window: WindowLayout,
+    /// Bounded local history of finished jobs, oldest first.
+    ///
+    /// New records are appended with [`AppConfig::push_job_history`]. Configs
+    /// written before this field existed load an empty list; unknown or
+    /// corrupt entries are rejected by [`AppConfig::validate`].
+    #[serde(default)]
+    pub job_history: Vec<JobHistoryRecord>,
 }
 
 impl Default for AppConfig {
@@ -149,18 +247,21 @@ impl Default for AppConfig {
             last_profile: None,
             setup_complete: false,
             window: WindowLayout::default(),
+            job_history: Vec::new(),
         }
     }
 }
 
 impl AppConfig {
-    /// Validate the schema version, locale tag, and layout bounds.
+    /// Validate the schema version, locale tag, layout bounds, and job
+    /// history.
     ///
     /// # Errors
     ///
     /// Returns a [`ValidationError`] when the record was written by another
-    /// schema version, the locale tag is malformed, or the window size is
-    /// impossible.
+    /// schema version, the locale tag is malformed, the window size is
+    /// impossible, the job history exceeds [`MAX_JOB_HISTORY`] entries, or a
+    /// history entry is invalid.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.schema_version != APP_SCHEMA_VERSION {
             return Err(ValidationError::UnsupportedVersion {
@@ -170,8 +271,48 @@ impl AppConfig {
             });
         }
         validate_locale(&self.locale)?;
-        self.window.validate()
+        self.window.validate()?;
+        validate_job_history(&self.job_history)
     }
+
+    /// Append one finished job to the local history.
+    ///
+    /// The record is validated and its name is trimmed before it is stored.
+    /// When the history is already at [`MAX_JOB_HISTORY`] entries, the oldest
+    /// entries are dropped so the newest entries are kept. This helper only
+    /// updates the in-memory config; persistence is owned by
+    /// [`crate::ConfigStore::save_app_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidJobHistoryEntry`] when the record is
+    /// invalid. The config is left unchanged in that case.
+    pub fn push_job_history(
+        &mut self,
+        mut record: JobHistoryRecord,
+    ) -> Result<(), ValidationError> {
+        record.name = record.name.trim().to_owned();
+        record.validate()?;
+        self.job_history.push(record);
+        let excess = self.job_history.len().saturating_sub(MAX_JOB_HISTORY);
+        if excess > 0 {
+            self.job_history.drain(..excess);
+        }
+        Ok(())
+    }
+}
+
+fn validate_job_history(history: &[JobHistoryRecord]) -> Result<(), ValidationError> {
+    if history.len() > MAX_JOB_HISTORY {
+        return Err(ValidationError::TooManyJobHistoryEntries {
+            count: history.len(),
+            max: MAX_JOB_HISTORY,
+        });
+    }
+    for record in history {
+        record.validate()?;
+    }
+    Ok(())
 }
 
 fn default_locale() -> String {
@@ -215,6 +356,25 @@ fn check_range(field: &'static str, value: u32, min: u32, max: u32) -> Result<()
 mod tests {
     use super::*;
 
+    const RESULTS: [JobHistoryResult; 5] = [
+        JobHistoryResult::Completed,
+        JobHistoryResult::Aborted,
+        JobHistoryResult::Stopped,
+        JobHistoryResult::Interrupted,
+        JobHistoryResult::Failed,
+    ];
+
+    fn history_record(name: &str) -> JobHistoryRecord {
+        JobHistoryRecord {
+            name: name.to_owned(),
+            started_unix_s: 1_700_000_000,
+            elapsed_s: 42,
+            lines: 1_200,
+            result: JobHistoryResult::Completed,
+            check_run: false,
+        }
+    }
+
     #[test]
     fn defaults_are_stable() {
         let config = AppConfig::default();
@@ -228,6 +388,7 @@ mod tests {
         assert_eq!(config.window.height, 800);
         assert_eq!(config.window.left_panel_width, 360);
         assert_eq!(config.window.bottom_panel_height, 240);
+        assert!(config.job_history.is_empty());
         config.validate().expect("defaults are valid");
     }
 
@@ -400,5 +561,254 @@ mod tests {
         config.window.height = 800;
         config.window.left_panel_width = MAX_PANEL + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn job_history_defaults_to_empty() {
+        assert!(AppConfig::default().job_history.is_empty());
+        let decoded: AppConfig = serde_json::from_str(r#"{"schema_version":1}"#).expect("parse");
+        assert!(decoded.job_history.is_empty());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn old_json_without_job_history_loads_empty() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "theme": "dark",
+            "units": "Mm",
+            "locale": "en",
+            "last_profile": null,
+            "setup_complete": true,
+            "window": {
+                "width": 1280,
+                "height": 800,
+                "x": null,
+                "y": null,
+                "maximized": false,
+                "left_panel_width": 360,
+                "bottom_panel_height": 240
+            }
+        });
+        let decoded: AppConfig = serde_json::from_value(value).expect("parse");
+        assert!(decoded.job_history.is_empty());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn job_history_round_trips_every_result_and_check_flag() {
+        for result in RESULTS {
+            for check_run in [false, true] {
+                let record = JobHistoryRecord {
+                    result,
+                    check_run,
+                    ..history_record("part.nc")
+                };
+                record.validate().expect("valid record");
+                let json = serde_json::to_string(&record).expect("serialize");
+                let decoded: JobHistoryRecord = serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(decoded, record);
+                assert_eq!(decoded.result, result);
+                assert_eq!(decoded.check_run, check_run);
+            }
+        }
+    }
+
+    #[test]
+    fn job_history_result_serializes_as_snake_case() {
+        for (result, expected) in [
+            (JobHistoryResult::Completed, "completed"),
+            (JobHistoryResult::Aborted, "aborted"),
+            (JobHistoryResult::Stopped, "stopped"),
+            (JobHistoryResult::Interrupted, "interrupted"),
+            (JobHistoryResult::Failed, "failed"),
+        ] {
+            let record = JobHistoryRecord {
+                result,
+                ..history_record("part.nc")
+            };
+            let json = serde_json::to_string(&record).expect("serialize");
+            let needle = format!("\"result\":\"{expected}\"");
+            assert!(json.contains(&needle), "{json} does not contain {needle}");
+        }
+    }
+
+    #[test]
+    fn job_history_round_trips_inside_app_config_json() {
+        let mut config = AppConfig::default();
+        config
+            .push_job_history(history_record(" part.nc "))
+            .expect("append");
+        let mut check_run = history_record("check.nc");
+        check_run.result = JobHistoryResult::Interrupted;
+        check_run.check_run = true;
+        config.push_job_history(check_run).expect("append");
+
+        let json = serde_json::to_string_pretty(&config).expect("serialize");
+        assert!(json.contains("\"job_history\""));
+        let decoded: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.job_history.len(), 2);
+        assert_eq!(decoded.job_history[0].name, "part.nc");
+        assert!(decoded.job_history[1].check_run);
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn push_job_history_keeps_order_and_drops_the_oldest() {
+        let extra = 5;
+        let mut config = AppConfig::default();
+        for index in 0..(MAX_JOB_HISTORY + extra) {
+            let mut record = history_record("part.nc");
+            record.started_unix_s = 1_700_000_000 + index as u64;
+            record.lines = index as u32;
+            config.push_job_history(record).expect("append");
+        }
+
+        assert_eq!(config.job_history.len(), MAX_JOB_HISTORY);
+        assert_eq!(
+            config
+                .job_history
+                .first()
+                .expect("oldest kept")
+                .started_unix_s,
+            1_700_000_000 + extra as u64
+        );
+        assert_eq!(
+            config.job_history.last().expect("newest").started_unix_s,
+            1_700_000_000 + (MAX_JOB_HISTORY + extra - 1) as u64
+        );
+        assert!(
+            config
+                .job_history
+                .windows(2)
+                .all(|pair| pair[0].started_unix_s < pair[1].started_unix_s)
+        );
+        config.validate().expect("valid");
+    }
+
+    #[test]
+    fn push_job_history_rejects_empty_and_whitespace_names() {
+        for name in ["", " ", " \t\n "] {
+            let mut config = AppConfig::default();
+            let error = config
+                .push_job_history(history_record(name))
+                .expect_err("rejected");
+            assert!(
+                matches!(
+                    error,
+                    ValidationError::InvalidJobHistoryEntry { field: "name", .. }
+                ),
+                "{name:?} produced {error}"
+            );
+            assert!(
+                config.job_history.is_empty(),
+                "rejected record must not be stored"
+            );
+        }
+    }
+
+    #[test]
+    fn push_job_history_bounds_names_in_utf8_bytes() {
+        let mut config = AppConfig::default();
+        let at_limit = "\u{00e9}".repeat(MAX_JOB_HISTORY_NAME_BYTES / 2);
+        assert_eq!(at_limit.len(), MAX_JOB_HISTORY_NAME_BYTES);
+        config
+            .push_job_history(history_record(&at_limit))
+            .expect("256 bytes accepted");
+        assert_eq!(config.job_history[0].name, at_limit);
+
+        let over_limit = "\u{00e9}".repeat(MAX_JOB_HISTORY_NAME_BYTES / 2 + 1);
+        assert!(over_limit.len() > MAX_JOB_HISTORY_NAME_BYTES);
+        let error = config
+            .push_job_history(history_record(&over_limit))
+            .expect_err("rejected");
+        assert!(
+            matches!(
+                error,
+                ValidationError::InvalidJobHistoryEntry { field: "name", .. }
+            ),
+            "over-limit name produced {error}"
+        );
+        assert_eq!(config.job_history.len(), 1, "rejected record was stored");
+
+        let ascii_over_limit = "a".repeat(MAX_JOB_HISTORY_NAME_BYTES + 1);
+        assert!(
+            config
+                .push_job_history(history_record(&ascii_over_limit))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn push_job_history_trims_the_name() {
+        let mut config = AppConfig::default();
+        config
+            .push_job_history(history_record("  /jobs/part.nc \n"))
+            .expect("append");
+        assert_eq!(config.job_history[0].name, "/jobs/part.nc");
+    }
+
+    #[test]
+    fn job_history_rejects_runtimes_over_thirty_days() {
+        let mut record = history_record("part.nc");
+        record.elapsed_s = MAX_JOB_HISTORY_ELAPSED_S;
+        record.validate().expect("30 days accepted");
+        record.elapsed_s = MAX_JOB_HISTORY_ELAPSED_S + 1;
+        let error = record.validate().expect_err("rejected");
+        assert!(
+            matches!(
+                error,
+                ValidationError::InvalidJobHistoryEntry {
+                    field: "elapsed_s",
+                    ..
+                }
+            ),
+            "over-limit runtime produced {error}"
+        );
+
+        let mut config = AppConfig::default();
+        assert!(config.push_job_history(record).is_err());
+        assert!(config.job_history.is_empty());
+    }
+
+    #[test]
+    fn config_validate_rejects_an_invalid_history_entry() {
+        let mut config = AppConfig::default();
+        config.job_history.push(history_record(" "));
+        let error = config.validate().expect_err("invalid name");
+        assert!(matches!(
+            error,
+            ValidationError::InvalidJobHistoryEntry { field: "name", .. }
+        ));
+
+        config.job_history[0] = history_record("part.nc");
+        config.job_history[0].elapsed_s = MAX_JOB_HISTORY_ELAPSED_S + 1;
+        let error = config.validate().expect_err("invalid runtime");
+        assert!(matches!(
+            error,
+            ValidationError::InvalidJobHistoryEntry {
+                field: "elapsed_s",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_too_many_history_entries() {
+        let mut config = AppConfig::default();
+        for _ in 0..=MAX_JOB_HISTORY {
+            config.job_history.push(history_record("part.nc"));
+        }
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::TooManyJobHistoryEntries {
+                count: MAX_JOB_HISTORY + 1,
+                max: MAX_JOB_HISTORY,
+            })
+        );
+
+        config.job_history.pop();
+        config.validate().expect("exactly the limit is accepted");
     }
 }

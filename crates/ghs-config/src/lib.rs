@@ -9,8 +9,8 @@
 //!
 //! # Data at rest
 //!
-//! - [`AppConfig`] holds theme, display units, the last profile key, and
-//!   window/layout fields in `app.json`.
+//! - [`AppConfig`] holds theme, display units, the last profile key,
+//!   window/layout fields, and a bounded job history in `app.json`.
 //! - [`ControllerData`] is one profile: settings snapshot, offsets, probe
 //!   mount offset, probe defaults, the application-owned tool table, macros,
 //!   startup lines, keymap, and persisted height maps.
@@ -61,7 +61,10 @@ mod error;
 mod profile;
 mod store;
 
-pub use app::{APP_SCHEMA_VERSION, AppConfig, ThemeMode, WindowLayout};
+pub use app::{
+    APP_SCHEMA_VERSION, AppConfig, JobHistoryRecord, JobHistoryResult, MAX_JOB_HISTORY,
+    MAX_JOB_HISTORY_ELAPSED_S, MAX_JOB_HISTORY_NAME_BYTES, ThemeMode, WindowLayout,
+};
 pub use backup::{
     BACKUP_SCHEMA_VERSION, BackupBundle, ControllerIdentity, IdentityCheck, IdentityMismatch,
     IdentityPolicy, ImportOutcome,

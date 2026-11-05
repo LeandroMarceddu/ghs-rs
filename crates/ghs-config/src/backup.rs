@@ -252,6 +252,7 @@ mod tests {
     use ghs_core::{Position, Wcs, parse_controller_info};
 
     use super::*;
+    use crate::app::{JobHistoryRecord, JobHistoryResult};
     use crate::controller::{
         HeightMapFrame, HeightMapRecord, MAX_PROBE_OFFSET_MM, Macro, ProbeDefaultsRecord,
         ProbeOffsetRecord, ToolRecord,
@@ -375,6 +376,39 @@ mod tests {
         let decoded = BackupBundle::from_json_str(&json).expect("decode");
         assert_eq!(decoded, original);
         assert!(decoded.app.setup_complete);
+    }
+
+    #[test]
+    fn bundle_round_trips_job_history() {
+        let mut app = AppConfig::default();
+        app.push_job_history(JobHistoryRecord {
+            name: " fixture.nc ".into(),
+            started_unix_s: 1_700_000_100,
+            elapsed_s: 90,
+            lines: 42,
+            result: JobHistoryResult::Completed,
+            check_run: false,
+        })
+        .expect("append");
+        app.push_job_history(JobHistoryRecord {
+            name: "check.nc".into(),
+            started_unix_s: 1_700_000_200,
+            elapsed_s: 3,
+            lines: 12,
+            result: JobHistoryResult::Failed,
+            check_run: true,
+        })
+        .expect("append");
+
+        let original = BackupBundle::new(app, &info(), data()).with_created_at(1_700_000_300);
+        let json = original.to_json_string().expect("encode");
+        assert!(json.contains("\"job_history\""));
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.app.job_history.len(), 2);
+        assert_eq!(decoded.app.job_history[0].name, "fixture.nc");
+        assert!(!decoded.app.job_history[0].check_run);
+        assert!(decoded.app.job_history[1].check_run);
     }
 
     #[test]

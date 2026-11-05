@@ -213,6 +213,22 @@ pub enum ValidationError {
         /// Human-readable reason.
         reason: &'static str,
     },
+    /// A job-history record has an invalid field.
+    #[error("job history entry {field} is invalid: {reason}")]
+    InvalidJobHistoryEntry {
+        /// Field name, for example `"name"` or `"elapsed_s"`.
+        field: &'static str,
+        /// Human-readable reason.
+        reason: &'static str,
+    },
+    /// The app config stores more job-history records than the format allows.
+    #[error("app config stores {count} job-history entries; the limit is {max}")]
+    TooManyJobHistoryEntries {
+        /// Number of entries in the config.
+        count: usize,
+        /// Maximum accepted number of entries.
+        max: usize,
+    },
     /// The bundle's stored key does not match its embedded controller info.
     #[error("profile key {stored:?} does not match the embedded controller identity {computed:?}")]
     ProfileIdentityMismatch {
