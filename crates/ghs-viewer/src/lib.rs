@@ -53,6 +53,7 @@ pub mod camera3d;
 pub mod geom;
 pub mod render;
 pub mod segment;
+pub mod stock;
 pub mod toolpath;
 pub mod viewport;
 
@@ -62,5 +63,6 @@ pub use camera3d::{Camera3D, ProjectedPoint, Projection};
 pub use geom::{Bounds2, Bounds3, Point2, Point3};
 pub use render::{Polyline, RenderOptions, RenderPlan};
 pub use segment::{Segment, SegmentKind};
+pub use stock::StockBox;
 pub use toolpath::{Toolpath, synthetic_toolpath};
 pub use viewport::Viewport;
