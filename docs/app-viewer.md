@@ -43,14 +43,17 @@ M2 snapshot.wpos → live tool marker
 
 1. `Camera3D::fitted(viewport, toolpath.bounds(), padding_px)` with Z up and the
    crate's default yaw/pitch.
-2. `RenderPlan::from_3d` projects and sorts polylines far to near; the painter
+2. A subdued Z=0 ground grid gives a depth cue.
+3. The inferred stock box is projected from the program bounds when `STOCK` is
+   on; only camera-facing quads are filled, far to near, under the toolpath.
+4. A dashed work-envelope box gives an additional depth reference.
+5. `RenderPlan::from_3d` projects and sorts polylines far to near; the painter
    uses that order. Motion styles and colors match the 2D view.
-3. A subdued Z=0 ground grid and a dashed work-envelope box give depth cues.
-4. The marker is projected with `Camera3D::project`, hidden behind the near
+6. The marker is projected with `Camera3D::project`, hidden behind the near
    plane, and drawn as a dropline plus a plane shadow and ring.
-5. The height-map overlay projects measured cells at their effective Z and sorts
+7. The height-map overlay projects measured cells at their effective Z and sorts
    them far to near.
-6. The 3D cache key adds target X/Y/Z, yaw, pitch, distance, and viewport size.
+8. The 3D cache key adds target X/Y/Z, yaw, pitch, distance, and viewport size.
    Orbit/pan/zoom rebuilds; a marker-only tick does not.
 
 Performance target: 200k visible segments at 60 fps; use the viewer benchmark

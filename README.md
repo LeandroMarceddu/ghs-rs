@@ -53,8 +53,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   a bounded local job history, and job recovery that never auto-resumes after
   an alarm or disconnect.
 - **Viewer** — parsed toolpath in 2D top or 3D orbit view, fit/pan/zoom/pinch,
-  ground grid and work envelope, motion-style paths, height-map overlay, and a
-  live tool marker.
+  ground grid, inferred 3D stock box, work envelope, motion-style paths,
+  height-map overlay, and a live tool marker.
 - **Settings** — generated from `$ES`/`$EG` metadata, grouped and searchable,
   with boolean, bitfield, axis-mask, radio, numeric, text and password controls,
   range validation, read-back-verified writes, and `$N0`/`$N1` startup-line

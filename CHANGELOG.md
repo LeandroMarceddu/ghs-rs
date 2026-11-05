@@ -17,6 +17,9 @@ until the next release is cut.
   `$RST=&`, and `$RST=*`. Each target requires a backup prompt or explicit
   data-loss acknowledgement and a two-step confirmation; the reset is
   idle-only and never changes local profiles or backups.
+- **3D stock mesh** — the 3D viewer draws an inferred translucent stock box
+  from the program bounds, with a `STOCK ON/OFF` toggle and an explicit
+  reminder that it is not a measured stock model.
 - **Job history** — completed, stopped, aborted, failed, and interrupted runs
   record a local entry with start time, elapsed time, line count, result, and
   dry-run flag. The Utility card shows the newest ten, `OPEN HISTORY` shows all

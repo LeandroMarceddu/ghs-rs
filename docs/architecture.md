@@ -292,10 +292,10 @@ Hard rules:
 - 2D: orthographic top view, pan/zoom/fit, grid, bounds, work envelope, tool
   marker, color by motion type.
 - 3D: software projection into painter-sorted polylines, orbit/pan/zoom, grid,
-  work envelope, and tool marker. There is no stock mesh or orthographic toggle
-  (VIEW-07). If profiling fails the budget, render offscreen with wgpu into a
-  texture and present it as an image; the geometry layer is independent of
-  either path.
+  an inferred translucent stock box (toggled with `STOCK`), work envelope, and
+  tool marker. There is no orthographic toggle. If profiling fails the budget,
+  render offscreen with wgpu into a texture and present it as an image; the
+  geometry layer is independent of either path.
 - Decimation is zoom-dependent; culling and decimation happen while building the
   screen-space render plan. Hit testing and path selection are not implemented.
 

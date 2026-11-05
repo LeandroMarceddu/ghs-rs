@@ -421,6 +421,11 @@ The center workspace shows the parsed toolpath in the **Job** mode.
 - `2D TOP` is the default and resets at every restart.
 - `3D` is an orbit view. It is perspective only; there is no orthographic
   toggle.
+- The `STOCK ON` / `STOCK OFF` chip toggles an inferred stock box in 3D. It is
+  derived from the program's XY bounds with a small margin, a top at work Z=0
+  (or above the path when the whole path is at/above zero), and a bottom two
+  millimetres below the lowest path Z. It is a visual reference, not a
+  measured stock model.
 - `FIT` refits the current view. Double-click also refits.
 - The overlay chips show WCS, units, and zoom. The legend shows `Cut`,
   `Rapid`, and `Plunge`.
@@ -432,10 +437,11 @@ The center workspace shows the parsed toolpath in the **Job** mode.
   pinch zooms at the cursor.
 - The 3D strip reads `DRAG ORBIT | SHIFT/MIDDLE PAN | WHEEL ZOOM`.
 
-The viewer draws a ground grid and a dashed work-envelope box in 3D, and a
-grid/envelope in 2D. The tool marker follows the live work position (or
-machine position when no work offset is available). A height-map cell overlay
-appears in the height-map result and saved-map views.
+The viewer draws a ground grid and a dashed work-envelope box in 3D, plus the
+inferred stock box when `STOCK ON`, and a grid/envelope in 2D. The tool marker
+follows the live work position (or machine position when no work offset is
+available). A height-map cell overlay appears in the height-map result and
+saved-map views.
 
 Geometry is cached by program identity, camera, and viewport. A status tick
 moves only the marker; it does not rebuild the toolpath. The performance
@@ -966,8 +972,9 @@ Exports are user-initiated. There is no telemetry and no network transport.
 - **Probe Apply is partial.** Rotation reports its measured angle, but work
   rotation is deferred. Tool-length probing can apply or clear TLO with a
   confirmed `G43.1`/`G49` write verified through `$#`.
-- **3D is perspective only.** There is no orthographic toggle, no stock mesh,
-  and the height overlay is a cell projection rather than a shaded surface.
+- **3D is perspective only.** There is no orthographic toggle. The stock box
+  is inferred from program bounds, not measured from the fixture, and the
+  height overlay is a cell projection rather than a shaded surface.
 - **No SD, ATC, or MPG UI.** Their protocol fields are parsed for future use;
   the v1.0 shell does not expose them.
 - **No Park quick action.** A machine-specific park position is not configured;

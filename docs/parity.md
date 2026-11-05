@@ -126,7 +126,7 @@ implemented before its UI or hardware validation row is complete.
 | VIEW-04 | 2D pan, zoom, fit, grid, bounds | M4 | done | 60 fps |
 | VIEW-05 | Live tool marker | M4 | done | Status-driven |
 | VIEW-06 | Color by motion type, layer, or tool | M4 | done | Configurable, color-blind safe |
-| VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | partial | 3D camera/grid/envelope/marker; stock mesh open |
+| VIEW-07 | 3D orbit, pan, zoom, stock, and tool | M7 | done | Inferred stock mesh + toggle; tool marker |
 | VIEW-08 | Height map overlay | M6 | done | 2D cells and 3D projection |
 | VIEW-09 | 1M-line and 200k-segment performance | M4 | partial | Benchmarked; CI threshold open |
 | VIEW-10 | Program limits and outline display | M4 | done | Bounds card; over-travel confirmation |
