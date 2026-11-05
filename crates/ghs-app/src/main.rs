@@ -60,6 +60,11 @@
 //! profile path, and `--demo-height-map-open-saved` then opens that record in
 //! the read-only saved-map browser. Normal startup never applies or starts
 //! anything.
+//! `--demo-setup` opens the first-run safety/setup wizard at SAFETY with
+//! nothing checked; `--demo-setup-units` acknowledges the checklist and opens
+//! UNITS, and `--demo-setup-review` does the same and opens REVIEW. The wizard
+//! never connects, homes, jogs, probes, or writes controller settings, and no
+//! demo setup flag completes it or changes `setup_complete`.
 //! `--file-browser=PATH` opens the in-app program file browser at PATH (a
 //! folder, or a program file whose folder opens with the file selected);
 //! `--demo-load-file=PATH` loads that file through the same bounded reader and
@@ -100,6 +105,7 @@ mod offsets_export;
 mod pins;
 mod probe;
 mod settings;
+mod setup;
 mod shell;
 mod startup;
 mod state;

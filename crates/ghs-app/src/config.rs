@@ -178,6 +178,43 @@ impl ConfigModel {
         &self.app
     }
 
+    /// Whether the first-run safety/setup wizard has been completed.
+    ///
+    /// This is an app preference, not a controller setting. A config written
+    /// before the field existed loads as `false`.
+    #[must_use]
+    pub fn setup_complete(&self) -> bool {
+        self.app.setup_complete
+    }
+
+    /// Persist the first-run setup completion flag through [`Self::save_app`].
+    ///
+    /// This is the only path that flips [`AppConfig::setup_complete`]. The flag
+    /// is changed in memory only after the write succeeds; a refusal (no store,
+    /// corrupt `app.json`, or an I/O error) leaves the previous value and never
+    /// overwrites a corrupt file. Completing an already-complete setup still
+    /// writes the file, so the operator can review and update the choices.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::save_app`] message when the store is unavailable or
+    /// the write is refused.
+    pub fn set_setup_complete(&mut self, complete: bool) -> Result<PathBuf, String> {
+        let previous = self.app.setup_complete;
+        self.app.setup_complete = complete;
+        match self.save_app() {
+            Ok(path) => Ok(path),
+            Err(error) => {
+                self.app.setup_complete = previous;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Setup completion was not saved: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
     /// Current controller profile data.
     #[must_use]
     pub fn data(&self) -> &ControllerData {
@@ -1205,6 +1242,94 @@ mod tests {
         let reopened = ConfigModel::from_store(ConfigStore::new(&dir.path));
         assert_eq!(reopened.app().units, CoreUnits::Inch);
         assert_eq!(reopened.app().theme, ThemeMode::Light);
+    }
+
+    #[test]
+    fn setup_complete_round_trips_through_the_store() {
+        let dir = TempDir::new("setup-flag");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        assert!(!model.setup_complete(), "a new config is not complete");
+
+        let path = model.set_setup_complete(true).expect("save setup flag");
+        assert_eq!(path, store.app_config_path());
+        assert!(model.setup_complete());
+        assert!(ConfigModel::from_store(store.clone()).setup_complete());
+
+        model.set_setup_complete(false).expect("clear setup flag");
+        assert!(!model.setup_complete());
+        assert!(!ConfigModel::from_store(store).setup_complete());
+    }
+
+    #[test]
+    fn an_old_app_config_without_setup_complete_loads_false() {
+        let dir = TempDir::new("setup-old");
+        let store = ConfigStore::new(&dir.path);
+        let path = store.app_config_path();
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "theme": "dark",
+                "units": "Mm",
+                "locale": "en",
+                "last_profile": null,
+                "window": {
+                    "width": 1280,
+                    "height": 800,
+                    "x": null,
+                    "y": null,
+                    "maximized": false,
+                    "left_panel_width": 360,
+                    "bottom_panel_height": 240
+                }
+            }"#,
+        )
+        .expect("write old config");
+
+        let model = ConfigModel::from_store(store);
+        assert!(model.app_error().is_none());
+        assert!(!model.setup_complete());
+    }
+
+    #[test]
+    fn corrupt_app_config_blocks_setup_complete_and_is_never_overwritten() {
+        let dir = TempDir::new("setup-corrupt");
+        let store = ConfigStore::new(&dir.path);
+        let path = store.app_config_path();
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let corrupt = b"{ this is not json";
+        fs::write(&path, corrupt).expect("write corrupt config");
+
+        let mut model = ConfigModel::from_store(store);
+        let error = model
+            .set_setup_complete(true)
+            .expect_err("a corrupt app file blocks the write");
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(
+            !model.setup_complete(),
+            "a failed write leaves the flag false"
+        );
+        assert_eq!(fs::read(&path).expect("read"), corrupt);
+    }
+
+    #[test]
+    fn setup_complete_is_saved_again_when_the_wizard_is_revisited() {
+        let dir = TempDir::new("setup-again");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        model.set_setup_complete(true).expect("first completion");
+
+        // A changed app preference is written by the same save on the next
+        // completion, proving the method does not skip a completed flag.
+        model.app.units = CoreUnits::Inch;
+        model.set_setup_complete(true).expect("second completion");
+        assert!(model.setup_complete());
+
+        let reopened = ConfigModel::from_store(store);
+        assert!(reopened.setup_complete());
+        assert_eq!(reopened.app().units, CoreUnits::Inch);
     }
 
     #[test]

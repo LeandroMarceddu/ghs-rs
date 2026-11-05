@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ghs_config::{Keymap, MAX_HEIGHT_MAPS, Macro as ConfigMacro, ToolRecord};
+use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axes, Axis as CoreAxis, Command, EngineError, JobPauseReason, JobState, JogCommand,
     MachineState, Position, Program, RealtimeCommand, SerialConfig, Signals as CoreSignals,
@@ -87,6 +88,7 @@ use crate::probe::{
     height_map_summary, outcome_summary,
 };
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
+use crate::setup::{SafetyItem, SetupStep};
 use crate::startup::{StartupRequest, StartupStatus};
 use crate::state::{
     AppState, Axis, BreakpointOutcome, CheckOutcome, ConnectionState, ConsoleCounts, ConsoleFilter,
@@ -411,6 +413,11 @@ pub struct Shell {
     demo_height_map_save_done: bool,
     demo_height_map_open_saved: bool,
     demo_height_map_open_saved_done: bool,
+    /// The first frame has rendered; the first-run setup prompt waits for it.
+    first_render_done: bool,
+    /// A demo/layout flag already selects the initial screen, so the first-run
+    /// setup wizard must not auto-open.
+    demo_initial_screen: bool,
     /// Toolpath captured before a height-map probe replaced the job program.
     height_map_base_program: Option<Arc<ghs_gcode::Program>>,
     _poll_task: Option<Task<()>>,
@@ -492,6 +499,16 @@ impl Shell {
                 "Design-review mock mode; no controller is attached",
             );
         }
+        // Demo/screenshot switches for the setup wizard. They only open the
+        // overlay; they never complete setup or send a command.
+        let demo_setup_review = std::env::args().any(|arg| arg == "--demo-setup-review");
+        let demo_setup_units = std::env::args().any(|arg| arg == "--demo-setup-units");
+        let demo_setup = std::env::args().any(|arg| arg == "--demo-setup")
+            || demo_setup_units
+            || demo_setup_review;
+        // The first-run prompt must not fight a flag that already picks the
+        // initial screen (a workspace, a sheet, or a demo capture).
+        let demo_initial_screen = std::env::args().any(|arg| demo_initial_screen_arg(&arg));
         if std::env::args().any(|arg| arg == "--keypad") {
             state.open_keypad(KeypadTarget::Dro(Axis::X));
         }
@@ -817,6 +834,8 @@ impl Shell {
             demo_height_map_save_done: false,
             demo_height_map_open_saved,
             demo_height_map_open_saved_done: false,
+            first_render_done: false,
+            demo_initial_screen,
             height_map_base_program: None,
             _poll_task: None,
             _subscriptions: subscriptions,
@@ -877,6 +896,15 @@ impl Shell {
             }
             shell.open_connection(cx);
         }
+        // Demo/screenshot switches: open a deterministic setup page after the
+        // session starts. Opening sends nothing and never marks setup complete.
+        if demo_setup_review {
+            shell.state.open_setup_review_for_demo();
+        } else if demo_setup_units {
+            shell.state.open_setup_units_for_demo();
+        } else if demo_setup {
+            shell.state.open_setup();
+        }
         shell._poll_task = Some(shell.spawn_poll(cx));
         shell
     }
@@ -897,6 +925,12 @@ impl Shell {
     fn poll(&mut self, cx: &mut Context<Self>) {
         let console_before = self.state.console.len();
         let mut changed = false;
+        // The first-run prompt waits for the first frame, then runs once. A
+        // dismissed prompt is not offered again in this app run; the Utility
+        // card remains the explicit way back in.
+        if self.first_render_done && self.state.auto_open_setup(self.demo_initial_screen) {
+            changed = true;
+        }
         if let Some(link) = self.link.as_mut() {
             changed |= link.poll(&mut self.state);
         }
@@ -14068,6 +14102,537 @@ impl Shell {
             .into_any_element()
     }
 
+    /// First-run safety/setup wizard overlay.
+    ///
+    /// Every action here mutates the local [`crate::setup::SetupModel`] or the
+    /// app config. No path calls the engine, so opening, navigating, changing
+    /// units, closing, or finishing can never produce a controller command.
+    fn setup_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.state.setup.is_open() {
+            return div().into_any_element();
+        }
+        let setup = &self.state.setup;
+        let step = setup.step();
+        let units = setup.units();
+        let acknowledged = setup.acknowledged_count();
+        let can_advance = setup.can_advance();
+        let error = setup.error().map(std::string::ToString::to_string);
+        let view = cx.entity();
+        let scrim_view = view.clone();
+
+        let mut step_chips = h_flex().gap_1();
+        for candidate in SetupStep::ALL {
+            let active = candidate == step;
+            step_chips = step_chips.child(
+                div()
+                    .h(px(26.0))
+                    .px_2()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.0))
+                    .bg(if active { p.accent_muted } else { p.panel_alt })
+                    .border_1()
+                    .border_color(if active { p.accent } else { p.border })
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(if active { p.accent } else { p.text_faint })
+                    .child(format!("{} {}", candidate.number(), candidate.title())),
+            );
+        }
+
+        let mut body = v_flex()
+            .gap_2()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scrollbar();
+
+        match step {
+            SetupStep::Safety => {
+                let mut checklist = v_flex().gap_1();
+                for item in SafetyItem::ALL {
+                    let toggle_view = view.clone();
+                    let checked = setup.safety_checked(item);
+                    checklist = checklist.child(
+                        h_flex()
+                            .id(format!("setup-safety-{}", item.index()))
+                            .h(px(56.0))
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(if checked { p.accent } else { p.border })
+                            .bg(if checked { p.accent_muted } else { p.panel })
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                toggle_view.update(cx, |this, cx| {
+                                    this.state.setup_toggle_safety(item);
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .border_1()
+                                    .border_color(if checked { p.accent } else { p.border_strong })
+                                    .bg(if checked { p.accent } else { p.panel_alt })
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.on_accent)
+                                    .when(checked, |this| this.child("X")),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .gap_0()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if checked { p.text } else { p.text_dim })
+                                            .child(t(item.title())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(p.text_faint)
+                                            .child(t(item.detail())),
+                                    ),
+                            ),
+                    );
+                }
+                body = body
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel_alt)
+                            .border_1()
+                            .border_color(p.warning)
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.warning)
+                                    .child(t("THIS WIZARD DOES NOT TEST THE MACHINE")),
+                            )
+                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                                "The controller, its firmware, and the physical safety wiring remain authoritative. Acknowledge only what you have checked on this machine.",
+                            ))),
+                    )
+                    .child(checklist)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(if acknowledged == SafetyItem::ALL.len() {
+                                        p.success
+                                    } else {
+                                        p.warning
+                                    })
+                                    .child(format!("ACKNOWLEDGED {acknowledged} OF {}", SafetyItem::ALL.len())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_faint)
+                                    .child(t("EVERY ITEM IS REQUIRED BEFORE NEXT")),
+                            ),
+                    );
+            }
+            SetupStep::Units => {
+                let mm_selected = units == CoreUnits::Mm;
+                let inch_selected = units == CoreUnits::Inch;
+                let mm_view = view.clone();
+                let inch_view = view.clone();
+                let mm = Button::new("setup-units-mm")
+                    .label(t("MILLIMETRES (MM)"))
+                    .h(px(56.0))
+                    .flex_1()
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .on_click(move |_, _, cx| {
+                        mm_view.update(cx, |this, cx| {
+                            this.state.setup_set_units(CoreUnits::Mm);
+                            cx.notify();
+                        });
+                    });
+                let inch = Button::new("setup-units-inch")
+                    .label(t("INCHES (IN)"))
+                    .h(px(56.0))
+                    .flex_1()
+                    .rounded_lg()
+                    .text_size(px(12.0))
+                    .on_click(move |_, _, cx| {
+                        inch_view.update(cx, |this, cx| {
+                            this.state.setup_set_units(CoreUnits::Inch);
+                            cx.notify();
+                        });
+                    });
+                body = body
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(t("DEFAULT DISPLAY UNITS")),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(if mm_selected { mm.primary() } else { mm.secondary() })
+                            .child(if inch_selected {
+                                inch.primary()
+                            } else {
+                                inch.secondary()
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel_alt)
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.info)
+                                    .child(t("APP PREFERENCE ONLY")),
+                            )
+                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                                "This choice is saved for the next session. The wizard does not send G20 or G21 and does not change the controller's units. The live controller parser state still controls the current session.",
+                            ))),
+                    );
+            }
+            SetupStep::Connection => {
+                body = body
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel_alt)
+                            .border_1()
+                            .border_color(p.info)
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.info)
+                                    .child(t("INFORMATIONAL ONLY")),
+                            )
+                            .child(div().text_size(px(11.0)).text_color(p.text).child(t(
+                                "The wizard never connects, homes, jogs, probes, or writes controller settings.",
+                            )))
+                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                                "After setup, use the normal Connection panel. Start with the simulator or with the spindle off, then run only status, DRO, and small jogs.",
+                            ))),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.text_dim)
+                                    .child(t("FIRST CONNECTION ORDER")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_faint)
+                                    .child(t(
+                                        "1. Confirm the physical E-stop and independent spindle stop. 2. Open CONNECTION and select the serial port. 3. Wait for READY and Idle. 4. Check the DRO with one small jog. 5. Verify units, WCS, and soft limits before loading a program.",
+                                    )),
+                            ),
+                    );
+            }
+            SetupStep::Review => {
+                let unit_label = if units == CoreUnits::Mm {
+                    "MILLIMETRES (MM)"
+                } else {
+                    "INCHES (IN)"
+                };
+                let row = |label: &'static str, value: String| {
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel_alt)
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(p.text_faint)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.text)
+                                .child(value),
+                        )
+                };
+                body = body
+                    .child(row(
+                        t("SAFETY ITEMS ACKNOWLEDGED"),
+                        format!("{acknowledged} OF {}", SafetyItem::ALL.len()),
+                    ))
+                    .child(row(t("DISPLAY UNITS"), unit_label.to_string()))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.panel_alt)
+                            .border_1()
+                            .border_color(p.danger)
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.danger)
+                                    .child(t("SETUP IS NOT A MACHINE CERTIFICATION")),
+                            )
+                            .child(div().text_size(px(10.0)).text_color(p.text_dim).child(t(
+                                "This records that you reviewed the checklist and chose an app preference. It does not test, certify, or configure the machine. Verify every motion, limit, and safety device yourself.",
+                            ))),
+                    );
+            }
+        }
+
+        let mut footer = h_flex().items_center().gap_2();
+        if step.previous().is_some() {
+            let back_view = view.clone();
+            footer = footer.child(
+                Button::new("setup-back")
+                    .label(t("BACK"))
+                    .secondary()
+                    .h(px(48.0))
+                    .w(px(96.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .on_click(move |_, _, cx| {
+                        back_view.update(cx, |this, cx| {
+                            if this.state.setup_back() {
+                                cx.notify();
+                            }
+                        });
+                    }),
+            );
+        }
+        let later_view = view.clone();
+        footer = footer.child(
+            Button::new("setup-remind-later")
+                .label(t("REMIND ME LATER"))
+                .secondary()
+                .h(px(48.0))
+                .w(px(170.0))
+                .rounded_lg()
+                .text_size(px(10.0))
+                .on_click(move |_, _, cx| {
+                    later_view.update(cx, |this, cx| {
+                        this.state.remind_later_setup();
+                        cx.notify();
+                    });
+                }),
+        );
+        footer = footer.child(div().flex_1());
+        if step == SetupStep::Review {
+            let finish_view = view.clone();
+            footer = footer.child(
+                Button::new("setup-finish")
+                    .label(t("FINISH SETUP"))
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(164.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .on_click(move |_, _, cx| {
+                        finish_view.update(cx, |this, cx| {
+                            let _ = this.state.finish_setup();
+                            cx.notify();
+                        });
+                    }),
+            );
+        } else {
+            let next_view = view.clone();
+            footer = footer.child(
+                Button::new("setup-next")
+                    .label(t("NEXT"))
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(116.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .disabled(!can_advance)
+                    .on_click(move |_, _, cx| {
+                        next_view.update(cx, |this, cx| {
+                            if this.state.setup_next() {
+                                cx.notify();
+                            }
+                        });
+                    }),
+            );
+        }
+
+        let sheet = v_flex()
+            .relative()
+            .w(px(760.0))
+            .max_w_full()
+            .max_h(px(700.0))
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border_strong)
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(t("MACHINE SETUP")),
+                    )
+                    .child(chip(
+                        &format!("STEP {} OF {}", step.number(), SetupStep::ALL.len()),
+                        p,
+                    )),
+            )
+            .child(step_chips)
+            .child(body)
+            .when_some(error, |this, error| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.danger)
+                        .child(error),
+                )
+            })
+            .child(footer);
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("setup-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| {
+                            this.state.remind_later_setup();
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
+    /// First-run setup status and the explicit reopen action.
+    ///
+    /// The card never marks setup complete. `OPEN SETUP` reopens at SAFETY; the
+    /// operator must pass the checklist and REVIEW again to save the flag.
+    fn machine_setup_card(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let complete = self.state.config.setup_complete();
+        let status_color = if complete { p.success } else { p.warning };
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .border_1()
+            .border_color(if complete { p.border } else { p.warning })
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("MACHINE SETUP"), p))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(status_color)
+                            .child(if complete {
+                                t("COMPLETE")
+                            } else {
+                                t("NOT COMPLETED")
+                            }),
+                    ),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "The wizard reviews the physical safety checklist, the app display unit preference, and what the first connection should look like. It never connects, homes, jogs, probes, or writes controller settings.",
+            )))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("machine-setup-open")
+                            .label(t("OPEN SETUP"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(132.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.state.open_setup();
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.text_faint)
+                            .child(if complete {
+                                t("REOPENS AT SAFETY TO REVIEW OR UPDATE THE CHOICES")
+                            } else {
+                                t("START HERE BEFORE THE FIRST COMMANDED MOVE")
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let config = &self.state.config;
@@ -14541,6 +15106,7 @@ impl Shell {
             .gap_2()
             .size_full()
             .overflow_y_scrollbar()
+            .child(self.machine_setup_card(p, cx))
             .child(self.calibration_card(p, cx))
             .child(self.surfacing_card(p, cx))
             .child(self.program_limits_card(p))
@@ -18680,6 +19246,13 @@ impl Render for Shell {
         if self.file_browser.is_some() {
             root = root.child(self.file_browser_overlay(p, cx));
         }
+        if self.state.setup.is_open() {
+            root = root.child(self.setup_overlay(p, cx));
+        }
+        // The first frame is now on screen; the poll may offer the first-run
+        // setup once. This is a plain write, not a notify, so rendering stays
+        // side-effect free for the frame.
+        self.first_render_done = true;
         root
     }
 }
@@ -19096,6 +19669,33 @@ fn program_search_arg() -> Option<String> {
         arg.strip_prefix("--program-search=")
             .map(std::string::ToString::to_string)
     })
+}
+
+/// Whether a command-line flag already determines the initial screen.
+///
+/// The first-run setup prompt is suppressed so it cannot cover a workspace or
+/// sheet selected for a demo capture. `--mock` is intentionally not listed: it
+/// is a review shell, not an initial-screen choice.
+fn demo_initial_screen_arg(arg: &str) -> bool {
+    arg.starts_with("--demo")
+        || arg.starts_with("--settings-group=")
+        || arg.starts_with("--probe-card=")
+        || arg.starts_with("--file-browser=")
+        || arg.starts_with("--connection-panel")
+        || matches!(
+            arg,
+            "--settings"
+                | "--offsets"
+                | "--tools"
+                | "--utility"
+                | "--startup-lines"
+                | "--macros"
+                | "--probe"
+                | "--pins"
+                | "--keymap"
+                | "--keypad"
+                | "--console-tab"
+        )
 }
 
 fn mode_variant(cx: &App, p: Palette, active: bool) -> ButtonCustomVariant {

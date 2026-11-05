@@ -34,6 +34,7 @@ use crate::offsets_export::{OffsetsBackupModel, OffsetsExport};
 use crate::pins::PinsModel;
 use crate::probe::{ProbeField, ProbeModel};
 use crate::settings::{SettingKind, SettingsModel};
+use crate::setup::{SafetyItem, SetupModel, SetupStep};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::utilities::{
@@ -2299,8 +2300,12 @@ pub struct AppState {
     pub user_macros: MacroModel,
     /// Material surfacing wizard, program-limits state, and source transforms.
     pub utilities: UtilityModel,
+    /// First-run safety/setup wizard. Nothing in it can send a command.
+    pub setup: SetupModel,
     /// Local app preferences, controller profile, and backup helpers.
     pub config: ConfigModel,
+    /// Whether this app run already offered the first-run wizard once.
+    setup_auto_prompted: bool,
 }
 
 impl AppState {
@@ -2393,7 +2398,9 @@ impl AppState {
             pins: PinsModel::new(),
             user_macros: MacroModel::new(),
             utilities: UtilityModel::default(),
+            setup: SetupModel::new(config.app().units),
             config,
+            setup_auto_prompted: false,
         };
         state.sync_offset_context();
         state
@@ -2794,6 +2801,105 @@ impl AppState {
         match send(command) {
             Ok(()) => SleepOutcome::Sent,
             Err(detail) => SleepOutcome::Rejected(detail),
+        }
+    }
+
+    // ------------------------------------------------------- setup wizard
+
+    /// Open the first-run safety/setup wizard at SAFETY.
+    ///
+    /// The checklist starts unchecked and the unit preference is prefilled from
+    /// the current app config. Opening the overlay sends nothing to the
+    /// controller.
+    pub fn open_setup(&mut self) {
+        let units = self.config.app().units;
+        self.setup.open(units);
+    }
+
+    /// Offer the first-run wizard once in this app run.
+    ///
+    /// Returns `true` only when the overlay was opened. A completed setup, a
+    /// demo flag that already selects the initial screen, or a second call in
+    /// the same run all return `false`. This is what keeps "REMIND ME LATER"
+    /// from re-opening the wizard until the next launch.
+    pub fn auto_open_setup(&mut self, demo_initial_screen: bool) -> bool {
+        if self.setup_auto_prompted {
+            return false;
+        }
+        self.setup_auto_prompted = true;
+        if demo_initial_screen || self.config.setup_complete() {
+            return false;
+        }
+        self.open_setup();
+        true
+    }
+
+    /// Demo/screenshot aid: open UNITS with the checklist acknowledged.
+    pub fn open_setup_units_for_demo(&mut self) {
+        let units = self.config.app().units;
+        self.setup.open_units_for_demo(units);
+    }
+
+    /// Demo/screenshot aid: open REVIEW with the checklist acknowledged.
+    pub fn open_setup_review_for_demo(&mut self) {
+        let units = self.config.app().units;
+        self.setup.open_review_for_demo(units);
+    }
+
+    /// Toggle one required safety acknowledgement.
+    pub fn setup_toggle_safety(&mut self, item: SafetyItem) {
+        self.setup.toggle_safety(item);
+    }
+
+    /// Advance one wizard page, honoring the SAFETY gate.
+    pub fn setup_next(&mut self) -> bool {
+        self.setup.next()
+    }
+
+    /// Go back one wizard page, preserving acknowledgements and units.
+    pub fn setup_back(&mut self) -> bool {
+        self.setup.back()
+    }
+
+    /// Select the app display-unit preference. This never sends `G20`/`G21`.
+    pub fn setup_set_units(&mut self, units: CoreUnits) {
+        self.setup.set_units(units);
+    }
+
+    /// Close the wizard without completing setup. The saved flag is untouched.
+    pub fn remind_later_setup(&mut self) {
+        self.setup.close();
+    }
+
+    /// Complete the wizard: persist the unit preference, then the flag.
+    ///
+    /// The overlay closes only when [`ConfigModel::set_setup_complete`]
+    /// succeeds. A save failure keeps it open, records the reason, and leaves
+    /// `setup_complete` false. No controller command is built or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the save error when the app config cannot be written, or a local
+    /// gate message when the operator is not on the reviewed summary.
+    pub fn finish_setup(&mut self) -> Result<PathBuf, String> {
+        if self.setup.step() != SetupStep::Review || !self.setup.all_safety_checked() {
+            let message =
+                "every safety item must be acknowledged on the review page before setup can finish";
+            self.setup.set_error(message);
+            return Err(message.to_string());
+        }
+        let units = self.setup.units();
+        self.config.set_units(units);
+        match self.config.set_setup_complete(true) {
+            Ok(path) => {
+                self.setup.close();
+                Ok(path)
+            }
+            Err(error) => {
+                self.setup
+                    .set_error(format!("Setup was not saved: {error}"));
+                Err(error)
+            }
         }
     }
 
@@ -4789,6 +4895,7 @@ mod tests {
 
     use super::*;
     use crate::probe::ProbeContext;
+    use crate::setup::{SafetyItem, SetupStep};
     use crate::utilities::LimitsStatus;
 
     const FLEXIHAL: &[&str] = &[
@@ -8013,5 +8120,245 @@ mod tests {
             StartOutcome::Stale
         );
         assert!(sent.is_empty(), "a stale held start must not send");
+    }
+
+    // ------------------------------------------------------- setup wizard
+
+    fn setup_state(label: &str) -> (AppState, TempRoot, ConfigStore) {
+        let dir = TempRoot::new(label);
+        let store = ConfigStore::new(&dir.path);
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store.clone());
+        state.setup = crate::setup::SetupModel::new(state.config.app().units);
+        (state, dir, store)
+    }
+
+    fn acknowledged_setup_state(label: &str) -> (AppState, TempRoot, ConfigStore) {
+        let (mut state, dir, store) = setup_state(label);
+        state.open_setup();
+        for item in SafetyItem::ALL {
+            state.setup_toggle_safety(item);
+        }
+        (state, dir, store)
+    }
+
+    #[test]
+    fn first_run_setup_opens_once_only_when_incomplete() {
+        let (mut state, _dir, store) = setup_state("setup-first-run");
+        assert!(!state.config.setup_complete());
+        assert!(state.auto_open_setup(false));
+        assert!(state.setup.is_open());
+        assert_eq!(state.setup.step(), SetupStep::Safety);
+        assert_eq!(state.setup.acknowledged_count(), 0);
+
+        state.remind_later_setup();
+        assert!(!state.setup.is_open());
+        assert!(
+            !state.auto_open_setup(false),
+            "REMIND ME LATER must not re-open the wizard in the same run"
+        );
+
+        let mut complete = AppState::new();
+        complete.config = ConfigModel::from_store(store);
+        complete
+            .config
+            .set_setup_complete(true)
+            .expect("write completion flag");
+        complete.setup = crate::setup::SetupModel::new(CoreUnits::Mm);
+        assert!(
+            !complete.auto_open_setup(false),
+            "a completed setup must not open on startup"
+        );
+        assert!(!complete.setup.is_open());
+    }
+
+    #[test]
+    fn a_demo_initial_screen_suppresses_the_first_run_setup() {
+        let (mut state, _dir, _store) = setup_state("setup-demo-screen");
+        assert!(!state.auto_open_setup(true));
+        assert!(!state.setup.is_open());
+        assert!(
+            !state.auto_open_setup(false),
+            "the startup prompt was already considered"
+        );
+    }
+
+    #[test]
+    fn safety_gate_blocks_next_until_every_item_is_checked_and_unchecking_blocks_again() {
+        let (mut state, _dir, _store) = setup_state("setup-gate");
+        state.open_setup();
+        assert_eq!(state.setup.step(), SetupStep::Safety);
+
+        for item in SafetyItem::ALL {
+            assert!(
+                !state.setup_next(),
+                "advanced with {} unchecked",
+                item.title()
+            );
+            state.setup_toggle_safety(item);
+        }
+        assert!(state.setup_next());
+        assert_eq!(state.setup.step(), SetupStep::Units);
+
+        assert!(state.setup_back());
+        state.setup_toggle_safety(SafetyItem::Workholding);
+        assert!(!state.setup.can_advance());
+        assert!(!state.setup_next());
+        assert_eq!(state.setup.step(), SetupStep::Safety);
+    }
+
+    #[test]
+    fn back_navigation_preserves_checked_items_and_units() {
+        let (mut state, _dir, _store) = acknowledged_setup_state("setup-back");
+        assert!(state.setup_next());
+        state.setup_set_units(CoreUnits::Inch);
+        assert!(state.setup_next());
+        assert_eq!(state.setup.step(), SetupStep::Connection);
+
+        assert!(state.setup_back());
+        assert_eq!(state.setup.step(), SetupStep::Units);
+        assert_eq!(state.setup.units(), CoreUnits::Inch);
+        assert!(state.setup_back());
+        assert_eq!(state.setup.step(), SetupStep::Safety);
+        assert!(state.setup.all_safety_checked());
+        assert_eq!(state.setup.acknowledged_count(), SafetyItem::ALL.len());
+        assert_eq!(state.setup.units(), CoreUnits::Inch);
+    }
+
+    #[test]
+    fn finish_setup_saves_units_and_closes() {
+        let (mut state, _dir, store) = acknowledged_setup_state("setup-units");
+        assert!(state.setup_next());
+        state.setup_set_units(CoreUnits::Inch);
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        assert_eq!(state.setup.step(), SetupStep::Review);
+
+        state.finish_setup().expect("finish setup");
+        assert!(!state.setup.is_open());
+
+        let reopened = ConfigModel::from_store(store);
+        assert_eq!(reopened.app().units, CoreUnits::Inch);
+    }
+
+    #[test]
+    fn finish_setup_sets_the_flag_through_the_config_model() {
+        let (mut state, _dir, store) = acknowledged_setup_state("setup-flag");
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        assert_eq!(state.setup.step(), SetupStep::Review);
+
+        state.finish_setup().expect("finish setup");
+        assert!(state.config.setup_complete());
+        assert!(ConfigModel::from_store(store).setup_complete());
+    }
+
+    #[test]
+    fn save_failure_keeps_the_wizard_open_and_the_flag_false() {
+        let dir = TempRoot::new("setup-save-failure");
+        let store = ConfigStore::new(&dir.path);
+        let path = store.app_config_path();
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let corrupt = b"{ not json";
+        fs::write(&path, corrupt).expect("write corrupt app config");
+
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(store);
+        state.setup = crate::setup::SetupModel::new(CoreUnits::Mm);
+        state.open_setup();
+        for item in SafetyItem::ALL {
+            state.setup_toggle_safety(item);
+        }
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+
+        let error = state.finish_setup().expect_err("save must be refused");
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(state.setup.is_open(), "the wizard stays open");
+        assert_eq!(state.setup.step(), SetupStep::Review);
+        assert!(state.setup.error().is_some());
+        assert!(!state.config.setup_complete());
+        assert_eq!(fs::read(&path).expect("read"), corrupt);
+    }
+
+    #[test]
+    fn remind_me_later_closes_without_setting_the_flag() {
+        let (mut state, _dir, store) = acknowledged_setup_state("setup-later");
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+
+        state.remind_later_setup();
+        assert!(!state.setup.is_open());
+        assert!(!state.config.setup_complete());
+        assert!(!store.app_config_path().exists());
+    }
+
+    #[test]
+    fn utility_reopen_starts_at_safety_and_completing_again_saves_the_flag() {
+        let (mut state, _dir, store) = setup_state("setup-reopen");
+        state
+            .config
+            .set_setup_complete(true)
+            .expect("pre-complete setup");
+        state.open_setup();
+        assert!(state.config.setup_complete());
+        assert_eq!(state.setup.step(), SetupStep::Safety);
+        assert_eq!(state.setup.acknowledged_count(), 0);
+
+        for item in SafetyItem::ALL {
+            state.setup_toggle_safety(item);
+        }
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        state.finish_setup().expect("finish again");
+        assert!(state.config.setup_complete());
+        assert!(ConfigModel::from_store(store).setup_complete());
+    }
+
+    #[test]
+    fn no_wizard_path_emits_a_controller_command() {
+        let (mut state, _dir, _store) = setup_state("setup-no-command");
+        let mut sent = Vec::new();
+        let recorder = recorded_send(&mut sent);
+
+        state.open_setup();
+        for item in SafetyItem::ALL {
+            state.setup_toggle_safety(item);
+        }
+        assert!(state.setup_next());
+        state.setup_set_units(CoreUnits::Inch);
+        assert!(state.setup_next());
+        assert!(state.setup_next());
+        state.finish_setup().expect("finish setup");
+        state.remind_later_setup();
+        drop(recorder);
+
+        assert!(
+            sent.is_empty(),
+            "the wizard never builds or dispatches a controller command"
+        );
+    }
+
+    #[test]
+    fn demo_setup_pages_are_reproducible_and_do_not_complete_setup() {
+        let (mut state, _dir, _store) = setup_state("setup-demo");
+        state.open_setup_units_for_demo();
+        assert!(state.setup.is_open());
+        assert_eq!(state.setup.step(), SetupStep::Units);
+        assert!(state.setup.all_safety_checked());
+
+        state.open_setup_review_for_demo();
+        assert!(state.setup.is_open());
+        assert_eq!(state.setup.step(), SetupStep::Review);
+        assert_eq!(state.setup.acknowledged_count(), SafetyItem::ALL.len());
+        assert!(!state.config.setup_complete());
+
+        state.open_setup();
+        assert_eq!(state.setup.step(), SetupStep::Safety);
+        assert_eq!(state.setup.acknowledged_count(), 0);
     }
 }
