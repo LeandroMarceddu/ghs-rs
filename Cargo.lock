@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-app"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "ghs-config",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-config"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ghs-core",
  "serde",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-demo"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "ghs-proto",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "ghs-core",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-gcode"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ghs-core",
  "ghs-viewer",
@@ -2009,11 +2009,11 @@ dependencies = [
 
 [[package]]
 name = "ghs-i18n"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "ghs-probe"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ghs-core",
  "ghs-viewer",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ghs-core",
  "proptest",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-serial"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossbeam-channel",
  "serialport",
@@ -2042,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-sim"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ghs-core",
  "ghs-proto",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "ghs-viewer"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "gif"

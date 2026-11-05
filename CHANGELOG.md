@@ -11,6 +11,15 @@ until the next release is cut.
 
 ## [Unreleased]
 
+No changes yet after `v0.7.0`.
+
+## [0.7.0] - 2026-11-05
+
+Third release and the largest feature update since the first preview. It adds
+the utility/transform set, probe defaults/macros, controller reset, job history,
+recent files, 3D stock, high contrast, and keyboard hold-to-jog. It is a
+simulator-first release: unsigned, not notarized, and not hardware-validated.
+
 ### Added
 
 - **Program check** — the read-only program-limits card now shows feed/spindle
@@ -57,6 +66,16 @@ until the next release is cut.
   and plate thickness are stored per controller profile with validation and
   backward-compatible defaults. The Probe `SAVE DEFAULTS` action writes only
   the local profile and reloads the values on the next profile load.
+
+### Safety
+
+- `START` and `RUN TO` hold behind the over-travel confirmation when the
+  program's estimated machine bounds leave reported travel.
+- `$RST` is idle-only, backup-gated, and requires a two-step confirmation.
+- Tool-length apply is idle-only and reports `APPLIED` only after `$#`
+  verifies the target.
+- Source rotation/scaling previews warnings and loads only after confirmation;
+  unsupported programs are refused instead of rewritten approximately.
 
 ## [0.6.0] - 2026-11-05
 

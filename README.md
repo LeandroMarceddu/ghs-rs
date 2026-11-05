@@ -14,15 +14,15 @@ macOS, and Linux.
 *The same Job workspace split between Light and Dark themes. See the
 [gallery](docs/GALLERY.md) for setup, probing, utilities, and viewer captures.*
 
-> **Status: v0.6.0 pre-release published.** Protocol, simulator, serial, job
-> streaming, the 2D/3D viewer, generated settings, live offsets, tools,
-> profiles, backups, probing (including verified tool-length apply), height maps
-> with Apply/Revert, macros, startup lines, keymap, pins diagnostics, dry-run
-> check mode, utilities/calibration, first-run setup, pre-run travel
-> confirmation, and localization are implemented. **V1.0 means total ioSender
-> milling parity.** The v0.6.0 packages are unsigned and not hardware-validated;
-> see
-> [GitHub Releases](https://github.com/LeandroMarceddu/ghs-rs/releases/tag/v0.6.0).
+> **Status: v0.7.0 released.** Protocol, simulator, serial, job streaming,
+> the 2D/3D viewer, generated settings, live offsets, tools, profiles, backups,
+> probing (including verified tool-length apply), height maps with Apply/Revert,
+> macros, startup lines, keymap, pins diagnostics, dry-run check mode,
+> utilities/calibration, source rotation/scaling, first-run setup, pre-run
+> travel confirmation, job history, high contrast, and localization are
+> implemented. **V1.0 means total ioSender milling parity.** The v0.7.0
+> packages are unsigned and not hardware-validated; see
+> [GitHub Releases](https://github.com/LeandroMarceddu/ghs-rs/releases/tag/v0.7.0).
 > See [docs/PLAN.md](docs/PLAN.md).
 
 ## Scope

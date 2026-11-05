@@ -1,6 +1,6 @@
 # ghs-rs — implementation plan
 
-**Status:** M7 closeout — `v0.6.0` preview released; V1.0 total-parity gate open
+**Status:** M7 closeout — `v0.7.0` released; V1.0 total-parity gate open
 **Updated:** 2026-11-05
 **V1.0 target:** total ioSender milling parity
 **Reference hardware:** FlexiHAL / STM32F446, grblHAL `1.1f.20240604`
@@ -33,7 +33,7 @@ persisted shared cycle defaults, and bounded pre/post macros are implemented).
 The viewer remainder (measured stock/tool modelling), portrait reflow,
 high-contrast theme, session recording, and the optional Workbench mode are
 also open against the full checklist in [parity.md](parity.md).
-`v0.6.0` is an optional preview pre-release; it does not close the V1.0 gate.
+`v0.7.0` is the current release; it does not close the V1.0 gate.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
 it parses every status field, real-time command, system command, and runtime
@@ -352,3 +352,4 @@ interlocks, and check mode promoted in the UI. See [SAFETY.md](SAFETY.md).
 | 2026-11-01 | Subagent execution with orchestrator review gates |
 | 2026-11-03 | v1.0 = total ioSender milling parity; `v0.5.0` is an optional preview pre-release |
 | 2026-11-05 | `v0.6.0` preview: utilities/calibration, setup wizard, travel gate, TLO apply |
+| 2026-11-05 | `v0.7.0`: probe macros/defaults, reset, job history, stock, transforms, hold-jog |
