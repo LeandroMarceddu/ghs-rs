@@ -87,6 +87,26 @@
 //! assert!(result.source.contains("Z0.1"));
 //! ```
 //!
+//! # Rotation
+//!
+//! [`apply_rotation`] is the pure sender-side rewrite behind a **Rotate
+//! program** action. It rotates absolute XY endpoints and `I`/`J` center
+//! offsets of `G0`/`G1` moves and `G17` `G2`/`G3` arcs about a pivot, resolves
+//! `R` arcs to `I`/`J`, and leaves every other line untouched. It works in
+//! millimetres and emits in the program's `G20`/`G21` unit mode.
+//!
+//! ```
+//! use ghs_gcode::{RotationOptions, apply_rotation};
+//!
+//! let options = RotationOptions {
+//!     angle_deg: 90.0,
+//!     pivot_mm: (0.0, 0.0),
+//! };
+//! let result = apply_rotation("G21 G90\nG0 X10 Y0\n", &options).expect("rotate");
+//! assert!(result.source.contains("G0 X0 Y10"));
+//! assert_eq!(result.stats.rotated_moves, 1);
+//! ```
+//!
 //! # Coordinates
 //!
 //! Stored coordinates are millimetres. The display toolpath applies `G51`
@@ -108,6 +128,7 @@ mod lexer;
 mod parser;
 mod planner;
 mod program;
+mod rotate;
 mod state;
 
 pub use compensation::{
@@ -121,6 +142,10 @@ pub use error::{ParseError, ParseErrorKind, ParseWarning, WarningKind};
 pub use lexer::{DEFAULT_MAX_WORDS, LexedLine, Word, checksum_xor, lex_line};
 pub use parser::{Parser, parse_program, parse_program_with};
 pub use program::{Program, ProgramLine, ProgramStats};
+pub use rotate::{
+    MAX_ROTATED_OUTPUT_LINES, MAX_ROTATION_ANGLE_DEG, RotatedProgram, RotationError,
+    RotationOptions, RotationStats, RotationWarning, RotationWarningKind, apply_rotation,
+};
 pub use state::{
     CannedCycleKind, CannedCycleParams, CoolantMode, DistanceMode, FeedMode, MotionMode,
     ParserState, PathControl, Plane, ProbeKind, RetractMode, Rotation, Scaling, SpindleMode,

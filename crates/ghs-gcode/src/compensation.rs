@@ -1250,7 +1250,7 @@ fn arc_delta_is_zero(
 }
 
 /// Formats a millimetre value in program units with six decimal places.
-fn format_units(units: Units, value_mm: f64) -> String {
+pub(crate) fn format_units(units: Units, value_mm: f64) -> String {
     format_decimal(units.from_mm(value_mm))
 }
 
