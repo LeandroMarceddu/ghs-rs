@@ -17,6 +17,10 @@ until the next release is cut.
   `$RST=&`, and `$RST=*`. Each target requires a backup prompt or explicit
   data-loss acknowledgement and a two-step confirmation; the reset is
   idle-only and never changes local profiles or backups.
+- **Job history** — completed, stopped, aborted, failed, and interrupted runs
+  record a local entry with start time, elapsed time, line count, result, and
+  dry-run flag. The Utility card shows the newest ten, `OPEN HISTORY` shows all
+  100, and `CLEAR HISTORY` requires confirmation. It writes only `app.json`.
 - **Gantry squaring** — a Utility calculator for span and left/right Y
   readings. It reports the delta, angle, and pivot-centre per-side correction,
   with explicit direction wording. It never moves or adjusts the gantry.

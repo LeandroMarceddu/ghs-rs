@@ -114,7 +114,7 @@ implemented before its UI or hardware validation row is complete.
 | JOB-11 | Defined reconnect and interruption policy | M3 | done | No silent resume |
 | JOB-12 | Program list with follow, search, context menu | M4 | partial | Follow/search/jump done; context menu open |
 | JOB-13 | Add line numbers, strip comments | M4 | done | Non-destructive source transforms |
-| JOB-14 | Job statistics and run history | M4 | todo | Local only |
+| JOB-14 | Job statistics and run history | M4 | done | Local 100-entry history in `app.json`; clear confirmation |
 
 ## Viewer
 

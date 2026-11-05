@@ -398,6 +398,16 @@ app tool-table record (name, diameter, length) if one exists.
 
 The job does not send another line until you resume.
 
+### Job history
+
+Utility → `JOB HISTORY` records one entry when a job completes, stops, aborts,
+fails, or is interrupted by a lost link. Each entry stores the local start
+time, program name, elapsed time, line count, result, and whether it was a
+`$C` dry run. The card shows the newest ten; `OPEN HISTORY` shows all stored
+entries, capped at 100. History is stored in `app.json` on this computer and is
+never sent to the controller. `CLEAR HISTORY` asks for confirmation and removes
+only those local records.
+
 ### Alarms and disconnects
 
 An `ALARM`, E-stop, door event, or lost link stops the job. Nothing
@@ -713,6 +723,12 @@ starts automatically.
   offsets/tool data (`#`), core settings (`$`), driver/plugin defaults (`&`),
   or everything (`*`). It is idle-only, never changes local profiles or
   backups, and never auto-reconnects or resumes.
+- `JOB HISTORY` is local only. A completed, stopped, aborted, failed, or
+  interrupted run records its program name, start time, elapsed time, line
+  count, result, and whether it was a dry run. The card shows the newest ten;
+  `OPEN HISTORY` shows all stored entries (maximum 100). `CLEAR HISTORY`
+  requires confirmation and writes only `app.json`; nothing is sent to the
+  controller.
 
 ### User macros
 

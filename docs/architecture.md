@@ -252,11 +252,14 @@ Hard rules:
 
 - App config: JSON (`app.json`) in the platform config directory
   (`~/.config/ghs-rs`, `%APPDATA%\ghs-rs`, `~/Library/Application Support/ghs-rs`).
+  It carries app preferences and the bounded local job history (100 entries);
+  history is never sent to the controller.
 - Controller profiles: `profiles/<id>.json`, keyed by `$I` identity plus board
   and firmware.
 - Backup bundles are versioned JSON: app config, controller identity, settings,
-  offsets, tool table, macros, startup lines, keymap, height maps, and the probe
-  offset. The store also keeps rolling copies of previous documents.
+  offsets, tool table, macros, startup lines, keymap, height maps, probe
+  defaults/macros, and the probe offset. The store also keeps rolling copies of
+  previous documents.
 - Work offsets export as WCS-only G-code (`offsets.nc`); it is not a JSON or CSV
   export and deliberately omits G92, G28/G30, HOME, TLO/TLR, G51, and PRB.
 - Atomic writes: write to a temporary file, fsync, rename.
