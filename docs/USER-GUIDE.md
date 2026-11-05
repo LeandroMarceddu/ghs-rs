@@ -252,6 +252,8 @@ path. Both require a live controller and `Idle`.
 - Turn on `CONT` for press-and-hold. The app re-issues the step every 120 ms
   while held; releasing after at least 250 ms sends jog cancel. A quick tap
   keeps its single step.
+- Mapped jog keys work the same way: tap for one step, hold for repeat. OS key
+  repeat is ignored; a different jog key ends the previous hold first.
 - Jog is allowed in `Idle`, `Hold`, `Jog`, and `Tool`. It is refused in
   `Alarm` and `Door`.
 - Continuous jog is a repeated step, not a true velocity jog. Keep steps small
@@ -832,7 +834,8 @@ the Probe workspace's Z touch-plate card; it does **not** start a probe.
   required.
 - A focused text field or the key-capture editor suppresses machine actions.
   `STOP` remains available while non-text sheets are open.
-- Keyboard jog is one step per press; hold-to-jog remains pointer-only.
+- Keyboard jog is press-and-hold on mapped jog keys: tap for one step, hold to
+  repeat. OS key repeat is ignored, and a quick tap keeps its single step.
 - Refusals follow the same gates as the buttons: mock, not ready, Alarm/Door,
   active job, no program, probe program, no paused/running job, pending tool
   change, or watchdog pause.

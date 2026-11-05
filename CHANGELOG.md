@@ -20,6 +20,8 @@ until the next release is cut.
 - **3D stock mesh** — the 3D viewer draws an inferred translucent stock box
   from the program bounds, with a `STOCK ON/OFF` toggle and an explicit
   reminder that it is not a measured stock model.
+- **Keyboard hold-to-jog** — mapped jog keys now repeat every 120 ms while
+  held and send jog cancel after a real hold; a quick tap keeps one step.
 - **Source scaling** — a Utility transform applies a uniform positive factor
   about a work-coordinate pivot, previews line/move/arc counts and `R`→`I`/`J`
   warnings, and loads only after confirmation. Feeds, speeds, Z depths, and

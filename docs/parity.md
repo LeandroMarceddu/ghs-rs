@@ -80,7 +80,7 @@ implemented before its UI or hardware validation row is complete.
 | CTL-01 | DRO for all axes and work coordinate systems | M2 | done | X/Y/Z first, 9-axis capable |
 | CTL-02 | Zero axes and set position | M2 | done | Per axis and all |
 | CTL-03 | Goto and park | M2 | partial | Confirmation for Goto |
-| CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | partial | Keyboard one-step; hold pointer-only; jog feed global |
+| CTL-04 | Step and continuous jog, configurable distances/feeds, keyboard jog | M2 | partial | Keyboard/pointer hold-to-jog; jog feed global |
 | CTL-05 | Jog cancel and pendant-safe behavior | M2 | done | `0x85` |
 | CTL-06 | Feed override, fine and coarse, reset | M2 | done | Slider, ±1/±10, reset |
 | CTL-07 | Rapid override | M2 | done | 100/50/25 compact chip |
