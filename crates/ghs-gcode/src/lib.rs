@@ -107,6 +107,27 @@
 //! assert_eq!(result.stats.rotated_moves, 1);
 //! ```
 //!
+//! # Scaling
+//!
+//! [`apply_scale`] is the pure sender-side rewrite behind a **Scale
+//! program** action. It scales absolute XY endpoints and `I`/`J` center
+//! offsets of `G0`/`G1` moves and `G17` `G2`/`G3` arcs about a pivot by one
+//! uniform positive factor, resolves `R` arcs to `I`/`J`, and leaves every
+//! other line untouched. It works in millimetres and emits in the program's
+//! `G20`/`G21` unit mode. Z, feed, speed, tool, and modal state are preserved.
+//!
+//! ```
+//! use ghs_gcode::{ScaleOptions, apply_scale};
+//!
+//! let options = ScaleOptions {
+//!     factor: 2.0,
+//!     pivot_mm: (0.0, 0.0),
+//! };
+//! let result = apply_scale("G21 G90\nG0 X10 Y0\n", &options).expect("scale");
+//! assert!(result.source.contains("G0 X20 Y0"));
+//! assert_eq!(result.stats.scaled_moves, 1);
+//! ```
+//!
 //! # Coordinates
 //!
 //! Stored coordinates are millimetres. The display toolpath applies `G51`
@@ -128,7 +149,9 @@ mod lexer;
 mod parser;
 mod planner;
 mod program;
+mod rewrite;
 mod rotate;
+mod scale;
 mod state;
 
 pub use compensation::{
@@ -145,6 +168,10 @@ pub use program::{Program, ProgramLine, ProgramStats};
 pub use rotate::{
     MAX_ROTATED_OUTPUT_LINES, MAX_ROTATION_ANGLE_DEG, RotatedProgram, RotationError,
     RotationOptions, RotationStats, RotationWarning, RotationWarningKind, apply_rotation,
+};
+pub use scale::{
+    MAX_SCALE_FACTOR, MAX_SCALED_OUTPUT_LINES, MIN_SCALE_FACTOR, ScaleError, ScaleOptions,
+    ScaleStats, ScaleWarning, ScaleWarningKind, ScaledProgram, apply_scale,
 };
 pub use state::{
     CannedCycleKind, CannedCycleParams, CoolantMode, DistanceMode, FeedMode, MotionMode,
