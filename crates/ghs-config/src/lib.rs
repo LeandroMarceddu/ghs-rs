@@ -12,8 +12,8 @@
 //! - [`AppConfig`] holds theme, display units, the last profile key,
 //!   window/layout fields, and a bounded job history in `app.json`.
 //! - [`ControllerData`] is one profile: settings snapshot, offsets, probe
-//!   mount offset, probe defaults, the application-owned tool table, macros,
-//!   startup lines, keymap, and persisted height maps.
+//!   mount offset, probe defaults and macros, the application-owned tool
+//!   table, macros, startup lines, keymap, and persisted height maps.
 //! - [`BackupBundle`] is a versioned portable snapshot with app config,
 //!   controller identity, controller data, and a creation timestamp.
 //!
@@ -73,9 +73,9 @@ pub use controller::{
     CONTROLLER_SCHEMA_VERSION, ControllerData, HeightMapFrame, HeightMapRecord, KeyBinding, Keymap,
     MAX_HEIGHT_MAP_AXIS_POINTS, MAX_HEIGHT_MAP_COORDINATE_MM, MAX_HEIGHT_MAP_STEP_MM,
     MAX_HEIGHT_MAPS, MAX_PROBE_DIAMETER_MM, MAX_PROBE_EDGE_OFFSET_MM, MAX_PROBE_FEED_MM_MIN,
-    MAX_PROBE_OFFSET_MM, MAX_PROBE_PLATE_THICKNESS_MM, MAX_PROBE_RETRACT_MM, MAX_PROBE_SAFE_Z_MM,
-    MAX_PROBE_SEARCH_DISTANCE_MM, Macro, OffsetSnapshot, ProbeDefaultsRecord, ProbeOffsetRecord,
-    StartupLines, ToolRecord, ToolTable,
+    MAX_PROBE_MACRO_BYTES, MAX_PROBE_OFFSET_MM, MAX_PROBE_PLATE_THICKNESS_MM, MAX_PROBE_RETRACT_MM,
+    MAX_PROBE_SAFE_Z_MM, MAX_PROBE_SEARCH_DISTANCE_MM, Macro, OffsetSnapshot, ProbeDefaultsRecord,
+    ProbeOffsetRecord, StartupLines, ToolRecord, ToolTable,
 };
 pub use error::{ConfigError, ValidationError};
 pub use profile::ProfileKey;

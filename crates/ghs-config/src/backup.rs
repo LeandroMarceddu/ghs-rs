@@ -45,8 +45,8 @@ pub struct BackupBundle {
     pub app: AppConfig,
     /// Controller the profile belongs to.
     pub controller: ControllerIdentity,
-    /// Per-controller settings, offsets, probe defaults, tools, macros, startup
-    /// lines, and keymap.
+    /// Per-controller settings, offsets, probe defaults and macros, tools,
+    /// macros, startup lines, and keymap.
     pub data: ControllerData,
 }
 
@@ -319,6 +319,8 @@ mod tests {
             probe_diameter_mm: 5.0,
             edge_offset_mm: 0.75,
             plate_thickness_mm: 11.5,
+            pre_probe_macro: "(pre)\nM5".into(),
+            post_probe_macro: "(post)\nM9".into(),
         };
         data
     }
@@ -347,6 +349,27 @@ mod tests {
         let decoded = BackupBundle::from_json_str(&json).expect("decode");
         assert_eq!(decoded.data.probe_defaults, original.data.probe_defaults);
         assert_eq!(decoded, original);
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn bundle_round_trips_probe_macros() {
+        let original = bundle();
+        assert_eq!(original.data.probe_defaults.pre_probe_macro, "(pre)\nM5");
+        assert_eq!(original.data.probe_defaults.post_probe_macro, "(post)\nM9");
+        let json = original.to_json_string().expect("encode");
+        assert!(json.contains("\"pre_probe_macro\""));
+        assert!(json.contains("\"post_probe_macro\""));
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(
+            decoded.data.probe_defaults.pre_probe_macro,
+            original.data.probe_defaults.pre_probe_macro
+        );
+        assert_eq!(
+            decoded.data.probe_defaults.post_probe_macro,
+            original.data.probe_defaults.post_probe_macro
+        );
         decoded.validate().expect("valid");
     }
 

@@ -132,6 +132,24 @@ pub enum ValidationError {
         /// Largest accepted value.
         max: f64,
     },
+    /// A persisted pre- or post-probe macro exceeds the byte limit.
+    #[error("probe macro {field} is {bytes} bytes; the limit is {max}")]
+    ProbeMacroTooLong {
+        /// Field name, `"pre_probe_macro"` or `"post_probe_macro"`.
+        field: &'static str,
+        /// Length of the rejected text, in UTF-8 bytes.
+        bytes: usize,
+        /// Largest accepted length, in UTF-8 bytes.
+        max: usize,
+    },
+    /// A persisted probe macro contains a forbidden control character.
+    #[error("probe macro {field} must not contain control character {character:?}")]
+    ProbeMacroControlCharacter {
+        /// Field name, `"pre_probe_macro"` or `"post_probe_macro"`.
+        field: &'static str,
+        /// First rejected character.
+        character: char,
+    },
     /// A setting value is NaN, infinite, or structurally invalid.
     #[error("setting ${number} is invalid: {reason}")]
     InvalidSetting {

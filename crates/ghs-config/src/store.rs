@@ -970,9 +970,11 @@ mod tests {
             probe_diameter_mm: 2.0,
             edge_offset_mm: 0.25,
             plate_thickness_mm: 9.5,
+            pre_probe_macro: "(pre)\nM5".into(),
+            post_probe_macro: "(post)\nM9".into(),
         };
         let mut with_defaults = sample_data();
-        with_defaults.probe_defaults = defaults;
+        with_defaults.probe_defaults = defaults.clone();
 
         store
             .save_controller_data(&first, &with_defaults)

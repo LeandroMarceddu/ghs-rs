@@ -63,6 +63,13 @@ pub const MAX_PROBE_EDGE_OFFSET_MM: f64 = 100.0;
 /// Largest touch-plate thickness in persisted probe defaults, in millimetres.
 pub const MAX_PROBE_PLATE_THICKNESS_MM: f64 = 100.0;
 
+/// Maximum length of a stored pre- or post-probe macro, in UTF-8 bytes.
+///
+/// This matches the bound in the probe crate, which reparses the text and
+/// enforces the no-motion allowlist before a cycle. `ghs-config` does not
+/// depend on that crate, so the value is repeated here and must stay in sync.
+pub const MAX_PROBE_MACRO_BYTES: usize = 512;
+
 /// Maximum length of a tool name in characters.
 const MAX_TOOL_NAME: usize = 128;
 /// Maximum length of a macro name in characters.
@@ -670,10 +677,17 @@ const fn default_probe_plate_thickness_mm() -> f64 {
 /// millimetres; [`ProbeDefaultsRecord::feed_mm_min`] is in millimetres per
 /// minute.
 ///
+/// [`ProbeDefaultsRecord::pre_probe_macro`] and
+/// [`ProbeDefaultsRecord::post_probe_macro`] are opaque operator text. This
+/// record bounds their size and rejects control characters, but it does not
+/// parse G-code: the probe crate validates syntax and the no-motion allowlist
+/// before a cycle.
+///
 /// A profile written before this record existed loads
 /// [`ProbeDefaultsRecord::default`]. A record missing individual fields also
-/// falls back to their defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// falls back to their defaults; profiles written before the macro fields
+/// existed load them empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeDefaultsRecord {
     /// Safe Z plane, in millimetres, within `+/-`[`MAX_PROBE_SAFE_Z_MM`].
     #[serde(default = "default_probe_safe_z_mm")]
@@ -700,6 +714,20 @@ pub struct ProbeDefaultsRecord {
     /// `0..=`[`MAX_PROBE_PLATE_THICKNESS_MM`].
     #[serde(default = "default_probe_plate_thickness_mm")]
     pub plate_thickness_mm: f64,
+    /// Operator text inserted before the first probe move.
+    ///
+    /// Empty by default. At most [`MAX_PROBE_MACRO_BYTES`] UTF-8 bytes, with
+    /// no control characters other than `\n`, `\r`, and `\t`. Syntax and the
+    /// no-motion allowlist are validated by the probe crate, not here.
+    #[serde(default)]
+    pub pre_probe_macro: String,
+    /// Operator text inserted after the last probe move.
+    ///
+    /// Empty by default. At most [`MAX_PROBE_MACRO_BYTES`] UTF-8 bytes, with
+    /// no control characters other than `\n`, `\r`, and `\t`. Syntax and the
+    /// no-motion allowlist are validated by the probe crate, not here.
+    #[serde(default)]
+    pub post_probe_macro: String,
 }
 
 impl Default for ProbeDefaultsRecord {
@@ -712,6 +740,8 @@ impl Default for ProbeDefaultsRecord {
             probe_diameter_mm: DEFAULT_PROBE_DIAMETER_MM,
             edge_offset_mm: DEFAULT_PROBE_EDGE_OFFSET_MM,
             plate_thickness_mm: DEFAULT_PROBE_PLATE_THICKNESS_MM,
+            pre_probe_macro: String::new(),
+            post_probe_macro: String::new(),
         }
     }
 }
@@ -723,9 +753,12 @@ impl ProbeDefaultsRecord {
     ///
     /// Returns [`ValidationError::NonFiniteProbeDefault`] when a value is NaN or
     /// infinite, [`ValidationError::ProbeDefaultNotPositive`] when search,
-    /// feed, or retract is zero or negative, and
+    /// feed, or retract is zero or negative,
     /// [`ValidationError::ProbeDefaultOutOfRange`] when a value is outside its
-    /// documented inclusive range.
+    /// documented inclusive range, [`ValidationError::ProbeMacroTooLong`] when
+    /// a macro exceeds [`MAX_PROBE_MACRO_BYTES`], and
+    /// [`ValidationError::ProbeMacroControlCharacter`] when a macro contains a
+    /// control character other than `\n`, `\r`, or `\t`.
     /// Only a zero probe diameter and zero plate thickness are accepted as
     /// non-positive values, matching the probe engine.
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -759,8 +792,27 @@ impl ProbeDefaultsRecord {
             self.plate_thickness_mm,
             0.0,
             MAX_PROBE_PLATE_THICKNESS_MM,
-        )
+        )?;
+        validate_probe_macro("pre_probe_macro", &self.pre_probe_macro)?;
+        validate_probe_macro("post_probe_macro", &self.post_probe_macro)
     }
+}
+
+fn validate_probe_macro(field: &'static str, value: &str) -> Result<(), ValidationError> {
+    if value.len() > MAX_PROBE_MACRO_BYTES {
+        return Err(ValidationError::ProbeMacroTooLong {
+            field,
+            bytes: value.len(),
+            max: MAX_PROBE_MACRO_BYTES,
+        });
+    }
+    if let Some(character) = value
+        .chars()
+        .find(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(ValidationError::ProbeMacroControlCharacter { field, character });
+    }
+    Ok(())
 }
 
 fn validate_probe_default_range(
@@ -1317,6 +1369,8 @@ mod tests {
             probe_diameter_mm: 4.0,
             edge_offset_mm: 1.5,
             plate_thickness_mm: 12.0,
+            pre_probe_macro: "(pre-probe)\nM5".into(),
+            post_probe_macro: "(post-probe)\nG4 P1".into(),
         };
 
         data.tools = sample_tools();
@@ -1905,6 +1959,18 @@ mod tests {
     }
 
     #[test]
+    fn probe_macros_default_to_empty() {
+        let defaults = ProbeDefaultsRecord::default();
+        assert!(defaults.pre_probe_macro.is_empty());
+        assert!(defaults.post_probe_macro.is_empty());
+
+        let data = ControllerData::new();
+        assert!(data.probe_defaults.pre_probe_macro.is_empty());
+        assert!(data.probe_defaults.post_probe_macro.is_empty());
+        data.validate().expect("empty macros are valid");
+    }
+
+    #[test]
     fn probe_defaults_round_trip_non_default_values() {
         let defaults = ProbeDefaultsRecord {
             safe_z_mm: 25.0,
@@ -1914,6 +1980,8 @@ mod tests {
             probe_diameter_mm: 6.0,
             edge_offset_mm: 2.5,
             plate_thickness_mm: 12.0,
+            pre_probe_macro: "(pre)\nM5\nG4 P2".into(),
+            post_probe_macro: "; done\r\nM9\t(off)".into(),
         };
         defaults.validate().expect("valid");
         let json = serde_json::to_string(&defaults).expect("serialize");
@@ -1927,8 +1995,15 @@ mod tests {
         };
         let json = serde_json::to_string(&data).expect("serialize profile");
         assert!(json.contains("\"probe_defaults\""));
+        assert!(json.contains("\"pre_probe_macro\""));
+        assert!(json.contains("\"post_probe_macro\""));
         let decoded: ControllerData = serde_json::from_str(&json).expect("deserialize profile");
-        assert_eq!(decoded.probe_defaults, defaults);
+        assert_eq!(decoded.probe_defaults, data.probe_defaults);
+        assert_eq!(decoded.probe_defaults.pre_probe_macro, "(pre)\nM5\nG4 P2");
+        assert_eq!(
+            decoded.probe_defaults.post_probe_macro,
+            "; done\r\nM9\t(off)"
+        );
         decoded.validate().expect("valid after round trip");
     }
 
@@ -1960,7 +2035,144 @@ mod tests {
         assert_eq!(partial.probe_diameter_mm, 3.0);
         assert_eq!(partial.edge_offset_mm, 0.0);
         assert_eq!(partial.plate_thickness_mm, 10.0);
+        assert!(partial.pre_probe_macro.is_empty());
+        assert!(partial.post_probe_macro.is_empty());
         partial.validate().expect("partial record is valid");
+    }
+
+    #[test]
+    fn probe_macros_round_trip_in_json() {
+        let data = ControllerData {
+            probe_defaults: ProbeDefaultsRecord {
+                pre_probe_macro: "(pre)\nM5".into(),
+                post_probe_macro: "(post)\r\nM9".into(),
+                ..ProbeDefaultsRecord::default()
+            },
+            ..ControllerData::new()
+        };
+        data.validate().expect("valid");
+        let json = serde_json::to_string_pretty(&data).expect("serialize");
+        assert!(json.contains("\"pre_probe_macro\""));
+        assert!(json.contains("\"post_probe_macro\""));
+        let decoded: ControllerData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.probe_defaults, data.probe_defaults);
+        assert_eq!(decoded.probe_defaults.pre_probe_macro, "(pre)\nM5");
+        assert_eq!(decoded.probe_defaults.post_probe_macro, "(post)\r\nM9");
+        decoded.validate().expect("valid after round trip");
+    }
+
+    #[test]
+    fn old_profiles_without_probe_macros_load_empty() {
+        let data: ControllerData =
+            serde_json::from_str(r#"{"schema_version":1}"#).expect("old profile");
+        assert!(data.probe_defaults.pre_probe_macro.is_empty());
+        assert!(data.probe_defaults.post_probe_macro.is_empty());
+
+        let mut value = serde_json::to_value(sample_data()).expect("json");
+        let defaults = value["probe_defaults"]
+            .as_object_mut()
+            .expect("probe defaults object");
+        defaults.remove("pre_probe_macro");
+        defaults.remove("post_probe_macro");
+        let decoded: ControllerData = serde_json::from_value(value).expect("decode");
+        assert!(decoded.probe_defaults.pre_probe_macro.is_empty());
+        assert!(decoded.probe_defaults.post_probe_macro.is_empty());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn probe_macro_byte_bound_is_enforced() {
+        let at_limit = "a".repeat(MAX_PROBE_MACRO_BYTES);
+        let mut record = ProbeDefaultsRecord {
+            pre_probe_macro: at_limit,
+            ..ProbeDefaultsRecord::default()
+        };
+        record.validate().expect("bound is inclusive");
+
+        record.pre_probe_macro = "a".repeat(MAX_PROBE_MACRO_BYTES + 1);
+        assert_eq!(
+            record.validate(),
+            Err(ValidationError::ProbeMacroTooLong {
+                field: "pre_probe_macro",
+                bytes: MAX_PROBE_MACRO_BYTES + 1,
+                max: MAX_PROBE_MACRO_BYTES,
+            })
+        );
+
+        let record = ProbeDefaultsRecord {
+            post_probe_macro: "é".repeat(MAX_PROBE_MACRO_BYTES),
+            ..ProbeDefaultsRecord::default()
+        };
+        assert!(matches!(
+            record.validate(),
+            Err(ValidationError::ProbeMacroTooLong {
+                field: "post_probe_macro",
+                bytes,
+                max: MAX_PROBE_MACRO_BYTES,
+            }) if bytes == MAX_PROBE_MACRO_BYTES * 2
+        ));
+    }
+
+    #[test]
+    fn probe_macros_accept_newline_carriage_return_and_tab() {
+        let record = ProbeDefaultsRecord {
+            pre_probe_macro: "M5\nM9\r\nG4\tP1".into(),
+            post_probe_macro: "\r\n\t".into(),
+            ..ProbeDefaultsRecord::default()
+        };
+        record.validate().expect("line controls are allowed");
+    }
+
+    #[test]
+    fn probe_macros_reject_nul_and_other_control_characters() {
+        for character in ['\0', '\u{7}', '\u{1b}', '\u{7f}', '\u{85}'] {
+            let pre = ProbeDefaultsRecord {
+                pre_probe_macro: format!("M5{character}"),
+                ..ProbeDefaultsRecord::default()
+            };
+            assert_eq!(
+                pre.validate(),
+                Err(ValidationError::ProbeMacroControlCharacter {
+                    field: "pre_probe_macro",
+                    character,
+                })
+            );
+
+            let post = ProbeDefaultsRecord {
+                post_probe_macro: format!("{character}M9"),
+                ..ProbeDefaultsRecord::default()
+            };
+            assert_eq!(
+                post.validate(),
+                Err(ValidationError::ProbeMacroControlCharacter {
+                    field: "post_probe_macro",
+                    character,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn controller_data_rejects_invalid_probe_macros() {
+        let mut too_long = ControllerData::new();
+        too_long.probe_defaults.pre_probe_macro = "a".repeat(MAX_PROBE_MACRO_BYTES + 1);
+        assert!(matches!(
+            too_long.validate(),
+            Err(ValidationError::ProbeMacroTooLong {
+                field: "pre_probe_macro",
+                ..
+            })
+        ));
+
+        let mut control = ControllerData::new();
+        control.probe_defaults.post_probe_macro = "M5\0".into();
+        assert_eq!(
+            control.validate(),
+            Err(ValidationError::ProbeMacroControlCharacter {
+                field: "post_probe_macro",
+                character: '\0',
+            })
+        );
     }
 
     #[test]
