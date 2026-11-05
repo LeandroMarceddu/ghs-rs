@@ -11,6 +11,15 @@ until the next release is cut.
 
 ## [Unreleased]
 
+No changes yet after `v0.6.0`.
+
+## [0.6.0] - 2026-11-05
+
+Second pre-release. It adds the utility/calibration set, first-run setup,
+pre-run travel confirmation, verified tool-length apply, and broader
+localization. It is a simulator-only preview: unsigned and not
+hardware-validated.
+
 ### Added
 
 - **Utilities** — a bounded material-surfacing wizard, an informational
@@ -31,6 +40,17 @@ until the next release is cut.
   reopenable from Utility. `AppConfig.setup_complete` persists completion with
   a backward-compatible default of `false`; setup never connects, moves, or
   writes a controller setting.
+- **Localization** — Italian, German, and Dutch catalogs cover the utility,
+  calibration, limits, transform, setup, and tool-length strings added since
+  `v0.5.0`.
+
+### Safety
+
+- A run-to start is now gated by the same reported-travel confirmation as a
+  normal `START`; the breakpoint is set before the held start, and cancelling
+  leaves it enabled.
+- Tool-length apply is idle-only, confirmed, and verified through `$#`; a
+  missing or mismatched read-back is `FAILED`, never `APPLIED`.
 
 ## [0.5.0] - 2026-11-03
 
