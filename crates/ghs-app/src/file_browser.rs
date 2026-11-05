@@ -314,6 +314,37 @@ pub fn read_program(path: &Path) -> Result<ProgramFile, ProgramFileError> {
     })
 }
 
+/// Validate the paths from an external OS file drop.
+///
+/// Exactly one regular file is accepted. The file extension, size, and text
+/// are validated later by [`read_program`], so a dropped text file that is not
+/// a program gets the same clear refusal as a browser selection. Directories,
+/// multiple items, and empty drops are refused before any read.
+///
+/// # Errors
+///
+/// Returns a short message for the console or inline error when the drop does
+/// not contain exactly one regular file.
+pub fn dropped_program_path(paths: &[PathBuf]) -> Result<&Path, String> {
+    match paths {
+        [] => Err("Drop one .nc, .gcode, .tap, or .ngc program file".to_string()),
+        [path] => {
+            if path.is_file() {
+                Ok(path)
+            } else {
+                Err(format!(
+                    "'{}' is not a regular file; drop one program file",
+                    display_path(path)
+                ))
+            }
+        }
+        _ => Err(format!(
+            "Drop exactly one program file; {} items were dropped",
+            paths.len()
+        )),
+    }
+}
+
 /// State of one open file browser.
 ///
 /// The model is pure data so navigation, filtering, and selection can be tested
@@ -843,6 +874,31 @@ M30\n";
         assert_eq!(program.name, "Part.NC");
         assert_eq!(program.source, SOURCE);
         assert_eq!(program.byte_len(), SOURCE.len());
+    }
+
+    #[test]
+    fn a_drop_accepts_exactly_one_regular_file() {
+        let root = TempRoot::new("drop-one");
+        let file = root.file("part.nc", SOURCE.as_bytes());
+        let accepted = dropped_program_path(std::slice::from_ref(&file)).expect("accepted");
+        assert_eq!(accepted, file.as_path());
+    }
+
+    #[test]
+    fn a_drop_refuses_empty_multiple_and_directory_payloads() {
+        let root = TempRoot::new("drop-refusals");
+        let first = root.file("first.nc", SOURCE.as_bytes());
+        let second = root.file("second.nc", SOURCE.as_bytes());
+        let folder = root.dir("parts");
+
+        let empty = dropped_program_path(&[]).expect_err("empty drop");
+        assert!(empty.contains("one"), "{empty}");
+
+        let multiple = dropped_program_path(&[first.clone(), second]).expect_err("multiple files");
+        assert!(multiple.contains("exactly one"), "{multiple}");
+
+        let directory = dropped_program_path(&[folder]).expect_err("directory drop");
+        assert!(directory.contains("not a regular file"), "{directory}");
     }
 
     #[test]

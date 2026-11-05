@@ -247,6 +247,22 @@ pub enum ValidationError {
         /// Maximum accepted number of entries.
         max: usize,
     },
+    /// A recent-file record has an invalid path.
+    #[error("recent file entry {field} is invalid: {reason}")]
+    InvalidRecentFileEntry {
+        /// Field name, currently always `"path"`.
+        field: &'static str,
+        /// Human-readable reason.
+        reason: &'static str,
+    },
+    /// The app config stores more recent-file records than the format allows.
+    #[error("app config stores {count} recent-file entries; the limit is {max}")]
+    TooManyRecentFiles {
+        /// Number of entries in the config.
+        count: usize,
+        /// Maximum accepted number of entries.
+        max: usize,
+    },
     /// The bundle's stored key does not match its embedded controller info.
     #[error("profile key {stored:?} does not match the embedded controller identity {computed:?}")]
     ProfileIdentityMismatch {

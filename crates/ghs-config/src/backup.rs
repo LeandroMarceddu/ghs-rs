@@ -435,6 +435,24 @@ mod tests {
     }
 
     #[test]
+    fn bundle_round_trips_recent_files() {
+        let mut app = AppConfig::default();
+        app.push_recent_file(" /jobs/first.nc ", 1_700_000_100)
+            .expect("first");
+        app.push_recent_file("/jobs/second.nc", 1_700_000_200)
+            .expect("second");
+        let original = BackupBundle::new(app, &info(), data()).with_created_at(1_700_000_300);
+        let json = original.to_json_string().expect("encode");
+        assert!(json.contains("\"recent_files\""));
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.app.recent_files.len(), 2);
+        assert_eq!(decoded.app.recent_files[0].path, "/jobs/second.nc");
+        assert_eq!(decoded.app.recent_files[1].path, "/jobs/first.nc");
+        assert_eq!(decoded.app.recent_files[1].opened_unix_s, 1_700_000_100);
+    }
+
+    #[test]
     fn old_bundle_without_locale_uses_english() {
         let app = AppConfig {
             locale: "pt-BR".into(),

@@ -8,12 +8,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ghs_config::{
     AppConfig, BackupBundle, ConfigStore, ControllerData, HeightMapRecord, IdentityCheck,
     IdentityPolicy, ImportOutcome, JobHistoryRecord, JobHistoryResult, Keymap, MAX_HEIGHT_MAPS,
-    Macro, OffsetSnapshot, ProbeDefaultsRecord, ProbeOffsetRecord, ProfileKey, ThemeMode,
-    ToolTable,
+    Macro, OffsetSnapshot, ProbeDefaultsRecord, ProbeOffsetRecord, ProfileKey, RecentFileRecord,
+    ThemeMode, ToolTable,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{ControllerInfo, SettingValue};
@@ -249,6 +250,168 @@ impl ConfigModel {
                 self.last_result = Some(ConfigStatus {
                     ok: false,
                     text: format!("Job history was not cleared: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Bounded list of recently opened local program files, newest first.
+    ///
+    /// The slice is empty before the first local file load or after
+    /// [`Self::clear_recent_files`]. New records are added with
+    /// [`Self::record_recent_file`]; the UI displays them in this order.
+    #[must_use]
+    pub fn recent_files(&self) -> &[RecentFileRecord] {
+        &self.app.recent_files
+    }
+
+    /// Record one local program file and persist `app.json`.
+    ///
+    /// The previous list is kept in memory until the atomic app-config write
+    /// succeeds. A validation refusal or write error restores the previous
+    /// list, so the displayed list never claims a record was saved when it was
+    /// not. This method only writes local JSON: it builds no command and never
+    /// sends anything to the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the path is not valid UTF-8 or fails validation,
+    /// or the [`Self::save_app`] message when the store is unavailable,
+    /// `app.json` is corrupt, or the write fails.
+    pub fn record_recent_file(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let Some(path) = path.to_str() else {
+            return Err("recent file path is not valid UTF-8".to_string());
+        };
+        self.record_recent_file_at(path, now_unix_s())
+    }
+
+    /// Record one recent file with a caller-supplied timestamp.
+    ///
+    /// This is the shared implementation for [`Self::record_recent_file`] and
+    /// lets tests use a fixed clock.
+    fn record_recent_file_at(&mut self, path: &str, opened_unix_s: u64) -> Result<PathBuf, String> {
+        let previous_files = self.app.recent_files.clone();
+        let previous_result = self.last_result.clone();
+        self.app
+            .push_recent_file(path, opened_unix_s)
+            .map_err(|error| format!("recent file is invalid: {error}"))?;
+        match self.save_app() {
+            Ok(saved_path) => {
+                // A routine recent-file append must not replace the operator's
+                // current Utility status line.
+                self.last_result = previous_result;
+                Ok(saved_path)
+            }
+            Err(error) => {
+                self.app.recent_files = previous_files;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Recent file not saved: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove one recent-file entry and persist `app.json`.
+    ///
+    /// The match is exact after trimming the supplied path. On a refused write
+    /// the previous list is restored in memory. No controller command is built
+    /// or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the path is not in the list, or the
+    /// [`Self::save_app`] message when the store is unavailable, `app.json` is
+    /// corrupt, or the write fails.
+    pub fn remove_recent_file(&mut self, path: &str) -> Result<PathBuf, String> {
+        let path = path.trim();
+        let previous_files = self.app.recent_files.clone();
+        let previous_result = self.last_result.clone();
+        let before = self.app.recent_files.len();
+        self.app
+            .recent_files
+            .retain(|record| record.path.trim() != path);
+        if self.app.recent_files.len() == before {
+            return Err(format!("'{path}' is not in the recent-file list"));
+        }
+        match self.save_app() {
+            Ok(saved_path) => {
+                self.last_result = previous_result;
+                Ok(saved_path)
+            }
+            Err(error) => {
+                self.app.recent_files = previous_files;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Recent file not removed: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove every recent-file entry and persist `app.json`.
+    ///
+    /// The empty list is written atomically through [`Self::save_app`]. On a
+    /// refused write the previous list is restored in memory. No controller
+    /// command is built or sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::save_app`] message when the store is unavailable,
+    /// `app.json` is corrupt, or the write fails.
+    pub fn clear_recent_files(&mut self) -> Result<PathBuf, String> {
+        let previous_files = std::mem::take(&mut self.app.recent_files);
+        let previous_result = self.last_result.clone();
+        match self.save_app() {
+            Ok(saved_path) => {
+                self.last_result = previous_result;
+                Ok(saved_path)
+            }
+            Err(error) => {
+                self.app.recent_files = previous_files;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Recent files were not cleared: {error}"),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Replace the recent list with fixed sample paths for screenshots.
+    ///
+    /// This is the `--demo-recent-files` seeding path. It uses the same
+    /// validation and `app.json` save/rollback path as
+    /// [`Self::record_recent_file`], replaces any previous list so a repeated
+    /// flag is reproducible, and never sends a controller command or loads a
+    /// program.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same messages as [`Self::record_recent_file`].
+    pub fn seed_demo_recent_files(&mut self) -> Result<PathBuf, String> {
+        let previous_files = self.app.recent_files.clone();
+        let previous_result = self.last_result.clone();
+        self.app.recent_files.clear();
+        for (path, opened_unix_s) in demo_recent_file_records() {
+            if let Err(error) = self.app.push_recent_file(path, opened_unix_s) {
+                self.app.recent_files = previous_files;
+                return Err(format!("demo recent files are invalid: {error}"));
+            }
+        }
+        match self.save_app() {
+            Ok(saved_path) => {
+                self.last_result = previous_result;
+                Ok(saved_path)
+            }
+            Err(error) => {
+                self.app.recent_files = previous_files;
+                self.last_result = Some(ConfigStatus {
+                    ok: false,
+                    text: format!("Demo recent files were not saved: {error}"),
                 });
                 Err(error)
             }
@@ -1356,6 +1519,28 @@ impl ConfigModel {
     }
 }
 
+/// Fixed sample recent files for the `--demo-recent-files` review switch.
+///
+/// Values are deliberately fixed so the same flag renders the same list on
+/// every run. The paths are local demo data only; they are never read, loaded,
+/// or sent to a controller. The newest entry is last here because
+/// [`AppConfig::push_recent_file`] inserts at the front.
+fn demo_recent_file_records() -> [(&'static str, u64); 3] {
+    [
+        ("/home/operator/gcode/demo-pocket.nc", 1_700_000_000),
+        ("/home/operator/gcode/bracket-24.nc", 1_700_003_600),
+        ("/home/operator/gcode/sign-panel.nc", 1_700_007_200),
+    ]
+}
+
+/// Current wall-clock time as Unix seconds, or zero before the epoch.
+fn now_unix_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 /// Fixed sample records for the `--demo-job-history` review switch.
 ///
 /// Values are deliberately fixed so the same flag renders the same card on
@@ -2206,5 +2391,217 @@ mod tests {
         model.seed_demo_job_history().expect("seed again");
         assert_eq!(model.job_history(), expected.as_slice());
         assert_eq!(model.job_history().len(), 3);
+    }
+
+    // -------------------------------------------------------- recent files
+
+    fn recent_paths(model: &ConfigModel) -> Vec<&str> {
+        model
+            .recent_files()
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn recent_files_record_in_order_and_reopen_through_app_json() {
+        let dir = TempDir::new("recent-files");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        assert!(model.recent_files().is_empty());
+
+        let first = Path::new("/jobs/first.nc");
+        let second = Path::new("/jobs/second.nc");
+        let path = model
+            .record_recent_file_at(first.to_str().expect("utf8"), 1_700_000_000)
+            .expect("first");
+        assert_eq!(path, store.app_config_path());
+        model
+            .record_recent_file_at(second.to_str().expect("utf8"), 1_700_000_100)
+            .expect("second");
+
+        assert_eq!(
+            recent_paths(&model),
+            vec!["/jobs/second.nc", "/jobs/first.nc"]
+        );
+        assert_eq!(model.recent_files()[0].opened_unix_s, 1_700_000_100);
+
+        let reopened = ConfigModel::from_store(store.clone());
+        assert_eq!(
+            recent_paths(&reopened),
+            vec!["/jobs/second.nc", "/jobs/first.nc"],
+            "the newest-first order is stored in app.json"
+        );
+
+        // Reopening the first file moves it to the front without duplicating.
+        model
+            .record_recent_file_at(first.to_str().expect("utf8"), 1_700_000_200)
+            .expect("reopen first");
+        assert_eq!(
+            recent_paths(&model),
+            vec!["/jobs/first.nc", "/jobs/second.nc"]
+        );
+        assert_eq!(model.recent_files().len(), 2);
+    }
+
+    #[test]
+    fn recent_file_record_rolls_back_when_the_store_is_unavailable() {
+        let mut model = ConfigModel::empty();
+        let error = model
+            .record_recent_file(Path::new("/jobs/part.nc"))
+            .expect_err("no store");
+        assert!(
+            error.contains("no platform configuration directory"),
+            "{error}"
+        );
+        assert!(
+            model.recent_files().is_empty(),
+            "a failed save must not keep the appended record"
+        );
+    }
+
+    #[test]
+    fn recent_file_record_rejects_an_invalid_path_without_changing_the_list() {
+        let dir = TempDir::new("recent-files-invalid");
+        let mut model = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        model
+            .record_recent_file_at("/jobs/part.nc", 1_700_000_000)
+            .expect("first");
+        let error = model
+            .record_recent_file_at("   ", 1_700_000_100)
+            .expect_err("empty path refused");
+        assert!(error.contains("invalid"), "{error}");
+        assert_eq!(model.recent_files().len(), 1);
+    }
+
+    #[test]
+    fn recent_file_remove_persists_and_rolls_back_on_failure() {
+        let dir = TempDir::new("recent-files-remove");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        model
+            .record_recent_file_at("/jobs/stale.nc", 1_700_000_000)
+            .expect("stale");
+        model
+            .record_recent_file_at("/jobs/live.nc", 1_700_000_100)
+            .expect("live");
+
+        let path = model.remove_recent_file("/jobs/stale.nc").expect("remove");
+        assert_eq!(path, store.app_config_path());
+        assert_eq!(recent_paths(&model), vec!["/jobs/live.nc"]);
+        assert_eq!(
+            recent_paths(&ConfigModel::from_store(store.clone())),
+            vec!["/jobs/live.nc"],
+            "the removal is persisted"
+        );
+
+        let error = model
+            .remove_recent_file("/jobs/not-there.nc")
+            .expect_err("unknown path");
+        assert!(error.contains("not in the recent-file list"), "{error}");
+
+        let mut no_store = ConfigModel::empty();
+        no_store.app.recent_files.push(RecentFileRecord {
+            path: "/jobs/stale.nc".to_string(),
+            opened_unix_s: 1_700_000_000,
+        });
+        let error = no_store
+            .remove_recent_file("/jobs/stale.nc")
+            .expect_err("no store");
+        assert!(
+            error.contains("no platform configuration directory"),
+            "{error}"
+        );
+        assert_eq!(
+            recent_paths(&no_store),
+            vec!["/jobs/stale.nc"],
+            "a failed removal restores the previous list"
+        );
+    }
+
+    #[test]
+    fn recent_files_clear_persists_and_rolls_back() {
+        let dir = TempDir::new("recent-files-clear");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        model
+            .record_recent_file_at("/jobs/part.nc", 1_700_000_000)
+            .expect("record");
+        model.clear_recent_files().expect("clear");
+        assert!(model.recent_files().is_empty());
+        assert!(
+            ConfigModel::from_store(store.clone())
+                .recent_files()
+                .is_empty()
+        );
+
+        let mut no_store = ConfigModel::empty();
+        no_store.app.recent_files.push(RecentFileRecord {
+            path: "/jobs/part.nc".to_string(),
+            opened_unix_s: 1_700_000_000,
+        });
+        assert!(no_store.clear_recent_files().is_err());
+        assert_eq!(no_store.recent_files().len(), 1);
+    }
+
+    #[test]
+    fn demo_recent_files_seed_is_reproducible() {
+        let dir = TempDir::new("recent-files-demo");
+        let store = ConfigStore::new(&dir.path);
+        let mut model = ConfigModel::from_store(store.clone());
+        model
+            .record_recent_file_at("/jobs/old.nc", 1_700_000_000)
+            .expect("existing record");
+
+        model.seed_demo_recent_files().expect("seed demo recent");
+        let expected = vec![
+            "/home/operator/gcode/sign-panel.nc",
+            "/home/operator/gcode/bracket-24.nc",
+            "/home/operator/gcode/demo-pocket.nc",
+        ];
+        assert_eq!(recent_paths(&model), expected);
+        assert_eq!(
+            recent_paths(&ConfigModel::from_store(store.clone())),
+            expected,
+            "the demo records are stored in app.json"
+        );
+
+        // Repeating the flag replaces the samples instead of appending them.
+        model.seed_demo_recent_files().expect("seed again");
+        assert_eq!(recent_paths(&model), expected);
+    }
+
+    #[test]
+    fn an_old_app_config_without_recent_files_loads_empty() {
+        let dir = TempDir::new("recent-files-old");
+        let store = ConfigStore::new(&dir.path);
+        let path = store.app_config_path();
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "theme": "dark",
+                "units": "Mm",
+                "locale": "en",
+                "last_profile": null,
+                "setup_complete": true,
+                "window": {
+                    "width": 1280,
+                    "height": 800,
+                    "x": null,
+                    "y": null,
+                    "maximized": false,
+                    "left_panel_width": 360,
+                    "bottom_panel_height": 240
+                },
+                "job_history": []
+            }"#,
+        )
+        .expect("write old config");
+
+        let model = ConfigModel::from_store(store);
+        assert!(model.app_error().is_none());
+        assert!(model.recent_files().is_empty());
     }
 }

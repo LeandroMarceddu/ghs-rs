@@ -97,6 +97,12 @@
 //! folder, or a program file whose folder opens with the file selected);
 //! `--demo-load-file=PATH` loads that file through the same bounded reader and
 //! guarded `LoadProgram` path once the simulator is ready, without starting it.
+//! `--demo-recent-files` seeds three fixed recent-file records through the
+//! normal app-config save path and opens the `LOAD PROGRAM` sheet with the
+//! `RECENT FILES` list; it loads and starts nothing. Dropping one program file
+//! on the Job workspace uses the same bounded reader and `LoadProgram` guard
+//! as the browser and never starts the job. `--demo-drop-hint` renders the
+//! drop hint over the Job workspace without an OS drag, for screenshots.
 //! `--demo-breakpoints` enables three demo breakpoints through the normal
 //! toggle action and shows the Program tab; `--demo-run-to` does the same and
 //! opens the run-to confirmation without confirming it.

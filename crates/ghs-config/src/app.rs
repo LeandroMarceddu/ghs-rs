@@ -17,6 +17,12 @@ pub const MAX_JOB_HISTORY_NAME_BYTES: usize = 256;
 /// Maximum accepted job runtime in a history record: 30 days in seconds.
 pub const MAX_JOB_HISTORY_ELAPSED_S: u64 = 30 * 24 * 60 * 60;
 
+/// Maximum number of recently opened program files kept in
+/// [`AppConfig::recent_files`].
+pub const MAX_RECENT_FILES: usize = 10;
+/// Maximum accepted length of a recent-file path, in UTF-8 bytes.
+pub const MAX_RECENT_FILE_PATH_BYTES: usize = 4096;
+
 /// Default window width in logical pixels.
 const DEFAULT_WIDTH: u32 = 1280;
 /// Default window height in logical pixels.
@@ -134,6 +140,51 @@ impl JobHistoryRecord {
     }
 }
 
+/// One local program file that was opened recently.
+///
+/// Records are added with [`AppConfig::push_recent_file`], which trims the
+/// path, removes an exact duplicate, and keeps the newest
+/// [`MAX_RECENT_FILES`] entries. The timestamp is supplied by the caller; this
+/// crate never reads the clock for a recent-file record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentFileRecord {
+    /// File path as recorded by the app.
+    ///
+    /// The stored value is trimmed, non-empty, and at most
+    /// [`MAX_RECENT_FILE_PATH_BYTES`] UTF-8 bytes.
+    pub path: String,
+    /// Last time the file was opened, as Unix seconds.
+    pub opened_unix_s: u64,
+}
+
+impl RecentFileRecord {
+    /// Validate the path bounds.
+    ///
+    /// The path is trimmed before it is checked, so surrounding whitespace is
+    /// not significant; the byte limit applies to the trimmed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidRecentFileEntry`] when the trimmed
+    /// path is empty or longer than [`MAX_RECENT_FILE_PATH_BYTES`].
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let path = self.path.trim();
+        if path.is_empty() {
+            return Err(ValidationError::InvalidRecentFileEntry {
+                field: "path",
+                reason: "must not be empty",
+            });
+        }
+        if path.len() > MAX_RECENT_FILE_PATH_BYTES {
+            return Err(ValidationError::InvalidRecentFileEntry {
+                field: "path",
+                reason: "exceeds the 4096-byte limit",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Last known main-window geometry and panel sizes.
 ///
 /// These values are suggestions for the shell; a window manager may clamp or
@@ -235,6 +286,13 @@ pub struct AppConfig {
     /// corrupt entries are rejected by [`AppConfig::validate`].
     #[serde(default)]
     pub job_history: Vec<JobHistoryRecord>,
+    /// Recently opened local program files, newest first.
+    ///
+    /// New records are added with [`AppConfig::push_recent_file`]. Configs
+    /// written before this field existed load an empty list; invalid entries
+    /// and an over-limit list are rejected by [`AppConfig::validate`].
+    #[serde(default)]
+    pub recent_files: Vec<RecentFileRecord>,
 }
 
 impl Default for AppConfig {
@@ -248,20 +306,21 @@ impl Default for AppConfig {
             setup_complete: false,
             window: WindowLayout::default(),
             job_history: Vec::new(),
+            recent_files: Vec::new(),
         }
     }
 }
 
 impl AppConfig {
-    /// Validate the schema version, locale tag, layout bounds, and job
-    /// history.
+    /// Validate the schema version, locale tag, layout bounds, job history,
+    /// and recent files.
     ///
     /// # Errors
     ///
     /// Returns a [`ValidationError`] when the record was written by another
     /// schema version, the locale tag is malformed, the window size is
-    /// impossible, the job history exceeds [`MAX_JOB_HISTORY`] entries, or a
-    /// history entry is invalid.
+    /// impossible, the job history or recent-file list exceeds its cap, or an
+    /// entry is invalid.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.schema_version != APP_SCHEMA_VERSION {
             return Err(ValidationError::UnsupportedVersion {
@@ -272,7 +331,8 @@ impl AppConfig {
         }
         validate_locale(&self.locale)?;
         self.window.validate()?;
-        validate_job_history(&self.job_history)
+        validate_job_history(&self.job_history)?;
+        validate_recent_files(&self.recent_files)
     }
 
     /// Append one finished job to the local history.
@@ -300,6 +360,37 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    /// Add or move one local program file to the front of the recent list.
+    ///
+    /// The path is trimmed before it is stored. A record with the same exact
+    /// path (after trimming) replaces the previous one, so reopening a file
+    /// moves it to the front with a new timestamp. The newest
+    /// [`MAX_RECENT_FILES`] entries are kept and older entries are dropped.
+    /// This helper only updates the in-memory config; persistence is owned by
+    /// [`crate::ConfigStore::save_app_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidRecentFileEntry`] when the trimmed
+    /// path is empty or exceeds [`MAX_RECENT_FILE_PATH_BYTES`]. The config is
+    /// left unchanged in that case.
+    pub fn push_recent_file(
+        &mut self,
+        path: &str,
+        opened_unix_s: u64,
+    ) -> Result<(), ValidationError> {
+        let record = RecentFileRecord {
+            path: path.trim().to_owned(),
+            opened_unix_s,
+        };
+        record.validate()?;
+        self.recent_files
+            .retain(|existing| existing.path.trim() != record.path);
+        self.recent_files.insert(0, record);
+        self.recent_files.truncate(MAX_RECENT_FILES);
+        Ok(())
+    }
 }
 
 fn validate_job_history(history: &[JobHistoryRecord]) -> Result<(), ValidationError> {
@@ -310,6 +401,19 @@ fn validate_job_history(history: &[JobHistoryRecord]) -> Result<(), ValidationEr
         });
     }
     for record in history {
+        record.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_recent_files(files: &[RecentFileRecord]) -> Result<(), ValidationError> {
+    if files.len() > MAX_RECENT_FILES {
+        return Err(ValidationError::TooManyRecentFiles {
+            count: files.len(),
+            max: MAX_RECENT_FILES,
+        });
+    }
+    for record in files {
         record.validate()?;
     }
     Ok(())
@@ -809,6 +913,217 @@ mod tests {
         );
 
         config.job_history.pop();
+        config.validate().expect("exactly the limit is accepted");
+    }
+
+    fn recent(path: &str, opened_unix_s: u64) -> RecentFileRecord {
+        RecentFileRecord {
+            path: path.to_owned(),
+            opened_unix_s,
+        }
+    }
+
+    #[test]
+    fn recent_files_default_to_empty() {
+        let config = AppConfig::default();
+        assert!(config.recent_files.is_empty());
+        config.validate().expect("defaults are valid");
+
+        let decoded: AppConfig = serde_json::from_str(r#"{"schema_version":1}"#).expect("parse");
+        assert!(decoded.recent_files.is_empty());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn old_json_without_recent_files_loads_empty() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "theme": "dark",
+            "units": "Mm",
+            "locale": "en",
+            "last_profile": null,
+            "setup_complete": true,
+            "window": {
+                "width": 1280,
+                "height": 800,
+                "x": null,
+                "y": null,
+                "maximized": false,
+                "left_panel_width": 360,
+                "bottom_panel_height": 240
+            },
+            "job_history": []
+        });
+        let decoded: AppConfig = serde_json::from_value(value).expect("parse");
+        assert!(decoded.recent_files.is_empty());
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn recent_files_round_trip_inside_app_config_json() {
+        let mut config = AppConfig::default();
+        config
+            .push_recent_file(" /jobs/first.nc ", 1_700_000_000)
+            .expect("first");
+        config
+            .push_recent_file("/jobs/second.nc", 1_700_000_100)
+            .expect("second");
+
+        let json = serde_json::to_string_pretty(&config).expect("serialize");
+        assert!(json.contains("\"recent_files\""));
+        let decoded: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.recent_files.len(), 2);
+        assert_eq!(decoded.recent_files[0].path, "/jobs/second.nc");
+        assert_eq!(decoded.recent_files[1].path, "/jobs/first.nc");
+        assert_eq!(decoded.recent_files[1].opened_unix_s, 1_700_000_000);
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn push_recent_file_moves_a_duplicate_to_the_front() {
+        let mut config = AppConfig::default();
+        config
+            .push_recent_file("/jobs/a.nc", 1_700_000_000)
+            .expect("a");
+        config
+            .push_recent_file("/jobs/b.nc", 1_700_000_100)
+            .expect("b");
+        config
+            .push_recent_file("/jobs/a.nc", 1_700_000_200)
+            .expect("a again");
+
+        assert_eq!(
+            config
+                .recent_files
+                .iter()
+                .map(|record| (record.path.as_str(), record.opened_unix_s))
+                .collect::<Vec<_>>(),
+            vec![("/jobs/a.nc", 1_700_000_200), ("/jobs/b.nc", 1_700_000_100)],
+            "a duplicate is moved to the front with its new timestamp"
+        );
+        config.validate().expect("valid");
+    }
+
+    #[test]
+    fn push_recent_file_trims_but_dedupes_exact_paths() {
+        let mut config = AppConfig::default();
+        config
+            .push_recent_file("  /jobs/part.nc  ", 1_700_000_000)
+            .expect("trimmed");
+        assert_eq!(config.recent_files[0].path, "/jobs/part.nc");
+
+        config
+            .push_recent_file("/jobs/part.nc\n", 1_700_000_100)
+            .expect("same path");
+        assert_eq!(config.recent_files.len(), 1);
+        assert_eq!(config.recent_files[0].opened_unix_s, 1_700_000_100);
+    }
+
+    #[test]
+    fn push_recent_file_keeps_the_newest_ten() {
+        let extra = 4;
+        let mut config = AppConfig::default();
+        for index in 0..(MAX_RECENT_FILES + extra) {
+            config
+                .push_recent_file(
+                    &format!("/jobs/part-{index}.nc"),
+                    1_700_000_000 + index as u64,
+                )
+                .expect("append");
+        }
+
+        assert_eq!(config.recent_files.len(), MAX_RECENT_FILES);
+        assert_eq!(config.recent_files[0].path, "/jobs/part-13.nc");
+        assert_eq!(
+            config
+                .recent_files
+                .last()
+                .map(|record| record.path.as_str()),
+            Some("/jobs/part-4.nc")
+        );
+        config.validate().expect("valid");
+    }
+
+    #[test]
+    fn push_recent_file_rejects_empty_and_oversized_paths() {
+        for path in ["", " ", " \t\n "] {
+            let mut config = AppConfig::default();
+            let error = config
+                .push_recent_file(path, 1_700_000_000)
+                .expect_err("empty path rejected");
+            assert!(
+                matches!(
+                    error,
+                    ValidationError::InvalidRecentFileEntry { field: "path", .. }
+                ),
+                "{path:?} produced {error}"
+            );
+            assert!(config.recent_files.is_empty());
+        }
+
+        let mut config = AppConfig::default();
+        let at_limit = "/".to_string() + &"a".repeat(MAX_RECENT_FILE_PATH_BYTES - 1);
+        assert_eq!(at_limit.len(), MAX_RECENT_FILE_PATH_BYTES);
+        config
+            .push_recent_file(&at_limit, 1_700_000_000)
+            .expect("4096 bytes accepted");
+
+        let over_limit = "/".to_string() + &"a".repeat(MAX_RECENT_FILE_PATH_BYTES);
+        let error = config
+            .push_recent_file(&over_limit, 1_700_000_000)
+            .expect_err("oversized path rejected");
+        assert!(
+            matches!(
+                error,
+                ValidationError::InvalidRecentFileEntry { field: "path", .. }
+            ),
+            "over-limit path produced {error}"
+        );
+        assert_eq!(config.recent_files.len(), 1, "rejected record was stored");
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_recent_files() {
+        let mut config = AppConfig::default();
+        config.recent_files.push(recent(" ", 1_700_000_000));
+        let error = config.validate().expect_err("empty path");
+        assert!(matches!(
+            error,
+            ValidationError::InvalidRecentFileEntry { field: "path", .. }
+        ));
+
+        config.recent_files[0] = recent(
+            &("/".to_string() + &"a".repeat(MAX_RECENT_FILE_PATH_BYTES)),
+            1_700_000_000,
+        );
+        let error = config.validate().expect_err("oversized path");
+        assert!(matches!(
+            error,
+            ValidationError::InvalidRecentFileEntry { field: "path", .. }
+        ));
+
+        config.recent_files[0] = recent("/jobs/part.nc", 1_700_000_000);
+        config.validate().expect("valid record");
+    }
+
+    #[test]
+    fn config_validate_rejects_too_many_recent_files() {
+        let mut config = AppConfig::default();
+        for index in 0..=MAX_RECENT_FILES {
+            config
+                .recent_files
+                .push(recent(&format!("/jobs/part-{index}.nc"), 1_700_000_000));
+        }
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::TooManyRecentFiles {
+                count: MAX_RECENT_FILES + 1,
+                max: MAX_RECENT_FILES,
+            })
+        );
+
+        config.recent_files.pop();
         config.validate().expect("exactly the limit is accepted");
     }
 }

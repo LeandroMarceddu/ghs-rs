@@ -58,8 +58,8 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Sizable as _, Size, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, ExternalPaths, FocusHandle,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
     ParentElement as _, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
     Window, div, px, uniform_list,
@@ -71,7 +71,9 @@ use crate::controller_reset::{
     LOCAL_PROFILE_NOTE, RESET_TARGETS, ResetGate, ResetOutcome, ResetResult, command_text,
     consequence, is_most_destructive, refresh_commands, refresh_note, summary, target_title,
 };
-use crate::file_browser::{BrowserEntry, FileBrowser, compact_path, format_size, read_program};
+use crate::file_browser::{
+    BrowserEntry, FileBrowser, compact_path, dropped_program_path, format_size, read_program,
+};
 use crate::height_compensation::{
     HeightApplyGate, HeightApplyPreview, HeightMapApplyStatus, HeightMapSnapshot,
 };
@@ -392,11 +394,15 @@ pub struct Shell {
     /// Editable path field in the browser modal.
     file_browser_input: Entity<InputState>,
     file_browser_scroll: UniformListScrollHandle,
+    /// Scroll position of the recent-file rows in the browser modal.
+    recent_files_scroll: ScrollHandle,
     /// Last folder visited, reused the next time the browser opens.
     browser_dir: PathBuf,
     /// Screenshot switch: load this file once the demo link is ready.
     demo_load_file: Option<PathBuf>,
     demo_load_file_done: bool,
+    /// Screenshot switch: render the Job-workspace drop hint without a drag.
+    demo_drop_hint: bool,
     viewer: viewer::ViewerHandle,
     last_job_line: u32,
     demo_program: DemoProgram,
@@ -694,7 +700,12 @@ impl Shell {
 
         // The file browser starts at home, or at the folder/file named by the
         // screenshot switch. Browsing stays available in every mode; loading
-        // is gated separately.
+        // is gated separately. `--demo-recent-files` seeds the fixed review
+        // list through the normal app-config save path and opens this sheet.
+        let demo_recent_files = std::env::args().any(|arg| arg == "--demo-recent-files");
+        if demo_recent_files && let Err(error) = state.config.seed_demo_recent_files() {
+            tracing::warn!(%error, "demo recent files were not seeded");
+        }
         let browser_arg =
             std::env::args().find_map(|arg| arg.strip_prefix("--file-browser=").map(PathBuf::from));
         let browser_dir = browser_arg
@@ -709,9 +720,13 @@ impl Shell {
             })
             .filter(|path| path.is_dir())
             .unwrap_or_else(crate::file_browser::default_root);
-        let file_browser = browser_arg
-            .as_deref()
-            .map(crate::file_browser::FileBrowser::open);
+        let file_browser = if browser_arg.is_some() || demo_recent_files {
+            Some(crate::file_browser::FileBrowser::open(
+                browser_arg.as_deref().unwrap_or(browser_dir.as_path()),
+            ))
+        } else {
+            None
+        };
         let browser_input_value = file_browser.as_ref().map_or_else(
             || browser_dir.to_string_lossy().into_owned(),
             FileBrowser::path_display,
@@ -936,9 +951,11 @@ impl Shell {
             file_browser,
             file_browser_input,
             file_browser_scroll: UniformListScrollHandle::new(),
+            recent_files_scroll: ScrollHandle::new(),
             browser_dir,
             demo_load_file,
             demo_load_file_done: false,
+            demo_drop_hint: std::env::args().any(|arg| arg == "--demo-drop-hint"),
             viewer: viewer::ViewerHandle::new(),
             last_job_line: 0,
             demo_program,
@@ -2223,40 +2240,14 @@ impl Shell {
     /// This is the only load path in the app besides the bundled demo and the
     /// height-map workflow. It sends exactly one `LoadProgram`; parsing and
     /// `JobLoaded` stay in the engine. On rejection the previous program stays
-    /// loaded and the failed exact source is discarded.
+    /// loaded and the failed exact source is discarded. A successful local load
+    /// is recorded in the recent-file list; a failed load is not.
     fn load_program_file(&mut self, path: &Path) -> Result<String, String> {
-        if let Some(refusal) = self.state.program_load_refusal() {
-            return Err(t(refusal.message()).to_string());
-        }
-        let file = read_program(path).map_err(|error| error.to_string())?;
-        let command = self
-            .state
-            .program_load(&file.name, &file.source)
-            .map_err(|refusal| t(refusal.message()).to_string())?;
-        match self.send_command_quiet(command) {
-            Ok(()) => Ok(format!(
-                "Loading program: {} ({})",
-                file.name,
-                format_size(file.byte_len() as u64)
-            )),
-            // `send` waits one second for the engine to accept the command. A
-            // timeout is not a rejection: the load is already queued and the
-            // engine continues parsing in the background. Waiting for
-            // `JobLoaded` is safer than reporting a failure and discarding the
-            // exact source.
-            Err(EngineError::Timeout { .. }) => Ok(format!(
-                "Program load accepted; waiting for the engine to parse {} ({})",
-                file.name,
-                format_size(file.byte_len() as u64)
-            )),
-            Err(error) => {
-                self.state.height_map.discard_exact_source(&file.name);
-                let message = format!("Program load rejected: {error}");
-                self.state
-                    .push_console(ConsoleLevel::Error, message.clone());
-                Err(message)
-            }
-        }
+        let link = self.link.as_ref();
+        load_local_program(&mut self.state, path, |command| match link {
+            Some(link) => link.send(command),
+            None => Err(EngineError::NotConnected),
+        })
     }
 
     /// LOAD PROGRAM: load the selected file, or explain why it is unavailable.
@@ -2286,6 +2277,74 @@ impl Shell {
                     browser.set_error(message);
                 }
             }
+        }
+        cx.notify();
+    }
+
+    /// Load one recent-file row through the same bounded path as the browser.
+    ///
+    /// A missing or unreadable file leaves the sheet open with the reader's
+    /// error; the engine is not asked to load anything. On success the sheet
+    /// closes and the path moves to the front of the recent list.
+    fn browser_load_recent(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match self.load_program_file(&path) {
+            Ok(message) => {
+                if let Some(browser) = self.file_browser.take() {
+                    self.browser_dir = browser.cwd().to_path_buf();
+                }
+                self.state.left_tab = LeftTab::Program;
+                self.state.push_console(ConsoleLevel::Info, message);
+            }
+            Err(message) => {
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.set_error(message);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Remove one entry from the recent list without loading or sending.
+    fn browser_remove_recent(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Err(error) = self.state.config.remove_recent_file(&path)
+            && let Some(browser) = self.file_browser.as_mut()
+        {
+            browser.set_error(format!("Recent file was not removed: {error}"));
+        }
+        cx.notify();
+    }
+
+    /// Clear the recent list without loading or sending anything.
+    fn browser_clear_recent(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.state.config.clear_recent_files()
+            && let Some(browser) = self.file_browser.as_mut()
+        {
+            browser.set_error(format!("Recent files were not cleared: {error}"));
+        }
+        cx.notify();
+    }
+
+    /// Accept one external file drop over the Job workspace.
+    ///
+    /// Exactly one regular file is accepted. The drop uses the same bounded
+    /// reader and guarded `LoadProgram` path as the browser, so extension,
+    /// size, UTF-8, binary, and ready/idle checks all still apply. A refused
+    /// drop reports the reason and sends nothing; a successful drop loads only
+    /// and never starts.
+    fn drop_program_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        match dropped_program_path(paths) {
+            Ok(path) => {
+                let path = path.to_path_buf();
+                match self.load_program_file(&path) {
+                    Ok(message) => {
+                        self.state.mode = Mode::Job;
+                        self.state.left_tab = LeftTab::Program;
+                        self.state.push_console(ConsoleLevel::Info, message);
+                    }
+                    Err(message) => self.state.push_console(ConsoleLevel::Error, message),
+                }
+            }
+            Err(message) => self.state.push_console(ConsoleLevel::Warn, message),
         }
         cx.notify();
     }
@@ -8563,11 +8622,16 @@ impl Shell {
                 cx.notify();
             });
         });
+        let drop_view = cx.entity();
 
         div()
             .relative()
             .size_full()
             .bg(p.bg)
+            .on_drop::<ExternalPaths>(move |paths, _, cx| {
+                let paths = paths.paths().to_vec();
+                drop_view.update(cx, |shell, cx| shell.drop_program_paths(&paths, cx));
+            })
             .child(viewer::view(
                 &self.viewer,
                 p,
@@ -8687,6 +8751,46 @@ impl Shell {
                         .child(self.empty_program_prompt("job-empty-load", p, cx)),
                 )
             })
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(if self.demo_drop_hint { 1.0 } else { 0.0 })
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                        style
+                            .opacity(1.0)
+                            .bg(p.accent.opacity(0.1))
+                            .border_2()
+                            .border_color(p.accent)
+                    })
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_1()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(p.panel)
+                            .border_1()
+                            .border_color(p.accent)
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.accent)
+                                    .child(t("DROP PROGRAM TO LOAD")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(p.text_dim)
+                                    .child(t("One .nc, .gcode, .tap, or .ngc file. \
+                                         Loading never starts the job.")),
+                            ),
+                    ),
+            )
     }
 
     // ------------------------------------------------------- file browser
@@ -8805,6 +8909,87 @@ impl Shell {
             .track_scroll(&self.file_browser_scroll)
             .into_any_element()
         };
+
+        let recent_records = self.state.config.recent_files();
+        let recent_count = recent_records.len();
+        let clear_view = view.clone();
+        let mut recent_rows = v_flex()
+            .id("recent-files-list")
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .max_h(px(164.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.recent_files_scroll);
+        if recent_records.is_empty() {
+            recent_rows = recent_rows.child(
+                div()
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .rounded_lg()
+                    .bg(p.panel)
+                    .text_size(px(9.5))
+                    .text_color(p.text_faint)
+                    .child(t("No recent files yet. A loaded local file appears here.")),
+            );
+        } else {
+            for record in recent_records {
+                let missing = !Path::new(&record.path).is_file();
+                recent_rows = recent_rows.child(recent_file_row(
+                    record.path.clone(),
+                    missing,
+                    p,
+                    self.mono.clone(),
+                    view.clone(),
+                ));
+            }
+        }
+        let recent_section = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                h_flex()
+                    .h(px(20.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text_faint)
+                            .child(t("RECENT FILES")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(9.0))
+                            .text_color(p.text_faint)
+                            .child(format!("{recent_count} | {}", t("NEWEST FIRST"))),
+                    )
+                    .when(recent_count > 0, |this| {
+                        this.child(
+                            Button::new("recent-files-clear")
+                                .label(t("CLEAR"))
+                                .secondary()
+                                .h(px(28.0))
+                                .w(px(64.0))
+                                .rounded(px(5.0))
+                                .text_size(px(8.5))
+                                .on_click(move |_, _, cx| {
+                                    clear_view.update(cx, |shell, cx| {
+                                        shell.browser_clear_recent(cx);
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .child(recent_rows);
 
         let mut card = v_flex()
             .relative()
@@ -8935,6 +9120,7 @@ impl Shell {
                             }),
                     ),
             )
+            .child(recent_section)
             .child(
                 div()
                     .flex_1()
@@ -22066,6 +22252,109 @@ fn program_row(row: ProgramRow, p: Palette, view: Entity<Shell>) -> impl IntoEle
         )
 }
 
+/// One 48 px row in the LOAD PROGRAM recent-file list.
+///
+/// The row loads on tap and carries its own REMOVE button. A missing path is
+/// marked before the operator taps it; the bounded reader still produces the
+/// authoritative error when a stale row is clicked.
+fn recent_file_row(
+    path: String,
+    missing: bool,
+    p: Palette,
+    mono: SharedString,
+    view: Entity<Shell>,
+) -> AnyElement {
+    let file_name = Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.clone());
+    let load_path = path.clone();
+    let load_view = view.clone();
+    let remove_path = path.clone();
+    let remove_view = view.clone();
+    h_flex()
+        .id(format!("recent-file-{path}"))
+        .w_full()
+        .h(px(48.0))
+        .flex_shrink_0()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(if missing {
+            p.warning.opacity(0.55)
+        } else {
+            p.border
+        })
+        .bg(p.panel)
+        .cursor_pointer()
+        .hover(|style| style.bg(p.raised_hover))
+        .on_click(move |_, _, cx| {
+            let path = PathBuf::from(load_path.clone());
+            load_view.update(cx, |shell, cx| shell.browser_load_recent(path, cx));
+        })
+        .child(
+            div()
+                .w(px(58.0))
+                .h(px(24.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .bg(if missing {
+                    p.warning.opacity(0.16)
+                } else {
+                    p.accent.opacity(0.14)
+                })
+                .text_size(px(8.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(if missing { p.warning } else { p.accent })
+                .child(if missing {
+                    t("MISSING").to_string()
+                } else {
+                    t("RECENT").to_string()
+                }),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.text)
+                        .child(file_name),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(mono)
+                        .text_size(px(9.0))
+                        .text_color(p.text_faint)
+                        .child(path),
+                ),
+        )
+        .child(
+            Button::new(format!("recent-file-remove-{remove_path}"))
+                .label(t("REMOVE"))
+                .secondary()
+                .h(px(36.0))
+                .w(px(76.0))
+                .rounded(px(6.0))
+                .text_size(px(8.5))
+                .on_click(move |_, _, cx| {
+                    let path = remove_path.clone();
+                    remove_view.update(cx, |shell, cx| shell.browser_remove_recent(path, cx));
+                }),
+        )
+        .into_any_element()
+}
+
 /// One 48 px row in the file browser's virtualized list.
 ///
 /// Folder rows enter on tap; file rows only select. The selected row keeps its
@@ -22251,6 +22540,60 @@ fn job_status_color(job: &JobView, p: Palette) -> Hsla {
         JobState::Aborted | JobState::Interrupted => p.danger,
         JobState::Idle => p.text_dim,
     }
+}
+
+/// Read, validate, send, and record one local program file.
+///
+/// This is the shared implementation behind the file browser, a recent-file
+/// click, a drag-and-drop, and `--demo-load-file`. It sends exactly one
+/// `LoadProgram` through `send`; a timeout means the engine already queued the
+/// load, so it is treated as accepted. On success the path is recorded in the
+/// recent-file list. Failed reads, refusals, and engine rejections are not
+/// recorded. Nothing here starts the job: START remains a separate operator
+/// action.
+fn load_local_program(
+    state: &mut AppState,
+    path: &Path,
+    send: impl FnOnce(Command) -> Result<(), EngineError>,
+) -> Result<String, String> {
+    if let Some(refusal) = state.program_load_refusal() {
+        return Err(t(refusal.message()).to_string());
+    }
+    let file = read_program(path).map_err(|error| error.to_string())?;
+    let command = state
+        .program_load(&file.name, &file.source)
+        .map_err(|refusal| t(refusal.message()).to_string())?;
+    let result = match send(command) {
+        Ok(()) => Ok(format!(
+            "Loading program: {} ({})",
+            file.name,
+            format_size(file.byte_len() as u64)
+        )),
+        // `send` waits one second for the engine to accept the command. A
+        // timeout is not a rejection: the load is already queued and the
+        // engine continues parsing in the background. Waiting for `JobLoaded`
+        // is safer than reporting a failure and discarding the exact source.
+        Err(EngineError::Timeout { .. }) => Ok(format!(
+            "Program load accepted; waiting for the engine to parse {} ({})",
+            file.name,
+            format_size(file.byte_len() as u64)
+        )),
+        Err(error) => {
+            state.height_map.discard_exact_source(&file.name);
+            let message = format!("Program load rejected: {error}");
+            state.push_console(ConsoleLevel::Error, message.clone());
+            Err(message)
+        }
+    };
+    if result.is_ok()
+        && let Err(error) = state.config.record_recent_file(path)
+    {
+        state.push_console(
+            ConsoleLevel::Warn,
+            format!("Recent file not saved: {error}"),
+        );
+    }
+    result
 }
 
 /// Persist at most one finished-job record from the shell poll.
@@ -24153,6 +24496,200 @@ mod tests {
             "a failed record is dropped, not retried"
         );
         assert!(store.load_app_config().is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --------------------------------------------------------- recent files
+
+    fn recent_load_state(root: &Path) -> AppState {
+        let store = ghs_config::ConfigStore::new(root);
+        let mut state = AppState::new();
+        state.config = crate::config::ConfigModel::from_store(store);
+        state.begin_live("recent-file test");
+        state.connection = ConnectionState::Ready;
+        state
+    }
+
+    fn recent_paths(state: &AppState) -> Vec<&str> {
+        state
+            .config
+            .recent_files()
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn local_load_records_the_file_and_sends_only_load_program() {
+        let root = shell_temp_root("recent-load");
+        let file = root.join("part.nc");
+        fs::write(&file, "G21\nG0 X1\nM30\n").expect("program");
+        let mut state = recent_load_state(&root);
+        let mut sent = Vec::new();
+
+        let message = load_local_program(&mut state, &file, |command| {
+            sent.push(command);
+            Ok(())
+        })
+        .expect("local load");
+        assert!(message.contains("part.nc"), "{message}");
+        assert_eq!(sent.len(), 1, "exactly one command is sent");
+        assert_eq!(
+            sent[0],
+            Command::LoadProgram {
+                name: "part.nc".to_string(),
+                source: "G21\nG0 X1\nM30\n".to_string(),
+            }
+        );
+        assert!(
+            !matches!(sent[0], Command::StartProgram { .. }),
+            "loading never starts"
+        );
+        assert!(!state.job.is_active());
+        assert_eq!(
+            recent_paths(&state),
+            vec![file.to_str().expect("utf8 path")]
+        );
+
+        let stored = ghs_config::ConfigStore::new(&root)
+            .load_app_config()
+            .expect("load config")
+            .expect("written config");
+        assert_eq!(stored.recent_files.len(), 1);
+        assert_eq!(stored.recent_files[0].path, file.to_str().expect("utf8"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_loads_keep_the_newest_recent_file_first() {
+        let root = shell_temp_root("recent-order");
+        let first = root.join("first.nc");
+        let second = root.join("second.nc");
+        fs::write(&first, "G21\nM30\n").expect("first program");
+        fs::write(&second, "G21\nM30\n").expect("second program");
+        let mut state = recent_load_state(&root);
+
+        for path in [&first, &second, &first] {
+            load_local_program(&mut state, path, |_| Ok(())).expect("load");
+        }
+
+        assert_eq!(
+            recent_paths(&state),
+            vec![
+                first.to_str().expect("utf8 first"),
+                second.to_str().expect("utf8 second")
+            ],
+            "reopening first moves it to the front without a duplicate"
+        );
+        assert_eq!(state.config.recent_files().len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_load_refuses_a_missing_file_without_sending_or_recording() {
+        let root = shell_temp_root("recent-missing");
+        let missing = root.join("missing.nc");
+        let mut state = recent_load_state(&root);
+        let mut sent = 0;
+
+        let error = load_local_program(&mut state, &missing, |_| {
+            sent += 1;
+            Ok(())
+        })
+        .expect_err("missing file is refused");
+        assert!(error.contains("missing.nc"), "{error}");
+        assert_eq!(sent, 0, "no command is sent for an unreadable file");
+        assert!(state.config.recent_files().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_load_refuses_mock_without_sending_or_recording() {
+        let root = shell_temp_root("recent-mock");
+        let file = root.join("part.nc");
+        fs::write(&file, "G21\nM30\n").expect("program");
+        let mut state = AppState::new();
+        let mut sent = 0;
+
+        let error = load_local_program(&mut state, &file, |_| {
+            sent += 1;
+            Ok(())
+        })
+        .expect_err("mock mode is refused");
+        assert!(!error.is_empty());
+        assert_eq!(sent, 0);
+        assert!(state.config.recent_files().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_load_records_only_after_the_engine_accepts_or_times_out() {
+        let root = shell_temp_root("recent-engine-result");
+        let file = root.join("part.nc");
+        fs::write(&file, "G21\nM30\n").expect("program");
+        let mut state = recent_load_state(&root);
+
+        let error = load_local_program(&mut state, &file, |_| Err(EngineError::NotConnected))
+            .expect_err("engine rejection is reported");
+        assert!(error.contains("rejected"), "{error}");
+        assert!(
+            state.config.recent_files().is_empty(),
+            "a rejected load is not a recent file"
+        );
+
+        let message = load_local_program(&mut state, &file, |_| {
+            Err(EngineError::Timeout {
+                operation: "load program",
+            })
+        })
+        .expect("a timeout is an accepted queued load");
+        assert!(message.contains("accepted"), "{message}");
+        assert_eq!(recent_paths(&state), vec![file.to_str().expect("utf8")]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn demo_synthetic_program_load_does_not_touch_recent_files() {
+        let root = shell_temp_root("recent-demo");
+        let mut state = recent_load_state(&root);
+        // LiveLink loads a bundled demo source directly through `program_load`;
+        // only the local-file loader records a recent entry.
+        let command = state
+            .program_load("demo-pocket.nc", "G21\nG0 X0 Y0\nM30\n")
+            .expect("demo load command");
+        assert!(matches!(command, Command::LoadProgram { .. }));
+        assert!(state.config.recent_files().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dropped_program_paths_reach_the_same_local_load_path() {
+        let root = shell_temp_root("recent-drop");
+        let file = root.join("dropped.nc");
+        fs::write(&file, "G21\nG0 Y2\nM30\n").expect("program");
+        let mut state = recent_load_state(&root);
+
+        assert_eq!(
+            dropped_program_path(std::slice::from_ref(&file)),
+            Ok(file.as_path())
+        );
+        let accepted = dropped_program_path(std::slice::from_ref(&file)).expect("accepted");
+        let mut sent = Vec::new();
+        load_local_program(&mut state, accepted, |command| {
+            sent.push(command);
+            Ok(())
+        })
+        .expect("drop load");
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(sent[0], Command::LoadProgram { .. }));
+        assert_eq!(state.config.recent_files().len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }
