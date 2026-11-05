@@ -167,6 +167,8 @@ const JOB_HISTORY_CARD_INDEX: usize = 2;
 const ROTATION_CARD_INDEX: usize = 8;
 /// Position of the source-scale card in the Utility scroll list.
 const SCALE_CARD_INDEX: usize = 9;
+/// Position of the program-limits/program-check card in the Utility scroll list.
+const PROGRAM_CHECK_CARD_INDEX: usize = 6;
 
 /// What the shared settings text sheet is editing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +424,11 @@ pub struct Shell {
     viewer: viewer::ViewerHandle,
     last_job_line: u32,
     demo_program: DemoProgram,
+    /// Screenshot switch: show the read-only program-check card after the demo
+    /// check program loads. It loads and starts nothing beyond the normal demo
+    /// load path.
+    demo_program_check: bool,
+    demo_program_check_done: bool,
     demo_start: bool,
     demo_start_sent: bool,
     /// Screenshot switch: enable `$20` through the normal settings write path
@@ -782,7 +789,10 @@ impl Shell {
 
         // Screenshot/demo switches. They only select a bundled demo source or
         // press the same Start action a tap would; normal startup ignores them.
-        let demo_program = if std::env::args().any(|arg| arg == "--demo-toolchange") {
+        let demo_program_check = std::env::args().any(|arg| arg == "--demo-program-check");
+        let demo_program = if demo_program_check {
+            DemoProgram::ProgramCheck
+        } else if std::env::args().any(|arg| arg == "--demo-toolchange") {
             DemoProgram::ToolChange
         } else if std::env::args().any(|arg| arg == "--demo-m0") {
             DemoProgram::ProgramStop
@@ -1000,6 +1010,8 @@ impl Shell {
             viewer: viewer::ViewerHandle::new(),
             last_job_line: 0,
             demo_program,
+            demo_program_check,
+            demo_program_check_done: false,
             demo_start,
             demo_start_sent: false,
             demo_soft_limits,
@@ -1473,6 +1485,21 @@ impl Shell {
             } else {
                 self.state.check_confirm_open = false;
             }
+            changed = true;
+        }
+        // Screenshot switch: reveal the read-only program-check card after the
+        // bundled demo check program loads. The source was loaded by the normal
+        // demo path; this only selects Utility and scrolls the card into view.
+        if self.demo_program_check
+            && !self.demo_program_check_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.name == DemoProgram::ProgramCheck.name()
+        {
+            self.demo_program_check_done = true;
+            self.state.mode = Mode::Utility;
+            self.state.keypad = None;
+            self.utility_scroll
+                .scroll_to_top_of_item(PROGRAM_CHECK_CARD_INDEX);
             changed = true;
         }
         // Screenshot switch: open the RUN OPTIONS sheet and flip optional stop
@@ -15748,9 +15775,10 @@ impl Shell {
             )
     }
 
-    /// Read-only program limits card for the loaded program.
+    /// Read-only program limits and pre-stream check for the loaded program.
     fn program_limits_card(&self, p: Palette) -> impl IntoElement {
         let limits = self.state.program_limits();
+        let check = self.state.program_check();
         let status_color = if limits.is_over_travel() {
             p.danger
         } else if limits.is_not_checked() {
@@ -15760,6 +15788,27 @@ impl Shell {
         } else {
             p.text_faint
         };
+        let check_color = if check.has_warnings() {
+            p.warning
+        } else if check.is_valid() {
+            p.success
+        } else {
+            p.text_faint
+        };
+        let check_chip = div()
+            .px_2()
+            .h(px(22.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .rounded(px(5.0))
+            .bg(p.panel_alt)
+            .border_1()
+            .border_color(check_color.opacity(0.6))
+            .text_size(px(10.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(check_color)
+            .child(check.chip_text());
         let soft_limits = match limits.soft_limits {
             Some(true) => t("ON").to_string(),
             Some(false) => t("OFF").to_string(),
@@ -15774,6 +15823,69 @@ impl Shell {
                     .text_color(p.danger)
                     .child(line),
             );
+        }
+        let mut warning_rows = v_flex()
+            .id("program-check-warnings")
+            .w_full()
+            .min_w(px(0.0))
+            .gap_1()
+            .max_h(px(200.0))
+            .overflow_y_scrollbar();
+        if check.warnings.is_empty() {
+            warning_rows = warning_rows.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(if check.has_program() {
+                        t(
+                            "No feed, spindle, tool, machine-coordinate, or probe warnings in this program.",
+                        )
+                    } else {
+                        t("No program loaded: the source check has nothing to scan.")
+                    }),
+            );
+        } else {
+            for warning in &check.warnings {
+                warning_rows = warning_rows.child(
+                    h_flex()
+                        .items_start()
+                        .gap_2()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .w(px(44.0))
+                                .flex_shrink_0()
+                                .font_family(self.mono.clone())
+                                .text_size(px(9.5))
+                                .text_color(p.text_faint)
+                                .child(format!("L{}", warning.line_text())),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .line_height(px(12.0))
+                                        .text_color(p.warning)
+                                        .child(warning.message.clone()),
+                                )
+                                .when(!warning.source.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .font_family(self.mono.clone())
+                                            .text_size(px(9.0))
+                                            .line_height(px(11.0))
+                                            .text_color(p.text_faint)
+                                            .child(warning.source.clone()),
+                                    )
+                                }),
+                        ),
+                );
+            }
         }
         v_flex()
             .gap_1()
@@ -15801,6 +15913,79 @@ impl Shell {
                         limits.tool_changes
                     )),
             )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("PROGRAM CHECK"), p))
+                    .child(check_chip),
+            )
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(t(
+                        "INFORMATIONAL - START IS NOT BLOCKED. NOT A MACHINE/TRAVEL CHECK.",
+                    )),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(check.feed_text()),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(check.spindle_text()),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(check.tool_text()),
+            )
+            .when(check.warnings_truncated(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(format!(
+                            "SHOWING FIRST {} OF {} WARNINGS",
+                            check.warnings.len(),
+                            check.warning_count
+                        )),
+                )
+            })
+            .when(check.scan_truncated(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.warning)
+                        .child(t(
+                            "SOURCE SCAN WAS TRUNCATED: the check did not read every line.",
+                        )),
+                )
+            })
+            .child(warning_rows)
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .line_height(px(12.0))
+                    .text_color(p.text_faint)
+                    .child(t(
+                        "Missing app tool-table entries are warnings, not blockers. The check reads source text and parsed counts only; it cannot verify controller state, offsets, tool length, fixtures, or actual travel. No controller command is sent.",
+                    )),
+            )
+            .child(div().h(px(1.0)).w_full().bg(p.border))
             .child(
                 div()
                     .font_family(self.mono.clone())
@@ -18511,6 +18696,12 @@ impl Shell {
             // Screenshot switch: keep the scale card at the top of the list so
             // the 1280x800 card capture does not depend on a manual scroll.
             self.utility_scroll.scroll_to_top_of_item(SCALE_CARD_INDEX);
+        }
+        if self.demo_program_check {
+            // Screenshot switch: keep the program-check section at the top of
+            // the Utility list for the 1280x800 capture.
+            self.utility_scroll
+                .scroll_to_top_of_item(PROGRAM_CHECK_CARD_INDEX);
         }
         let view = cx.entity();
         let config = &self.state.config;

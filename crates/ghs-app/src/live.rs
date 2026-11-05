@@ -34,6 +34,8 @@ pub enum DemoProgram {
     ToolChange,
     /// Same pocket with an `M0` after the first cut, for pause/resume review.
     ProgramStop,
+    /// Deterministic source for the read-only pre-stream check card.
+    ProgramCheck,
 }
 
 impl DemoProgram {
@@ -43,6 +45,7 @@ impl DemoProgram {
             DemoProgram::Pocket => "demo-pocket.nc",
             DemoProgram::ToolChange => "demo-toolchange.nc",
             DemoProgram::ProgramStop => "demo-program-stop.nc",
+            DemoProgram::ProgramCheck => crate::utilities::PROGRAM_CHECK_DEMO_NAME,
         }
     }
 
@@ -52,6 +55,7 @@ impl DemoProgram {
             DemoProgram::Pocket => POCKET_SOURCE,
             DemoProgram::ToolChange => TOOL_CHANGE_SOURCE,
             DemoProgram::ProgramStop => PROGRAM_STOP_SOURCE,
+            DemoProgram::ProgramCheck => crate::utilities::PROGRAM_CHECK_DEMO_SOURCE,
         }
     }
 }

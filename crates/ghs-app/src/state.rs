@@ -43,7 +43,7 @@ use crate::startup::{StartupLinesModel, StartupWriteGate};
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::utilities::{
     CalibrationAxis, CalibrationField, CalibrationGate, CalibrationWrite, GantryField,
-    ProgramLimits, TravelSettings, UtilityField, UtilityModel,
+    ProgramCheck, ProgramLimits, TravelSettings, UtilityField, UtilityModel,
 };
 
 /// Connection state shown in the top-bar status pill.
@@ -4039,6 +4039,18 @@ impl AppState {
             travel,
             self.travel_work_offset_mm(),
         )
+    }
+
+    /// Read-only pre-stream warning summary for the Utility card.
+    ///
+    /// The check scans the loaded source and parsed program evidence for feed,
+    /// spindle, tool, machine-coordinate, and probe warnings. It never sends a
+    /// controller command and never blocks START. Missing app tool-table entries
+    /// are warnings, not blockers; the controller and safety gateway remain
+    /// authoritative.
+    #[must_use]
+    pub fn program_check(&self) -> ProgramCheck {
+        ProgramCheck::evaluate(self.job.program().map(Arc::as_ref), self.tools.table())
     }
 
     fn setting_f64(&self, number: u16) -> Option<f64> {
@@ -10573,5 +10585,30 @@ mod tests {
             reopened.job_history().is_empty(),
             "the empty list is persisted"
         );
+    }
+
+    #[test]
+    fn program_check_is_read_only_and_leaves_start_gates_unchanged() {
+        let mut state = AppState::new();
+        state.begin_live("program check test");
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        let source = "G21\nM6 T99\nG38.2 Z-5 F50\nM30\n";
+        let program = Arc::new(ghs_gcode::parse_program(source).expect("check program parses"));
+        state.job.loaded("demo-program-check.nc".into(), program, 3);
+        let limits_before = state.program_limits();
+
+        let check = state.program_check();
+        assert!(check.has_program());
+        assert!(check.has_warnings());
+        assert!(check.warning_count >= 2);
+
+        // The check has no send path: `program_check` takes `&self`, and the
+        // read-only result cannot open a confirmation or change the job.
+        assert_eq!(state.program_limits(), limits_before);
+        assert!(!state.start_confirm_open());
+        assert!(!state.check_confirm_open);
+        assert_eq!(state.job.state, JobState::Idle);
+        assert!(!state.job.tool_change_pending());
     }
 }

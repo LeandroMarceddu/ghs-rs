@@ -13,8 +13,11 @@
 //! source is cleared, because the height-map model tracks the current part
 //! program. Keep an external copy if the pre-transform original matters.
 
+use std::collections::BTreeSet;
+
+use ghs_config::ToolTable;
 use ghs_core::Wcs;
-use ghs_engine::{Command, Program, SettingValue};
+use ghs_engine::{Command, Program, ProgramLine, SettingValue};
 use ghs_gcode::{
     MAX_ROTATION_ANGLE_DEG, MAX_SCALE_FACTOR, MIN_SCALE_FACTOR, RotationOptions, RotationWarning,
     ScaleOptions, ScaleWarning, apply_rotation, apply_scale,
@@ -2102,6 +2105,577 @@ impl ProgramLimits {
         }
         parts.join(" | ")
     }
+}
+
+// -------------------------------------------------------------- program check
+
+/// Upper bound for warnings kept in one program check.
+pub const PROGRAM_CHECK_WARNING_LIMIT: usize = 50;
+/// Upper bound for source lines scanned by the program check.
+pub const PROGRAM_CHECK_SCAN_LINE_LIMIT: usize = 200_000;
+/// Maximum characters of one source line kept with a warning.
+pub const PROGRAM_CHECK_LINE_TEXT_LIMIT: usize = 140;
+/// Reproducible screenshot sample name for the pre-stream check card.
+pub const PROGRAM_CHECK_DEMO_NAME: &str = "demo-program-check.nc";
+/// Reproducible screenshot sample with feed, tool, probe, and machine warnings.
+///
+/// The sample parses cleanly and is loaded through the normal demo path. It is
+/// not started automatically.
+pub const PROGRAM_CHECK_DEMO_SOURCE: &str = "\
+G21 G90 G54 G17
+G0 Z5
+G0 X0 Y0
+M3 S12000
+G1 Z-1 F200
+G1 X20 F800
+F0
+G1 X40 F900
+M6 T99
+G38.2 Z-5 F50
+G53 G0 Z0
+G28 G91 Z0
+G30 G91 Z0
+S0
+M5
+M30
+";
+
+/// Overall result of the read-only pre-stream program check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramCheckStatus {
+    /// Nothing is loaded.
+    NoProgram,
+    /// The scan found no warnings.
+    Valid,
+    /// The scan found at least one warning.
+    Warnings,
+}
+
+impl ProgramCheckStatus {
+    /// Short status label for the card chip.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            ProgramCheckStatus::NoProgram => "NO PROGRAM",
+            ProgramCheckStatus::Valid => "VALID",
+            ProgramCheckStatus::Warnings => "WARNINGS",
+        }
+    }
+
+    /// Whether the check found warnings.
+    #[must_use]
+    pub const fn is_warnings(self) -> bool {
+        matches!(self, ProgramCheckStatus::Warnings)
+    }
+}
+
+/// One informational warning from the pre-stream source scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramCheckWarning {
+    /// 1-based source line, or zero for a program-wide warning.
+    pub line: usize,
+    /// Short operator-facing message.
+    pub message: String,
+    /// Bounded source text for the warning row.
+    pub source: String,
+}
+
+impl ProgramCheckWarning {
+    /// Line label for the warning row.
+    #[must_use]
+    pub fn line_text(&self) -> String {
+        if self.line == 0 {
+            "--".to_string()
+        } else {
+            self.line.to_string()
+        }
+    }
+}
+
+/// Read-only pre-stream program validation result.
+///
+/// The check is informational. It scans the already-parsed source for feed,
+/// spindle, tool, machine-coordinate, and probe evidence. It never sends a
+/// controller command, never blocks START, and makes no claim that the program
+/// is safe or inside machine travel. The controller and its safety gateway stay
+/// authoritative.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgramCheck {
+    /// Overall result.
+    pub status: ProgramCheckStatus,
+    /// Parsed source line count.
+    pub lines: usize,
+    /// Parsed toolpath segments (arc chords included).
+    pub segments: usize,
+    /// Blocks that commanded an arc.
+    pub arcs: usize,
+    /// Blocks that commanded a tool change (`M6`).
+    pub tool_changes: usize,
+    /// Non-zero tool numbers selected by a `T` word, sorted.
+    pub tools: Vec<u16>,
+    /// Number of `F` words seen in the source.
+    pub feeds_seen: usize,
+    /// Lowest programmed feed, in millimetres per minute.
+    pub min_feed_mm_per_min: Option<f64>,
+    /// Highest programmed feed, in millimetres per minute.
+    pub max_feed_mm_per_min: Option<f64>,
+    /// A `G1`/`G2`/`G3` appeared before any `F` word.
+    pub missing_feed_before_first_cut: bool,
+    /// Number of `S` words seen in the source.
+    pub spindle_speeds_seen: usize,
+    /// Lowest programmed spindle speed, in revolutions per minute.
+    pub min_spindle_rpm: Option<f64>,
+    /// Highest programmed spindle speed, in revolutions per minute.
+    pub max_spindle_rpm: Option<f64>,
+    /// Number of `M3`/`M4` spindle-start words.
+    pub spindle_starts: usize,
+    /// Bounded warning rows in source order.
+    pub warnings: Vec<ProgramCheckWarning>,
+    /// Total warnings found, including rows omitted by the warning cap.
+    pub warning_count: usize,
+    /// The source scan stopped at [`PROGRAM_CHECK_SCAN_LINE_LIMIT`].
+    pub scan_truncated: bool,
+}
+
+impl ProgramCheck {
+    /// Evaluate the loaded program and its source text.
+    ///
+    /// `tools` is the application-owned tool table. A selected tool number that
+    /// is not in the table is a warning, never a blocker. The function is pure:
+    /// it returns data and cannot build or send a controller command.
+    #[must_use]
+    pub fn evaluate(program: Option<&Program>, tools: &ToolTable) -> Self {
+        Self::evaluate_with_limits(
+            program,
+            tools,
+            PROGRAM_CHECK_WARNING_LIMIT,
+            PROGRAM_CHECK_SCAN_LINE_LIMIT,
+        )
+    }
+
+    fn evaluate_with_limits(
+        program: Option<&Program>,
+        tools: &ToolTable,
+        warning_limit: usize,
+        scan_line_limit: usize,
+    ) -> Self {
+        let Some(program) = program else {
+            return Self {
+                status: ProgramCheckStatus::NoProgram,
+                lines: 0,
+                segments: 0,
+                arcs: 0,
+                tool_changes: 0,
+                tools: Vec::new(),
+                feeds_seen: 0,
+                min_feed_mm_per_min: None,
+                max_feed_mm_per_min: None,
+                missing_feed_before_first_cut: false,
+                spindle_speeds_seen: 0,
+                min_spindle_rpm: None,
+                max_spindle_rpm: None,
+                spindle_starts: 0,
+                warnings: Vec::new(),
+                warning_count: 0,
+                scan_truncated: false,
+            };
+        };
+
+        let mut scan = ProgramScan::new(warning_limit);
+        scan.run(program, scan_line_limit, &|tool| {
+            tools.get(u32::from(tool)).is_some()
+        });
+        let status = if scan.warning_count == 0 {
+            ProgramCheckStatus::Valid
+        } else {
+            ProgramCheckStatus::Warnings
+        };
+        Self {
+            status,
+            lines: program.stats.lines.max(program.lines.len()),
+            segments: program.stats.segments,
+            arcs: program.stats.arc_moves,
+            tool_changes: program.stats.tool_changes,
+            tools: scan.tools.into_iter().collect(),
+            feeds_seen: scan.feeds_seen,
+            min_feed_mm_per_min: program
+                .stats
+                .min_feed_mm_per_min
+                .or(scan.min_feed_mm_per_min),
+            max_feed_mm_per_min: program
+                .stats
+                .max_feed_mm_per_min
+                .or(scan.max_feed_mm_per_min),
+            missing_feed_before_first_cut: scan.missing_feed_before_first_cut,
+            spindle_speeds_seen: scan.spindle_speeds_seen,
+            min_spindle_rpm: scan.min_spindle_rpm,
+            max_spindle_rpm: scan.max_spindle_rpm,
+            spindle_starts: scan.spindle_starts,
+            warnings: scan.warnings,
+            warning_count: scan.warning_count,
+            scan_truncated: scan.scan_truncated,
+        }
+    }
+
+    /// Status chip text, including the warning count.
+    #[must_use]
+    pub fn chip_text(&self) -> String {
+        match self.status {
+            ProgramCheckStatus::NoProgram | ProgramCheckStatus::Valid => {
+                self.status.label().to_string()
+            }
+            ProgramCheckStatus::Warnings => {
+                if self.warnings_truncated() {
+                    format!("WARNINGS {}+", self.warning_count)
+                } else {
+                    format!("WARNINGS {}", self.warning_count)
+                }
+            }
+        }
+    }
+
+    /// Whether the check found at least one warning.
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        self.status.is_warnings()
+    }
+
+    /// Whether a program was loaded for the check.
+    #[must_use]
+    pub fn has_program(&self) -> bool {
+        !matches!(self.status, ProgramCheckStatus::NoProgram)
+    }
+
+    /// Whether the scan found no warnings.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(self.status, ProgramCheckStatus::Valid)
+    }
+
+    /// Whether the warning list omits rows behind the cap.
+    #[must_use]
+    pub fn warnings_truncated(&self) -> bool {
+        self.warning_count > self.warnings.len()
+    }
+
+    /// Whether the whole program was scanned.
+    #[must_use]
+    pub fn scan_truncated(&self) -> bool {
+        self.scan_truncated
+    }
+
+    /// Feed range and count for the card.
+    #[must_use]
+    pub fn feed_text(&self) -> String {
+        match (self.min_feed_mm_per_min, self.max_feed_mm_per_min) {
+            (Some(min), Some(max)) => format!(
+                "FEED  F {} .. {} mm/min ({} F words)",
+                compact(min),
+                compact(max),
+                self.feeds_seen
+            ),
+            _ => format!("FEED  F -- ({} F words)", self.feeds_seen),
+        }
+    }
+
+    /// Spindle range, count, and start count for the card.
+    #[must_use]
+    pub fn spindle_text(&self) -> String {
+        match (self.min_spindle_rpm, self.max_spindle_rpm) {
+            (Some(min), Some(max)) => format!(
+                "SPINDLE  S {} .. {} rpm ({} S words, {} M3/M4)",
+                compact(min),
+                compact(max),
+                self.spindle_speeds_seen,
+                self.spindle_starts
+            ),
+            _ => format!(
+                "SPINDLE  S -- ({} S words, {} M3/M4)",
+                self.spindle_speeds_seen, self.spindle_starts
+            ),
+        }
+    }
+
+    /// Selected tool numbers and the parsed tool-change count.
+    #[must_use]
+    pub fn tool_text(&self) -> String {
+        let tools = if self.tools.is_empty() {
+            "T --".to_string()
+        } else {
+            format!(
+                "T {}",
+                self.tools
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!("TOOLS  {tools} | {} tool changes", self.tool_changes)
+    }
+}
+
+struct ProgramScan {
+    warning_limit: usize,
+    feeds_seen: usize,
+    min_feed_mm_per_min: Option<f64>,
+    max_feed_mm_per_min: Option<f64>,
+    feed_seen_before_cut: bool,
+    missing_feed_before_first_cut: bool,
+    spindle_speeds_seen: usize,
+    min_spindle_rpm: Option<f64>,
+    max_spindle_rpm: Option<f64>,
+    spindle_starts: usize,
+    tools: BTreeSet<u16>,
+    warnings: Vec<ProgramCheckWarning>,
+    warning_count: usize,
+    scan_truncated: bool,
+}
+
+impl ProgramScan {
+    fn new(warning_limit: usize) -> Self {
+        Self {
+            warning_limit,
+            feeds_seen: 0,
+            min_feed_mm_per_min: None,
+            max_feed_mm_per_min: None,
+            feed_seen_before_cut: false,
+            missing_feed_before_first_cut: false,
+            spindle_speeds_seen: 0,
+            min_spindle_rpm: None,
+            max_spindle_rpm: None,
+            spindle_starts: 0,
+            tools: BTreeSet::new(),
+            warnings: Vec::new(),
+            warning_count: 0,
+            scan_truncated: false,
+        }
+    }
+
+    fn run(
+        &mut self,
+        program: &Program,
+        scan_line_limit: usize,
+        is_known_tool: &impl Fn(u16) -> bool,
+    ) {
+        for (index, line) in program.lines.iter().enumerate() {
+            if index >= scan_line_limit {
+                self.scan_truncated = true;
+                self.warn(
+                    0,
+                    "",
+                    format!("SOURCE SCAN STOPPED AT {scan_line_limit} LINES; CHECK INCOMPLETE"),
+                );
+                break;
+            }
+            self.scan_line(line, is_known_tool);
+        }
+    }
+
+    fn scan_line(&mut self, line: &ProgramLine, is_known_tool: &impl Fn(u16) -> bool) {
+        let line_number = line.line;
+        let mut g_codes = Vec::new();
+        let mut m_codes = Vec::new();
+        let mut cut_on_line = false;
+
+        for_each_source_word(&line.source, |letter, value| match letter {
+            b'F' => {
+                self.feeds_seen = self.feeds_seen.saturating_add(1);
+                self.feed_seen_before_cut = true;
+                if value.is_finite() {
+                    self.min_feed_mm_per_min = Some(
+                        self.min_feed_mm_per_min
+                            .map_or(value, |current| current.min(value)),
+                    );
+                    self.max_feed_mm_per_min = Some(
+                        self.max_feed_mm_per_min
+                            .map_or(value, |current| current.max(value)),
+                    );
+                    if value <= 0.0 {
+                        let label = if value < 0.0 { "NEGATIVE" } else { "ZERO" };
+                        self.warn(
+                            line_number,
+                            &line.source,
+                            format!("{label} FEED RATE F{}", compact(value)),
+                        );
+                    }
+                }
+            }
+            b'S' => {
+                self.spindle_speeds_seen = self.spindle_speeds_seen.saturating_add(1);
+                if value.is_finite() {
+                    self.min_spindle_rpm = Some(
+                        self.min_spindle_rpm
+                            .map_or(value, |current| current.min(value)),
+                    );
+                    self.max_spindle_rpm = Some(
+                        self.max_spindle_rpm
+                            .map_or(value, |current| current.max(value)),
+                    );
+                    if value <= 0.0 {
+                        let label = if value < 0.0 { "NEGATIVE" } else { "ZERO" };
+                        self.warn(
+                            line_number,
+                            &line.source,
+                            format!("{label} SPINDLE SPEED S{}", compact(value)),
+                        );
+                    }
+                }
+            }
+            b'T' => {
+                if let Some(tool) = tool_number(value)
+                    && tool > 0
+                    && self.tools.insert(tool)
+                    && !is_known_tool(tool)
+                {
+                    self.warn(
+                        line_number,
+                        &line.source,
+                        format!("TOOL T{tool} IS NOT IN THE APP TOOL TABLE"),
+                    );
+                }
+            }
+            b'G' => g_codes.push(value),
+            b'M' => m_codes.push(value),
+            _ => {}
+        });
+
+        for value in g_codes {
+            let integer = value.trunc();
+            if integer == 38.0 {
+                self.warn(
+                    line_number,
+                    &line.source,
+                    format!("PROBE MOVE G{} IN A NORMAL JOB", compact(value)),
+                );
+            } else if integer == 53.0 || integer == 28.0 || integer == 30.0 {
+                self.warn(
+                    line_number,
+                    &line.source,
+                    format!("MACHINE-COORDINATE MOVE G{}", compact(value)),
+                );
+            }
+            if integer == 1.0 || integer == 2.0 || integer == 3.0 {
+                cut_on_line = true;
+            }
+        }
+        for value in m_codes {
+            let integer = value.trunc();
+            if integer == 3.0 || integer == 4.0 {
+                self.spindle_starts = self.spindle_starts.saturating_add(1);
+            }
+        }
+
+        if cut_on_line && !self.feed_seen_before_cut && !self.missing_feed_before_first_cut {
+            self.missing_feed_before_first_cut = true;
+            self.warn(
+                line_number,
+                &line.source,
+                "MISSING FEED BEFORE FIRST CUT: add F before G1/G2/G3".to_string(),
+            );
+        }
+    }
+
+    fn warn(&mut self, line: usize, source: &str, message: String) {
+        self.warning_count = self.warning_count.saturating_add(1);
+        if self.warnings.len() >= self.warning_limit {
+            return;
+        }
+        self.warnings.push(ProgramCheckWarning {
+            line,
+            message,
+            source: bounded_warning_text(source),
+        });
+    }
+}
+
+/// Scan one source line for address words, ignoring comments and checksums.
+///
+/// The scanner is deliberately tolerant: comments, mixed case, arbitrary
+/// spacing between an address letter and its number, and malformed words are
+/// skipped rather than rejected. It never indexes by an untrusted length.
+fn for_each_source_word(source: &str, mut visit: impl FnMut(u8, f64)) {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b';' => break,
+            b'*' => break,
+            b'(' => {
+                index = index.saturating_add(1);
+                while let Some(&inner) = bytes.get(index) {
+                    index = index.saturating_add(1);
+                    if inner == b')' {
+                        break;
+                    }
+                }
+            }
+            b'/' => index = index.saturating_add(1),
+            byte if byte.is_ascii_alphabetic() => {
+                let letter = byte.to_ascii_uppercase();
+                let mut cursor = index.saturating_add(1);
+                while bytes
+                    .get(cursor)
+                    .is_some_and(|value| value.is_ascii_whitespace())
+                {
+                    cursor = cursor.saturating_add(1);
+                }
+                let start = cursor;
+                if bytes
+                    .get(cursor)
+                    .is_some_and(|value| *value == b'+' || *value == b'-')
+                {
+                    cursor = cursor.saturating_add(1);
+                }
+                let mut has_digit = false;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                    has_digit = true;
+                    cursor = cursor.saturating_add(1);
+                }
+                if bytes.get(cursor) == Some(&b'.') {
+                    cursor = cursor.saturating_add(1);
+                    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                        has_digit = true;
+                        cursor = cursor.saturating_add(1);
+                    }
+                }
+                if has_digit
+                    && let Some(slice) = bytes.get(start..cursor)
+                    && let Ok(text) = std::str::from_utf8(slice)
+                    && let Ok(value) = text.parse::<f64>()
+                {
+                    visit(letter, value);
+                }
+                index = cursor.max(index.saturating_add(1));
+            }
+            _ => index = index.saturating_add(1),
+        }
+    }
+}
+
+fn tool_number(value: f64) -> Option<u16> {
+    if !value.is_finite() || value < 0.0 || value > f64::from(u16::MAX) {
+        return None;
+    }
+    let rounded = value.round();
+    if (rounded - value).abs() > 1.0e-9 || rounded > f64::from(u16::MAX) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(rounded as u16)
+}
+
+fn bounded_warning_text(source: &str) -> String {
+    let trimmed = source.trim();
+    if trimmed.chars().count() <= PROGRAM_CHECK_LINE_TEXT_LIMIT {
+        return trimmed.to_string();
+    }
+    let mut text = trimmed
+        .chars()
+        .take(PROGRAM_CHECK_LINE_TEXT_LIMIT.saturating_sub(3))
+        .collect::<String>();
+    text.push_str("...");
+    text
 }
 
 // ------------------------------------------------------------------ transforms
@@ -4717,5 +5291,280 @@ mod tests {
         assert!(!model.scale_confirmed());
         assert!(model.scale_preview().is_none());
         assert!(model.scale_error().is_none());
+    }
+
+    // ------------------------------------------------------------ program check
+
+    use ghs_config::ToolRecord;
+
+    fn check_tools(numbers: &[u32]) -> ToolTable {
+        let mut table = ToolTable::new();
+        for number in numbers {
+            table.insert(ToolRecord {
+                number: *number,
+                name: format!("T{number}"),
+                diameter_mm: 1.0,
+                length_mm: 1.0,
+                pocket: None,
+            });
+        }
+        table
+    }
+
+    fn check_program(source: &str) -> Program {
+        ghs_gcode::parse_program(source).expect("program check fixture parses")
+    }
+
+    /// Program evidence for scanner edge cases the strict parser rejects.
+    fn program_with_source(source: &str) -> Program {
+        let mut program = check_program("M30\n");
+        program.lines = source
+            .lines()
+            .enumerate()
+            .map(|(index, text)| ProgramLine {
+                line: index.saturating_add(1),
+                number: None,
+                source: text.to_string(),
+                words: Vec::new(),
+                comments: Vec::new(),
+                block_delete: false,
+                checksum: None,
+                segments: 0..0,
+            })
+            .collect();
+        program.stats.lines = program.lines.len();
+        program
+    }
+
+    fn check_warning_lines(check: &ProgramCheck) -> Vec<String> {
+        check
+            .warnings
+            .iter()
+            .map(|warning| {
+                if warning.line == 0 {
+                    warning.message.clone()
+                } else {
+                    format!("line {}: {}", warning.line, warning.message)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn program_check_valid_program_is_valid_without_warnings() {
+        let program = check_program(
+            "G21 G90\n\
+             G0 Z5\n\
+             G0 X0 Y0\n\
+             M3 S12000\n\
+             G1 Z-1 F200\n\
+             G1 X20 F800\n\
+             G2 X40 Y0 I10 J0\n\
+             M5\n\
+             M30\n",
+        );
+        let check = ProgramCheck::evaluate(Some(&program), &check_tools(&[1]));
+        assert!(check.has_program());
+        assert!(check.is_valid());
+        assert!(!check.has_warnings());
+        assert_eq!(check.status, ProgramCheckStatus::Valid);
+        assert_eq!(check.warning_count, 0);
+        assert!(check.warnings.is_empty());
+        assert_eq!(check.chip_text(), "VALID");
+        assert_eq!(check.arcs, 1);
+        assert!(check.segments > 0);
+        assert_eq!(check.min_feed_mm_per_min, Some(200.0));
+        assert_eq!(check.max_feed_mm_per_min, Some(800.0));
+        assert_eq!(check.min_spindle_rpm, Some(12000.0));
+        assert_eq!(check.max_spindle_rpm, Some(12000.0));
+        assert_eq!(check.spindle_starts, 1);
+        assert!(!check.missing_feed_before_first_cut);
+    }
+
+    #[test]
+    fn program_check_reports_feed_range_and_missing_feed() {
+        let program = check_program("G21\nG1 Z-1 F120\nG1 X20 F800\nM30\n");
+        let check = ProgramCheck::evaluate(Some(&program), &check_tools(&[]));
+        assert_eq!(check.feeds_seen, 2);
+        assert_eq!(check.min_feed_mm_per_min, Some(120.0));
+        assert_eq!(check.max_feed_mm_per_min, Some(800.0));
+        assert!(check.feed_text().contains("F 120 .. 800"));
+
+        let missing = ProgramCheck::evaluate(
+            Some(&program_with_source("G1 X10\nM30\n")),
+            &check_tools(&[]),
+        );
+        assert!(missing.missing_feed_before_first_cut);
+        assert!(missing.has_warnings());
+        assert!(
+            check_warning_lines(&missing)
+                .iter()
+                .any(|line| line.contains("MISSING FEED")),
+            "{:?}",
+            check_warning_lines(&missing)
+        );
+    }
+
+    #[test]
+    fn program_check_reports_spindle_range_and_zero_or_negative_speed() {
+        let program = check_program("G21\nM3 S12000\nG1 X10 F100\nS8000\nM5\nM30\n");
+        let check = ProgramCheck::evaluate(Some(&program), &check_tools(&[]));
+        assert_eq!(check.spindle_speeds_seen, 2);
+        assert_eq!(check.min_spindle_rpm, Some(8000.0));
+        assert_eq!(check.max_spindle_rpm, Some(12000.0));
+        assert_eq!(check.spindle_starts, 1);
+        assert!(check.spindle_text().contains("S 8000 .. 12000"));
+
+        let bad = ProgramCheck::evaluate(
+            Some(&program_with_source("S0\nS-500\nM3 S12000\nM30\n")),
+            &check_tools(&[]),
+        );
+        let messages = check_warning_lines(&bad).join("\n");
+        assert!(messages.contains("ZERO SPINDLE SPEED S0"), "{messages}");
+        assert!(
+            messages.contains("NEGATIVE SPINDLE SPEED S-500"),
+            "{messages}"
+        );
+        assert_eq!(bad.warning_count, 2);
+        assert_eq!(bad.min_spindle_rpm, Some(-500.0));
+    }
+
+    #[test]
+    fn program_check_reports_tool_numbers_and_missing_app_table_entry() {
+        let program = check_program("G21\nM6 T2\nG1 X10 F100\nM30\n");
+        let unknown = ProgramCheck::evaluate(Some(&program), &check_tools(&[1, 3]));
+        assert_eq!(unknown.tools, vec![2]);
+        assert_eq!(unknown.tool_changes, 1);
+        let messages = check_warning_lines(&unknown).join("\n");
+        assert!(
+            messages.contains("TOOL T2 IS NOT IN THE APP TOOL TABLE"),
+            "{messages}"
+        );
+
+        let known = ProgramCheck::evaluate(Some(&program), &check_tools(&[2]));
+        assert!(!known.has_warnings());
+        assert_eq!(known.tools, vec![2]);
+    }
+
+    #[test]
+    fn program_check_warns_on_probe_moves() {
+        let program = check_program("G21\nG0 Z5\nG38.2 Z-5 F50\nG0 Z5\nM30\n");
+        let check = ProgramCheck::evaluate(Some(&program), &check_tools(&[]));
+        assert_eq!(check.warning_count, 1);
+        assert!(
+            check_warning_lines(&check)
+                .iter()
+                .any(|line| line.contains("PROBE MOVE G38.2")),
+            "{:?}",
+            check_warning_lines(&check)
+        );
+    }
+
+    #[test]
+    fn program_check_warns_on_machine_coordinate_moves() {
+        let program = check_program("G21\nG53 G0 Z0\nG28 G91 Z0\nG30 G91 Z0\nM30\n");
+        let check = ProgramCheck::evaluate(Some(&program), &check_tools(&[]));
+        assert_eq!(check.warning_count, 3);
+        let messages = check_warning_lines(&check).join("\n");
+        assert!(
+            messages.contains("MACHINE-COORDINATE MOVE G53"),
+            "{messages}"
+        );
+        assert!(
+            messages.contains("MACHINE-COORDINATE MOVE G28"),
+            "{messages}"
+        );
+        assert!(
+            messages.contains("MACHINE-COORDINATE MOVE G30"),
+            "{messages}"
+        );
+    }
+
+    #[test]
+    fn program_check_tolerates_comments_case_spacing_and_no_cut() {
+        let mixed = program_with_source(
+            "g21 g90\n\
+             g0 z5\n\
+             (comment G38.2 F0 S0 G53)\n\
+             m3  s12000   ; G28 G30 T99\n\
+             g1  x 10  f 800\n\
+             m30\n",
+        );
+        let check = ProgramCheck::evaluate(Some(&mixed), &check_tools(&[]));
+        assert!(check.is_valid(), "{:?}", check_warning_lines(&check));
+        assert_eq!(check.warning_count, 0);
+        assert!(!check.missing_feed_before_first_cut);
+
+        let no_cut = check_program("G21\nG0 X10 Y10\nM30\n");
+        let check = ProgramCheck::evaluate(Some(&no_cut), &check_tools(&[]));
+        assert!(check.is_valid());
+        assert_eq!(check.feeds_seen, 0);
+        assert!(!check.missing_feed_before_first_cut);
+    }
+
+    #[test]
+    fn program_check_caps_warning_rows_but_keeps_the_total() {
+        let source = (0..60u32)
+            .map(|index| format!("G38.2 Z-{} F50", index.saturating_add(1)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let program = program_with_source(&format!("{source}\nM30\n"));
+        let check = ProgramCheck::evaluate(Some(&program), &check_tools(&[]));
+        assert_eq!(check.warning_count, 60);
+        assert_eq!(check.warnings.len(), PROGRAM_CHECK_WARNING_LIMIT);
+        assert!(check.warnings_truncated());
+        assert_eq!(check.chip_text(), "WARNINGS 60+");
+        assert!(check.has_warnings());
+    }
+
+    #[test]
+    fn program_check_bounds_the_source_scan() {
+        let program = program_with_source(
+            "G38.2 Z-1 F50\nG38.2 Z-2 F50\nG38.2 Z-3 F50\nG38.2 Z-4 F50\nM30\n",
+        );
+        let check = ProgramCheck::evaluate_with_limits(Some(&program), &check_tools(&[]), 10, 3);
+        assert!(check.scan_truncated());
+        assert!(check.warning_count >= 4);
+        assert!(
+            check
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("SOURCE SCAN STOPPED")),
+            "{:?}",
+            check_warning_lines(&check)
+        );
+    }
+
+    #[test]
+    fn program_check_demo_is_reproducible_and_has_feed_tool_probe_warnings() {
+        let first_program = check_program(PROGRAM_CHECK_DEMO_SOURCE);
+        let second_program = check_program(PROGRAM_CHECK_DEMO_SOURCE);
+        let first = ProgramCheck::evaluate(Some(&first_program), &ToolTable::new());
+        let second = ProgramCheck::evaluate(Some(&second_program), &ToolTable::new());
+        assert_eq!(first, second);
+        assert!(first.has_warnings());
+        let messages = check_warning_lines(&first).join("\n");
+        assert!(messages.contains("ZERO FEED RATE F0"), "{messages}");
+        assert!(messages.contains("TOOL T99"), "{messages}");
+        assert!(messages.contains("PROBE MOVE G38.2"), "{messages}");
+        assert!(messages.contains("ZERO SPINDLE SPEED S0"), "{messages}");
+        assert_eq!(first.tool_changes, 1);
+        assert!(first.min_feed_mm_per_min.is_some());
+        assert_eq!(
+            first.chip_text(),
+            format!("WARNINGS {}", first.warning_count)
+        );
+    }
+
+    #[test]
+    fn program_check_is_read_only_data_with_no_command_output() {
+        // `ProgramCheck::evaluate` returns plain data. There is no send
+        // callback, no `Command`, and no mutable app or engine input, so a
+        // check cannot start, jog, probe, or write anything.
+        let program = check_program(PROGRAM_CHECK_DEMO_SOURCE);
+        let first = ProgramCheck::evaluate(Some(&program), &ToolTable::new());
+        let second = ProgramCheck::evaluate(Some(&program), &ToolTable::new());
+        assert_eq!(first, second);
+        assert!(first.has_warnings());
     }
 }

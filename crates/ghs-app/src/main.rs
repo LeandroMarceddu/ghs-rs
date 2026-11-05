@@ -15,8 +15,12 @@
 //! loads (screenshot switch: it exercises the same path as the toolbar
 //! button). `--demo-check-confirm` opens the check-run confirmation without
 //! confirming it, and `--demo-check` presses CHECK then START CHECK through
-//! the same model actions for a dry-run status capture. `--viewer-3d` starts
-//! the job viewer in the orbit view; 2D top is the default.
+//! the same model actions for a dry-run status capture. `--demo-program-check`
+//! loads a deterministic local sample through the normal demo load path and
+//! opens Utility at the read-only `PROGRAM CHECK` section. The sample has feed,
+//! tool, probe, and machine-coordinate warnings; the flag never starts the job
+//! and sends nothing from the validation model. `--viewer-3d` starts the job
+//! viewer in the orbit view; 2D top is the default.
 //! `--viewer-stock-off` hides the inferred stock box for a capture; it changes
 //! no controller state. `--settings` opens the generated settings workspace directly;
 //! `--settings-group=NAME` selects a reported group in that workspace;
