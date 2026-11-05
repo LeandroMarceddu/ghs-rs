@@ -37,6 +37,7 @@ use ghs_core::Units;
 use ghs_engine::{
     Axis as CoreAxis, Command, MachineState, Position, ProbeResult, SystemCommand, Wcs,
 };
+use ghs_i18n::t;
 use ghs_probe::{
     CornerProbe, EdgeMode, EdgeSpec, HeightMap, HeightMapEstimate, HeightMapGrid,
     MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM, MAX_HEIGHT_MAP_AXIS_POINTS,
@@ -1218,9 +1219,9 @@ impl ProbeModel {
             .filter(|line| !line.is_empty())
             .count();
         if pre == 0 && post == 0 {
-            "EMPTY".to_string()
+            t("EMPTY").to_string()
         } else {
-            format!("PRE {pre} / POST {post} LINES")
+            format!("{} {pre} / {} {post} {}", t("PRE"), t("POST"), t("LINES"))
         }
     }
 
@@ -1283,20 +1284,25 @@ impl ProbeModel {
     fn validate_field_text(&self, field: ProbeField, trimmed: &str) -> Result<(), String> {
         let value = trimmed
             .parse::<f64>()
-            .map_err(|_| format!("{} must be numeric", field.label()))?;
+            .map_err(|_| format!("{} {}", t(field.label()), t("must be numeric")))?;
         if !value.is_finite() {
-            return Err(format!("{} must be finite", field.label()));
+            return Err(format!("{} {}", t(field.label()), t("must be finite")));
         }
         let (min, max) = field.bounds();
         if value < min || value > max {
             return Err(format!(
-                "{} must be within {min:.3} ..= {max:.3} {}",
-                field.label(),
+                "{} {} {min:.3} ..= {max:.3} {}",
+                t(field.label()),
+                t("must be within"),
                 field.unit()
             ));
         }
         if field.is_integer() && value.fract() != 0.0 {
-            return Err(format!("{} must be a whole number", field.label()));
+            return Err(format!(
+                "{} {}",
+                t(field.label()),
+                t("must be a whole number")
+            ));
         }
         Ok(())
     }
@@ -1309,16 +1315,16 @@ impl ProbeModel {
     pub fn field_value(&self, field: ProbeField) -> Result<f64, String> {
         let text = self.field_text(field);
         if text.trim().is_empty() {
-            return Err(format!("{} is empty", field.label()));
+            return Err(format!("{} {}", t(field.label()), t("is empty")));
         }
         let value = text
             .trim()
             .parse::<f64>()
-            .map_err(|_| format!("{} must be numeric", field.label()))?;
+            .map_err(|_| format!("{} {}", t(field.label()), t("must be numeric")))?;
         if value.is_finite() {
             Ok(value)
         } else {
-            Err(format!("{} must be finite", field.label()))
+            Err(format!("{} {}", t(field.label()), t("must be finite")))
         }
     }
 
@@ -1841,10 +1847,14 @@ impl ProbeModel {
     fn field_u16(&self, field: ProbeField) -> Result<u16, String> {
         let value = self.field_value(field)?;
         if value.fract() != 0.0 {
-            return Err(format!("{} must be a whole number", field.label()));
+            return Err(format!(
+                "{} {}",
+                t(field.label()),
+                t("must be a whole number")
+            ));
         }
         u16::try_from(value.round() as i64)
-            .map_err(|_| format!("{} is out of range", field.label()))
+            .map_err(|_| format!("{} {}", t(field.label()), t("is out of range")))
     }
 
     fn geometry(&self, card: ProbeCard, ctx: &ProbeContext) -> Result<GeometryInput, String> {

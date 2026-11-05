@@ -17,6 +17,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ghs_i18n::t;
+
 /// Largest program file accepted from the file browser: 20 MB.
 ///
 /// The engine accepts more, but a touch panel must stay responsive; the bound
@@ -69,11 +71,12 @@ impl fmt::Display for BrowseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BrowseError::NotADirectory(path) => {
-                write!(formatter, "'{path}' is not a readable folder")
+                write!(formatter, "'{path}' {}", t("is not a readable folder"))
             }
             BrowseError::NotAProgramFile(name) => write!(
                 formatter,
-                "'{name}' is not a .nc, .gcode, .tap, or .ngc program"
+                "'{name}' {}",
+                t("is not a .nc, .gcode, .tap, or .ngc program")
             ),
             BrowseError::Io(message) => formatter.write_str(message),
         }
@@ -107,22 +110,27 @@ pub enum ProgramFileError {
 impl fmt::Display for ProgramFileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProgramFileError::NotAFile(path) => write!(formatter, "'{path}' is not a regular file"),
+            ProgramFileError::NotAFile(path) => {
+                write!(formatter, "'{path}' {}", t("is not a regular file"))
+            }
             ProgramFileError::UnsupportedExtension(name) => write!(
                 formatter,
-                "'{name}' is not a .nc, .gcode, .tap, or .ngc program"
+                "'{name}' {}",
+                t("is not a .nc, .gcode, .tap, or .ngc program")
             ),
             ProgramFileError::TooLarge { bytes, limit } => write!(
                 formatter,
-                "file is {}; the limit for the file browser is {}",
+                "{} {}; {} {}",
+                t("file is"),
                 format_size(*bytes),
+                t("the limit for the file browser is"),
                 format_size(*limit)
             ),
             ProgramFileError::Binary => {
-                formatter.write_str("file contains binary data, not a G-code program")
+                formatter.write_str(t("file contains binary data, not a G-code program"))
             }
-            ProgramFileError::NotUtf8 => formatter.write_str("file is not valid UTF-8 text"),
-            ProgramFileError::Empty => formatter.write_str("file is empty"),
+            ProgramFileError::NotUtf8 => formatter.write_str(t("file is not valid UTF-8 text")),
+            ProgramFileError::Empty => formatter.write_str(t("file is empty")),
             ProgramFileError::Io(message) => formatter.write_str(message),
         }
     }
@@ -327,20 +335,24 @@ pub fn read_program(path: &Path) -> Result<ProgramFile, ProgramFileError> {
 /// not contain exactly one regular file.
 pub fn dropped_program_path(paths: &[PathBuf]) -> Result<&Path, String> {
     match paths {
-        [] => Err("Drop one .nc, .gcode, .tap, or .ngc program file".to_string()),
+        [] => Err(t("Drop one .nc, .gcode, .tap, or .ngc program file").to_string()),
         [path] => {
             if path.is_file() {
                 Ok(path)
             } else {
                 Err(format!(
-                    "'{}' is not a regular file; drop one program file",
-                    display_path(path)
+                    "'{}' {}; {}",
+                    display_path(path),
+                    t("is not a regular file"),
+                    t("drop one program file")
                 ))
             }
         }
         _ => Err(format!(
-            "Drop exactly one program file; {} items were dropped",
-            paths.len()
+            "{}; {} {}",
+            t("Drop exactly one program file"),
+            paths.len(),
+            t("items were dropped")
         )),
     }
 }
@@ -541,7 +553,7 @@ impl FileBrowser {
     pub fn commit_path(&mut self) -> bool {
         let draft = self.path_draft.trim().to_string();
         if draft.is_empty() {
-            self.error = Some("Enter a folder path first".to_string());
+            self.error = Some(t("Enter a folder path first").to_string());
             return false;
         }
         self.navigate_to(Path::new(&draft))

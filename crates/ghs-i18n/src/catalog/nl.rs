@@ -1218,4 +1218,502 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
     ("MEASURED MOVE", "GEMETEN BEWEGING"),
     ("CALCULATED", "BEREKEND"),
     ("CONFIRMED", "BEVESTIGD"),
+    (
+        "ALLOWED: comments `(...)` or `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`.",
+        "TOEGESTAAN: commentaar `(...)` of `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`.",
+    ),
+    ("ANGLE", "HOEK"),
+    ("APPLY TLO", "TLO TOEPASSEN"),
+    (
+        "BACKUP EXPORTED THIS SESSION",
+        "BACKUP DEZE SESSIE GEËXPORTEERD",
+    ),
+    (
+        "BACKUP EXPORTED THIS SESSION - RESET ACKNOWLEDGED",
+        "BACKUP DEZE SESSIE GEËXPORTEERD - RESET BEVESTIGD",
+    ),
+    ("BACKUP FILE", "BACKUPBESTAND"),
+    ("BACKUP REQUIRED", "BACKUP VEREIST"),
+    ("CALCULATOR ONLY", "ALLEEN REKENHULP"),
+    (
+        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY",
+        "ALLEEN REKENHULP - DE APP BEWEEGT OF STELT HET PORTAAL NIET AF",
+    ),
+    ("CLEAR ALL HISTORY", "ALLE GESCHIEDENIS WISSEN"),
+    ("CLEAR ALL HISTORY?", "ALLE GESCHIEDENIS WISSEN?"),
+    (
+        "CLEAR ASKS FOR CONFIRMATION FIRST",
+        "WISSEN VRAAGT EERST OM BEVESTIGING",
+    ),
+    ("CLEAR HISTORY", "GESCHIEDENIS WISSEN"),
+    ("CLEAR TLO", "TLO WISSEN"),
+    ("CONTROLLER RESET", "CONTROLLER RESETTEN"),
+    (
+        "DATA LOSS ACKNOWLEDGED - RESET MAY PROCEED",
+        "GEGEVENSVERLIES BEVESTIGD - RESET TOEGESTAAN",
+    ),
+    (
+        "DATA LOSS ACKNOWLEDGED BY THE OPERATOR",
+        "GEGEVENSVERLIES BEVESTIGD DOOR DE OPERATOR",
+    ),
+    ("DELTA", "DELTA"),
+    ("DELTA (TOTAL)", "DELTA (TOTAAL)"),
+    ("DESTRUCTIVE", "DESTRUCTIEF"),
+    ("DROP PROGRAM TO LOAD", "SLEEP PROGRAMMA OM TE LADEN"),
+    (
+        "Drop exactly one program file",
+        "Sleep precies één programmabestand",
+    ),
+    (
+        "Drop one .nc, .gcode, .tap, or .ngc program file",
+        "Sleep één .nc-, .gcode-, .tap- of .ngc-programmabestand",
+    ),
+    ("EMPTY", "LEEG"),
+    ("EXPORT BACKUP", "BACKUP EXPORTEREN"),
+    (
+        "EXPORT IN FLIGHT - WAIT FOR THE WRITE TO FINISH",
+        "EXPORT LOOPT - WACHT TOT HET SCHRIJVEN KLAAR IS",
+    ),
+    ("Enter a folder path first", "Voer eerst een mappad in"),
+    (
+        "Enter millimetres. The span is the distance between the two measurement points; the \
+         readings are the Y values at the left and right points. CALCULATE is local \
+         arithmetic.",
+        "Voer millimeters in. De afstand is de afstand tussen de twee meetpunten; de metingen \
+         zijn de Y-waarden links en rechts. BEREKENEN is lokale rekenkunde.",
+    ),
+    (
+        "Finished jobs are stored in app.json on this computer. The newest 100 records are \
+         kept; the card shows the newest 10.",
+        "Voltooide taken worden opgeslagen in app.json op deze computer. De nieuwste 100 \
+         records blijven bewaard; de kaart toont de nieuwste 10.",
+    ),
+    (
+        "GANTRY IS SQUARE WITHIN MEASUREMENT RESOLUTION; NO CORRECTION INDICATED",
+        "PORTAAL IS HAAKS BINNEN DE MEETNAUWKEURIGHEID; GEEN CORRECTIE NODIG",
+    ),
+    ("GANTRY MEASUREMENT (mm)", "PORTAALMETING (mm)"),
+    ("GANTRY SQUARING", "PORTAAL UITLIJNEN"),
+    ("GANTRY SQUARING CALCULATOR", "REKENHULP PORTAAL UITLIJNEN"),
+    (
+        "I HAVE A BACKUP OR ACCEPT DATA LOSS",
+        "IK HEB EEN BACKUP OF ACCEPTEER GEGEVENSVERLIES",
+    ),
+    ("JOB HISTORY", "TAAKGESCHIEDENIS"),
+    ("LEFT FORWARD", "LINKS VOOR"),
+    (
+        "LEFT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE RIGHT SIDE",
+        "DE LINKERZIJDE STAAT {amount} mm NAAR VOREN; SCHUIF DEZE {amount} mm TERUG OF VUL DE \
+         RECHTERZIJDE OP",
+    ),
+    ("LINES", "REGELS"),
+    (
+        "LOCAL ONLY - NOT SENT TO THE CONTROLLER",
+        "ALLEEN LOKAAL - NIET NAAR DE CONTROLLER VERSTUURD",
+    ),
+    (
+        "LOCAL ONLY - NOT SENT TO THE CONTROLLER. Records are kept in app.json on this \
+         computer, newest first.",
+        "ALLEEN LOKAAL - NIET NAAR DE CONTROLLER VERSTUURD. Records staan in app.json op deze \
+         computer, nieuwste eerst.",
+    ),
+    ("LOCAL PROFILE", "LOKAAL PROFIEL"),
+    ("LOCAL TIME", "LOKALE TIJD"),
+    ("MAX", "MAX"),
+    ("MEASUREMENT RESULT", "MEETRESULTAAT"),
+    ("MOST DESTRUCTIVE", "MEEST DESTRUCTIEF"),
+    ("Max", "Max"),
+    (
+        "Measure the Y distance from a common reference to the left and right ends of the \
+         gantry, enter the span between those points, and calculate the delta, angle, and \
+         per-side correction. Follow the machine's squaring procedure for any adjustment.",
+        "Meet de Y-afstand vanaf een gemeenschappelijk referentiepunt naar de linker- en \
+         rechterkant van het portaal, voer de afstand tussen die punten in en bereken delta, \
+         hoek en correctie per zijde. Volg voor elke afstelling de uitlijnprocedure van de \
+         machine.",
+    ),
+    ("NEWEST FIRST", "NIEUWSTE EERST"),
+    (
+        "NO BACKUP EXPORTED THIS SESSION",
+        "DEZE SESSIE GEEN BACKUP GEËXPORTEERD",
+    ),
+    ("NO JOBS RECORDED", "GEEN TAKEN VASTGELEGD"),
+    ("NO MOTION / NO WRITE", "GEEN BEWEGING / GEEN SCHRIJFACTIE"),
+    ("NO PER-SIDE CORRECTION", "GEEN CORRECTIE PER ZIJDE"),
+    ("NOT SAVED", "NIET OPGESLAGEN"),
+    (
+        "No measurement yet. Enter the span and both Y readings in the calculator.",
+        "Nog geen meting. Voer de afstand en beide Y-metingen in de rekenhulp in.",
+    ),
+    (
+        "No motion, probing, spindle-on, coolant-on, tool change, coordinate, or system \
+         commands.",
+        "Geen beweging, tasten, spindel aan, koelmiddel aan, gereedschapswissel, coördinaat- \
+         of systeemopdrachten.",
+    ),
+    (
+        "No recent files yet. A loaded local file appears here.",
+        "Nog geen recente bestanden. Een geladen lokaal bestand verschijnt hier.",
+    ),
+    ("OF", "VAN"),
+    ("ONE COMMAND", "ÉÉN COMMANDO"),
+    ("OPEN CALCULATOR", "REKENHULP OPENEN"),
+    ("OPEN HISTORY", "GESCHIEDENIS OPENEN"),
+    ("OPEN MACROS", "MACRO'S OPENEN"),
+    (
+        "One .nc, .gcode, .tap, or .ngc file. Loading never starts the job.",
+        "Eén .nc-, .gcode-, .tap- of .ngc-bestand. Laden start de taak nooit.",
+    ),
+    ("PER-SIDE", "PER ZIJDE"),
+    ("PER-SIDE (PIVOT CENTRE)", "PER ZIJDE (DRAAIPUNT)"),
+    (
+        "PIVOT CENTRE: MOVE THE LEFT SIDE BACK {amount} mm AND THE RIGHT SIDE FORWARD \
+         {amount} mm",
+        "DRAAIPUNT: SCHUIF DE LINKERZIJDE {amount} mm TERUG EN DE RECHTERZIJDE {amount} mm \
+         NAAR VOREN",
+    ),
+    (
+        "PIVOT CENTRE: MOVE THE RIGHT SIDE BACK {amount} mm AND THE LEFT SIDE FORWARD \
+         {amount} mm",
+        "DRAAIPUNT: SCHUIF DE RECHTERZIJDE {amount} mm TERUG EN DE LINKERZIJDE {amount} mm \
+         NAAR VOREN",
+    ),
+    ("POST", "POST"),
+    (
+        "POST MACRO - after the final safe-Z retract",
+        "POST-MACRO - na de laatste terugtrek naar veilige Z",
+    ),
+    ("PRE", "PRE"),
+    (
+        "PRE MACRO - after the safety preamble",
+        "PRE-MACRO - na de veiligheidspreamble",
+    ),
+    ("PREFLIGHT OK", "VOORCONTROLE OK"),
+    ("PROBE DEFAULTS", "TASTERSTANDAARDEN"),
+    ("PROBE MACROS", "TASTERMACRO'S"),
+    (
+        "Press CALCULATE to validate the fields and show the correction.",
+        "Druk op BEREKENEN om de velden te controleren en de correctie te tonen.",
+    ),
+    ("RECENT", "RECENT"),
+    ("RECENT FILES", "RECENTE BESTANDEN"),
+    ("REFUSED", "GEWEIGERD"),
+    ("REMOVE", "VERWIJDEREN"),
+    (
+        "RESET GATES READY - TWO-STEP CONFIRMATION REQUIRED",
+        "RESETVOORWAARDEN OK - TWESTAPPIGE BEVESTIGING VEREIST",
+    ),
+    ("RESET LOCKED", "RESET VERGRENDELD"),
+    ("RESULT", "RESULTAAT"),
+    ("RIGHT FORWARD", "RECHTS VOOR"),
+    (
+        "RIGHT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE LEFT SIDE",
+        "DE RECHTERZIJDE STAAT {amount} mm NAAR VOREN; SCHUIF DEZE {amount} mm TERUG OF VUL \
+         DE LINKERZIJDE OP",
+    ),
+    (
+        "Recent file was not removed",
+        "Recent bestand is niet verwijderd",
+    ),
+    (
+        "Recent files were not cleared",
+        "Recente bestanden zijn niet gewist",
+    ),
+    ("SAVE DEFAULTS", "STANDAARDEN OPSLAAN"),
+    ("SAVE MACROS", "MACRO'S OPSLAAN"),
+    ("SAVED", "OPGESLAGEN"),
+    (
+        "SAVED PER CONTROLLER PROFILE",
+        "OPGESLAGEN PER CONTROLLERPROFIEL",
+    ),
+    ("SHOWING", "GETOOND"),
+    ("SPAN BETWEEN POINTS", "AFSTAND TUSSEN PUNTEN"),
+    ("SQUARE", "HAAKS"),
+    ("STEP", "STAP"),
+    (
+        "STOCK INFERRED FROM PROGRAM BOUNDS | NOT A MEASURED MODEL",
+        "MATERIAAL AFGELEID UIT PROGRAMMAGRENZEN | GEEN GEMETEN MODEL",
+    ),
+    ("STOCK OFF", "MATERIAAL UIT"),
+    ("STOCK ON", "MATERIAAL AAN"),
+    ("STORED", "OPGESLAGEN"),
+    ("TAP FOR", "TIK VOOR"),
+    ("THEME", "THEMA"),
+    (
+        "The controller may reset or re-handshake after this command. The app does not \
+         reconnect, home, jog, or resume anything. CANCEL sends nothing.",
+        "De controller kan na deze opdracht resetten of opnieuw onderhandelen. De app \
+         verbindt niet opnieuw, referentieert niet, beweegt niet en hervat niets. ANNULEREN \
+         stuurt niets.",
+    ),
+    (
+        "There is no APPLY. Move or shim the gantry by hand, then measure again.",
+        "Er is geen TOEPASSEN. Beweeg of vul het portaal handmatig op en meet opnieuw.",
+    ),
+    (
+        "These lines run inside the generated probe program and are still subject to every \
+         preflight gate. SAVE MACROS writes only the local controller profile: no controller \
+         command, setting, offset, or start.",
+        "Deze regels lopen in het gegenereerde tastprogramma en blijven onderworpen aan elke \
+         voorcontrole. MACRO'S OPSLAAN schrijft alleen het lokale controllerprofiel: geen \
+         controlleropdracht, instelling, offset of start.",
+    ),
+    (
+        "This removes every stored job record from app.json on this computer. It does not \
+         change the loaded program or send anything to the controller.",
+        "Verwijdert elk opgeslagen taakrecord uit app.json op deze computer. Het geladen \
+         programma verandert niet en er wordt niets naar de controller gestuurd.",
+    ),
+    (
+        "bounded pre/post lines; local profile; still subject to preflight",
+        "begrensde PRE/POST-regels; lokaal profiel; nog steeds voorcontroleplichtig",
+    ),
+    ("bytes and", "bytes en"),
+    ("correction is not finite", "is niet eindig"),
+    ("drop one program file", "sleep één programmabestand"),
+    (
+        "file contains binary data, not a G-code program",
+        "bestand bevat binaire gegevens, geen G-code-programma",
+    ),
+    ("file is", "bestand is"),
+    ("file is empty", "bestand is leeg"),
+    (
+        "file is not valid UTF-8 text",
+        "bestand is geen geldige UTF-8-tekst",
+    ),
+    ("is empty", "is leeg"),
+    (
+        "is not a .nc, .gcode, .tap, or .ngc program",
+        "is geen .nc-, .gcode-, .tap- of .ngc-programma",
+    ),
+    ("is not a readable folder", "is geen leesbare map"),
+    ("is not a regular file", "is geen gewoon bestand"),
+    ("is not finite", "is niet eindig"),
+    ("is out of range", "valt buiten het bereik"),
+    ("items were dropped", "items zijn neergezet"),
+    ("lines per macro.", "regels per macro."),
+    (
+        "local JSON only; nothing is sent to the controller",
+        "alleen lokale JSON; niets wordt naar de controller gestuurd",
+    ),
+    (
+        "mm | probe tip - controlled point | plan shifts controlled by -offset",
+        "mm | tasttip - gecontroleerd punt | plan verschuift het gecontroleerde punt met \
+         -offset",
+    ),
+    ("must be a whole number", "moet een geheel getal zijn"),
+    ("must be at most", "mag maximaal"),
+    ("must be finite", "moet eindig zijn"),
+    ("must be greater than 0", "moet groter dan 0 zijn"),
+    ("must be numeric", "moet een getal zijn"),
+    ("must be within", "moet liggen tussen"),
+    (
+        "the limit for the file browser is",
+        "de limiet voor de bestandsbrowser is",
+    ),
+    ("REVIEW", "OVERZICHT"),
+    (
+        "PHYSICAL E-STOP LOCATED AND TESTED",
+        "FYSIEKE NOODSTOP GEVONDEN EN GETEST",
+    ),
+    (
+        "SPINDLE CAN BE STOPPED INDEPENDENTLY",
+        "SPINDEL KAN ONAFHANKELIJK WORDEN GESTOPT",
+    ),
+    (
+        "MACHINE TRAVEL AND SOFT LIMITS VERIFIED",
+        "MACHINEVERPLAATSING EN SOFTLIMIETEN GEVERIFIEERD",
+    ),
+    (
+        "WORKHOLDING AND TOOL CLEARANCE CHECKED",
+        "WERKSTUKOPSPANNING EN GEREEDSCHAPSVRIJHEID GECONTROLEERD",
+    ),
+    (
+        "SIMULATOR OR SPINDLE-OFF FIRST CONNECTION",
+        "EERSTE VERBINDING MET SIMULATOR OF SPINDEL UIT",
+    ),
+    (
+        "Know where it is, reach it, and prove it stops the machine before any commanded \
+         move.",
+        "Weet waar hij is, kunt hem bereiken en hebt bewezen dat hij de machine stopt vóór \
+         elke opgedragen beweging.",
+    ),
+    (
+        "Use the VFD or the power control, not this sender, to stop the cutter.",
+        "Gebruik de VFD of de voedingsregeling, niet deze sender, om de frees te stoppen.",
+    ),
+    (
+        "Confirm the physical travel and the controller's soft-limit settings.",
+        "Bevestig de fysieke verplaatsing en de softlimietinstellingen van de controller.",
+    ),
+    (
+        "Secure the stock, clear the tool, and keep hands clear of every axis.",
+        "Zet het werkstuk vast, houd het gereedschap vrij en houd handen weg van alle assen.",
+    ),
+    (
+        "Learn the sender in the simulator, then connect with the spindle off and run only \
+         status, DRO, and small jogs.",
+        "Leer de sender in de simulator, verbind daarna met de spindel uit en voer alleen \
+         status, DRO en kleine jogs uit.",
+    ),
+    ("STOPPED", "GESTOPT"),
+    ("CONFIRM APPLY TLO", "TLO TOEPASSEN BEVESTIGEN"),
+    ("CONFIRM CLEAR TLO", "TLO WISSEN BEVESTIGEN"),
+    ("HIGH CONTRAST", "HOOG CONTRAST"),
+    ("LIGHT", "LICHT"),
+    ("DARK", "DONKER"),
+    ("LEFT Y READING", "Y-METING LINKS"),
+    ("RIGHT Y READING", "Y-METING RECHTS"),
+    (
+        "OFFSETS AND CONTROLLER TOOL DATA",
+        "OFFSETS EN CONTROLLER-GEREEDSCHAPSGEGEVENS",
+    ),
+    ("CORE SETTING DEFAULTS", "STANDAARD KERNINSTELLINGEN"),
+    ("DRIVER AND PLUGIN DEFAULTS", "STANDAARDEN DRIVER EN PLUGIN"),
+    (
+        "ALL SETTINGS, PARAMETERS, STARTUP LINES, AND BUILD INFO",
+        "ALLE INSTELLINGEN, PARAMETERS, STARTREGELS EN BUILD-INFO",
+    ),
+    (
+        "Offsets and controller tool data. Local profile, backups, and saved maps stay.",
+        "Offsets en controller-gereedschapsgegevens. Lokaal profiel, back-ups en opgeslagen \
+         kaarten blijven.",
+    ),
+    (
+        "Core setting defaults. Offsets and tool data stay.",
+        "Standaardwaarden voor kerninstellingen. Offsets en gereedschapsgegevens blijven.",
+    ),
+    (
+        "Driver and plugin defaults. Core settings, offsets, and tool data stay.",
+        "Standaardwaarden voor driver en plugins. Kerninstellingen, offsets en \
+         gereedschapsgegevens blijven.",
+    ),
+    (
+        "All settings, parameters, startup lines, and build info. Most destructive.",
+        "Alle instellingen, parameters, startregels en build-info. Meest destructief.",
+    ),
+    (
+        "Offsets ($#) and controller tool data are reset. Work coordinate systems, G28/G30, \
+         G92, TLO, and the controller's tool records may be lost. Local profile data, \
+         backups, and saved height maps stay.",
+        "Offsets ($#) en controller-gereedschapsgegevens worden gereset. \
+         Werkcoördinatenstelsels, G28/G30, G92, TLO en de gereedschapsrecords van de \
+         controller kunnen verloren gaan. Lokale profielgegevens, back-ups en opgeslagen \
+         hoogtekaarten blijven.",
+    ),
+    (
+        "Core controller settings return to their defaults. Offsets and controller tool data \
+         stay. Export a backup before changing settings again.",
+        "De kerninstellingen van de controller keren terug naar hun standaardwaarden. Offsets \
+         en controller-gereedschapsgegevens blijven. Exporteer een back-up voordat je \
+         instellingen opnieuw wijzigt.",
+    ),
+    (
+        "Driver and plugin settings return to their defaults. Core settings, offsets, and \
+         controller tool data stay.",
+        "Driver- en plugininstellingen keren terug naar hun standaardwaarden. \
+         Kerninstellingen, offsets en controller-gereedschapsgegevens blijven.",
+    ),
+    (
+        "ALL settings, parameters, startup lines, and build info are reset. Offsets, tool \
+         data, and controller parameters may be unrecoverable. This is the most destructive \
+         reset and the controller will usually re-handshake.",
+        "ALLE instellingen, parameters, startregels en build-info worden gereset. Offsets, \
+         gereedschapsgegevens en controllerparameters zijn mogelijk onherstelbaar. Dit is de \
+         meest destructieve reset en de controller onderhandelt meestal opnieuw.",
+    ),
+    (
+        "Requested read-only `$#` refresh.",
+        "Alleen-lezen `$#`-verversing aangevraagd.",
+    ),
+    (
+        "Requested read-only `$$` settings dump.",
+        "Alleen-lezen `$$`-instellingenoverzicht aangevraagd.",
+    ),
+    (
+        "No read-only report is defined for driver parameters.",
+        "Er is geen alleen-lezen rapport gedefinieerd voor driverparameters.",
+    ),
+    (
+        "Requested read-only `$#` and `$$` refreshes.",
+        "Alleen-lezen `$#`- en `$$`-verversingen aangevraagd.",
+    ),
+    (
+        "MOCK MODE: controller reset needs a live controller",
+        "MOCKMODUS: controller reset vereist een actieve controller",
+    ),
+    (
+        "NOT LIVE: connect the controller before reset",
+        "NIET ACTIEF: verbind de controller vóór de reset",
+    ),
+    (
+        "LINK NOT READY: reset is disabled until the handshake completes",
+        "VERBINDING NIET GEREED: reset is uitgeschakeld tot de handshake is voltooid",
+    ),
+    (
+        "ALARM OR DOOR: clear the alarm or door state before reset",
+        "ALARM OF DEUR: wis de alarm- of deurstatus vóór de reset",
+    ),
+    (
+        "JOB ACTIVE: stop or finish the job before reset",
+        "TAAK ACTIEF: stop of voltooi de taak vóór de reset",
+    ),
+    (
+        "TOOL CHANGE PENDING: finish or stop the tool change before reset",
+        "GEREEDSCHAPSWISSEL OPENSTAAND: rond de wissel af of stop deze vóór de reset",
+    ),
+    (
+        "PROBE ACTIVE: finish or abort the probe run before reset",
+        "TASTACTIE ACTIEF: rond de tastmeting af of breek deze af vóór de reset",
+    ),
+    (
+        "HEIGHT MAP BUSY: finish the Apply or Revert before reset",
+        "HOOGTEKAART BEZIG: rond Toepassen of Terugdraaien af vóór de reset",
+    ),
+    (
+        "PENDANT ACTIVE (MPG:1): release the pendant before reset",
+        "HANDWIEL ACTIEF (MPG:1): geef het handwiel vrij vóór de reset",
+    ),
+    (
+        "SETTINGS WRITE PENDING: finish or discard it before reset",
+        "INSTELLINGSSCHRIJFACTIE OPENSTAAND: rond deze af of verwerp deze vóór de reset",
+    ),
+    (
+        "OFFSET WRITE PENDING: finish the write and refresh before reset",
+        "OFFSETSCHRIJFACTIE OPENSTAAND: rond het schrijven af en ververs vóór de reset",
+    ),
+    (
+        "NOT IDLE: reset is available only while the controller reports Idle",
+        "NIET INACTIEF: reset is alleen beschikbaar terwijl de controller Inactief meldt",
+    ),
+    (
+        "BACKUP EXPORT IN FLIGHT: wait for the export to finish",
+        "BACKUPEXPORT LOOPT: wacht tot de export klaar is",
+    ),
+    (
+        "BACKUP NOT ACKNOWLEDGED: export a backup or accept data loss first",
+        "BACKUP NIET BEVESTIGD: exporteer eerst een back-up of accepteer gegevensverlies",
+    ),
+    (
+        "LOCAL PROFILE IS NOT CHANGED AUTOMATICALLY",
+        "HET LOKALE PROFIEL WORDT NIET AUTOMATISCH GEWIJZIGD",
+    ),
+    (
+        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY. Follow the machine's \
+         squaring procedure, move or shim the gantry by hand, and verify the result with a \
+         fresh measurement before the next cut.",
+        "ALLEEN REKENHULP - DE APP BEWEEGT OF STELT HET PORTAAL NIET AF. Volg de \
+         uitlijnprocedure van de machine, beweeg of vul het portaal handmatig op en verifieer \
+         het resultaat met een nieuwe meting vóór de volgende snede.",
+    ),
+    (
+        "Positive delta and angle: the right measurement point is further along +Y (forward) \
+         than the left. Negative: the left point is further along +Y. Per-side is delta / 2: \
+         with the centre fixed, each end moves half the delta in opposite directions.",
+        "Positieve delta en hoek: het rechter meetpunt ligt verder langs +Y (naar voren) dan \
+         het linker. Negatief: het linker punt ligt verder langs +Y. Per zijde is delta / 2: \
+         met het midden vast beweegt elk uiteinde de helft van de delta in tegengestelde \
+         richtingen.",
+    ),
+    ("SENT", "VERZONDEN"),
 ];

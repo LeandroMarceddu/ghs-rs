@@ -15,6 +15,7 @@
 
 use ghs_core::Wcs;
 use ghs_engine::{Command, Program, SettingValue};
+use ghs_i18n::t;
 
 /// Upper bound for one generated surfacing program.
 pub const MAX_SURFACING_LINES: usize = 10_000;
@@ -1284,14 +1285,24 @@ impl GantrySquaring {
     /// out-of-range input.
     pub fn measure(span_mm: f64, left_y_mm: f64, right_y_mm: f64) -> Result<Self, String> {
         if !span_mm.is_finite() {
-            return Err("SPAN BETWEEN POINTS must be finite".to_string());
+            return Err(format!(
+                "{} {}",
+                t("SPAN BETWEEN POINTS"),
+                t("must be finite")
+            ));
         }
         if span_mm <= 0.0 {
-            return Err("SPAN BETWEEN POINTS must be greater than 0".to_string());
+            return Err(format!(
+                "{} {}",
+                t("SPAN BETWEEN POINTS"),
+                t("must be greater than 0")
+            ));
         }
         if span_mm > GANTRY_MAX_SPAN_MM {
             return Err(format!(
-                "SPAN BETWEEN POINTS must be at most {GANTRY_MAX_SPAN_MM:.0} mm"
+                "{} {} {GANTRY_MAX_SPAN_MM:.0} mm",
+                t("SPAN BETWEEN POINTS"),
+                t("must be at most")
             ));
         }
         validate_gantry_reading(GantryField::LeftY, left_y_mm)?;
@@ -1299,7 +1310,7 @@ impl GantrySquaring {
 
         let delta_mm = right_y_mm - left_y_mm;
         if !delta_mm.is_finite() {
-            return Err("DELTA is not finite".to_string());
+            return Err(format!("{} {}", t("DELTA"), t("is not finite")));
         }
         let angle_deg = if delta_mm == 0.0 {
             0.0
@@ -1307,11 +1318,15 @@ impl GantrySquaring {
             delta_mm.atan2(span_mm).to_degrees()
         };
         if !angle_deg.is_finite() || angle_deg.abs() > 90.0 {
-            return Err("ANGLE is not finite".to_string());
+            return Err(format!("{} {}", t("ANGLE"), t("is not finite")));
         }
         let per_side_mm = delta_mm / 2.0;
         if !per_side_mm.is_finite() {
-            return Err("PER-SIDE correction is not finite".to_string());
+            return Err(format!(
+                "{} {}",
+                t("PER-SIDE"),
+                t("correction is not finite")
+            ));
         }
         Ok(Self {
             span_mm,
@@ -1365,50 +1380,47 @@ impl GantrySquaring {
     #[must_use]
     pub fn correction_text(&self) -> String {
         if self.is_square() {
-            return "GANTRY IS SQUARE WITHIN MEASUREMENT RESOLUTION; NO CORRECTION INDICATED"
+            return t("GANTRY IS SQUARE WITHIN MEASUREMENT RESOLUTION; NO CORRECTION INDICATED")
                 .to_string();
         }
         let amount = format!("{:.3}", self.delta_mm.abs());
-        if self.delta_mm > 0.0 {
-            format!(
-                "RIGHT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE LEFT SIDE"
-            )
+        let template = if self.delta_mm > 0.0 {
+            t("RIGHT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE LEFT SIDE")
         } else {
-            format!(
-                "LEFT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE RIGHT SIDE"
-            )
-        }
+            t("LEFT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE RIGHT SIDE")
+        };
+        template.replace("{amount}", &amount)
     }
 
     /// Plain-language per-side correction when pivoting about the centre.
     #[must_use]
     pub fn per_side_note(&self) -> String {
         if self.is_square() {
-            return "NO PER-SIDE CORRECTION".to_string();
+            return t("NO PER-SIDE CORRECTION").to_string();
         }
         let amount = format!("{:.3}", self.per_side_mm.abs());
-        if self.delta_mm > 0.0 {
-            format!(
-                "PIVOT CENTRE: MOVE THE RIGHT SIDE BACK {amount} mm AND THE LEFT SIDE FORWARD \
-                 {amount} mm"
+        let template = if self.delta_mm > 0.0 {
+            t(
+                "PIVOT CENTRE: MOVE THE RIGHT SIDE BACK {amount} mm AND THE LEFT SIDE FORWARD {amount} mm",
             )
         } else {
-            format!(
-                "PIVOT CENTRE: MOVE THE LEFT SIDE BACK {amount} mm AND THE RIGHT SIDE FORWARD \
-                 {amount} mm"
+            t(
+                "PIVOT CENTRE: MOVE THE LEFT SIDE BACK {amount} mm AND THE RIGHT SIDE FORWARD {amount} mm",
             )
-        }
+        };
+        template.replace("{amount}", &amount)
     }
 }
 
 fn validate_gantry_reading(field: GantryField, value: f64) -> Result<(), String> {
     if !value.is_finite() {
-        return Err(format!("{} must be finite", field.label()));
+        return Err(format!("{} {}", t(field.label()), t("must be finite")));
     }
     if value < -GANTRY_MAX_READING_MM || value > GANTRY_MAX_READING_MM {
         return Err(format!(
-            "{} must be within {:.3} ..= {:.3} mm",
-            field.label(),
+            "{} {} {:.3} ..= {:.3} mm",
+            t(field.label()),
+            t("must be within"),
             -GANTRY_MAX_READING_MM,
             GANTRY_MAX_READING_MM
         ));
@@ -1554,22 +1566,28 @@ impl GantrySquaringModel {
 fn parse_gantry_field(field: GantryField, text: &str) -> Result<f64, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(format!("{} is empty", field.label()));
+        return Err(format!("{} {}", t(field.label()), t("is empty")));
     }
     let value = trimmed
         .parse::<f64>()
-        .map_err(|_| format!("{} must be numeric", field.label()))?;
+        .map_err(|_| format!("{} {}", t(field.label()), t("must be numeric")))?;
     if !value.is_finite() {
-        return Err(format!("{} must be finite", field.label()));
+        return Err(format!("{} {}", t(field.label()), t("must be finite")));
     }
     match field {
         GantryField::Span => {
             if value <= 0.0 {
-                return Err("SPAN BETWEEN POINTS must be greater than 0".to_string());
+                return Err(format!(
+                    "{} {}",
+                    t("SPAN BETWEEN POINTS"),
+                    t("must be greater than 0")
+                ));
             }
             if value > GANTRY_MAX_SPAN_MM {
                 return Err(format!(
-                    "SPAN BETWEEN POINTS must be at most {GANTRY_MAX_SPAN_MM:.0} mm"
+                    "{} {} {GANTRY_MAX_SPAN_MM:.0} mm",
+                    t("SPAN BETWEEN POINTS"),
+                    t("must be at most")
                 ));
             }
         }

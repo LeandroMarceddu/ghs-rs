@@ -1171,4 +1171,490 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
     ("MEASURED MOVE", "MEASURED MOVE"),
     ("CALCULATED", "CALCULATED"),
     ("CONFIRMED", "CONFIRMED"),
+    (
+        "ALLOWED: comments `(...)` or `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`.",
+        "ALLOWED: comments `(...)` or `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`.",
+    ),
+    ("ANGLE", "ANGLE"),
+    ("APPLY TLO", "APPLY TLO"),
+    (
+        "BACKUP EXPORTED THIS SESSION",
+        "BACKUP EXPORTED THIS SESSION",
+    ),
+    (
+        "BACKUP EXPORTED THIS SESSION - RESET ACKNOWLEDGED",
+        "BACKUP EXPORTED THIS SESSION - RESET ACKNOWLEDGED",
+    ),
+    ("BACKUP FILE", "BACKUP FILE"),
+    ("BACKUP REQUIRED", "BACKUP REQUIRED"),
+    ("CALCULATOR ONLY", "CALCULATOR ONLY"),
+    (
+        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY",
+        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY",
+    ),
+    ("CLEAR ALL HISTORY", "CLEAR ALL HISTORY"),
+    ("CLEAR ALL HISTORY?", "CLEAR ALL HISTORY?"),
+    (
+        "CLEAR ASKS FOR CONFIRMATION FIRST",
+        "CLEAR ASKS FOR CONFIRMATION FIRST",
+    ),
+    ("CLEAR HISTORY", "CLEAR HISTORY"),
+    ("CLEAR TLO", "CLEAR TLO"),
+    ("CONTROLLER RESET", "CONTROLLER RESET"),
+    (
+        "DATA LOSS ACKNOWLEDGED - RESET MAY PROCEED",
+        "DATA LOSS ACKNOWLEDGED - RESET MAY PROCEED",
+    ),
+    (
+        "DATA LOSS ACKNOWLEDGED BY THE OPERATOR",
+        "DATA LOSS ACKNOWLEDGED BY THE OPERATOR",
+    ),
+    ("DELTA", "DELTA"),
+    ("DELTA (TOTAL)", "DELTA (TOTAL)"),
+    ("DESTRUCTIVE", "DESTRUCTIVE"),
+    ("DROP PROGRAM TO LOAD", "DROP PROGRAM TO LOAD"),
+    (
+        "Drop exactly one program file",
+        "Drop exactly one program file",
+    ),
+    (
+        "Drop one .nc, .gcode, .tap, or .ngc program file",
+        "Drop one .nc, .gcode, .tap, or .ngc program file",
+    ),
+    ("EMPTY", "EMPTY"),
+    ("EXPORT BACKUP", "EXPORT BACKUP"),
+    (
+        "EXPORT IN FLIGHT - WAIT FOR THE WRITE TO FINISH",
+        "EXPORT IN FLIGHT - WAIT FOR THE WRITE TO FINISH",
+    ),
+    ("Enter a folder path first", "Enter a folder path first"),
+    (
+        "Enter millimetres. The span is the distance between the two measurement points; the \
+         readings are the Y values at the left and right points. CALCULATE is local \
+         arithmetic.",
+        "Enter millimetres. The span is the distance between the two measurement points; the \
+         readings are the Y values at the left and right points. CALCULATE is local \
+         arithmetic.",
+    ),
+    (
+        "Finished jobs are stored in app.json on this computer. The newest 100 records are \
+         kept; the card shows the newest 10.",
+        "Finished jobs are stored in app.json on this computer. The newest 100 records are \
+         kept; the card shows the newest 10.",
+    ),
+    (
+        "GANTRY IS SQUARE WITHIN MEASUREMENT RESOLUTION; NO CORRECTION INDICATED",
+        "GANTRY IS SQUARE WITHIN MEASUREMENT RESOLUTION; NO CORRECTION INDICATED",
+    ),
+    ("GANTRY MEASUREMENT (mm)", "GANTRY MEASUREMENT (mm)"),
+    ("GANTRY SQUARING", "GANTRY SQUARING"),
+    ("GANTRY SQUARING CALCULATOR", "GANTRY SQUARING CALCULATOR"),
+    (
+        "I HAVE A BACKUP OR ACCEPT DATA LOSS",
+        "I HAVE A BACKUP OR ACCEPT DATA LOSS",
+    ),
+    ("JOB HISTORY", "JOB HISTORY"),
+    ("LEFT FORWARD", "LEFT FORWARD"),
+    (
+        "LEFT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE RIGHT SIDE",
+        "LEFT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE RIGHT SIDE",
+    ),
+    ("LINES", "LINES"),
+    (
+        "LOCAL ONLY - NOT SENT TO THE CONTROLLER",
+        "LOCAL ONLY - NOT SENT TO THE CONTROLLER",
+    ),
+    (
+        "LOCAL ONLY - NOT SENT TO THE CONTROLLER. Records are kept in app.json on this \
+         computer, newest first.",
+        "LOCAL ONLY - NOT SENT TO THE CONTROLLER. Records are kept in app.json on this \
+         computer, newest first.",
+    ),
+    ("LOCAL PROFILE", "LOCAL PROFILE"),
+    ("LOCAL TIME", "LOCAL TIME"),
+    ("MAX", "MAX"),
+    ("MEASUREMENT RESULT", "MEASUREMENT RESULT"),
+    ("MOST DESTRUCTIVE", "MOST DESTRUCTIVE"),
+    ("Max", "Max"),
+    (
+        "Measure the Y distance from a common reference to the left and right ends of the \
+         gantry, enter the span between those points, and calculate the delta, angle, and \
+         per-side correction. Follow the machine's squaring procedure for any adjustment.",
+        "Measure the Y distance from a common reference to the left and right ends of the \
+         gantry, enter the span between those points, and calculate the delta, angle, and \
+         per-side correction. Follow the machine's squaring procedure for any adjustment.",
+    ),
+    ("NEWEST FIRST", "NEWEST FIRST"),
+    (
+        "NO BACKUP EXPORTED THIS SESSION",
+        "NO BACKUP EXPORTED THIS SESSION",
+    ),
+    ("NO JOBS RECORDED", "NO JOBS RECORDED"),
+    ("NO MOTION / NO WRITE", "NO MOTION / NO WRITE"),
+    ("NO PER-SIDE CORRECTION", "NO PER-SIDE CORRECTION"),
+    ("NOT SAVED", "NOT SAVED"),
+    (
+        "No measurement yet. Enter the span and both Y readings in the calculator.",
+        "No measurement yet. Enter the span and both Y readings in the calculator.",
+    ),
+    (
+        "No motion, probing, spindle-on, coolant-on, tool change, coordinate, or system \
+         commands.",
+        "No motion, probing, spindle-on, coolant-on, tool change, coordinate, or system \
+         commands.",
+    ),
+    (
+        "No recent files yet. A loaded local file appears here.",
+        "No recent files yet. A loaded local file appears here.",
+    ),
+    ("OF", "OF"),
+    ("ONE COMMAND", "ONE COMMAND"),
+    ("OPEN CALCULATOR", "OPEN CALCULATOR"),
+    ("OPEN HISTORY", "OPEN HISTORY"),
+    ("OPEN MACROS", "OPEN MACROS"),
+    (
+        "One .nc, .gcode, .tap, or .ngc file. Loading never starts the job.",
+        "One .nc, .gcode, .tap, or .ngc file. Loading never starts the job.",
+    ),
+    ("PER-SIDE", "PER-SIDE"),
+    ("PER-SIDE (PIVOT CENTRE)", "PER-SIDE (PIVOT CENTRE)"),
+    (
+        "PIVOT CENTRE: MOVE THE LEFT SIDE BACK {amount} mm AND THE RIGHT SIDE FORWARD \
+         {amount} mm",
+        "PIVOT CENTRE: MOVE THE LEFT SIDE BACK {amount} mm AND THE RIGHT SIDE FORWARD \
+         {amount} mm",
+    ),
+    (
+        "PIVOT CENTRE: MOVE THE RIGHT SIDE BACK {amount} mm AND THE LEFT SIDE FORWARD \
+         {amount} mm",
+        "PIVOT CENTRE: MOVE THE RIGHT SIDE BACK {amount} mm AND THE LEFT SIDE FORWARD \
+         {amount} mm",
+    ),
+    ("POST", "POST"),
+    (
+        "POST MACRO - after the final safe-Z retract",
+        "POST MACRO - after the final safe-Z retract",
+    ),
+    ("PRE", "PRE"),
+    (
+        "PRE MACRO - after the safety preamble",
+        "PRE MACRO - after the safety preamble",
+    ),
+    ("PREFLIGHT OK", "PREFLIGHT OK"),
+    ("PROBE DEFAULTS", "PROBE DEFAULTS"),
+    ("PROBE MACROS", "PROBE MACROS"),
+    (
+        "Press CALCULATE to validate the fields and show the correction.",
+        "Press CALCULATE to validate the fields and show the correction.",
+    ),
+    ("RECENT", "RECENT"),
+    ("RECENT FILES", "RECENT FILES"),
+    ("REFUSED", "REFUSED"),
+    ("REMOVE", "REMOVE"),
+    (
+        "RESET GATES READY - TWO-STEP CONFIRMATION REQUIRED",
+        "RESET GATES READY - TWO-STEP CONFIRMATION REQUIRED",
+    ),
+    ("RESET LOCKED", "RESET LOCKED"),
+    ("RESULT", "RESULT"),
+    ("RIGHT FORWARD", "RIGHT FORWARD"),
+    (
+        "RIGHT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE LEFT SIDE",
+        "RIGHT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE LEFT SIDE",
+    ),
+    ("Recent file was not removed", "Recent file was not removed"),
+    (
+        "Recent files were not cleared",
+        "Recent files were not cleared",
+    ),
+    ("SAVE DEFAULTS", "SAVE DEFAULTS"),
+    ("SAVE MACROS", "SAVE MACROS"),
+    ("SAVED", "SAVED"),
+    (
+        "SAVED PER CONTROLLER PROFILE",
+        "SAVED PER CONTROLLER PROFILE",
+    ),
+    ("SHOWING", "SHOWING"),
+    ("SPAN BETWEEN POINTS", "SPAN BETWEEN POINTS"),
+    ("SQUARE", "SQUARE"),
+    ("STEP", "STEP"),
+    (
+        "STOCK INFERRED FROM PROGRAM BOUNDS | NOT A MEASURED MODEL",
+        "STOCK INFERRED FROM PROGRAM BOUNDS | NOT A MEASURED MODEL",
+    ),
+    ("STOCK OFF", "STOCK OFF"),
+    ("STOCK ON", "STOCK ON"),
+    ("STORED", "STORED"),
+    ("TAP FOR", "TAP FOR"),
+    ("THEME", "THEME"),
+    (
+        "The controller may reset or re-handshake after this command. The app does not \
+         reconnect, home, jog, or resume anything. CANCEL sends nothing.",
+        "The controller may reset or re-handshake after this command. The app does not \
+         reconnect, home, jog, or resume anything. CANCEL sends nothing.",
+    ),
+    (
+        "There is no APPLY. Move or shim the gantry by hand, then measure again.",
+        "There is no APPLY. Move or shim the gantry by hand, then measure again.",
+    ),
+    (
+        "These lines run inside the generated probe program and are still subject to every \
+         preflight gate. SAVE MACROS writes only the local controller profile: no controller \
+         command, setting, offset, or start.",
+        "These lines run inside the generated probe program and are still subject to every \
+         preflight gate. SAVE MACROS writes only the local controller profile: no controller \
+         command, setting, offset, or start.",
+    ),
+    (
+        "This removes every stored job record from app.json on this computer. It does not \
+         change the loaded program or send anything to the controller.",
+        "This removes every stored job record from app.json on this computer. It does not \
+         change the loaded program or send anything to the controller.",
+    ),
+    (
+        "bounded pre/post lines; local profile; still subject to preflight",
+        "bounded pre/post lines; local profile; still subject to preflight",
+    ),
+    ("bytes and", "bytes and"),
+    ("correction is not finite", "correction is not finite"),
+    ("drop one program file", "drop one program file"),
+    (
+        "file contains binary data, not a G-code program",
+        "file contains binary data, not a G-code program",
+    ),
+    ("file is", "file is"),
+    ("file is empty", "file is empty"),
+    (
+        "file is not valid UTF-8 text",
+        "file is not valid UTF-8 text",
+    ),
+    ("is empty", "is empty"),
+    (
+        "is not a .nc, .gcode, .tap, or .ngc program",
+        "is not a .nc, .gcode, .tap, or .ngc program",
+    ),
+    ("is not a readable folder", "is not a readable folder"),
+    ("is not a regular file", "is not a regular file"),
+    ("is not finite", "is not finite"),
+    ("is out of range", "is out of range"),
+    ("items were dropped", "items were dropped"),
+    ("lines per macro.", "lines per macro."),
+    (
+        "local JSON only; nothing is sent to the controller",
+        "local JSON only; nothing is sent to the controller",
+    ),
+    (
+        "mm | probe tip - controlled point | plan shifts controlled by -offset",
+        "mm | probe tip - controlled point | plan shifts controlled by -offset",
+    ),
+    ("must be a whole number", "must be a whole number"),
+    ("must be at most", "must be at most"),
+    ("must be finite", "must be finite"),
+    ("must be greater than 0", "must be greater than 0"),
+    ("must be numeric", "must be numeric"),
+    ("must be within", "must be within"),
+    (
+        "the limit for the file browser is",
+        "the limit for the file browser is",
+    ),
+    ("REVIEW", "REVIEW"),
+    (
+        "PHYSICAL E-STOP LOCATED AND TESTED",
+        "PHYSICAL E-STOP LOCATED AND TESTED",
+    ),
+    (
+        "SPINDLE CAN BE STOPPED INDEPENDENTLY",
+        "SPINDLE CAN BE STOPPED INDEPENDENTLY",
+    ),
+    (
+        "MACHINE TRAVEL AND SOFT LIMITS VERIFIED",
+        "MACHINE TRAVEL AND SOFT LIMITS VERIFIED",
+    ),
+    (
+        "WORKHOLDING AND TOOL CLEARANCE CHECKED",
+        "WORKHOLDING AND TOOL CLEARANCE CHECKED",
+    ),
+    (
+        "SIMULATOR OR SPINDLE-OFF FIRST CONNECTION",
+        "SIMULATOR OR SPINDLE-OFF FIRST CONNECTION",
+    ),
+    (
+        "Know where it is, reach it, and prove it stops the machine before any commanded \
+         move.",
+        "Know where it is, reach it, and prove it stops the machine before any commanded \
+         move.",
+    ),
+    (
+        "Use the VFD or the power control, not this sender, to stop the cutter.",
+        "Use the VFD or the power control, not this sender, to stop the cutter.",
+    ),
+    (
+        "Confirm the physical travel and the controller's soft-limit settings.",
+        "Confirm the physical travel and the controller's soft-limit settings.",
+    ),
+    (
+        "Secure the stock, clear the tool, and keep hands clear of every axis.",
+        "Secure the stock, clear the tool, and keep hands clear of every axis.",
+    ),
+    (
+        "Learn the sender in the simulator, then connect with the spindle off and run only \
+         status, DRO, and small jogs.",
+        "Learn the sender in the simulator, then connect with the spindle off and run only \
+         status, DRO, and small jogs.",
+    ),
+    ("STOPPED", "STOPPED"),
+    ("CONFIRM APPLY TLO", "CONFIRM APPLY TLO"),
+    ("CONFIRM CLEAR TLO", "CONFIRM CLEAR TLO"),
+    ("HIGH CONTRAST", "HIGH CONTRAST"),
+    ("LIGHT", "LIGHT"),
+    ("DARK", "DARK"),
+    ("LEFT Y READING", "LEFT Y READING"),
+    ("RIGHT Y READING", "RIGHT Y READING"),
+    (
+        "OFFSETS AND CONTROLLER TOOL DATA",
+        "OFFSETS AND CONTROLLER TOOL DATA",
+    ),
+    ("CORE SETTING DEFAULTS", "CORE SETTING DEFAULTS"),
+    ("DRIVER AND PLUGIN DEFAULTS", "DRIVER AND PLUGIN DEFAULTS"),
+    (
+        "ALL SETTINGS, PARAMETERS, STARTUP LINES, AND BUILD INFO",
+        "ALL SETTINGS, PARAMETERS, STARTUP LINES, AND BUILD INFO",
+    ),
+    (
+        "Offsets and controller tool data. Local profile, backups, and saved maps stay.",
+        "Offsets and controller tool data. Local profile, backups, and saved maps stay.",
+    ),
+    (
+        "Core setting defaults. Offsets and tool data stay.",
+        "Core setting defaults. Offsets and tool data stay.",
+    ),
+    (
+        "Driver and plugin defaults. Core settings, offsets, and tool data stay.",
+        "Driver and plugin defaults. Core settings, offsets, and tool data stay.",
+    ),
+    (
+        "All settings, parameters, startup lines, and build info. Most destructive.",
+        "All settings, parameters, startup lines, and build info. Most destructive.",
+    ),
+    (
+        "Offsets ($#) and controller tool data are reset. Work coordinate systems, G28/G30, \
+         G92, TLO, and the controller's tool records may be lost. Local profile data, \
+         backups, and saved height maps stay.",
+        "Offsets ($#) and controller tool data are reset. Work coordinate systems, G28/G30, \
+         G92, TLO, and the controller's tool records may be lost. Local profile data, \
+         backups, and saved height maps stay.",
+    ),
+    (
+        "Core controller settings return to their defaults. Offsets and controller tool data \
+         stay. Export a backup before changing settings again.",
+        "Core controller settings return to their defaults. Offsets and controller tool data \
+         stay. Export a backup before changing settings again.",
+    ),
+    (
+        "Driver and plugin settings return to their defaults. Core settings, offsets, and \
+         controller tool data stay.",
+        "Driver and plugin settings return to their defaults. Core settings, offsets, and \
+         controller tool data stay.",
+    ),
+    (
+        "ALL settings, parameters, startup lines, and build info are reset. Offsets, tool \
+         data, and controller parameters may be unrecoverable. This is the most destructive \
+         reset and the controller will usually re-handshake.",
+        "ALL settings, parameters, startup lines, and build info are reset. Offsets, tool \
+         data, and controller parameters may be unrecoverable. This is the most destructive \
+         reset and the controller will usually re-handshake.",
+    ),
+    (
+        "Requested read-only `$#` refresh.",
+        "Requested read-only `$#` refresh.",
+    ),
+    (
+        "Requested read-only `$$` settings dump.",
+        "Requested read-only `$$` settings dump.",
+    ),
+    (
+        "No read-only report is defined for driver parameters.",
+        "No read-only report is defined for driver parameters.",
+    ),
+    (
+        "Requested read-only `$#` and `$$` refreshes.",
+        "Requested read-only `$#` and `$$` refreshes.",
+    ),
+    (
+        "MOCK MODE: controller reset needs a live controller",
+        "MOCK MODE: controller reset needs a live controller",
+    ),
+    (
+        "NOT LIVE: connect the controller before reset",
+        "NOT LIVE: connect the controller before reset",
+    ),
+    (
+        "LINK NOT READY: reset is disabled until the handshake completes",
+        "LINK NOT READY: reset is disabled until the handshake completes",
+    ),
+    (
+        "ALARM OR DOOR: clear the alarm or door state before reset",
+        "ALARM OR DOOR: clear the alarm or door state before reset",
+    ),
+    (
+        "JOB ACTIVE: stop or finish the job before reset",
+        "JOB ACTIVE: stop or finish the job before reset",
+    ),
+    (
+        "TOOL CHANGE PENDING: finish or stop the tool change before reset",
+        "TOOL CHANGE PENDING: finish or stop the tool change before reset",
+    ),
+    (
+        "PROBE ACTIVE: finish or abort the probe run before reset",
+        "PROBE ACTIVE: finish or abort the probe run before reset",
+    ),
+    (
+        "HEIGHT MAP BUSY: finish the Apply or Revert before reset",
+        "HEIGHT MAP BUSY: finish the Apply or Revert before reset",
+    ),
+    (
+        "PENDANT ACTIVE (MPG:1): release the pendant before reset",
+        "PENDANT ACTIVE (MPG:1): release the pendant before reset",
+    ),
+    (
+        "SETTINGS WRITE PENDING: finish or discard it before reset",
+        "SETTINGS WRITE PENDING: finish or discard it before reset",
+    ),
+    (
+        "OFFSET WRITE PENDING: finish the write and refresh before reset",
+        "OFFSET WRITE PENDING: finish the write and refresh before reset",
+    ),
+    (
+        "NOT IDLE: reset is available only while the controller reports Idle",
+        "NOT IDLE: reset is available only while the controller reports Idle",
+    ),
+    (
+        "BACKUP EXPORT IN FLIGHT: wait for the export to finish",
+        "BACKUP EXPORT IN FLIGHT: wait for the export to finish",
+    ),
+    (
+        "BACKUP NOT ACKNOWLEDGED: export a backup or accept data loss first",
+        "BACKUP NOT ACKNOWLEDGED: export a backup or accept data loss first",
+    ),
+    (
+        "LOCAL PROFILE IS NOT CHANGED AUTOMATICALLY",
+        "LOCAL PROFILE IS NOT CHANGED AUTOMATICALLY",
+    ),
+    (
+        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY. Follow the machine's \
+         squaring procedure, move or shim the gantry by hand, and verify the result with a \
+         fresh measurement before the next cut.",
+        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY. Follow the machine's \
+         squaring procedure, move or shim the gantry by hand, and verify the result with a \
+         fresh measurement before the next cut.",
+    ),
+    (
+        "Positive delta and angle: the right measurement point is further along +Y (forward) \
+         than the left. Negative: the left point is further along +Y. Per-side is delta / 2: \
+         with the centre fixed, each end moves half the delta in opposite directions.",
+        "Positive delta and angle: the right measurement point is further along +Y (forward) \
+         than the left. Negative: the left point is further along +Y. Per-side is delta / 2: \
+         with the centre fixed, each end moves half the delta in opposite directions.",
+    ),
+    ("SENT", "SENT"),
 ];

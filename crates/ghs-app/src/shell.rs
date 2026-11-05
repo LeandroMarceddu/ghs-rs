@@ -2303,7 +2303,7 @@ impl Shell {
         if let Err(error) = self.state.config.remove_recent_file(&path)
             && let Some(browser) = self.file_browser.as_mut()
         {
-            browser.set_error(format!("Recent file was not removed: {error}"));
+            browser.set_error(format!("{}: {error}", t("Recent file was not removed")));
         }
         cx.notify();
     }
@@ -2313,7 +2313,7 @@ impl Shell {
         if let Err(error) = self.state.config.clear_recent_files()
             && let Some(browser) = self.file_browser.as_mut()
         {
-            browser.set_error(format!("Recent files were not cleared: {error}"));
+            browser.set_error(format!("{}: {error}", t("Recent files were not cleared")));
         }
         cx.notify();
     }
@@ -4644,7 +4644,7 @@ impl Shell {
     fn save_probe_defaults(&mut self, cx: &mut Context<Self>) {
         match self.state.save_probe_defaults() {
             Ok(path) => {
-                let text = format!("SAVED: {}", path.display());
+                let text = format!("{}: {}", t("SAVED"), path.display());
                 self.state.push_console(
                     ConsoleLevel::Ok,
                     format!("Probe defaults saved to {}", path.display()),
@@ -4652,7 +4652,7 @@ impl Shell {
                 self.probe_defaults_status = Some(ProbeDefaultsStatus { saved: true, text });
             }
             Err(message) => {
-                let text = format!("NOT SAVED: {message}");
+                let text = format!("{}: {message}", t("NOT SAVED"));
                 self.state.push_console(
                     ConsoleLevel::Warn,
                     format!("Probe defaults not saved: {message}"),
@@ -4731,7 +4731,7 @@ impl Shell {
             error: Some(error.clone()),
             status: Some(ProbeMacrosStatus {
                 saved: false,
-                text: format!("NOT SAVED: {error}"),
+                text: format!("{}: {error}", t("NOT SAVED")),
             }),
         });
         self.probe_macro_inputs_dirty = true;
@@ -4745,7 +4745,7 @@ impl Shell {
             .save_probe_macros(DEMO_PROBE_PRE_MACRO, DEMO_PROBE_POST_MACRO)
         {
             Ok(path) => {
-                let text = format!("SAVED: {}", path.display());
+                let text = format!("{}: {}", t("SAVED"), path.display());
                 self.state.push_console(
                     ConsoleLevel::Ok,
                     format!("Probe macros saved to {}", path.display()),
@@ -4753,7 +4753,7 @@ impl Shell {
                 self.probe_macros_status = Some(ProbeMacrosStatus { saved: true, text });
             }
             Err(message) => {
-                let text = format!("NOT SAVED: {message}");
+                let text = format!("{}: {message}", t("NOT SAVED"));
                 self.state.push_console(
                     ConsoleLevel::Warn,
                     format!("Probe macros not saved: {message}"),
@@ -4785,7 +4785,7 @@ impl Shell {
         let result = self.state.save_probe_macros(&pre, &post);
         let (status, console, level) = match result {
             Ok(path) => {
-                let text = format!("SAVED: {}", path.display());
+                let text = format!("{}: {}", t("SAVED"), path.display());
                 (
                     ProbeMacrosStatus { saved: true, text },
                     format!("Probe macros saved to {}", path.display()),
@@ -4793,7 +4793,7 @@ impl Shell {
                 )
             }
             Err(message) => {
-                let text = format!("NOT SAVED: {message}");
+                let text = format!("{}: {message}", t("NOT SAVED"));
                 (
                     ProbeMacrosStatus {
                         saved: false,
@@ -4807,9 +4807,10 @@ impl Shell {
         let saved = status.saved;
         if let Some(editor) = self.probe_macro_editor.as_mut() {
             editor.error = (!saved).then(|| {
+                let prefix = format!("{}: ", t("NOT SAVED"));
                 status
                     .text
-                    .strip_prefix("NOT SAVED: ")
+                    .strip_prefix(&prefix)
                     .unwrap_or(&status.text)
                     .to_string()
             });
@@ -6411,7 +6412,12 @@ impl Shell {
                 .rounded_lg()
                 .text_size(px(10.0))
                 .custom(mode_variant(cx, p, true))
-                .tooltip(format!("Theme {label}; tap for {}", theme_mode_label(next)))
+                .tooltip(format!(
+                    "{}: {label} - {} {}",
+                    t("THEME"),
+                    t("TAP FOR"),
+                    theme_mode_label(next)
+                ))
                 .on_click(move |_, _, cx| {
                     view.update(cx, |this, cx| this.choose_theme_mode(next, cx));
                 })
@@ -9451,7 +9457,10 @@ impl Shell {
                         div()
                             .text_size(px(9.0))
                             .text_color(p.text_dim)
-                            .child("mm | probe tip - controlled point | plan shifts controlled by -offset"),
+                            .child(t(
+                                "mm | probe tip - controlled point | plan shifts controlled by \
+                                 -offset",
+                            )),
                     ),
             )
             .child(
@@ -9625,10 +9634,15 @@ impl Shell {
             p.border_strong
         };
         let allowlist = format!(
-            "ALLOWED: comments `(...)` or `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`. \
-             Max {MAX_PROBE_MACRO_BYTES} bytes and {MAX_PROBE_MACRO_LINES} lines per macro. \
-             No motion, probing, spindle-on, coolant-on, tool change, coordinate, or \
-             system commands."
+            "{} {} {MAX_PROBE_MACRO_BYTES} {} {MAX_PROBE_MACRO_LINES} {} {}",
+            t("ALLOWED: comments `(...)` or `;...`, `G4 P0..60`, `M0`, `M1`, `M5`, `M9`."),
+            t("Max"),
+            t("bytes and"),
+            t("lines per macro."),
+            t(
+                "No motion, probing, spindle-on, coolant-on, tool change, coordinate, or system \
+                 commands."
+            )
         );
 
         div()
@@ -9732,7 +9746,7 @@ impl Shell {
                     })
                     .when_some(status, |this, status| {
                         let text = if has_error && !status.saved {
-                            "NOT SAVED".to_string()
+                            t("NOT SAVED").to_string()
                         } else {
                             status.text
                         };
@@ -9958,7 +9972,7 @@ impl Shell {
         } else if let Some(run) = self.state.probe.run() {
             t(run.phase.label())
         } else if preflight.setup.is_some() {
-            "PREFLIGHT OK"
+            t("PREFLIGHT OK")
         } else {
             t("SETUP")
         };
@@ -10810,7 +10824,7 @@ impl Shell {
                             .text_size(px(9.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(if ok { p.success } else { p.danger })
-                            .child(if ok { t("READY") } else { "REFUSED" }),
+                            .child(if ok { t("READY") } else { t("REFUSED") }),
                     )
                     .child(div().flex_1())
                     .child(
@@ -10884,7 +10898,7 @@ impl Shell {
                     div()
                         .text_size(px(11.0))
                         .text_color(p.danger)
-                        .child(format!("REFUSED: {blocker}")),
+                        .child(format!("{}: {blocker}", t("REFUSED"))),
                 );
             }
             panel = panel.child(list);
@@ -12746,7 +12760,7 @@ impl Shell {
                         div()
                             .text_size(px(8.5))
                             .text_color(p.text_faint)
-                            .child(write.action.label()),
+                            .child(t(write.action.label())),
                     )
                     .child(
                         div()
@@ -14999,9 +15013,12 @@ impl Shell {
                     t("SQUARE")
                 };
                 format!(
-                    "DELTA {} | ANGLE {} | PER-SIDE {} | {direction}",
+                    "{} {} | {} {} | {} {} | {direction}",
+                    t("DELTA"),
                     result.delta_text(),
+                    t("ANGLE"),
                     result.angle_text(),
+                    t("PER-SIDE"),
                     result.per_side_text()
                 )
             },
@@ -16225,7 +16242,7 @@ impl Shell {
                     .text_size(px(9.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(if active { p.accent } else { p.text_faint })
-                    .child(format!("{} {}", candidate.number(), candidate.title())),
+                    .child(format!("{} {}", candidate.number(), t(candidate.title()))),
             );
         }
 
@@ -16332,7 +16349,12 @@ impl Shell {
                                     } else {
                                         p.warning
                                     })
-                                    .child(format!("ACKNOWLEDGED {acknowledged} OF {}", SafetyItem::ALL.len())),
+                                    .child(format!(
+                                        "{} {acknowledged} {} {}",
+                                        t("ACKNOWLEDGED"),
+                                        t("OF"),
+                                        SafetyItem::ALL.len()
+                                    )),
                             )
                             .child(
                                 div()
@@ -16453,9 +16475,9 @@ impl Shell {
             }
             SetupStep::Review => {
                 let unit_label = if units == CoreUnits::Mm {
-                    "MILLIMETRES (MM)"
+                    t("MILLIMETRES (MM)")
                 } else {
-                    "INCHES (IN)"
+                    t("INCHES (IN)")
                 };
                 let row = |label: &'static str, value: String| {
                     h_flex()
@@ -16606,7 +16628,13 @@ impl Shell {
                             .child(t("MACHINE SETUP")),
                     )
                     .child(chip(
-                        &format!("STEP {} OF {}", step.number(), SetupStep::ALL.len()),
+                        &format!(
+                            "{} {} {} {}",
+                            t("STEP"),
+                            step.number(),
+                            t("OF"),
+                            SetupStep::ALL.len()
+                        ),
                         p,
                     )),
             )
@@ -16741,10 +16769,10 @@ impl Shell {
         let loss_accepted = model.loss_accepted();
 
         let export_text = if model.backup_export_in_flight() {
-            "EXPORT IN FLIGHT - WAIT FOR THE WRITE TO FINISH".to_string()
+            t("EXPORT IN FLIGHT - WAIT FOR THE WRITE TO FINISH").to_string()
         } else {
             model.export_result().map_or_else(
-                || "NO BACKUP EXPORTED THIS SESSION".to_string(),
+                || t("NO BACKUP EXPORTED THIS SESSION").to_string(),
                 |result| result.text().to_string(),
             )
         };
@@ -16767,14 +16795,16 @@ impl Shell {
             };
             let detail = model.error().map_or_else(
                 || {
-                    model
-                        .last_target()
-                        .map_or("", crate::controller_reset::refresh_note)
-                        .to_string()
+                    model.last_target().map_or_else(String::new, |target| {
+                        t(crate::controller_reset::refresh_note(target)).to_string()
+                    })
                 },
                 std::string::ToString::to_string,
             );
-            (color, format!("{} {} - {detail}", result.label(), target))
+            (
+                color,
+                format!("{} {} - {detail}", t(result.label()), target),
+            )
         });
 
         let export_view = view.clone();
@@ -16794,7 +16824,7 @@ impl Shell {
                 p.border
             };
             let button = Button::new(format!("reset-{}", target.as_str()))
-                .label(format!("RESET {}", command_text(target)))
+                .label(format!("{} {}", t("RESET"), command_text(target)))
                 .h(px(48.0))
                 .w(px(164.0))
                 .flex_shrink_0()
@@ -16929,7 +16959,7 @@ impl Shell {
                     .text_size(px(10.0))
                     .text_color(p.text_faint)
                     .truncate()
-                    .child(format!("BACKUP FILE   {backup_path}")),
+                    .child(format!("{}   {backup_path}", t("BACKUP FILE"))),
             )
             .child(
                 h_flex()
@@ -16966,10 +16996,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.danger)
-                        .child(format!(
-                            "RESET LOCKED: {}",
-                            refusal.message().to_uppercase()
-                        )),
+                        .child(format!("{}: {}", t("RESET LOCKED"), t(refusal.message()))),
                 )
             })
             .when_some(backup_refusal, |this, refusal| {
@@ -16978,7 +17005,7 @@ impl Shell {
                         .text_size(px(10.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(p.warning)
-                        .child(refusal.message().to_uppercase()),
+                        .child(t(refusal.message())),
                 )
             })
             .when(can_request, |this| {
@@ -17045,12 +17072,15 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .child(section_label(t("JOB HISTORY"), p))
-                            .child(chip(&format!("{total} STORED"), p))
+                            .child(chip(&format!("{total} {}", t("STORED")), p))
                             .child(chip(t("LOCAL ONLY"), p))
-                            .child(chip(&format!("MAX {MAX_JOB_HISTORY}"), p)),
+                            .child(chip(&format!("{} {MAX_JOB_HISTORY}", t("MAX")), p)),
                     )
                     .when(total > 0, |this| {
-                        this.child(chip(&format!("SHOWING {shown} OF {total}"), p))
+                        this.child(chip(
+                            &format!("{} {shown} {} {total}", t("SHOWING"), t("OF")),
+                            p,
+                        ))
                     }),
             )
             .child(
@@ -17257,10 +17287,10 @@ impl Shell {
                                             .text_color(p.text)
                                             .child(t("JOB HISTORY")),
                                     )
-                                    .child(chip(&format!("{total} STORED"), p))
+                                    .child(chip(&format!("{total} {}", t("STORED")), p))
                                     .child(chip(t("LOCAL ONLY"), p)),
                             )
-                            .child(chip(&format!("MAX {MAX_JOB_HISTORY}"), p)),
+                            .child(chip(&format!("{} {MAX_JOB_HISTORY}", t("MAX")), p)),
                     )
                     .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
                         "LOCAL ONLY - NOT SENT TO THE CONTROLLER. Records are kept in app.json on this computer, newest first.",
@@ -19197,12 +19227,12 @@ impl Shell {
         let destructive = is_most_destructive(target);
         let action_color = if destructive { p.danger } else { p.warning };
         let backup_line = if self.state.controller_reset.export_succeeded_this_session() {
-            "BACKUP EXPORTED THIS SESSION"
+            t("BACKUP EXPORTED THIS SESSION")
         } else {
-            "DATA LOSS ACKNOWLEDGED BY THE OPERATOR"
+            t("DATA LOSS ACKNOWLEDGED BY THE OPERATOR")
         };
         let confirm_button = Button::new("reset-confirm-send")
-            .label(format!("CONFIRM {command}"))
+            .label(format!("{} {command}", t("CONFIRM")))
             .h(px(48.0))
             .flex_1()
             .rounded_lg()
@@ -19262,9 +19292,9 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(action_color)
-                                    .child(format!("RESET {command}")),
+                                    .child(format!("{} {command}", t("RESET"))),
                             )
-                            .child(chip("ONE COMMAND", p)),
+                            .child(chip(t("ONE COMMAND"), p)),
                     )
                     .child(
                         v_flex()
@@ -22725,11 +22755,11 @@ fn demo_initial_screen_arg(arg: &str) -> bool {
 
 /// Short label for a concrete theme mode, including the resolved System case.
 fn theme_mode_label(mode: ThemeMode) -> &'static str {
-    match mode {
+    t(match mode {
         ThemeMode::HighContrast => "HIGH CONTRAST",
         ThemeMode::Light => "LIGHT",
         ThemeMode::Dark | ThemeMode::System => "DARK",
-    }
+    })
 }
 
 fn mode_variant(cx: &App, p: Palette, active: bool) -> ButtonCustomVariant {
@@ -23103,7 +23133,7 @@ fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("LOCAL TIME"),
+                .child(t("LOCAL TIME")),
         )
         .child(
             div()
@@ -23112,7 +23142,7 @@ fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("PROGRAM"),
+                .child(t("PROGRAM")),
         )
         .child(
             div()
@@ -23121,7 +23151,7 @@ fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("RESULT"),
+                .child(t("RESULT")),
         )
         .child(
             h_flex()
@@ -23131,7 +23161,7 @@ fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("ACTIVE"),
+                .child(t("ACTIVE")),
         )
         .child(
             h_flex()
@@ -23141,7 +23171,7 @@ fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("LINES"),
+                .child(t("LINES")),
         )
         .child(
             div()
@@ -23150,7 +23180,7 @@ fn job_history_column_header(p: Palette, mono: &SharedString) -> Div {
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(p.text_faint)
-                .child("CHECK"),
+                .child(t("CHECK")),
         )
 }
 
@@ -23190,7 +23220,7 @@ fn job_history_row(record: &JobHistoryRecord, mono: &SharedString, p: Palette, t
                 .text_size(px(8.5))
                 .font_weight(FontWeight::BOLD)
                 .text_color(job_history_result_color(record.result, p))
-                .child(job_history_result_label(record.result)),
+                .child(t(job_history_result_label(record.result))),
         )
         .child(
             h_flex()
@@ -23228,7 +23258,7 @@ fn job_history_row(record: &JobHistoryRecord, mono: &SharedString, p: Palette, t
                             .text_size(px(8.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(p.accent)
-                            .child("CHECK"),
+                            .child(t("CHECK")),
                     )
                 }),
         )

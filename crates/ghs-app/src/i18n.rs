@@ -73,6 +73,7 @@ mod tests {
     use ghs_config::{AppConfig, ConfigStore};
 
     use super::*;
+    use crate::setup::{SafetyItem, SetupStep};
 
     /// Tests that change the process-wide locale must not interleave.
     static LOCALE_LOCK: Mutex<()> = Mutex::new(());
@@ -315,6 +316,68 @@ mod tests {
             ),
             "SATZ LÖSCHEN IST GESPERRT, WÄHREND EIN AUFTRAG LÄUFT ODER PAUSIERT"
         );
+    }
+
+    #[test]
+    fn setup_checklist_titles_and_details_translate() {
+        let _guard = locale_lock();
+        let _reset = ResetLocale;
+
+        ghs_i18n::set_locale(Locale::It);
+        assert_eq!(ghs_i18n::t(SetupStep::Review.title()), "RIEPILOGO");
+        assert_eq!(
+            ghs_i18n::t(SafetyItem::EStop.title()),
+            "E-STOP FISICO INDIVIDUATO E COLLAUDATO"
+        );
+        assert_eq!(
+            ghs_i18n::t(SafetyItem::Workholding.detail()),
+            "Fissa il pezzo, libera l'utensile e tieni le mani lontane da tutti gli assi."
+        );
+
+        ghs_i18n::set_locale(Locale::De);
+        assert_eq!(ghs_i18n::t(SetupStep::Safety.title()), "SICHERHEIT");
+        assert_eq!(
+            ghs_i18n::t(SafetyItem::TravelLimits.title()),
+            "MASCHINENVERFAHRWEG UND SOFT-LIMITS GEPRÜFT"
+        );
+        assert_eq!(
+            ghs_i18n::t(SafetyItem::SimulatorFirst.detail()),
+            "Lerne den Sender im Simulator, verbinde dann mit ausgeschalteter Spindel und führe nur Status, DRO und kleine Jogs aus."
+        );
+
+        ghs_i18n::set_locale(Locale::Nl);
+        assert_eq!(ghs_i18n::t(SetupStep::Units.title()), "EENHEDEN");
+        assert_eq!(
+            ghs_i18n::t(SafetyItem::SpindleStop.title()),
+            "SPINDEL KAN ONAFHANKELIJK WORDEN GESTOPT"
+        );
+    }
+
+    #[test]
+    fn new_feature_labels_translate_in_every_catalog() {
+        let _guard = locale_lock();
+        let _reset = ResetLocale;
+
+        ghs_i18n::set_locale(Locale::It);
+        assert_eq!(ghs_i18n::t("JOB HISTORY"), "CRONOLOGIA LAVORI");
+        assert_eq!(ghs_i18n::t("CONTROLLER RESET"), "RESET CONTROLLER");
+        assert_eq!(ghs_i18n::t("PROBE MACROS"), "MACRO SONDA");
+        assert_eq!(ghs_i18n::t("HIGH CONTRAST"), "ALTO CONTRASTO");
+        assert_eq!(ghs_i18n::t("GANTRY SQUARING"), "SQUADRATURA PORTALE");
+
+        ghs_i18n::set_locale(Locale::De);
+        assert_eq!(ghs_i18n::t("JOB HISTORY"), "AUFTRAGSVERLAUF");
+        assert_eq!(ghs_i18n::t("CONTROLLER RESET"), "CONTROLLER-RESET");
+        assert_eq!(ghs_i18n::t("PROBE MACROS"), "TASTER-MAKROS");
+        assert_eq!(ghs_i18n::t("HIGH CONTRAST"), "HOHER KONTRAST");
+        assert_eq!(ghs_i18n::t("GANTRY SQUARING"), "PORTALAUSRICHTUNG");
+
+        ghs_i18n::set_locale(Locale::Nl);
+        assert_eq!(ghs_i18n::t("JOB HISTORY"), "TAAKGESCHIEDENIS");
+        assert_eq!(ghs_i18n::t("CONTROLLER RESET"), "CONTROLLER RESETTEN");
+        assert_eq!(ghs_i18n::t("PROBE MACROS"), "TASTERMACRO'S");
+        assert_eq!(ghs_i18n::t("HIGH CONTRAST"), "HOOG CONTRAST");
+        assert_eq!(ghs_i18n::t("GANTRY SQUARING"), "PORTAAL UITLIJNEN");
     }
 
     #[test]
