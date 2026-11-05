@@ -359,6 +359,16 @@ impl OffsetModel {
         self.offsets.g92
     }
 
+    /// Reported `$#` tool-length offset on Z, when the controller sent a TLO
+    /// row. A one-value `[TLO:...]` line is interpreted as Z.
+    #[must_use]
+    pub fn reported_tlo_z_mm(&self) -> Option<f64> {
+        match self.offsets.tlo.as_deref()? {
+            [single] => Some(*single),
+            values => values.get(2).copied(),
+        }
+    }
+
     /// Active tool-length offset on Z, in millimetres.
     ///
     /// A one-value `[TLO:...]` line is interpreted as Z, matching grblHAL's
@@ -366,11 +376,7 @@ impl OffsetModel {
     /// entry. An empty or absent line is zero.
     #[must_use]
     pub fn tlo_z_mm(&self) -> f64 {
-        match self.offsets.tlo.as_deref() {
-            Some([single]) => *single,
-            Some(values) => values.get(2).copied().unwrap_or(0.0),
-            None => 0.0,
-        }
+        self.reported_tlo_z_mm().unwrap_or(0.0)
     }
 
     /// Read-only rows for the remaining `$#` parameters.

@@ -51,7 +51,12 @@
 //! telemetry and `$#` are available; `--demo-probe-check` stands in for the
 //! operator's "probe connected" confirmation on a board without `PC`;
 //! `--demo-probe-run` and `--demo-probe-apply` press the same explicit RUN and
-//! Apply/Confirm actions for simulator evidence. `--demo-height-map-apply` and
+//! Apply/Confirm actions for simulator evidence. `--demo-probe-tlo` runs the
+//! tool-length card, opens the inline `APPLY TLO` confirmation with the
+//! computed current/delta/proposed values, and presses the same confirm action
+//! once; the applied state comes only from a real `$#` read-back.
+//! `--demo-probe-tlo-confirm` stops at that confirmation without confirming it,
+//! for the confirmation screenshot. `--demo-height-map-apply` and
 //! `--demo-height-map-revert` press the same explicit height-map Apply/Confirm
 //! and Revert actions after the 4x4 demo map completes.
 //! `--demo-height-map-confirm` opens the confirmation step without confirming;

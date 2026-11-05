@@ -84,8 +84,8 @@ use crate::pins::{
 };
 use crate::probe::{
     FieldProblem, PreflightRow, ProbeCard, ProbeContext, ProbeField, ProbePhase, ProbePreflight,
-    ProbeRun, ProbeTarget, RowState, format_duration, format_estimate, format_mm,
-    height_map_summary, outcome_summary,
+    ProbeRun, ProbeTarget, RowState, ToolLengthAction, ToolLengthWriteStatus, format_duration,
+    format_estimate, format_mm, height_map_summary, outcome_summary,
 };
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::setup::{SafetyItem, SetupStep};
@@ -397,6 +397,10 @@ pub struct Shell {
     demo_probe_run_done: bool,
     demo_probe_apply: bool,
     demo_probe_apply_done: bool,
+    demo_probe_tlo: bool,
+    demo_probe_tlo_opened: bool,
+    demo_probe_tlo_done: bool,
+    demo_probe_tlo_confirm: bool,
     demo_height_map: bool,
     demo_height_map_done: bool,
     demo_height_map_export: bool,
@@ -676,10 +680,17 @@ impl Shell {
         let demo_offsets_restore = std::env::args().any(|arg| arg == "--demo-offsets-restore");
         let demo_offsets_export =
             demo_offsets_restore || std::env::args().any(|arg| arg == "--demo-offsets-export");
-        let probe_card_demo = std::env::args().find_map(|arg| {
-            arg.strip_prefix("--probe-card=")
-                .map(std::string::ToString::to_string)
-        });
+        let demo_probe_tlo = std::env::args().any(|arg| arg == "--demo-probe-tlo");
+        let demo_probe_tlo_confirm = std::env::args().any(|arg| arg == "--demo-probe-tlo-confirm");
+        let probe_card_demo = if demo_probe_tlo || demo_probe_tlo_confirm {
+            // The TLO screenshot switches always use the tool-length card.
+            Some("tool-length".to_string())
+        } else {
+            std::env::args().find_map(|arg| {
+                arg.strip_prefix("--probe-card=")
+                    .map(std::string::ToString::to_string)
+            })
+        };
         if probe_card_demo.is_some() || std::env::args().any(|arg| arg == "--probe") {
             state.mode = Mode::Probe;
         }
@@ -712,6 +723,8 @@ impl Shell {
             state.mode = Mode::Probe;
         }
         let demo_probe_run = demo_probe_apply
+            || demo_probe_tlo
+            || demo_probe_tlo_confirm
             || demo_height_map_result
             || demo_height_map_save
             || demo_height_map_confirm
@@ -818,6 +831,10 @@ impl Shell {
             demo_probe_run_done: false,
             demo_probe_apply,
             demo_probe_apply_done: false,
+            demo_probe_tlo,
+            demo_probe_tlo_opened: false,
+            demo_probe_tlo_done: false,
+            demo_probe_tlo_confirm,
             demo_height_map,
             demo_height_map_done: false,
             demo_height_map_export,
@@ -988,6 +1005,26 @@ impl Shell {
             }
         } else {
             self.offset_refresh_sent = false;
+        }
+        // A confirmed TLO write must be verified by `$#`. If the report does not
+        // arrive, fail the write and retain the old displayed value; never
+        // assume the controller applied it.
+        if self.state.probe.check_tool_length_timeout(Instant::now()) {
+            let message = self
+                .state
+                .probe
+                .tool_length_write()
+                .and_then(|write| match &write.status {
+                    ToolLengthWriteStatus::Failed { message } => Some(message.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "timed out waiting for the `$#` TLO read-back".to_string());
+            self.state.offsets.failed(message.clone());
+            self.state.push_console(
+                ConsoleLevel::Error,
+                format!("TLO write FAILED: {message}; the old TLO is retained"),
+            );
+            changed = true;
         }
         // Settings writes are idle-only and verified one at a time. Pump the
         // next queued row after the previous `SettingWritten` arrived; stop the
@@ -1508,6 +1545,34 @@ impl Shell {
         {
             self.demo_probe_apply_done = true;
             self.confirm_probe_apply(cx);
+            changed = true;
+        }
+        // Screenshot switch: run the tool-length card, open the inline TLO
+        // confirmation with the computed values, then optionally press the same
+        // confirm action once. The capture uses the real `$#` read-back; no
+        // APPLIED state is fabricated.
+        if (self.demo_probe_tlo || self.demo_probe_tlo_confirm) && !self.demo_probe_tlo_opened {
+            let complete = self.state.probe.run().is_some_and(|run| {
+                run.phase == ProbePhase::Complete
+                    && matches!(
+                        run.outcome.as_ref().map(|outcome| &outcome.value),
+                        Some(ghs_probe::ProbeValue::ToolLength { .. })
+                    )
+            });
+            if complete
+                && self.state.probe.tool_length_write().is_none()
+                && self
+                    .state
+                    .request_probe_tool_length(ToolLengthAction::Apply)
+                    .is_ok()
+            {
+                self.demo_probe_tlo_opened = true;
+                changed = true;
+            }
+        }
+        if self.demo_probe_tlo && self.demo_probe_tlo_opened && !self.demo_probe_tlo_done {
+            self.demo_probe_tlo_done = true;
+            self.confirm_probe_tlo(cx);
             changed = true;
         }
         // Screenshot switch: press the same explicit CSV export action once the
@@ -4135,6 +4200,12 @@ impl Shell {
                 "A probe run is active; finish or stop it before changing cycles",
             );
             cx.notify();
+        } else if self.state.probe.tool_length_write_in_flight() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "A TLO write is awaiting its `$#` read-back; wait for the result before changing cycles",
+            );
+            cx.notify();
         }
     }
 
@@ -4142,10 +4213,16 @@ impl Shell {
         if self.state.probe.close_card() {
             self.state.clear_saved_map_selection();
             cx.notify();
-        } else {
+        } else if self.state.probe.is_running() {
             self.state.push_console(
                 ConsoleLevel::Warn,
                 "A probe run is active; finish or stop it before leaving the cycle",
+            );
+            cx.notify();
+        } else if self.state.probe.tool_length_write_in_flight() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "A TLO write is awaiting its `$#` read-back; wait for the result before leaving the cycle",
             );
             cx.notify();
         }
@@ -4157,6 +4234,14 @@ impl Shell {
     /// gateway remains the final authority; a rejected command is shown in the
     /// console and the run is marked failed, never retried automatically.
     fn start_probe_run(&mut self, cx: &mut Context<Self>) {
+        if self.state.probe.tool_length_write_in_flight() {
+            self.state.push_console(
+                ConsoleLevel::Warn,
+                "A TLO write is awaiting its `$#` read-back; wait for the result before another run",
+            );
+            cx.notify();
+            return;
+        }
         let ctx = self.probe_context();
         let preflight = self.state.probe.preflight(&ctx);
         let Some(setup) = preflight.setup else {
@@ -4556,6 +4641,82 @@ impl Shell {
 
     fn keep_probe_result(&mut self, cx: &mut Context<Self>) {
         self.state.probe.keep_result();
+        cx.notify();
+    }
+
+    /// Open the inline confirmation for one TLO action. Nothing is sent.
+    fn request_probe_tlo(&mut self, action: ToolLengthAction, cx: &mut Context<Self>) {
+        match self.state.request_probe_tool_length(action) {
+            Ok(()) => self.state.push_console(
+                ConsoleLevel::Info,
+                format!(
+                    "{} ready: confirm the exact line. Nothing was sent.",
+                    action.label()
+                ),
+            ),
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("{} refused: {message}", action.label()),
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Close the TLO confirmation without producing a command.
+    fn cancel_probe_tlo(&mut self, cx: &mut Context<Self>) {
+        if self.state.probe.cancel_tool_length_action() {
+            self.state
+                .push_console(ConsoleLevel::Info, "TLO action cancelled; nothing was sent");
+        }
+        cx.notify();
+    }
+
+    /// Send the confirmed TLO line and request the `$#` read-back.
+    ///
+    /// The model sends exactly one `Command::Mdi` line followed by one
+    /// `Command::System(SystemCommand::Offsets)` request. A Busy `$#` request
+    /// is retried by the normal read-only refresh pump, never by another TLO
+    /// write.
+    fn confirm_probe_tlo(&mut self, cx: &mut Context<Self>) {
+        let mut refresh_busy = false;
+        let link = self.link.as_ref();
+        let result = self.state.confirm_probe_tool_length(|command| {
+            let Some(link) = link else {
+                return Err("no engine connection; the TLO write was not sent".to_string());
+            };
+            let is_refresh = matches!(&command, Command::System(SystemCommand::Offsets));
+            match link.send(command) {
+                Ok(()) => Ok(()),
+                Err(EngineError::Busy) if is_refresh => {
+                    // The MDI line is still in the streamer. Keep the write
+                    // awaiting its read-back and let the poll request `$#`
+                    // once the engine accepts it.
+                    refresh_busy = true;
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+        match result {
+            Ok(write) => {
+                self.state.offsets.command_sent(write.line.clone());
+                self.offset_refresh_sent = !refresh_busy;
+                // A Busy `$#` request is retried by the normal poll pump once
+                // the MDI line has cleared the streamer. It is never replaced
+                // by a second TLO write.
+                self.state.push_console(
+                    ConsoleLevel::Command,
+                    format!(
+                        "TLO: {} sent; waiting for the `$#` read-back before APPLIED",
+                        write.line
+                    ),
+                );
+            }
+            Err(message) => {
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("TLO write refused: {message}"));
+            }
+        }
         cx.notify();
     }
 
@@ -8361,7 +8522,7 @@ impl Shell {
         ctx: &ProbeContext,
     ) -> impl IntoElement {
         let deferred = card.deferred_note().is_some();
-        let partial = matches!(card, ProbeCard::Rotation | ProbeCard::ToolLength);
+        let partial = card == ProbeCard::Rotation;
         let status = if partial {
             "APPLY DEFERRED"
         } else if ctx.ready && ctx.has_probe {
@@ -9514,6 +9675,10 @@ impl Shell {
             ProbePhase::Complete => p.success,
             ProbePhase::Failed => p.danger,
         };
+        let tool_length = matches!(
+            run.outcome.as_ref().map(|outcome| &outcome.value),
+            Some(ghs_probe::ProbeValue::ToolLength { .. })
+        );
         let mut panel = v_flex()
             .gap_2()
             .p_2()
@@ -9613,6 +9778,17 @@ impl Shell {
         }
 
         if let Some(summary) = run.outcome.as_ref().map(outcome_summary) {
+            let mut details = summary.details.clone();
+            if tool_length && let Ok(preview) = self.state.probe.tool_length_preview() {
+                details.push((
+                    "Current TLO".to_string(),
+                    format!("{} mm", format_mm(preview.current_tlo_mm)),
+                ));
+                details.push((
+                    "Proposed TLO".to_string(),
+                    format!("{} mm", format_mm(preview.target_tlo_mm)),
+                ));
+            }
             panel = panel
                 .child(
                     div()
@@ -9623,8 +9799,7 @@ impl Shell {
                 )
                 .child(
                     h_flex().flex_wrap().gap_2().children(
-                        summary
-                            .details
+                        details
                             .iter()
                             .map(|(label, value)| probe_detail_cell(label, value, p)),
                     ),
@@ -9641,6 +9816,12 @@ impl Shell {
                     .text_color(p.danger)
                     .child(format!("STOPPED: {error}")),
             );
+        }
+
+        // Tool-length actions and values come before the raw audit block so the
+        // preview and both actions are visible without scrolling at 1280x800.
+        if run.phase == ProbePhase::Complete && run.map.is_none() && tool_length {
+            panel = panel.child(self.probe_apply_section(p, cx, run));
         }
 
         if !run.raw.is_empty() {
@@ -9683,7 +9864,7 @@ impl Shell {
         }
 
         if run.phase == ProbePhase::Complete {
-            if run.map.is_none() {
+            if run.map.is_none() && !tool_length {
                 panel = panel.child(self.probe_apply_section(p, cx, run));
             }
         } else if run.phase == ProbePhase::Failed {
@@ -10946,6 +11127,12 @@ impl Shell {
     }
 
     fn probe_apply_section(&self, p: Palette, cx: &mut Context<Self>, run: &ProbeRun) -> Div {
+        if matches!(
+            run.outcome.as_ref().map(|outcome| &outcome.value),
+            Some(ghs_probe::ProbeValue::ToolLength { .. })
+        ) {
+            return self.probe_tool_length_section(p, cx, run);
+        }
         let supported = self.state.probe.apply_supported();
         let mut section = v_flex().gap_2().pt_2().border_t_1().border_color(p.border);
 
@@ -11035,9 +11222,6 @@ impl Shell {
             .and_then(|outcome| match &outcome.value {
                 ghs_probe::ProbeValue::Rotation { .. } => {
                     Some("Rotation is reported only; applying work rotation is deferred.")
-                }
-                ghs_probe::ProbeValue::ToolLength { .. } => {
-                    Some("TLO apply is deferred until the tool-change workflow owns it.")
                 }
                 _ => None,
             })
@@ -11177,6 +11361,224 @@ impl Shell {
         section
     }
 
+    /// Tool-length result values and the confirmed `G43.1`/`G49` actions.
+    ///
+    /// The preview and every button are local until `CONFIRM ...` is pressed.
+    /// The old TLO is retained in the display; `APPLIED` appears only after a
+    /// matching `$#` read-back.
+    fn probe_tool_length_section(
+        &self,
+        p: Palette,
+        cx: &mut Context<Self>,
+        _run: &ProbeRun,
+    ) -> Div {
+        let preview = self.state.probe.tool_length_preview();
+        let gate = self.state.probe_tool_length_gate().check();
+        let in_flight = self.state.probe.tool_length_write_in_flight();
+        let action_allowed = gate.is_ok() && !in_flight;
+        let mut section = v_flex().gap_1().pt_1().border_t_1().border_color(p.border);
+
+        if let Err(error) = &preview {
+            section = section.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.danger)
+                    .child(format!("TLO preview refused: {error}")),
+            );
+        }
+
+        if let Some(write) = self.state.probe.tool_length_write() {
+            let (chip, color, detail) = match &write.status {
+                ToolLengthWriteStatus::AwaitingReadBack => (
+                    t("PENDING"),
+                    p.warning,
+                    "`$#` read-back pending; APPLIED only after it matches".to_string(),
+                ),
+                ToolLengthWriteStatus::Applied { reported_tlo_mm } => (
+                    t("APPLIED"),
+                    p.success,
+                    format!("`$#` reports {} mm", format_mm(*reported_tlo_mm)),
+                ),
+                ToolLengthWriteStatus::Failed { message } => (
+                    t("FAILED"),
+                    p.danger,
+                    format!("{message}; old TLO retained"),
+                ),
+            };
+            section = section.child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .p_1()
+                    .rounded(px(6.0))
+                    .bg(color.opacity(0.10))
+                    .border_1()
+                    .border_color(color.opacity(0.45))
+                    .child(
+                        div()
+                            .px_2()
+                            .h(px(20.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(color.opacity(0.16))
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(color)
+                            .child(chip),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(p.text_faint)
+                            .child(write.action.label()),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(p.text)
+                            .child(write.line.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_dim)
+                            .child(detail),
+                    ),
+            );
+        }
+
+        if let Some(action) = self.state.probe.tool_length_confirmation() {
+            let line = match action {
+                ToolLengthAction::Apply => preview.as_ref().map_or_else(
+                    |error| format!("G43.1 unavailable: {error}"),
+                    |preview| preview.apply_line(),
+                ),
+                ToolLengthAction::Clear => "G49".to_string(),
+            };
+            let confirm_view = cx.entity();
+            let cancel_view = cx.entity();
+            section = section.child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .p_1()
+                    .rounded(px(6.0))
+                    .bg(p.warning.opacity(0.10))
+                    .border_1()
+                    .border_color(p.warning.opacity(0.5))
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .flex_shrink_0()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.warning)
+                            .child(t(action.confirm_label())),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(12.0))
+                            .text_color(p.text)
+                            .child(line),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("probe-tlo-confirm")
+                            .label(t(action.confirm_label()))
+                            .warning()
+                            .h(px(48.0))
+                            .w(px(170.0))
+                            .rounded_lg()
+                            .text_size(px(9.5))
+                            .disabled(!action_allowed)
+                            .on_click(move |_, _, cx| {
+                                confirm_view.update(cx, |this, cx| {
+                                    this.confirm_probe_tlo(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("probe-tlo-cancel")
+                            .label(t("CANCEL"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(96.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                cancel_view.update(cx, |this, cx| {
+                                    this.cancel_probe_tlo(cx);
+                                });
+                            }),
+                    )
+                    .when(!action_allowed, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(p.warning)
+                                .child(gate.clone().err().unwrap_or_default()),
+                        )
+                    }),
+            );
+        } else {
+            let apply_view = cx.entity();
+            let clear_view = cx.entity();
+            section =
+                section.child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Button::new("probe-tlo-apply")
+                                .label(t("APPLY TLO"))
+                                .primary()
+                                .h(px(48.0))
+                                .w(px(140.0))
+                                .rounded_lg()
+                                .text_size(px(11.0))
+                                .disabled(!action_allowed || preview.is_err())
+                                .on_click(move |_, _, cx| {
+                                    apply_view.update(cx, |this, cx| {
+                                        this.request_probe_tlo(ToolLengthAction::Apply, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("probe-tlo-clear")
+                                .label(t("CLEAR TLO"))
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(140.0))
+                                .rounded_lg()
+                                .text_size(px(11.0))
+                                .disabled(!action_allowed)
+                                .on_click(move |_, _, cx| {
+                                    clear_view.update(cx, |this, cx| {
+                                        this.request_probe_tlo(ToolLengthAction::Clear, cx);
+                                    });
+                                }),
+                        )
+                        .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                            match gate {
+                                Ok(()) => {
+                                    "Confirm every write; `$#` read-back required".to_string()
+                                }
+                                Err(reason) => format!("locked: {reason}"),
+                            },
+                        )),
+                );
+        }
+
+        section
+    }
+
     fn probe_footer(
         &self,
         p: Palette,
@@ -11184,7 +11586,9 @@ impl Shell {
         preflight: &ProbePreflight,
         running: bool,
     ) -> Div {
-        let can_run = preflight.setup.is_some() && !running;
+        let can_run = preflight.setup.is_some()
+            && !running
+            && !self.state.probe.tool_length_write_in_flight();
         let (title, title_color, detail) = if running {
             (
                 "PROBE PROGRAM RUNNING".to_string(),
@@ -11230,6 +11634,18 @@ impl Shell {
                             }
                         }
                     }
+                }
+                ProbePhase::Complete
+                    if matches!(
+                        run.outcome.as_ref().map(|outcome| &outcome.value),
+                        Some(ghs_probe::ProbeValue::ToolLength { .. })
+                    ) =>
+                {
+                    (
+                        "PROBE COMPLETE: review APPLY TLO or CLEAR TLO".to_string(),
+                        p.success,
+                        "G43.1/G49 are idle-only; every write needs confirmation and a `$#` read-back",
+                    )
                 }
                 ProbePhase::Complete if !self.state.probe.apply_supported() => (
                     "PROBE COMPLETE: result reported, apply deferred".to_string(),

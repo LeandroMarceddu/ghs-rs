@@ -598,6 +598,7 @@ impl LiveLink {
             }
             EngineEvent::Error(code) => {
                 state.startup_lines.on_controller_error(code);
+                state.probe.on_controller_error(code);
                 if state.offsets.status().is_pending() {
                     state.offsets.failed(format!("error:{code}"));
                 }

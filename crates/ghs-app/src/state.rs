@@ -17,8 +17,8 @@ use ghs_config::{HeightMapRecord, Macro as ConfigMacro, ProbeOffsetRecord};
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
     Axis as CoreAxis, Command, ControllerInfo, EngineEvent, JobAbortReason, JobInfo,
-    JobPauseReason, JobState, LastEvents, LimitState, MachineSnapshot, Offsets, PinMapping,
-    PinState, Position, Program, ProgramLine as EngineProgramLine, SettingValue,
+    JobPauseReason, JobState, LastEvents, LimitState, MachineSnapshot, MachineState, Offsets,
+    PinMapping, PinState, Position, Program, ProgramLine as EngineProgramLine, SettingValue,
     Signals as CoreSignals, StartupLine, StatusReport, ToolEntry, Wcs,
 };
 use ghs_i18n::t;
@@ -32,7 +32,7 @@ use crate::macros::{MacroModel, MacroRunGate, MacroRunRequest};
 use crate::offsets::OffsetModel;
 use crate::offsets_export::{OffsetsBackupModel, OffsetsExport};
 use crate::pins::PinsModel;
-use crate::probe::{ProbeField, ProbeModel};
+use crate::probe::{ProbeField, ProbeModel, ToolLengthAction, ToolLengthGate, ToolLengthWrite};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::setup::{SafetyItem, SetupModel, SetupStep};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
@@ -3887,9 +3887,80 @@ impl AppState {
     }
 
     /// Install the latest engine `$#` snapshot.
+    ///
+    /// A confirmed TLO write is verified against the reported `TLO` row here.
+    /// The old value is never replaced optimistically: `APPLIED` appears only
+    /// when the read-back matches the target.
     pub fn apply_offsets(&mut self, offsets: &Offsets) {
         self.sync_offset_context();
         self.offsets.apply_engine(offsets);
+        if self
+            .probe
+            .on_offsets_reported(self.offsets.reported_tlo_z_mm())
+        {
+            let notice = self
+                .probe
+                .tool_length_write()
+                .and_then(|write| match &write.status {
+                    crate::probe::ToolLengthWriteStatus::Applied { reported_tlo_mm } => Some((
+                        ConsoleLevel::Ok,
+                        format!(
+                            "TLO applied: {} verified by `$#` at {} mm",
+                            write.line,
+                            crate::probe::format_mm(*reported_tlo_mm)
+                        ),
+                    )),
+                    crate::probe::ToolLengthWriteStatus::Failed { message } => Some((
+                        ConsoleLevel::Error,
+                        format!("TLO write FAILED: {message}; the old TLO is retained"),
+                    )),
+                    crate::probe::ToolLengthWriteStatus::AwaitingReadBack => None,
+                });
+            if let Some((level, message)) = notice {
+                self.push_console(level, message);
+            }
+        }
+    }
+
+    /// Controller gate for the tool-length apply/clear actions.
+    #[must_use]
+    pub fn probe_tool_length_gate(&self) -> ToolLengthGate {
+        ToolLengthGate {
+            live: self.live,
+            ready: self.connection.is_ready_like(),
+            machine_state: MachineState::parse(self.machine_state),
+            job_active: self.job.is_active(),
+            offsets_pending: self.offsets.status().is_pending(),
+        }
+    }
+
+    /// Open the inline confirmation for a TLO action. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate refusal or the probe model's build/completion error.
+    pub fn request_probe_tool_length(&mut self, action: ToolLengthAction) -> Result<(), String> {
+        self.probe_tool_length_gate().check()?;
+        self.probe.request_tool_length_action(action)
+    }
+
+    /// Confirm and send one TLO write through the caller's sender.
+    ///
+    /// The model sends exactly one `Command::Mdi` line followed by one
+    /// `Command::System(SystemCommand::Offsets)` request. No other command is
+    /// produced by this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate refusal, a missing confirmation, a build error, or the
+    /// sender rejection. The model records a failed write on a sender error.
+    pub fn confirm_probe_tool_length(
+        &mut self,
+        send: impl FnMut(Command) -> Result<(), String>,
+    ) -> Result<ToolLengthWrite, String> {
+        let gate = self.probe_tool_length_gate();
+        gate.check()?;
+        self.probe.confirm_tool_length_action(gate, send)
     }
 
     /// Install the controller-reported, read-only `[T:...]` tool table.
@@ -8360,5 +8431,240 @@ mod tests {
         state.open_setup();
         assert_eq!(state.setup.step(), SetupStep::Safety);
         assert_eq!(state.setup.acknowledged_count(), 0);
+    }
+
+    /// A live, ready, Idle state with one completed tool-length probe.
+    ///
+    /// Reference -10, contact -8 gives delta +2; `current_tlo_mm` selects the
+    /// proposed target (`current + 2`).
+    fn completed_tool_length_state(label: &str, current_tlo_mm: f64) -> AppState {
+        let (mut state, _dir, _info) = state_with_profile(label);
+        state.connection = ConnectionState::Ready;
+        state.machine_state = "Idle";
+        let ctx = ProbeContext {
+            live: true,
+            ready: true,
+            machine_state: MachineState::Idle,
+            job_active: false,
+            machine_pos_mm: Position::xyz(0.0, 0.0, 0.0),
+            work_pos_mm: Position::zero(),
+            wcs: Wcs::G54,
+            wcs_value_mm: Position::zero(),
+            g92_mm: Position::zero(),
+            tlo_z_mm: current_tlo_mm,
+            spindle_on: false,
+            coolant_on: false,
+            has_probe: true,
+            has_probe_connected_signal: false,
+            probe_disconnected: false,
+            probe_triggered: false,
+            offsets_reported: true,
+            units: Units::Millimetre,
+        };
+        state
+            .probe
+            .select_card(crate::probe::ProbeCard::ToolLength, &ctx);
+        state.probe.probe_connected_confirmed = true;
+        state
+            .probe
+            .set_field_text(ProbeField::ReferenceZ, "-10.000")
+            .expect("reference Z");
+        let setup = state
+            .probe
+            .preflight(&ctx)
+            .setup
+            .expect("tool-length preflight");
+        let name = setup.plan.name.clone();
+        state.probe.begin(setup);
+        assert!(state.probe.on_job_loaded(&name));
+        assert!(state.probe.on_job_started());
+        assert!(state.probe.bind_result(ghs_engine::ProbeResult::new(
+            true,
+            Position::xyz(0.0, 0.0, -8.0)
+        )));
+        assert!(state.probe.on_job_completed());
+        state
+    }
+
+    #[test]
+    fn probe_tlo_confirm_sends_exactly_one_mdi_line_and_one_offsets_request() {
+        let mut state = completed_tool_length_state("probe-tlo-send", 4.0);
+        state
+            .request_probe_tool_length(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        let write = state
+            .confirm_probe_tool_length(recorded_send(&mut sent))
+            .expect("confirmed TLO write");
+        assert_eq!(
+            sent,
+            vec![
+                Command::Mdi("G43.1 Z6.000".to_string()),
+                Command::System(ghs_engine::SystemCommand::Offsets),
+            ]
+        );
+        assert_eq!(write.line, "G43.1 Z6.000");
+        assert_eq!(write.target_tlo_mm, 6.0);
+        assert!(state.probe.tool_length_write_in_flight());
+    }
+
+    #[test]
+    fn probe_tlo_matching_read_back_marks_applied_from_live_offsets() {
+        let mut state = completed_tool_length_state("probe-tlo-applied", 4.0);
+        state
+            .request_probe_tool_length(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        state
+            .confirm_probe_tool_length(recorded_send(&mut sent))
+            .expect("confirmed TLO write");
+
+        let offsets = Offsets {
+            tlo: Some(vec![0.0, 0.0, 6.0]),
+            ..Offsets::default()
+        };
+        state.apply_offsets(&offsets);
+
+        assert_eq!(
+            state.probe.tool_length_write().map(|write| &write.status),
+            Some(&crate::probe::ToolLengthWriteStatus::Applied {
+                reported_tlo_mm: 6.0
+            })
+        );
+        assert!(!state.probe.tool_length_write_in_flight());
+        assert_eq!(
+            state
+                .probe
+                .tool_length_preview()
+                .expect("preview")
+                .current_tlo_mm,
+            4.0
+        );
+    }
+
+    #[test]
+    fn probe_tlo_mismatched_read_back_fails_and_keeps_the_old_value() {
+        let mut state = completed_tool_length_state("probe-tlo-mismatch", 4.0);
+        state
+            .request_probe_tool_length(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        state
+            .confirm_probe_tool_length(recorded_send(&mut sent))
+            .expect("confirmed TLO write");
+
+        let offsets = Offsets {
+            tlo: Some(vec![0.0, 0.0, 6.4]),
+            ..Offsets::default()
+        };
+        state.apply_offsets(&offsets);
+
+        let write = state.probe.tool_length_write().expect("write");
+        assert!(
+            matches!(
+                &write.status,
+                crate::probe::ToolLengthWriteStatus::Failed { message }
+                    if message.contains("6.400") && message.contains("6.000")
+            ),
+            "{:?}",
+            write.status
+        );
+        assert_eq!(
+            state
+                .probe
+                .tool_length_preview()
+                .expect("preview")
+                .current_tlo_mm,
+            4.0,
+            "the old TLO stays displayed"
+        );
+    }
+
+    #[test]
+    fn probe_tlo_gates_refuse_without_sending_a_command() {
+        let cases = [
+            "live controller",
+            "not ready",
+            "Alarm",
+            "Door",
+            "job is active",
+            "Idle",
+            "$#",
+        ];
+        for (index, needle) in cases.into_iter().enumerate() {
+            let mut state = completed_tool_length_state(&format!("probe-tlo-gate-{index}"), 4.0);
+            match index {
+                0 => {
+                    state.live = false;
+                    state.connection = ConnectionState::Mock;
+                }
+                1 => state.connection = ConnectionState::Connecting,
+                2 => state.machine_state = "Alarm",
+                3 => state.machine_state = "Door",
+                4 => state.job.started(1, 4),
+                5 => state.machine_state = "Hold",
+                6 => state.offsets.command_sent("G10 L20 P1 X0.000"),
+                _ => unreachable!(),
+            }
+            // Open a confirmation through the model so the refusal below is the
+            // gate, not a missing confirmation.
+            state
+                .probe
+                .request_tool_length_action(ToolLengthAction::Apply)
+                .expect("model confirmation");
+            let mut sent = Vec::new();
+
+            let error = state
+                .request_probe_tool_length(ToolLengthAction::Clear)
+                .expect_err("request gate closed");
+            assert!(error.contains(needle), "request: {error}");
+            let error = state
+                .confirm_probe_tool_length(recorded_send(&mut sent))
+                .expect_err("confirm gate closed");
+            assert!(error.contains(needle), "confirm: {error}");
+            assert!(sent.is_empty(), "a refused gate sends nothing");
+        }
+    }
+
+    #[test]
+    fn probe_tlo_path_has_no_motion_start_load_g10_or_tlr_command() {
+        for action in [ToolLengthAction::Apply, ToolLengthAction::Clear] {
+            let mut state = completed_tool_length_state("probe-tlo-commands", 4.0);
+            state
+                .request_probe_tool_length(action)
+                .expect("open confirmation");
+            let mut sent = Vec::new();
+            state
+                .confirm_probe_tool_length(recorded_send(&mut sent))
+                .expect("confirmed TLO write");
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            for command in &sent {
+                match command {
+                    Command::Mdi(line) => {
+                        assert!(
+                            line == "G43.1 Z6.000" || line == "G49",
+                            "unexpected MDI line {line}"
+                        );
+                        for forbidden in [
+                            "G0", "G1 ", "G10", "G28", "G30", "G53", "G92", "M3", "M4", "M5", "M8",
+                            "M9", "$TLR",
+                        ] {
+                            assert!(!line.contains(forbidden), "forbidden {forbidden} in {line}");
+                        }
+                    }
+                    Command::System(ghs_engine::SystemCommand::Offsets) => {}
+                    other => panic!("unexpected command {other:?}"),
+                }
+            }
+            assert!(!sent.iter().any(|command| matches!(
+                command,
+                Command::LoadProgram { .. }
+                    | Command::StartProgram { .. }
+                    | Command::ResumeProgram
+                    | Command::Jog(_)
+                    | Command::Home
+                    | Command::SetSetting { .. }
+            )));
+        }
     }
 }

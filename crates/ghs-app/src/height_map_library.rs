@@ -456,6 +456,8 @@ mod tests {
             apply_confirm: false,
             kept: false,
             applied_line: None,
+            tool_length_confirm: None,
+            tool_length_write: None,
             checkpoints: Vec::new(),
             paused_after_probe: None,
             stop_requested: false,

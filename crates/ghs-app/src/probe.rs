@@ -1,10 +1,11 @@
 //! Probe workspace model.
 //!
 //! This module owns the preflight inputs, the `ghs-probe` plan/result binding,
-//! and the `G10 L2` offset commands the shell sends after an explicit Apply.
-//! It holds no GPUI types and never talks to a transport, so the safety gates,
-//! unit conversion, correlation and command formatting are testable without a
-//! window or an engine.
+//! the `G10 L2` offset commands the shell sends after an explicit Apply, and
+//! the confirmed `G43.1`/`G49` tool-length write model with its `$#`
+//! verification. It holds no GPUI types and never talks to a transport, so the
+//! safety gates, unit conversion, correlation and command formatting are
+//! testable without a window or an engine.
 //!
 //! # Frame conventions
 //!
@@ -24,12 +25,17 @@
 //! off, the probe is verified (PC signal when reported, otherwise an explicit
 //! operator checkbox), the probe is not already triggered, and `$#` has
 //! answered so the WCS conversion is real. The engine safety gateway remains
-//! the final authority; nothing here sends motion.
+//! the final authority; nothing here sends motion. A tool-length apply/clear
+//! additionally requires a completed cycle, an explicit confirmation, an Idle
+//! controller, and no other TLO write awaiting its `$#` read-back.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ghs_core::Units;
-use ghs_engine::{Axis as CoreAxis, MachineState, Position, ProbeResult, Wcs};
+use ghs_engine::{
+    Axis as CoreAxis, Command, MachineState, Position, ProbeResult, SystemCommand, Wcs,
+};
 use ghs_probe::{
     CornerProbe, EdgeMode, EdgeSpec, HeightMap, HeightMapEstimate, HeightMapGrid,
     MAX_CIRCLE_TOUCHES, MAX_COORDINATE_MM, MAX_EDGE_OFFSET_MM, MAX_HEIGHT_MAP_AXIS_POINTS,
@@ -43,6 +49,18 @@ use ghs_viewer::Point2;
 
 use crate::state::Units as DisplayUnits;
 use crate::viewer::{HeightCell, HeightOverlay};
+
+/// Largest absolute dynamic tool-length offset accepted for `G43.1`.
+///
+/// The reference envelope is far smaller. The bound rejects a typo before any
+/// command is built and keeps the emitted line comfortably bounded.
+pub const MAX_TOOL_LENGTH_MM: f64 = 10_000.0;
+
+/// Accepted difference between the requested TLO and the `$#` read-back.
+pub const TOOL_LENGTH_READBACK_TOLERANCE_MM: f64 = 0.001;
+
+/// How long a confirmed TLO write waits for its `$#` read-back.
+pub const TOOL_LENGTH_READBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One editable numeric preflight field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -416,7 +434,9 @@ impl ProbeCard {
             ProbeCard::XyTouchPlate => {
                 "Two outside plate edges; sets X/Y zero at the plate corner."
             }
-            ProbeCard::ToolLength => "Down onto the reference; reports delta, TLO apply deferred.",
+            ProbeCard::ToolLength => {
+                "Down onto the reference; reports delta and offers confirmed G43.1 TLO apply."
+            }
             ProbeCard::HeightMap => {
                 "Bounded Z grid; measured map overlay and explicit Apply/Revert."
             }
@@ -462,7 +482,8 @@ impl ProbeCard {
             }
             ProbeCard::ToolLength => {
                 "Probes down onto a reference surface and reports the signed tool-length delta. \
-                 Applying TLO or `$TLR` is deferred until the tool-change workflow owns it."
+                 APPLY TLO writes the absolute target with G43.1 and verifies the reported `$#` \
+                 value; CLEAR TLO sends G49. Neither action is automatic."
             }
             ProbeCard::HeightMap => {
                 "Row-major grid of Z touches with a retract between points. Missing cells stay \
@@ -477,10 +498,6 @@ impl ProbeCard {
             ProbeCard::Rotation => Some(
                 "The rotation cycle runs and reports the measured angle. Applying work rotation is \
                  controller/app dependent and is deferred; no G10 rotation word is sent.",
-            ),
-            ProbeCard::ToolLength => Some(
-                "The tool-length cycle runs and reports the delta. Applying TLO/`$TLR` is deferred \
-                 until the tool-change workflow owns it; no TLO write is sent from this card.",
             ),
             _ => None,
         }
@@ -603,6 +620,159 @@ impl ProbeCard {
                 ProbeField::Diameter,
             ],
         }
+    }
+}
+
+/// One confirmed dynamic tool-length write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolLengthAction {
+    /// Write the proposed absolute TLO with `G43.1`.
+    Apply,
+    /// Cancel the TLO with `G49`.
+    Clear,
+}
+
+impl ToolLengthAction {
+    /// Button label before the confirmation step.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            ToolLengthAction::Apply => "APPLY TLO",
+            ToolLengthAction::Clear => "CLEAR TLO",
+        }
+    }
+
+    /// Confirmation button/title label.
+    #[must_use]
+    pub const fn confirm_label(self) -> &'static str {
+        match self {
+            ToolLengthAction::Apply => "CONFIRM APPLY TLO",
+            ToolLengthAction::Clear => "CONFIRM CLEAR TLO",
+        }
+    }
+}
+
+/// Computed TLO values for the completed tool-length cycle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolLengthPreview {
+    /// TLO captured when the run started, in millimetres.
+    pub current_tlo_mm: f64,
+    /// Measured signed delta (`contact - reference`), in millimetres.
+    pub delta_mm: f64,
+    /// Proposed absolute TLO (`current + delta`), in millimetres.
+    pub target_tlo_mm: f64,
+}
+
+impl ToolLengthPreview {
+    /// Exact `G43.1` line for the proposed target.
+    #[must_use]
+    pub fn apply_line(&self) -> String {
+        format!("G43.1 Z{}", format_mm(self.target_tlo_mm))
+    }
+
+    /// Exact line that clears the dynamic TLO.
+    #[must_use]
+    pub const fn clear_line() -> &'static str {
+        "G49"
+    }
+}
+
+/// Controller preconditions for a TLO apply or clear.
+///
+/// The completed run, confirmation, and single-write rule live in
+/// [`ProbeModel`]; this gate covers the live machine state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolLengthGate {
+    /// A live engine session is open (`--mock` is refused).
+    pub live: bool,
+    /// The handshake completed.
+    pub ready: bool,
+    /// Current controller state.
+    pub machine_state: MachineState,
+    /// A job runner is feeding or paused.
+    pub job_active: bool,
+    /// Another offset write is waiting for its `$#` read-back.
+    pub offsets_pending: bool,
+}
+
+impl ToolLengthGate {
+    /// Validate the gate and return the first refusal reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for mock/no link, not ready, Alarm/Door, an active
+    /// job, a non-Idle machine, or another offset write in flight.
+    pub fn check(self) -> Result<(), String> {
+        if !self.live {
+            return Err("a live controller is required; mock mode has no TLO write".to_string());
+        }
+        if !self.ready {
+            return Err("the controller is not ready".to_string());
+        }
+        if matches!(self.machine_state, MachineState::Alarm | MachineState::Door) {
+            return Err(format!(
+                "the controller is in {}; recover before a TLO write",
+                self.machine_state.as_str()
+            ));
+        }
+        if self.job_active {
+            return Err("a job is active".to_string());
+        }
+        if self.machine_state != MachineState::Idle {
+            return Err("the controller must be Idle".to_string());
+        }
+        if self.offsets_pending {
+            return Err("another offset write is awaiting `$#`".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Lifecycle of one confirmed TLO write.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ToolLengthWriteStatus {
+    /// The line was accepted; waiting for the `$#` TLO read-back.
+    AwaitingReadBack,
+    /// `$#` reported the requested value.
+    Applied {
+        /// Reported TLO on Z, in millimetres.
+        reported_tlo_mm: f64,
+    },
+    /// The write was refused, unverified, mismatched, timed out or interrupted.
+    Failed {
+        /// Operator-facing reason.
+        message: String,
+    },
+}
+
+impl ToolLengthWriteStatus {
+    /// Whether the write is still waiting for its read-back.
+    #[must_use]
+    pub fn is_awaiting_read_back(&self) -> bool {
+        matches!(self, ToolLengthWriteStatus::AwaitingReadBack)
+    }
+}
+
+/// One confirmed TLO line and its verification state.
+#[derive(Clone, Debug)]
+pub struct ToolLengthWrite {
+    /// Action that produced the line.
+    pub action: ToolLengthAction,
+    /// Exact MDI line sent.
+    pub line: String,
+    /// Absolute target TLO in millimetres; zero for `G49`.
+    pub target_tlo_mm: f64,
+    /// Verification lifecycle.
+    pub status: ToolLengthWriteStatus,
+    /// When the line was accepted, for the read-back deadline.
+    started_at: Instant,
+}
+
+impl ToolLengthWrite {
+    /// Whether this write still blocks another TLO write.
+    #[must_use]
+    pub fn is_in_flight(&self) -> bool {
+        self.status.is_awaiting_read_back()
     }
 }
 
@@ -796,6 +966,10 @@ pub struct ProbeRun {
     pub kept: bool,
     /// A `G10 L2` line was sent by this run.
     pub applied_line: Option<String>,
+    /// The operator is confirming one TLO action.
+    pub tool_length_confirm: Option<ToolLengthAction>,
+    /// The last TLO write and its `$#` verification state.
+    pub tool_length_write: Option<ToolLengthWrite>,
     /// 1-based source lines at which the runner should pause after each probe.
     ///
     /// The app sets one engine breakpoint on the retract line immediately after
@@ -836,6 +1010,8 @@ impl ProbeRun {
             apply_confirm: false,
             kept: false,
             applied_line: None,
+            tool_length_confirm: None,
+            tool_length_write: None,
             checkpoints,
             paused_after_probe: None,
             stop_requested: false,
@@ -1180,10 +1356,11 @@ impl ProbeModel {
 
     /// Open a card and seed its geometry from the current pose.
     ///
-    /// Ignored while a probe run is active: a new card must never replace the
-    /// plan whose results are still being bound.
+    /// Ignored while a probe run is active or a TLO write is waiting for its
+    /// `$#` read-back: a new card must never replace the plan whose result or
+    /// write is still being resolved.
     pub fn select_card(&mut self, card: ProbeCard, ctx: &ProbeContext) -> bool {
-        if self.is_running() {
+        if self.is_running() || self.tool_length_write_in_flight() {
             return false;
         }
         self.card = Some(card);
@@ -1192,9 +1369,9 @@ impl ProbeModel {
         true
     }
 
-    /// Return to the card grid. Ignored while a run is active.
+    /// Return to the card grid. Ignored while a run or TLO write is active.
     pub fn close_card(&mut self) -> bool {
-        if self.is_running() {
+        if self.is_running() || self.tool_length_write_in_flight() {
             return false;
         }
         self.card = None;
@@ -2202,14 +2379,30 @@ impl ProbeModel {
 
     /// An alarm event.
     pub fn on_alarm(&mut self, code: u16) -> bool {
-        self.fail(format!(
+        let probe_failed = self.fail(format!(
             "ALARM:{code}; recover manually before another probe"
+        ));
+        let tlo_failed =
+            self.fail_tool_length_write(format!("ALARM:{code}; the TLO write was not verified"));
+        probe_failed || tlo_failed
+    }
+
+    /// A controller error event.
+    ///
+    /// A completed probe value stays for audit, but a TLO write waiting for
+    /// `$#` can no longer be trusted.
+    pub fn on_controller_error(&mut self, code: u16) -> bool {
+        self.fail_tool_length_write(format!(
+            "controller error:{code}; the TLO write was not verified"
         ))
     }
 
     /// A disconnect event.
     pub fn on_disconnected(&mut self) -> bool {
-        self.fail("disconnected; telemetry and offsets are stale".to_string())
+        let probe_failed = self.fail("disconnected; telemetry and offsets are stale".to_string());
+        let tlo_failed =
+            self.fail_tool_length_write("disconnected; the TLO write was not verified".to_string());
+        probe_failed || tlo_failed
     }
 
     /// Offset targets implied by the completed outcome.
@@ -2275,6 +2468,299 @@ impl ProbeModel {
             .as_ref()
             .and_then(|run| run.outcome.as_ref())
             .is_some_and(|outcome| apply_targets(&outcome.value).is_ok())
+    }
+
+    /// TLO values for the completed tool-length cycle.
+    ///
+    /// `current_tlo_mm` is the TLO captured when the run started,
+    /// `delta_mm` is the measured `contact - reference`, and
+    /// `target_tlo_mm` is their sum rounded to the millimetre formatting used
+    /// by the emitted line.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the run is incomplete or not a tool-length cycle,
+    /// when the current TLO or delta is non-finite, or when the target is
+    /// outside `+/-` [`MAX_TOOL_LENGTH_MM`].
+    pub fn tool_length_preview(&self) -> Result<ToolLengthPreview, String> {
+        let run = self
+            .run
+            .as_ref()
+            .ok_or_else(|| "no probe run to apply".to_string())?;
+        let (current_tlo_mm, delta_mm) = tool_length_parts(run)?;
+        if !current_tlo_mm.is_finite() {
+            return Err("the current TLO is not finite".to_string());
+        }
+        if !delta_mm.is_finite() {
+            return Err("the tool-length delta is not finite".to_string());
+        }
+        let target_tlo_mm = round_mm(current_tlo_mm + delta_mm);
+        if !target_tlo_mm.is_finite() {
+            return Err("the target TLO is not finite".to_string());
+        }
+        if target_tlo_mm.abs() > MAX_TOOL_LENGTH_MM {
+            return Err(format!(
+                "the target TLO {} mm is outside +/-{:.0} mm",
+                format_mm(target_tlo_mm),
+                MAX_TOOL_LENGTH_MM
+            ));
+        }
+        Ok(ToolLengthPreview {
+            current_tlo_mm,
+            delta_mm,
+            target_tlo_mm,
+        })
+    }
+
+    /// Exact `G49` line for the completed tool-length cycle.
+    ///
+    /// Clearing does not depend on the proposed target, so it stays available
+    /// when the measured delta cannot produce a valid `G43.1` target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the run is incomplete or not a tool-length cycle.
+    pub fn tool_length_clear_line(&self) -> Result<String, String> {
+        let run = self
+            .run
+            .as_ref()
+            .ok_or_else(|| "no probe run to apply".to_string())?;
+        let _ = tool_length_parts(run)?;
+        Ok(ToolLengthPreview::clear_line().to_string())
+    }
+
+    /// TLO action currently waiting for the operator's confirmation.
+    #[must_use]
+    pub fn tool_length_confirmation(&self) -> Option<ToolLengthAction> {
+        self.run.as_ref().and_then(|run| run.tool_length_confirm)
+    }
+
+    /// Last TLO write, including its verification state.
+    #[must_use]
+    pub fn tool_length_write(&self) -> Option<&ToolLengthWrite> {
+        self.run
+            .as_ref()
+            .and_then(|run| run.tool_length_write.as_ref())
+    }
+
+    /// Whether a TLO write is still waiting for its `$#` read-back.
+    #[must_use]
+    pub fn tool_length_write_in_flight(&self) -> bool {
+        self.tool_length_write()
+            .is_some_and(ToolLengthWrite::is_in_flight)
+    }
+
+    /// Open the inline confirmation for one TLO action. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the run is incomplete, the action cannot be
+    /// built, or another TLO write is still awaiting its read-back.
+    pub fn request_tool_length_action(&mut self, action: ToolLengthAction) -> Result<(), String> {
+        match action {
+            ToolLengthAction::Apply => {
+                let _ = self.tool_length_preview()?;
+            }
+            ToolLengthAction::Clear => {
+                let _ = self.tool_length_clear_line()?;
+            }
+        }
+        let run = self
+            .run
+            .as_mut()
+            .ok_or_else(|| "no probe run to apply".to_string())?;
+        if run
+            .tool_length_write
+            .as_ref()
+            .is_some_and(ToolLengthWrite::is_in_flight)
+        {
+            return Err("a TLO write is already awaiting its `$#` read-back".to_string());
+        }
+        run.tool_length_confirm = Some(action);
+        run.kept = false;
+        Ok(())
+    }
+
+    /// Cancel the inline TLO confirmation. Nothing is sent.
+    ///
+    /// Returns `true` when a confirmation was open.
+    pub fn cancel_tool_length_action(&mut self) -> bool {
+        self.run
+            .as_mut()
+            .and_then(|run| run.tool_length_confirm.take())
+            .is_some()
+    }
+
+    /// Consume the confirmed TLO action, send exactly one MDI line and one
+    /// `$#` request, then wait for the verified read-back.
+    ///
+    /// A gate refusal or a missing confirmation sends nothing. A sender
+    /// rejection is recorded as `FAILED`; no retry is scheduled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate refusal, a missing confirmation, a build error, or the
+    /// sender rejection.
+    pub fn confirm_tool_length_action(
+        &mut self,
+        gate: ToolLengthGate,
+        mut send: impl FnMut(Command) -> Result<(), String>,
+    ) -> Result<ToolLengthWrite, String> {
+        gate.check()?;
+        let (action, in_flight) = {
+            let run = self
+                .run
+                .as_ref()
+                .ok_or_else(|| "no probe run to apply".to_string())?;
+            if run.phase != ProbePhase::Complete {
+                return Err("the probe run has not completed".to_string());
+            }
+            let action = run
+                .tool_length_confirm
+                .ok_or_else(|| "confirm the TLO action before sending it".to_string())?;
+            let in_flight = run
+                .tool_length_write
+                .as_ref()
+                .is_some_and(ToolLengthWrite::is_in_flight);
+            (action, in_flight)
+        };
+        if in_flight {
+            return Err("a TLO write is already awaiting its `$#` read-back".to_string());
+        }
+        let (line, target_tlo_mm) = match action {
+            ToolLengthAction::Apply => {
+                let preview = self.tool_length_preview()?;
+                (preview.apply_line(), preview.target_tlo_mm)
+            }
+            ToolLengthAction::Clear => (self.tool_length_clear_line()?, 0.0),
+        };
+        if let Err(error) = send(Command::Mdi(line.clone())) {
+            let message = format!("the engine rejected {line}: {error}");
+            self.record_tool_length_failure(action, line, target_tlo_mm, message.clone());
+            return Err(message);
+        }
+        if let Err(error) = send(Command::System(SystemCommand::Offsets)) {
+            let message = format!(
+                "{line} was sent but the `$#` read-back request failed: {error}; the TLO is \
+                 unverified"
+            );
+            self.record_tool_length_failure(action, line, target_tlo_mm, message.clone());
+            return Err(message);
+        }
+        let write = ToolLengthWrite {
+            action,
+            line,
+            target_tlo_mm,
+            status: ToolLengthWriteStatus::AwaitingReadBack,
+            started_at: Instant::now(),
+        };
+        if let Some(run) = self.run.as_mut() {
+            run.tool_length_confirm = None;
+            run.tool_length_write = Some(write.clone());
+        }
+        Ok(write)
+    }
+
+    /// Verify the in-flight TLO write against the reported `$#` value.
+    ///
+    /// Returns `true` only when this report resolved the waiting write; an
+    /// unrelated or already-resolved report changes nothing.
+    pub fn on_offsets_reported(&mut self, tlo_z_mm: Option<f64>) -> bool {
+        let Some(run) = self.run.as_mut() else {
+            return false;
+        };
+        let Some(write) = run.tool_length_write.as_mut() else {
+            return false;
+        };
+        if !write.status.is_awaiting_read_back() {
+            return false;
+        }
+        write.status = match tlo_z_mm {
+            None => ToolLengthWriteStatus::Failed {
+                message: "`$#` did not report a TLO value".to_string(),
+            },
+            Some(reported) if !reported.is_finite() => ToolLengthWriteStatus::Failed {
+                message: "`$#` reported a non-finite TLO value".to_string(),
+            },
+            Some(reported)
+                if (reported - write.target_tlo_mm).abs() <= TOOL_LENGTH_READBACK_TOLERANCE_MM =>
+            {
+                ToolLengthWriteStatus::Applied {
+                    reported_tlo_mm: reported,
+                }
+            }
+            Some(reported) => ToolLengthWriteStatus::Failed {
+                message: format!(
+                    "`$#` reported TLO {} mm but the target is {} mm",
+                    format_mm(reported),
+                    format_mm(write.target_tlo_mm)
+                ),
+            },
+        };
+        true
+    }
+
+    /// Mark a waiting TLO write as failed after an alarm, error, disconnect or
+    /// operator timeout. A resolved write is left unchanged.
+    ///
+    /// Returns `true` when this call changed the state.
+    pub fn fail_tool_length_write(&mut self, reason: impl Into<String>) -> bool {
+        let Some(run) = self.run.as_mut() else {
+            return false;
+        };
+        let Some(write) = run.tool_length_write.as_mut() else {
+            return false;
+        };
+        if !write.status.is_awaiting_read_back() {
+            return false;
+        }
+        write.status = ToolLengthWriteStatus::Failed {
+            message: reason.into(),
+        };
+        true
+    }
+
+    /// Fail a waiting TLO write once the `$#` deadline expires.
+    ///
+    /// `now` is supplied by the shell so the timeout is deterministic in tests.
+    ///
+    /// Returns `true` when this call timed the write out.
+    pub fn check_tool_length_timeout(&mut self, now: Instant) -> bool {
+        let Some(run) = self.run.as_mut() else {
+            return false;
+        };
+        let Some(write) = run.tool_length_write.as_mut() else {
+            return false;
+        };
+        if !write.status.is_awaiting_read_back() {
+            return false;
+        }
+        if now.saturating_duration_since(write.started_at) < TOOL_LENGTH_READBACK_TIMEOUT {
+            return false;
+        }
+        write.status = ToolLengthWriteStatus::Failed {
+            message: "timed out waiting for the `$#` TLO read-back".to_string(),
+        };
+        true
+    }
+
+    fn record_tool_length_failure(
+        &mut self,
+        action: ToolLengthAction,
+        line: String,
+        target_tlo_mm: f64,
+        message: String,
+    ) {
+        if let Some(run) = self.run.as_mut() {
+            run.tool_length_confirm = None;
+            run.tool_length_write = Some(ToolLengthWrite {
+                action,
+                line,
+                target_tlo_mm,
+                status: ToolLengthWriteStatus::Failed { message },
+                started_at: Instant::now(),
+            });
+        }
     }
 
     /// Record that the shell sent the apply line and start the `$#` refresh.
@@ -2536,6 +3022,23 @@ fn cycle_error_field(message: &str) -> Option<ProbeField> {
     None
 }
 
+/// TLO values implied by a completed tool-length run.
+///
+/// Returns `(current_tlo_mm, delta_mm)`.
+fn tool_length_parts(run: &ProbeRun) -> Result<(f64, f64), String> {
+    if run.phase != ProbePhase::Complete {
+        return Err("the probe run has not completed".to_string());
+    }
+    let outcome = run
+        .outcome
+        .as_ref()
+        .ok_or_else(|| "no computed probe value".to_string())?;
+    let ProbeValue::ToolLength { offset_mm, .. } = &outcome.value else {
+        return Err("this probe run is not a tool-length cycle".to_string());
+    };
+    Ok((run.setup.tlo_z_mm, *offset_mm))
+}
+
 /// Offset targets for a computed value: `(axis, machine coordinate)`.
 fn apply_targets(value: &ProbeValue) -> Result<Vec<(CoreAxis, f64)>, String> {
     Ok(match value {
@@ -2548,10 +3051,7 @@ fn apply_targets(value: &ProbeValue) -> Result<Vec<(CoreAxis, f64)>, String> {
             vec![(CoreAxis::X, center.x_mm), (CoreAxis::Y, center.y_mm)]
         }
         ProbeValue::ToolLength { .. } => {
-            return Err(
-                "tool-length apply is deferred; no TLO/`$TLR` write is sent from this card"
-                    .to_string(),
-            );
+            return Err("tool-length uses a G43.1 TLO write, not a G10 L2 WCS offset".to_string());
         }
         ProbeValue::Rotation { .. } => {
             return Err(
@@ -2606,7 +3106,6 @@ pub fn outcome_summary(outcome: &ProbeOutcome) -> OutcomeSummary {
                     "Contact Z".to_string(),
                     format!("{} mm", format_mm(*contact_z_mm)),
                 ),
-                ("Apply".to_string(), "TLO apply is deferred".to_string()),
             ],
         },
         ProbeValue::Edge {
@@ -2829,9 +3328,14 @@ pub fn probe_checkpoints(program: &str) -> Vec<u32> {
     checkpoints
 }
 
+/// Round a millimetre value to the three decimals used by emitted lines.
+fn round_mm(value: f64) -> f64 {
+    (value * 1_000.0).round() / 1_000.0
+}
+
 /// Format a millimetre value with three decimals, normalising negative zero.
 pub fn format_mm(value: f64) -> String {
-    let rounded = (value * 1_000.0).round() / 1_000.0;
+    let rounded = round_mm(value);
     if rounded == 0.0 || rounded.abs() < 0.000_5 {
         "0.000".to_string()
     } else {
@@ -2882,6 +3386,53 @@ mod tests {
         ctx.machine_pos_mm = Position::xyz(0.0, 0.0, 0.0);
         assert!(model.select_card(card, &ctx));
         model.probe_connected_confirmed = true;
+        model
+    }
+
+    fn recorded_send<'a>(
+        sent: &'a mut Vec<Command>,
+    ) -> impl FnMut(Command) -> Result<(), String> + 'a {
+        move |command| {
+            sent.push(command);
+            Ok(())
+        }
+    }
+
+    fn ready_tlo_gate() -> ToolLengthGate {
+        ToolLengthGate {
+            live: true,
+            ready: true,
+            machine_state: MachineState::Idle,
+            job_active: false,
+            offsets_pending: false,
+        }
+    }
+
+    /// Build a completed tool-length run with a known reference/contact pair.
+    fn completed_tool_length(
+        current_tlo_mm: f64,
+        reference_z_mm: f64,
+        contact_z_mm: f64,
+    ) -> ProbeModel {
+        let mut ctx = context();
+        ctx.tlo_z_mm = current_tlo_mm;
+        ctx.machine_pos_mm = Position::xyz(0.0, 0.0, 0.0);
+        let mut model = ProbeModel::default();
+        assert!(model.select_card(ProbeCard::ToolLength, &ctx));
+        model.probe_connected_confirmed = true;
+        model
+            .set_field_text(ProbeField::ReferenceZ, format!("{reference_z_mm:.3}"))
+            .expect("reference Z");
+        let setup = model.prepare(&ctx).expect("tool-length plan");
+        let name = setup.plan.name.clone();
+        model.begin(setup);
+        assert!(model.on_job_loaded(&name));
+        assert!(model.on_job_started());
+        assert!(model.bind_result(ProbeResult::new(
+            true,
+            Position::xyz(0.0, 0.0, contact_z_mm)
+        )));
+        assert!(model.on_job_completed());
         model
     }
 
@@ -4247,6 +4798,425 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tool_length_preview_adds_a_positive_delta_to_the_current_tlo() {
+        let model = completed_tool_length(4.0, -10.0, -8.0);
+        let preview = model.tool_length_preview().expect("preview");
+        assert_eq!(preview.current_tlo_mm, 4.0);
+        assert_eq!(preview.delta_mm, 2.0);
+        assert_eq!(preview.target_tlo_mm, 6.0);
+        assert_eq!(preview.apply_line(), "G43.1 Z6.000");
+    }
+
+    #[test]
+    fn tool_length_preview_adds_a_negative_delta_to_the_current_tlo() {
+        let model = completed_tool_length(4.0, -10.0, -13.0);
+        let preview = model.tool_length_preview().expect("preview");
+        assert_eq!(preview.current_tlo_mm, 4.0);
+        assert_eq!(preview.delta_mm, -3.0);
+        assert_eq!(preview.target_tlo_mm, 1.0);
+        assert_eq!(preview.apply_line(), "G43.1 Z1.000");
+    }
+
+    #[test]
+    fn tool_length_builds_exactly_g431_and_g49() {
+        let model = completed_tool_length(4.0, -10.0, -8.0);
+        let preview = model.tool_length_preview().expect("preview");
+        assert_eq!(preview.apply_line(), "G43.1 Z6.000");
+        assert_eq!(
+            model.tool_length_clear_line().expect("clear line"),
+            "G49".to_string()
+        );
+        assert!(!preview.apply_line().contains('$'));
+        assert!(!preview.apply_line().contains("TLR"));
+    }
+
+    #[test]
+    fn tool_length_requires_confirmation_and_cancel_sends_nothing() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        let mut sent = Vec::new();
+        assert!(
+            model
+                .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+                .is_err(),
+            "no confirmation was opened"
+        );
+        assert!(sent.is_empty(), "confirmation is mandatory");
+
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        assert_eq!(
+            model.tool_length_confirmation(),
+            Some(ToolLengthAction::Apply)
+        );
+        assert!(sent.is_empty(), "opening the sheet sends nothing");
+
+        assert!(model.cancel_tool_length_action());
+        assert_eq!(model.tool_length_confirmation(), None);
+        assert!(
+            model
+                .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+                .is_err(),
+            "cancel must not leave a command behind"
+        );
+        assert!(sent.is_empty(), "cancel sends nothing");
+    }
+
+    #[test]
+    fn confirming_tool_length_sends_one_mdi_line_and_one_offsets_request() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        let write = model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("confirmed write");
+        assert_eq!(
+            sent,
+            vec![
+                Command::Mdi("G43.1 Z6.000".to_string()),
+                Command::System(SystemCommand::Offsets),
+            ]
+        );
+        assert_eq!(write.line, "G43.1 Z6.000");
+        assert_eq!(write.target_tlo_mm, 6.0);
+        assert_eq!(write.status, ToolLengthWriteStatus::AwaitingReadBack);
+        assert!(model.tool_length_write_in_flight());
+    }
+
+    #[test]
+    fn tool_length_gates_refuse_before_sending_anything() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let gates = [
+            (
+                ToolLengthGate {
+                    live: false,
+                    ..ready_tlo_gate()
+                },
+                "live controller",
+            ),
+            (
+                ToolLengthGate {
+                    ready: false,
+                    ..ready_tlo_gate()
+                },
+                "not ready",
+            ),
+            (
+                ToolLengthGate {
+                    machine_state: MachineState::Alarm,
+                    ..ready_tlo_gate()
+                },
+                "Alarm",
+            ),
+            (
+                ToolLengthGate {
+                    machine_state: MachineState::Door,
+                    ..ready_tlo_gate()
+                },
+                "Door",
+            ),
+            (
+                ToolLengthGate {
+                    job_active: true,
+                    ..ready_tlo_gate()
+                },
+                "job is active",
+            ),
+            (
+                ToolLengthGate {
+                    machine_state: MachineState::Hold,
+                    ..ready_tlo_gate()
+                },
+                "Idle",
+            ),
+            (
+                ToolLengthGate {
+                    offsets_pending: true,
+                    ..ready_tlo_gate()
+                },
+                "$#",
+            ),
+        ];
+        for (gate, needle) in gates {
+            let mut sent = Vec::new();
+            let error = model
+                .confirm_tool_length_action(gate, recorded_send(&mut sent))
+                .expect_err("closed gate");
+            assert!(error.contains(needle), "{error}");
+            assert!(sent.is_empty(), "a refused gate sends nothing");
+        }
+
+        // A still-open confirmation works once the gate is open again.
+        let mut sent = Vec::new();
+        model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("gate reopened");
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn matching_tool_length_read_back_marks_applied() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("confirmed write");
+
+        assert!(model.on_offsets_reported(Some(6.0)));
+        assert_eq!(
+            model.tool_length_write().map(|write| &write.status),
+            Some(&ToolLengthWriteStatus::Applied {
+                reported_tlo_mm: 6.0
+            })
+        );
+        let preview = model.tool_length_preview().expect("old preview retained");
+        assert_eq!(preview.current_tlo_mm, 4.0);
+        assert_eq!(preview.target_tlo_mm, 6.0);
+    }
+
+    #[test]
+    fn mismatched_tool_length_read_back_fails_and_keeps_the_old_value() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("confirmed write");
+
+        assert!(model.on_offsets_reported(Some(6.5)));
+        let write = model.tool_length_write().expect("write");
+        assert!(
+            matches!(
+                &write.status,
+                ToolLengthWriteStatus::Failed { message }
+                    if message.contains("6.500") && message.contains("6.000")
+            ),
+            "{:?}",
+            write.status
+        );
+        let preview = model.tool_length_preview().expect("preview");
+        assert_eq!(preview.current_tlo_mm, 4.0, "old TLO stays displayed");
+        assert_eq!(preview.target_tlo_mm, 6.0);
+    }
+
+    #[test]
+    fn non_finite_or_out_of_range_tool_length_targets_are_refused() {
+        let mut out_of_range = completed_tool_length(MAX_TOOL_LENGTH_MM, -10.0, -8.0);
+        let error = out_of_range
+            .tool_length_preview()
+            .expect_err("target above the bound");
+        assert!(error.contains("outside"), "{error}");
+        assert!(
+            out_of_range
+                .request_tool_length_action(ToolLengthAction::Apply)
+                .is_err()
+        );
+        assert_eq!(out_of_range.tool_length_confirmation(), None);
+
+        let mut non_finite = completed_tool_length(4.0, -10.0, -8.0);
+        if let Some(run) = non_finite.run_mut() {
+            run.setup.tlo_z_mm = f64::NAN;
+        }
+        let error = non_finite
+            .tool_length_preview()
+            .expect_err("non-finite current TLO");
+        assert!(error.contains("current TLO"), "{error}");
+
+        let mut bad_delta = completed_tool_length(4.0, -10.0, -8.0);
+        if let Some(outcome) = bad_delta.run_mut().and_then(|run| run.outcome.as_mut()) {
+            let ProbeValue::ToolLength { offset_mm, .. } = &mut outcome.value else {
+                panic!("wrong value");
+            };
+            *offset_mm = f64::INFINITY;
+        }
+        let error = bad_delta
+            .tool_length_preview()
+            .expect_err("non-finite delta");
+        assert!(error.contains("delta"), "{error}");
+    }
+
+    #[test]
+    fn tool_length_write_never_emits_motion_start_load_g10_or_tlr() {
+        for action in [ToolLengthAction::Apply, ToolLengthAction::Clear] {
+            let mut model = completed_tool_length(4.0, -10.0, -8.0);
+            model
+                .request_tool_length_action(action)
+                .expect("open confirmation");
+            let mut sent = Vec::new();
+            model
+                .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+                .expect("confirmed write");
+            assert_eq!(sent.len(), 2);
+            for command in &sent {
+                match command {
+                    Command::Mdi(line) => {
+                        assert!(
+                            line == "G43.1 Z6.000" || line == "G49",
+                            "unexpected MDI line {line}"
+                        );
+                        for forbidden in [
+                            "G0", "G1 ", "G2 ", "G3 ", "G10", "G28", "G30", "G53", "G92", "M3",
+                            "M4", "M5", "M6", "M7", "M8", "M9", "$TLR",
+                        ] {
+                            assert!(!line.contains(forbidden), "forbidden {forbidden} in {line}");
+                        }
+                    }
+                    Command::System(SystemCommand::Offsets) => {}
+                    other => panic!("unexpected command {other:?}"),
+                }
+            }
+            assert!(
+                !sent.iter().any(|command| matches!(
+                    command,
+                    Command::LoadProgram { .. }
+                        | Command::StartProgram { .. }
+                        | Command::ResumeProgram
+                        | Command::Jog(_)
+                        | Command::Home
+                        | Command::SetSetting { .. }
+                )),
+                "{sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pending_tool_length_write_blocks_a_second_one_until_it_resolves() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("confirmed write");
+        assert!(model.tool_length_write_in_flight());
+        let ctx = context();
+        assert!(
+            !model.select_card(ProbeCard::EdgeX, &ctx),
+            "an in-flight TLO write cannot be discarded"
+        );
+        assert!(!model.close_card());
+
+        assert!(
+            model
+                .request_tool_length_action(ToolLengthAction::Clear)
+                .is_err()
+        );
+        assert!(
+            model
+                .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+                .is_err()
+        );
+        assert_eq!(sent.len(), 2, "no second line was sent");
+
+        assert!(model.on_offsets_reported(Some(6.0)));
+        assert!(model.close_card(), "a resolved write allows navigation");
+        assert!(
+            model
+                .request_tool_length_action(ToolLengthAction::Clear)
+                .is_err(),
+            "leaving the card discards the run"
+        );
+    }
+
+    #[test]
+    fn tool_length_read_back_timeout_fails_and_keeps_the_old_value() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Apply)
+            .expect("open confirmation");
+        let mut sent = Vec::new();
+        model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("confirmed write");
+
+        assert!(!model.check_tool_length_timeout(Instant::now()));
+        assert!(model.check_tool_length_timeout(Instant::now() + TOOL_LENGTH_READBACK_TIMEOUT));
+        let write = model.tool_length_write().expect("write");
+        assert!(
+            matches!(
+                &write.status,
+                ToolLengthWriteStatus::Failed { message } if message.contains("timed out")
+            ),
+            "{:?}",
+            write.status
+        );
+        assert_eq!(
+            model
+                .tool_length_preview()
+                .expect("old preview retained")
+                .current_tlo_mm,
+            4.0
+        );
+    }
+
+    #[test]
+    fn clear_tool_length_sends_g49_and_verifies_zero() {
+        let mut model = completed_tool_length(4.0, -10.0, -8.0);
+        model
+            .request_tool_length_action(ToolLengthAction::Clear)
+            .expect("open clear confirmation");
+        assert_eq!(
+            model.tool_length_confirmation(),
+            Some(ToolLengthAction::Clear)
+        );
+        let mut sent = Vec::new();
+        let write = model
+            .confirm_tool_length_action(ready_tlo_gate(), recorded_send(&mut sent))
+            .expect("confirmed clear");
+        assert_eq!(
+            sent,
+            vec![
+                Command::Mdi("G49".to_string()),
+                Command::System(SystemCommand::Offsets),
+            ]
+        );
+        assert_eq!(write.target_tlo_mm, 0.0);
+        assert!(model.on_offsets_reported(Some(0.0)));
+        assert!(matches!(
+            model.tool_length_write().map(|write| &write.status),
+            Some(ToolLengthWriteStatus::Applied {
+                reported_tlo_mm: 0.0
+            })
+        ));
+    }
+
+    #[test]
+    fn existing_wcs_apply_still_works_for_an_edge_cycle() {
+        let ctx = context();
+        let mut model = model(ProbeCard::EdgeX);
+        model
+            .set_field_text(ProbeField::ExpectedX, "30.000")
+            .expect("expected X");
+        let setup = model.prepare(&ctx).expect("edge plan");
+        let name = setup.plan.name.clone();
+        model.begin(setup);
+        assert!(model.on_job_loaded(&name));
+        assert!(model.on_job_started());
+        assert!(model.bind_result(ProbeResult::new(true, Position::xyz(27.0, 20.0, -1.0))));
+        assert!(model.on_job_completed());
+        let lines = model.apply_lines().expect("G10 apply");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("G10 L2 P1 X"), "{lines:?}");
+        assert!(!lines[0].contains('$'));
+        assert!(
+            model.tool_length_preview().is_err(),
+            "a WCS edge cycle is not a TLO cycle"
+        );
     }
 
     #[test]
