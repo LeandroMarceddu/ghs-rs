@@ -28,7 +28,12 @@
 //! the line-number transform preview for the loaded demo program.
 //! `--demo-calibration` fills the stepper-calibration fields and shows the
 //! proposal without applying it; `--demo-calibration-confirm` opens the write
-//! confirmation. `--demo-soft-limits` enables `$20` through the normal settings
+//! confirmation. `--demo-gantry` loads a reproducible 500 mm / 0.250 mm sample
+//! into the gantry-squaring calculator and opens its sheet; `--demo-gantry-card`
+//! loads the same sample with the sheet closed so the Utility card can be
+//! captured. Both are local arithmetic only: neither moves nor adjusts the
+//! gantry, writes a setting, or starts a job.
+//! `--demo-soft-limits` enables `$20` through the normal settings
 //! write/read-back path, and `--demo-over-travel` then loads a program whose
 //! bounds exceed the reported travel and presses START so the over-travel sheet
 //! is shown without sending a start.

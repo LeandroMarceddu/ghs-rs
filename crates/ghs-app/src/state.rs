@@ -39,8 +39,8 @@ use crate::setup::{SafetyItem, SetupModel, SetupStep};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::utilities::{
-    CalibrationAxis, CalibrationField, CalibrationGate, CalibrationWrite, ProgramLimits,
-    TravelSettings, UtilityField, UtilityModel,
+    CalibrationAxis, CalibrationField, CalibrationGate, CalibrationWrite, GantryField,
+    ProgramLimits, TravelSettings, UtilityField, UtilityModel,
 };
 
 /// Connection state shown in the top-bar status pill.
@@ -415,6 +415,8 @@ pub enum KeypadTarget {
     Utility(UtilityField),
     /// One stepper-calibration distance field.
     Calibration(CalibrationField),
+    /// One gantry-squaring measurement field.
+    Gantry(GantryField),
 }
 
 impl KeypadTarget {
@@ -436,6 +438,7 @@ impl KeypadTarget {
             KeypadTarget::ProbeField(field) => t(field.label()).to_string(),
             KeypadTarget::Utility(field) => t(field.label()).to_string(),
             KeypadTarget::Calibration(field) => t(field.label()).to_string(),
+            KeypadTarget::Gantry(field) => t(field.label()).to_string(),
         }
     }
 }
@@ -3664,6 +3667,19 @@ impl AppState {
         self.utilities.calibration_mut().calculate(current)
     }
 
+    /// Recalculate the gantry-squaring result.
+    ///
+    /// This is pure local arithmetic: it returns no command and never moves,
+    /// writes, or adjusts the machine. Opening the calculator and pressing
+    /// CALCULATE are both send-free.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wizard's field or measurement message.
+    pub fn calculate_gantry_squaring(&mut self) -> Result<(), String> {
+        self.utilities.gantry_mut().calculate()
+    }
+
     /// Build the one confirmed calibration write after every safety gate.
     ///
     /// The returned command is always `Command::SetSetting`; it never jogs,
@@ -4759,6 +4775,14 @@ impl AppState {
                     Some(format!("{} ({})", field.label(), field.unit())),
                 )
             }
+            KeypadTarget::Gantry(field) => {
+                let value = self.utilities.gantry().field_text(field).to_string();
+                (
+                    value,
+                    true,
+                    Some(format!("{} ({})", field.label(), field.unit())),
+                )
+            }
         };
         self.keypad = Some(KeypadState {
             target,
@@ -4916,6 +4940,15 @@ impl AppState {
                 if let Err(message) = self
                     .utilities
                     .calibration_mut()
+                    .set_field_text(field, keypad.buffer.clone())
+                {
+                    self.push_console(ConsoleLevel::Warn, message);
+                }
+            }
+            KeypadTarget::Gantry(field) => {
+                if let Err(message) = self
+                    .utilities
+                    .gantry_mut()
                     .set_field_text(field, keypad.buffer.clone())
                 {
                     self.push_console(ConsoleLevel::Warn, message);
@@ -5527,6 +5560,43 @@ mod tests {
             failed.calibration_current_steps(CalibrationAxis::X),
             Some(250.0)
         );
+    }
+
+    #[test]
+    fn opening_and_running_the_gantry_calculator_sends_nothing() {
+        let mut state = AppState::new();
+        let mut sent = Vec::new();
+        let send = recorded_send(&mut sent);
+
+        // Opening a gantry field is the wizard's entry point. It only fills the
+        // shared keypad and never dispatches a command.
+        state.open_keypad(KeypadTarget::Gantry(GantryField::Span));
+        assert!(state.keypad.is_some());
+        state.keypad_action(KeypadAction::Clear);
+        for digit in "400".chars() {
+            state.keypad_action(KeypadAction::Digit(digit));
+        }
+        state.keypad_action(KeypadAction::Submit);
+        assert_eq!(
+            state.utilities.gantry().field_text(GantryField::Span),
+            "400"
+        );
+
+        state.utilities.gantry_mut().load_demo();
+        state
+            .calculate_gantry_squaring()
+            .expect("gantry result is local");
+        let result = state.utilities.gantry().result().expect("result");
+        assert_eq!(
+            result.correction_text(),
+            "RIGHT SIDE IS 0.250 mm FORWARD; MOVE IT BACK 0.250 mm OR SHIM THE LEFT SIDE"
+        );
+
+        // The calculator exposes no send path. The recorder stays empty; any
+        // future dispatch wired through it would fail this assertion.
+        drop(send);
+        assert!(sent.is_empty(), "gantry calculator sent {sent:?}");
+        assert!(!state.job.is_active());
     }
 
     #[test]

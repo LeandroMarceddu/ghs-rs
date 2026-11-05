@@ -119,6 +119,10 @@ pub fn overlay(
                         .hint
                         .clone()
                         .unwrap_or_else(|| t("CALIBRATION DISTANCE (mm)").to_string()),
+                    KeypadTarget::Gantry(_) => keypad
+                        .hint
+                        .clone()
+                        .unwrap_or_else(|| t("GANTRY MEASUREMENT (mm)").to_string()),
                 }),
         );
 

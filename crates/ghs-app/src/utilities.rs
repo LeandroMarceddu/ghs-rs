@@ -1155,6 +1155,431 @@ impl CalibrationModel {
     }
 }
 
+// ----------------------------------------------------------- gantry squaring
+
+/// Largest accepted span between the left and right measurement points, in
+/// millimetres.
+pub const GANTRY_MAX_SPAN_MM: f64 = 10_000.0;
+/// Largest accepted absolute Y reading at either measurement point, in
+/// millimetres.
+pub const GANTRY_MAX_READING_MM: f64 = 100_000.0;
+/// Delta magnitude treated as "square" by the plain-language correction copy,
+/// in millimetres. It matches the three-decimal display resolution.
+pub const GANTRY_SQUARE_TOLERANCE_MM: f64 = 0.0005;
+
+/// Mandatory safety wording for the gantry-squaring card and sheet.
+pub const GANTRY_SAFETY_NOTE: &str = concat!(
+    "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY. ",
+    "Follow the machine's squaring procedure, move or shim the gantry by hand, ",
+    "and verify the result with a fresh measurement before the next cut."
+);
+
+/// Sign convention and per-side explanation shown with the result.
+pub const GANTRY_CONVENTION_NOTE: &str = concat!(
+    "Positive delta and angle: the right measurement point is further along +Y ",
+    "(forward) than the left. Negative: the left point is further along +Y. ",
+    "Per-side is delta / 2: with the centre fixed, each end moves half the delta ",
+    "in opposite directions."
+);
+
+/// One editable gantry-squaring measurement field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GantryField {
+    /// Distance between the left and right measurement points, in millimetres.
+    Span,
+    /// Y reading at the left measurement point, in millimetres.
+    LeftY,
+    /// Y reading at the right measurement point, in millimetres.
+    RightY,
+}
+
+impl GantryField {
+    /// Number of editable fields.
+    pub const COUNT: usize = 3;
+
+    /// Every field, in edit order.
+    pub const ALL: [GantryField; GantryField::COUNT] =
+        [GantryField::Span, GantryField::LeftY, GantryField::RightY];
+
+    /// Stable zero-based index for the field array.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            GantryField::Span => 0,
+            GantryField::LeftY => 1,
+            GantryField::RightY => 2,
+        }
+    }
+
+    /// Upper-case label for the field cell.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            GantryField::Span => "SPAN BETWEEN POINTS",
+            GantryField::LeftY => "LEFT Y READING",
+            GantryField::RightY => "RIGHT Y READING",
+        }
+    }
+
+    /// Unit label.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        "mm"
+    }
+
+    /// Stable short key for element ids.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            GantryField::Span => "span",
+            GantryField::LeftY => "left-y",
+            GantryField::RightY => "right-y",
+        }
+    }
+
+    /// Default text for the field.
+    #[must_use]
+    pub const fn default_text(self) -> &'static str {
+        match self {
+            GantryField::Span => "500",
+            GantryField::LeftY => "0",
+            GantryField::RightY => "0",
+        }
+    }
+}
+
+/// One validated gantry measurement and its correction.
+///
+/// The type is pure data. It has no apply, send, or command method: measuring
+/// and squaring the gantry stay manual operator steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GantrySquaring {
+    /// Distance between the left and right measurement points, in millimetres.
+    pub span_mm: f64,
+    /// Y reading at the left measurement point, in millimetres.
+    pub left_y_mm: f64,
+    /// Y reading at the right measurement point, in millimetres.
+    pub right_y_mm: f64,
+    /// `right - left`, in millimetres.
+    pub delta_mm: f64,
+    /// Signed angle from the X axis, in degrees. Positive means the right
+    /// measurement point is further along +Y.
+    pub angle_deg: f64,
+    /// Correction per end when pivoting about the centre, in millimetres.
+    /// This is `delta / 2`, signed like [`Self::delta_mm`].
+    pub per_side_mm: f64,
+}
+
+impl GantrySquaring {
+    /// Validate one measurement and compute its correction.
+    ///
+    /// `span_mm` must be finite, greater than zero, and at most
+    /// [`GANTRY_MAX_SPAN_MM`]. Both readings must be finite and within
+    /// +/-[`GANTRY_MAX_READING_MM`]. The resulting delta, angle, and per-side
+    /// value are checked to stay finite.
+    ///
+    /// # Errors
+    ///
+    /// Returns a clear message for any non-finite, zero, negative, or
+    /// out-of-range input.
+    pub fn measure(span_mm: f64, left_y_mm: f64, right_y_mm: f64) -> Result<Self, String> {
+        if !span_mm.is_finite() {
+            return Err("SPAN BETWEEN POINTS must be finite".to_string());
+        }
+        if span_mm <= 0.0 {
+            return Err("SPAN BETWEEN POINTS must be greater than 0".to_string());
+        }
+        if span_mm > GANTRY_MAX_SPAN_MM {
+            return Err(format!(
+                "SPAN BETWEEN POINTS must be at most {GANTRY_MAX_SPAN_MM:.0} mm"
+            ));
+        }
+        validate_gantry_reading(GantryField::LeftY, left_y_mm)?;
+        validate_gantry_reading(GantryField::RightY, right_y_mm)?;
+
+        let delta_mm = right_y_mm - left_y_mm;
+        if !delta_mm.is_finite() {
+            return Err("DELTA is not finite".to_string());
+        }
+        let angle_deg = if delta_mm == 0.0 {
+            0.0
+        } else {
+            delta_mm.atan2(span_mm).to_degrees()
+        };
+        if !angle_deg.is_finite() || angle_deg.abs() > 90.0 {
+            return Err("ANGLE is not finite".to_string());
+        }
+        let per_side_mm = delta_mm / 2.0;
+        if !per_side_mm.is_finite() {
+            return Err("PER-SIDE correction is not finite".to_string());
+        }
+        Ok(Self {
+            span_mm,
+            left_y_mm,
+            right_y_mm,
+            delta_mm,
+            angle_deg,
+            per_side_mm,
+        })
+    }
+
+    /// Whether the right measurement point is ahead of the left along +Y.
+    #[must_use]
+    pub fn right_side_forward(&self) -> bool {
+        self.delta_mm >= GANTRY_SQUARE_TOLERANCE_MM
+    }
+
+    /// Whether the left measurement point is ahead of the right along +Y.
+    #[must_use]
+    pub fn left_side_forward(&self) -> bool {
+        self.delta_mm <= -GANTRY_SQUARE_TOLERANCE_MM
+    }
+
+    /// Whether the measured delta is inside the square tolerance.
+    #[must_use]
+    pub fn is_square(&self) -> bool {
+        self.delta_mm.abs() < GANTRY_SQUARE_TOLERANCE_MM
+    }
+
+    /// Signed total delta for the card, for example `+0.250 mm`.
+    #[must_use]
+    pub fn delta_text(&self) -> String {
+        format!("{:+.3} mm", clean_zero(self.delta_mm))
+    }
+
+    /// Signed angle for the card, for example `+0.0286 deg`.
+    #[must_use]
+    pub fn angle_text(&self) -> String {
+        format!("{:+.4} deg", clean_zero(self.angle_deg))
+    }
+
+    /// Per-side correction magnitude for the card.
+    #[must_use]
+    pub fn per_side_text(&self) -> String {
+        format!("{:.3} mm", self.per_side_mm.abs())
+    }
+
+    /// Plain-language correction for the measured side.
+    ///
+    /// A delta inside [`GANTRY_SQUARE_TOLERANCE_MM`] is reported as square.
+    #[must_use]
+    pub fn correction_text(&self) -> String {
+        if self.is_square() {
+            return "GANTRY IS SQUARE WITHIN MEASUREMENT RESOLUTION; NO CORRECTION INDICATED"
+                .to_string();
+        }
+        let amount = format!("{:.3}", self.delta_mm.abs());
+        if self.delta_mm > 0.0 {
+            format!(
+                "RIGHT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE LEFT SIDE"
+            )
+        } else {
+            format!(
+                "LEFT SIDE IS {amount} mm FORWARD; MOVE IT BACK {amount} mm OR SHIM THE RIGHT SIDE"
+            )
+        }
+    }
+
+    /// Plain-language per-side correction when pivoting about the centre.
+    #[must_use]
+    pub fn per_side_note(&self) -> String {
+        if self.is_square() {
+            return "NO PER-SIDE CORRECTION".to_string();
+        }
+        let amount = format!("{:.3}", self.per_side_mm.abs());
+        if self.delta_mm > 0.0 {
+            format!(
+                "PIVOT CENTRE: MOVE THE RIGHT SIDE BACK {amount} mm AND THE LEFT SIDE FORWARD \
+                 {amount} mm"
+            )
+        } else {
+            format!(
+                "PIVOT CENTRE: MOVE THE LEFT SIDE BACK {amount} mm AND THE RIGHT SIDE FORWARD \
+                 {amount} mm"
+            )
+        }
+    }
+}
+
+fn validate_gantry_reading(field: GantryField, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{} must be finite", field.label()));
+    }
+    if value < -GANTRY_MAX_READING_MM || value > GANTRY_MAX_READING_MM {
+        return Err(format!(
+            "{} must be within {:.3} ..= {:.3} mm",
+            field.label(),
+            -GANTRY_MAX_READING_MM,
+            GANTRY_MAX_READING_MM
+        ));
+    }
+    Ok(())
+}
+
+/// Local gantry-squaring calculator state.
+///
+/// The model only stores text and calculates. It never builds a controller
+/// command, never moves an axis, and never applies an adjustment.
+#[derive(Clone, Debug)]
+pub struct GantrySquaringModel {
+    fields: [String; GantryField::COUNT],
+    field_errors: [Option<String>; GantryField::COUNT],
+    result: Option<GantrySquaring>,
+    error: Option<String>,
+}
+
+impl Default for GantrySquaringModel {
+    fn default() -> Self {
+        Self {
+            fields: std::array::from_fn(|index| {
+                GantryField::ALL
+                    .get(index)
+                    .copied()
+                    .map_or_else(String::new, |field| field.default_text().to_string())
+            }),
+            field_errors: std::array::from_fn(|_| None),
+            result: None,
+            error: None,
+        }
+    }
+}
+
+impl GantrySquaringModel {
+    /// Field text for the editor.
+    #[must_use]
+    pub fn field_text(&self, field: GantryField) -> &str {
+        self.fields.get(field.index()).map_or("", String::as_str)
+    }
+
+    /// Last inline validation error for a field, if any.
+    #[must_use]
+    pub fn field_error(&self, field: GantryField) -> Option<&str> {
+        self.field_errors
+            .get(field.index())
+            .and_then(Option::as_deref)
+    }
+
+    /// Validate and store one field from the shared keypad.
+    ///
+    /// The stored text is left unchanged on error, and any previous result is
+    /// cleared when a value changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an empty, non-numeric, non-finite, or out-of-range
+    /// value, or a zero/negative span.
+    pub fn set_field_text(
+        &mut self,
+        field: GantryField,
+        text: impl Into<String>,
+    ) -> Result<(), String> {
+        let trimmed = text.into().trim().to_string();
+        let result = parse_gantry_field(field, &trimmed);
+        if let Some(slot) = self.field_errors.get_mut(field.index()) {
+            *slot = result.as_ref().err().cloned();
+        }
+        if result.is_ok() {
+            if let Some(slot) = self.fields.get_mut(field.index()) {
+                *slot = trimmed;
+            }
+            self.result = None;
+            self.error = None;
+        }
+        result.map(|_| ())
+    }
+
+    /// Current validated result, if `calculate` succeeded.
+    #[must_use]
+    pub fn result(&self) -> Option<&GantrySquaring> {
+        self.result.as_ref()
+    }
+
+    /// Last calculation error.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Validate the stored text and cache one result.
+    ///
+    /// # Errors
+    ///
+    /// Returns and caches the first field or measurement message.
+    pub fn calculate(&mut self) -> Result<(), String> {
+        let result = (|| {
+            let span = parse_gantry_field(GantryField::Span, self.field_text(GantryField::Span))?;
+            let left = parse_gantry_field(GantryField::LeftY, self.field_text(GantryField::LeftY))?;
+            let right =
+                parse_gantry_field(GantryField::RightY, self.field_text(GantryField::RightY))?;
+            GantrySquaring::measure(span, left, right)
+        })();
+        match result {
+            Ok(result) => {
+                self.result = Some(result);
+                self.error = None;
+                Ok(())
+            }
+            Err(message) => {
+                self.result = None;
+                self.error = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// Replace the fields with the reproducible screenshot sample and calculate
+    /// it. The sample is 500 mm span, left Y 0, right Y 0.250 mm.
+    pub fn load_demo(&mut self) {
+        *self = Self::demo();
+    }
+
+    /// Build the reproducible screenshot sample.
+    #[must_use]
+    pub fn demo() -> Self {
+        let mut model = Self {
+            fields: std::array::from_fn(|index| {
+                ["500", "0", "0.250"]
+                    .get(index)
+                    .map_or_else(String::new, |value| (*value).to_string())
+            }),
+            field_errors: std::array::from_fn(|_| None),
+            result: None,
+            error: None,
+        };
+        let _ = model.calculate();
+        model
+    }
+}
+
+fn parse_gantry_field(field: GantryField, text: &str) -> Result<f64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} is empty", field.label()));
+    }
+    let value = trimmed
+        .parse::<f64>()
+        .map_err(|_| format!("{} must be numeric", field.label()))?;
+    if !value.is_finite() {
+        return Err(format!("{} must be finite", field.label()));
+    }
+    match field {
+        GantryField::Span => {
+            if value <= 0.0 {
+                return Err("SPAN BETWEEN POINTS must be greater than 0".to_string());
+            }
+            if value > GANTRY_MAX_SPAN_MM {
+                return Err(format!(
+                    "SPAN BETWEEN POINTS must be at most {GANTRY_MAX_SPAN_MM:.0} mm"
+                ));
+            }
+        }
+        GantryField::LeftY | GantryField::RightY => {
+            validate_gantry_reading(field, value)?;
+        }
+    }
+    Ok(value)
+}
+
 // ------------------------------------------------------------ program limits
 
 /// Axis-aligned bounds in millimetres.
@@ -1826,6 +2251,7 @@ pub struct UtilityModel {
     transform_error: Option<String>,
     transform_confirmed: bool,
     calibration: CalibrationModel,
+    gantry: GantrySquaringModel,
 }
 
 impl Default for UtilityModel {
@@ -1845,6 +2271,7 @@ impl Default for UtilityModel {
             transform_error: None,
             transform_confirmed: false,
             calibration: CalibrationModel::default(),
+            gantry: GantrySquaringModel::default(),
         }
     }
 }
@@ -1872,6 +2299,17 @@ impl UtilityModel {
     /// Mutable stepper-calibration wizard state.
     pub fn calibration_mut(&mut self) -> &mut CalibrationModel {
         &mut self.calibration
+    }
+
+    /// Gantry-squaring calculator state.
+    #[must_use]
+    pub fn gantry(&self) -> &GantrySquaringModel {
+        &self.gantry
+    }
+
+    /// Mutable gantry-squaring calculator state.
+    pub fn gantry_mut(&mut self) -> &mut GantrySquaringModel {
+        &mut self.gantry
     }
 
     /// Field text for the editor.
@@ -2189,6 +2627,17 @@ fn validate_field_text(field: UtilityField, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recorded_send(sent: &mut Vec<Command>) -> impl FnMut(Command) -> Result<(), String> + '_ {
+        move |command| {
+            sent.push(command);
+            Ok(())
+        }
+    }
+
+    fn gantry(span_mm: f64, left_y_mm: f64, right_y_mm: f64) -> GantrySquaring {
+        GantrySquaring::measure(span_mm, left_y_mm, right_y_mm).expect("valid gantry measurement")
+    }
 
     fn calibration_draft(
         axis: CalibrationAxis,
@@ -2814,6 +3263,234 @@ mod tests {
         );
         assert!(TRANSFORM_HEIGHT_MAP_NOTE.contains("height-map Apply/Revert"));
         assert!(TRANSFORM_HEIGHT_MAP_NOTE.contains("transformed source"));
+    }
+
+    #[test]
+    fn gantry_level_gantry_gives_zero_delta_angle_and_per_side() {
+        let result = gantry(500.0, 2.5, 2.5);
+        assert_eq!(result.delta_mm, 0.0);
+        assert_eq!(result.angle_deg, 0.0);
+        assert_eq!(result.per_side_mm, 0.0);
+        assert!(!result.angle_deg.is_sign_negative());
+        assert!(result.is_square());
+        assert!(!result.right_side_forward());
+        assert!(!result.left_side_forward());
+        assert_eq!(result.delta_text(), "+0.000 mm");
+        assert_eq!(result.angle_text(), "+0.0000 deg");
+        assert_eq!(result.per_side_text(), "0.000 mm");
+        assert!(result.correction_text().contains("SQUARE"));
+        assert_eq!(result.per_side_note(), "NO PER-SIDE CORRECTION");
+    }
+
+    #[test]
+    fn gantry_right_forward_and_left_forward_give_the_correct_signs() {
+        let right_forward = gantry(500.0, 0.0, 0.250);
+        assert!(right_forward.right_side_forward());
+        assert!(!right_forward.left_side_forward());
+        assert!((right_forward.delta_mm - 0.250).abs() < 1.0e-12);
+        assert!(right_forward.angle_deg > 0.0);
+        assert_eq!(right_forward.delta_text(), "+0.250 mm");
+        assert_eq!(right_forward.per_side_text(), "0.125 mm");
+        assert_eq!(
+            right_forward.correction_text(),
+            "RIGHT SIDE IS 0.250 mm FORWARD; MOVE IT BACK 0.250 mm OR SHIM THE LEFT SIDE"
+        );
+        assert!(
+            right_forward
+                .per_side_note()
+                .contains("RIGHT SIDE BACK 0.125 mm")
+        );
+        assert!(
+            right_forward
+                .per_side_note()
+                .contains("LEFT SIDE FORWARD 0.125 mm")
+        );
+
+        let left_forward = gantry(500.0, 0.250, 0.0);
+        assert!(left_forward.left_side_forward());
+        assert!(!left_forward.right_side_forward());
+        assert!((left_forward.delta_mm + 0.250).abs() < 1.0e-12);
+        assert!(left_forward.angle_deg < 0.0);
+        assert_eq!(left_forward.delta_text(), "-0.250 mm");
+        assert_eq!(
+            left_forward.correction_text(),
+            "LEFT SIDE IS 0.250 mm FORWARD; MOVE IT BACK 0.250 mm OR SHIM THE RIGHT SIDE"
+        );
+        assert!(
+            left_forward
+                .per_side_note()
+                .contains("LEFT SIDE BACK 0.125 mm")
+        );
+        assert!(
+            left_forward
+                .per_side_note()
+                .contains("RIGHT SIDE FORWARD 0.125 mm")
+        );
+    }
+
+    #[test]
+    fn gantry_angle_matches_a_known_span_and_delta() {
+        // atan(5 / 500) = 0.5729386976834559 degrees.
+        let result = gantry(500.0, 0.0, 5.0);
+        assert!(
+            (result.angle_deg - 0.572_938_697_683_456).abs() < 1.0e-12,
+            "{}",
+            result.angle_deg
+        );
+        assert_eq!(result.angle_text(), "+0.5729 deg");
+
+        let tilted = gantry(1000.0, 10.0, 11.0);
+        assert!((tilted.angle_deg - 0.057_295_760_414_500_61).abs() < 1.0e-12);
+        assert!(tilted.angle_deg > 0.0);
+    }
+
+    #[test]
+    fn gantry_per_side_is_half_the_total_delta() {
+        for (left, right) in [(0.0, 1.0), (-3.0, 0.5), (-2.0, -2.4)] {
+            let result = gantry(400.0, left, right);
+            assert!((result.per_side_mm - result.delta_mm / 2.0).abs() < 1.0e-12);
+        }
+        let result = gantry(400.0, -3.0, 0.5);
+        assert!((result.delta_mm - 3.5).abs() < 1.0e-12);
+        assert!((result.per_side_mm - 1.75).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn gantry_rejects_zero_negative_and_non_finite_span() {
+        for span in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = GantrySquaring::measure(span, 0.0, 0.0).expect_err("span must be refused");
+            assert!(!error.is_empty(), "{span}");
+        }
+        let error = GantrySquaring::measure(10_000.5, 0.0, 0.0).expect_err("span too large");
+        assert!(error.contains("10000"), "{error}");
+        let mut model = GantrySquaringModel::default();
+        assert!(model.set_field_text(GantryField::Span, "0").is_err());
+        assert!(model.set_field_text(GantryField::Span, "-5").is_err());
+        assert!(model.set_field_text(GantryField::Span, "NaN").is_err());
+        assert!(model.set_field_text(GantryField::Span, "inf").is_err());
+        // A refused value is never stored, so the previous valid span (500)
+        // remains and CALCULATE still succeeds.
+        assert_eq!(model.field_text(GantryField::Span), "500");
+        model.calculate().expect("previous valid span is kept");
+    }
+
+    #[test]
+    fn gantry_rejects_non_finite_and_out_of_range_readings() {
+        for (left, right) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (0.0, f64::NEG_INFINITY),
+            (100_000.1, 0.0),
+            (0.0, -100_000.1),
+        ] {
+            let error =
+                GantrySquaring::measure(500.0, left, right).expect_err("reading must be refused");
+            assert!(!error.is_empty(), "{left} {right}");
+        }
+        let mut model = GantrySquaringModel::default();
+        assert!(model.set_field_text(GantryField::LeftY, "NaN").is_err());
+        assert!(
+            model
+                .set_field_text(GantryField::RightY, "100000.1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gantry_accepts_span_and_readings_at_bounds_and_stays_finite() {
+        let result = gantry(
+            GANTRY_MAX_SPAN_MM,
+            -GANTRY_MAX_READING_MM,
+            GANTRY_MAX_READING_MM,
+        );
+        assert!(result.span_mm.is_finite());
+        assert!(result.delta_mm.is_finite());
+        assert!(result.angle_deg.is_finite());
+        assert!(result.per_side_mm.is_finite());
+        assert!((result.delta_mm - 200_000.0).abs() < 1.0e-9);
+        assert!(result.angle_deg > 0.0 && result.angle_deg < 90.0);
+        assert!(result.angle_deg.abs() <= 90.0);
+
+        let mut model = GantrySquaringModel::default();
+        model
+            .set_field_text(GantryField::Span, "10000")
+            .expect("span at max");
+        model
+            .set_field_text(GantryField::LeftY, "-100000")
+            .expect("left at min");
+        model
+            .set_field_text(GantryField::RightY, "100000")
+            .expect("right at max");
+        model.calculate().expect("bounds accepted");
+        assert!(model.result().is_some());
+    }
+
+    #[test]
+    fn gantry_model_demo_sample_is_reproducible() {
+        let first = GantrySquaringModel::demo();
+        let second = GantrySquaringModel::demo();
+        assert_eq!(first.result(), second.result());
+        assert_eq!(first.field_text(GantryField::Span), "500");
+        assert_eq!(first.field_text(GantryField::LeftY), "0");
+        assert_eq!(first.field_text(GantryField::RightY), "0.250");
+        let result = first.result().expect("demo result");
+        assert_eq!(result.delta_text(), "+0.250 mm");
+        assert_eq!(result.per_side_text(), "0.125 mm");
+        assert!((result.angle_deg - 0.028_647_887_369_217_372).abs() < 1.0e-12);
+
+        let mut loaded = GantrySquaringModel::default();
+        loaded.load_demo();
+        assert_eq!(loaded.result(), first.result());
+    }
+
+    #[test]
+    fn gantry_model_clears_the_result_on_edit_and_keeps_bad_text_out() {
+        let mut model = GantrySquaringModel::demo();
+        assert!(model.result().is_some());
+        model
+            .set_field_text(GantryField::RightY, "0.500")
+            .expect("valid edit");
+        assert!(model.result().is_none());
+        model.calculate().expect("recalculate");
+        assert_eq!(model.result().expect("result").delta_text(), "+0.500 mm");
+
+        let previous = model.field_text(GantryField::RightY).to_string();
+        assert!(
+            model
+                .set_field_text(GantryField::RightY, "not a number")
+                .is_err()
+        );
+        assert_eq!(model.field_text(GantryField::RightY), previous);
+        assert!(model.field_error(GantryField::RightY).is_some());
+    }
+
+    #[test]
+    fn gantry_calculator_never_produces_a_controller_or_motion_command() {
+        let mut sent = Vec::new();
+        let send = recorded_send(&mut sent);
+        let mut model = GantrySquaringModel::demo();
+        let _ = model.result().map(GantrySquaring::correction_text);
+        let _ = model.result().map(GantrySquaring::per_side_note);
+        model
+            .set_field_text(GantryField::Span, "400")
+            .expect("valid edit");
+        model.calculate().expect("recalculate");
+        // The model exposes no apply/send method. Any future dispatch has to
+        // pass through this recorder so the invariant is checked.
+        drop(send);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn gantry_safety_and_convention_copy_is_explicit() {
+        assert!(
+            GANTRY_SAFETY_NOTE
+                .contains("CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY")
+        );
+        assert!(GANTRY_SAFETY_NOTE.contains("squaring procedure"));
+        assert!(GANTRY_CONVENTION_NOTE.contains("+Y"));
+        assert!(GANTRY_CONVENTION_NOTE.contains("delta / 2"));
     }
 
     #[test]

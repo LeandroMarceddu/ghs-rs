@@ -104,7 +104,8 @@ use crate::state::{
 use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::utilities::{
-    CalibrationAxis, CalibrationField, LimitsStatus, TransformKind, UtilityField,
+    CalibrationAxis, CalibrationField, GANTRY_CONVENTION_NOTE, GANTRY_SAFETY_NOTE, GantryField,
+    LimitsStatus, TransformKind, UtilityField,
 };
 use crate::viewer;
 
@@ -130,6 +131,12 @@ struct JogHold {
 /// instead of cancelling it. This also keeps a touch tap working, because GPUI
 /// delivers a touch tap's mouse down and up together.
 const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
+
+/// Index of the gantry-squaring card in the utility scroll list.
+///
+/// The list starts with `CONTROLLER RESET`, then `MACHINE SETUP`, then this
+/// card. The demo capture scrolls it to the top.
+const GANTRY_CARD_INDEX: usize = 2;
 
 /// What the shared settings text sheet is editing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +310,8 @@ pub struct Shell {
     feed_slider_active: bool,
     spindle_slider_active: bool,
     console_scroll: ScrollHandle,
+    /// Utility workspace scroll position, used by the gantry card capture.
+    utility_scroll: ScrollHandle,
     /// Screenshot switch: save the console log once after the demo handshake.
     demo_console_save: bool,
     demo_console_save_done: bool,
@@ -367,6 +376,8 @@ pub struct Shell {
     startup_confirm: Option<StartupConfirm>,
     /// Material surfacing wizard sheet is open. Opening sends nothing.
     surfacing_open: bool,
+    /// Gantry-squaring calculator sheet is open. Opening sends nothing.
+    gantry_open: bool,
     /// Stepper-calibration confirmation sheet is open. Opening sends nothing.
     calibration_confirm_open: bool,
     /// Screenshot switch: fill and calculate the calibration card.
@@ -374,6 +385,11 @@ pub struct Shell {
     demo_calibration_done: bool,
     /// Screenshot switch: also open the calibration confirmation sheet.
     demo_calibration_confirm: bool,
+    /// Screenshot switch: load the gantry sample and open the calculator.
+    demo_gantry: bool,
+    demo_gantry_done: bool,
+    /// Screenshot switch: load the gantry sample on the card, sheet closed.
+    demo_gantry_card: bool,
     /// Screenshot switch: open the surfacing wizard and generate a preview.
     demo_surfacing: bool,
     demo_surfacing_done: bool,
@@ -694,6 +710,8 @@ impl Shell {
         let demo_calibration = std::env::args().any(|arg| arg == "--demo-calibration");
         let demo_calibration_confirm =
             std::env::args().any(|arg| arg == "--demo-calibration-confirm");
+        let demo_gantry_card = std::env::args().any(|arg| arg == "--demo-gantry-card");
+        let demo_gantry = demo_gantry_card || std::env::args().any(|arg| arg == "--demo-gantry");
         let demo_surfacing = std::env::args().any(|arg| arg == "--demo-surfacing");
         let demo_transform = std::env::args().any(|arg| arg == "--demo-transform");
         let demo_reset_confirm = std::env::args().any(|arg| arg == "--demo-reset-confirm");
@@ -702,6 +720,7 @@ impl Shell {
             || demo_transform
             || demo_calibration
             || demo_calibration_confirm
+            || demo_gantry
             || demo_reset
         {
             state.mode = Mode::Utility;
@@ -786,6 +805,7 @@ impl Shell {
             feed_slider_active: false,
             spindle_slider_active: false,
             console_scroll: ScrollHandle::new(),
+            utility_scroll: ScrollHandle::new(),
             demo_console_save: std::env::args().any(|arg| arg == "--demo-console-save"),
             demo_console_save_done: false,
             demo_console_tab: std::env::args().any(|arg| arg == "--console-tab")
@@ -830,10 +850,14 @@ impl Shell {
             macro_delete: None,
             startup_confirm: None,
             surfacing_open: false,
+            gantry_open: false,
             calibration_confirm_open: false,
             demo_calibration,
             demo_calibration_done: false,
             demo_calibration_confirm,
+            demo_gantry,
+            demo_gantry_done: false,
+            demo_gantry_card,
             demo_surfacing,
             demo_surfacing_done: false,
             demo_transform,
@@ -1437,6 +1461,21 @@ impl Shell {
                 self.state.utilities.calibration_mut().set_confirmed(true);
                 self.calibration_confirm_open = true;
             }
+            changed = true;
+        }
+        // Screenshot switch: load the reproducible gantry sample through the
+        // calculator's own model. It opens the sheet for the result capture, or
+        // leaves the sheet closed for the card capture, and scrolls the card
+        // into view at the 1280x800 layout. Nothing is sent.
+        if self.demo_gantry
+            && !self.demo_gantry_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_gantry_done = true;
+            self.state.mode = Mode::Utility;
+            self.state.utilities.gantry_mut().load_demo();
+            self.gantry_open = !self.demo_gantry_card;
+            self.utility_scroll.scroll_to_top_of_item(GANTRY_CARD_INDEX);
             changed = true;
         }
         // Screenshot switch: open the surfacing wizard with a generated
@@ -5284,6 +5323,31 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the gantry-squaring calculator. Opening sends nothing and never
+    /// moves or adjusts the machine.
+    fn open_gantry_squaring(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.state.mode = Mode::Utility;
+        self.gantry_open = true;
+        cx.notify();
+    }
+
+    /// Close the gantry calculator without changing the measurement.
+    fn close_gantry_squaring(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.gantry_open = false;
+        cx.notify();
+    }
+
+    /// Recalculate the gantry correction from the three fields.
+    fn calculate_gantry_squaring(&mut self, cx: &mut Context<Self>) {
+        if let Err(message) = self.state.calculate_gantry_squaring() {
+            self.state
+                .push_console(ConsoleLevel::Warn, format!("Gantry squaring: {message}"));
+        }
+        cx.notify();
+    }
+
     /// Close the surfacing wizard without sending or loading anything.
     fn close_surfacing(&mut self, cx: &mut Context<Self>) {
         self.state.keypad = None;
@@ -5858,7 +5922,8 @@ impl Shell {
                     KeypadTarget::Setting(_)
                     | KeypadTarget::Tool(_)
                     | KeypadTarget::Utility(_)
-                    | KeypadTarget::Calibration(_) => {}
+                    | KeypadTarget::Calibration(_)
+                    | KeypadTarget::Gantry(_) => {}
                     KeypadTarget::ProbeField(field) => {
                         // The mount offset is setup data owned by the profile.
                         // A failed save never blocks the local value, but the
@@ -13978,6 +14043,365 @@ impl Shell {
             )
     }
 
+    /// One tap-to-edit gantry measurement, backed by the shared keypad.
+    fn gantry_field_cell(&self, field: GantryField, p: Palette, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let model = self.state.utilities.gantry();
+        let value = model.field_text(field).to_string();
+        let error = model
+            .field_error(field)
+            .map(std::string::ToString::to_string);
+        let mut cell = v_flex()
+            .w(px(210.0))
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_faint)
+                    .child(format!("{} ({})", t(field.label()), field.unit())),
+            )
+            .child(
+                Button::new(format!("gantry-field-{}", field.key()))
+                    .label(if value.is_empty() {
+                        "--".to_string()
+                    } else {
+                        value
+                    })
+                    .h(px(48.0))
+                    .w_full()
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(p.panel)
+                            .foreground(p.text)
+                            .hover(p.raised_hover)
+                            .active(p.accent_muted),
+                    )
+                    .border_1()
+                    .border_color(if error.is_some() { p.danger } else { p.border })
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.state.open_keypad(KeypadTarget::Gantry(field));
+                            cx.notify();
+                        });
+                    }),
+            );
+        if let Some(error) = error {
+            cell = cell.child(
+                div()
+                    .text_size(px(8.5))
+                    .line_height(px(11.0))
+                    .text_color(p.danger)
+                    .child(error),
+            );
+        }
+        cell
+    }
+
+    /// Gantry-squaring calculator card. Pure measurement; no motion or write.
+    fn gantry_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let model = self.state.utilities.gantry();
+        let result = model.result();
+        let error = model.error().map(std::string::ToString::to_string);
+        let summary = result.map_or_else(
+            || {
+                t("No measurement yet. Enter the span and both Y readings in the calculator.")
+                    .to_string()
+            },
+            |result| {
+                let direction = if result.right_side_forward() {
+                    t("RIGHT FORWARD")
+                } else if result.left_side_forward() {
+                    t("LEFT FORWARD")
+                } else {
+                    t("SQUARE")
+                };
+                format!(
+                    "DELTA {} | ANGLE {} | PER-SIDE {} | {direction}",
+                    result.delta_text(),
+                    result.angle_text(),
+                    result.per_side_text()
+                )
+            },
+        );
+        let correction = result.map(|result| result.correction_text());
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("GANTRY SQUARING"), p))
+                    .child(chip(t("CALCULATOR ONLY"), p)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.warning)
+                    .child(t(
+                        "CALCULATOR ONLY - THE APP DOES NOT MOVE OR ADJUST THE GANTRY",
+                    )),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Measure the Y distance from a common reference to the left and right ends of the gantry, enter the span between those points, and calculate the delta, angle, and per-side correction. Follow the machine's squaring procedure for any adjustment.",
+            )))
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.5))
+                    .text_color(p.text_dim)
+                    .child(summary),
+            )
+            .when_some(correction, |this, correction| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.accent)
+                        .child(correction),
+                )
+            })
+            .when_some(error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+            .child(
+                Button::new("gantry-open")
+                    .label(t("OPEN CALCULATOR"))
+                    .primary()
+                    .h(px(48.0))
+                    .w(px(210.0))
+                    .rounded_lg()
+                    .text_size(px(11.0))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.open_gantry_squaring(cx));
+                    }),
+            )
+    }
+
+    /// Gantry-squaring wizard sheet. It only displays a calculation.
+    fn gantry_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.gantry_open {
+            return div().into_any_element();
+        }
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let close_view = view.clone();
+        let calculate_view = view.clone();
+        let model = self.state.utilities.gantry();
+        let result = model.result();
+        let error = model.error().map(std::string::ToString::to_string);
+        let fields = GantryField::ALL
+            .into_iter()
+            .map(|field| self.gantry_field_cell(field, p, cx))
+            .collect::<Vec<_>>();
+        let mono = self.mono.clone();
+        let stat = move |label: &'static str, value: String| {
+            v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0()
+                .p_2()
+                .rounded(px(6.0))
+                .bg(p.panel)
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.text_faint)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(18.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.text)
+                        .child(value),
+                )
+        };
+        let delta_value = result.map_or_else(|| "--".to_string(), |result| result.delta_text());
+        let angle_value = result.map_or_else(|| "--".to_string(), |result| result.angle_text());
+        let per_side_value =
+            result.map_or_else(|| "--".to_string(), |result| result.per_side_text());
+        let correction = result.map(|result| result.correction_text());
+        let per_side_note = result.map(|result| result.per_side_note());
+
+        let sheet = v_flex()
+            .relative()
+            .w(px(820.0))
+            .max_w_full()
+            .max_h(px(720.0))
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(p.border_strong)
+            .bg(p.raised)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(t("GANTRY SQUARING CALCULATOR")),
+                    )
+                    .child(chip(t("NO MOTION / NO WRITE"), p)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::BOLD)
+                    .line_height(px(14.0))
+                    .text_color(p.warning)
+                    .child(t(GANTRY_SAFETY_NOTE)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(t(
+                "Enter millimetres. The span is the distance between the two measurement points; the readings are the Y values at the left and right points. CALCULATE is local arithmetic.",
+            )))
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex_wrap()
+                    .items_end()
+                    .gap_2()
+                    .children(fields)
+                    .child(
+                        Button::new("gantry-calculate")
+                            .label(t("CALCULATE"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(150.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                calculate_view.update(cx, |this, cx| {
+                                    this.calculate_gantry_squaring(cx);
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.0))
+                    .bg(p.panel_alt)
+                    .border_1()
+                    .border_color(if error.is_some() { p.danger } else { p.border })
+                    .child(section_label(t("MEASUREMENT RESULT"), p))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .gap_2()
+                            .child(stat(t("DELTA (TOTAL)"), delta_value))
+                            .child(stat(t("ANGLE"), angle_value))
+                            .child(stat(t("PER-SIDE (PIVOT CENTRE)"), per_side_value)),
+                    )
+                    .when_some(correction, |this, correction| {
+                        this.child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.accent)
+                                .child(correction),
+                        )
+                    })
+                    .when_some(per_side_note, |this, note| {
+                        this.child(div().text_size(px(10.0)).text_color(p.text_dim).child(note))
+                    })
+                    .when_some(error, |this, error| {
+                        this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+                    })
+                    .when(result.is_none() && model.error().is_none(), |this| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(p.text_faint)
+                                .child(t(
+                                    "Press CALCULATE to validate the fields and show the correction.",
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .line_height(px(12.0))
+                            .text_color(p.text_faint)
+                            .child(t(GANTRY_CONVENTION_NOTE)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("gantry-close")
+                            .label(t("CLOSE"))
+                            .secondary()
+                            .h(px(48.0))
+                            .w(px(140.0))
+                            .rounded_lg()
+                            .text_size(px(11.0))
+                            .on_click(move |_, _, cx| {
+                                close_view.update(cx, |this, cx| {
+                                    this.close_gantry_squaring(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(9.5))
+                            .text_color(p.text_faint)
+                            .child(t(
+                                "There is no APPLY. Move or shim the gantry by hand, then measure again.",
+                            )),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("gantry-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| {
+                            this.close_gantry_squaring(cx);
+                        });
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
     /// Material surfacing summary card in the Utility workspace.
     fn surfacing_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
@@ -15708,6 +16132,11 @@ impl Shell {
     }
 
     fn utility_view(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if self.demo_gantry_card {
+            // Screenshot switch: keep the gantry card at the top of the list so
+            // the 1280x800 card capture does not depend on a manual scroll.
+            self.utility_scroll.scroll_to_top_of_item(GANTRY_CARD_INDEX);
+        }
         let view = cx.entity();
         let config = &self.state.config;
         let profile_path = config
@@ -16179,9 +16608,11 @@ impl Shell {
             .id("utility-scroll")
             .gap_2()
             .size_full()
-            .overflow_y_scrollbar()
+            .track_scroll(&self.utility_scroll)
+            .overflow_y_scroll()
             .child(self.controller_reset_card(p, cx))
             .child(self.machine_setup_card(p, cx))
+            .child(self.gantry_card(p, cx))
             .child(self.calibration_card(p, cx))
             .child(self.surfacing_card(p, cx))
             .child(self.program_limits_card(p))
@@ -16194,6 +16625,7 @@ impl Shell {
             .child(sleep_card)
             .child(profile_card)
             .child(backup_card)
+            .vertical_scrollbar(&self.utility_scroll)
             .into_any_element()
     }
 
@@ -20444,6 +20876,9 @@ impl Render for Shell {
         }
         if self.surfacing_open {
             root = root.child(self.surfacing_overlay(p, cx));
+        }
+        if self.gantry_open {
+            root = root.child(self.gantry_overlay(p, cx));
         }
         if self.state.utilities.transform_preview().is_some() {
             root = root.child(self.transform_overlay(p, cx));
