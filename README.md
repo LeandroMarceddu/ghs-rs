@@ -74,9 +74,10 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   has a mandatory preflight (link, Idle, spindle/coolant off, probe signal or
   explicit confirmation, and loaded offsets), ordered `PRB` binding, and a
   confirmed `G10 L2` apply. Tool length adds a confirmed `G43.1` apply or `G49`
-  clear verified through `$#`. The probe mount XY offset and the seven shared
-  cycle defaults are persisted per profile; entered positions are
-  feature/probe-tip coordinates and plans shift the controlled point.
+  clear verified through `$#`. The probe mount XY offset, the seven shared
+  cycle defaults, and bounded pre/post macros are persisted per profile;
+  entered positions are feature/probe-tip coordinates and plans shift the
+  controlled point.
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
   partial-map invalidation, 2D overlay, and CSV export. A constant map Z offset
   shifts effective heights without re-probing. Explicit Apply rewrites the

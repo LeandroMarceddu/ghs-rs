@@ -27,6 +27,10 @@ until the next release is cut.
 - **Gantry squaring** — a Utility calculator for span and left/right Y
   readings. It reports the delta, angle, and pivot-centre per-side correction,
   with explicit direction wording. It never moves or adjusts the gantry.
+- **Probe macros** — per-profile pre/post snippets can be edited in the Probe
+  workspace and are inserted into generated plans. The allowlist is comments,
+  `G4 P0..60`, `M0`, `M1`, `M5`, and `M9`, capped at 512 bytes and 8 lines;
+  invalid lines are rejected with their line number.
 - **Probe defaults** — safe Z, search, feed, retract, diameter, edge offset,
   and plate thickness are stored per controller profile with validation and
   backward-compatible defaults. The Probe `SAVE DEFAULTS` action writes only

@@ -574,6 +574,20 @@ origin/step, rectangle size, plate X/Y) stay per run and are not saved.
 `SAVE DEFAULTS` is refused while a probe run is active or a shared field is
 invalid.
 
+### Probe macros
+
+The `PROBE MACROS` bar edits two optional snippets inserted into every generated
+probe program: a pre-macro after the safety preamble and safe-Z move, and a
+post-macro after the final safe-Z retract. Both are profile-wide, stored in the
+local controller profile, and saved with `SAVE MACROS`; nothing is sent to the
+controller.
+
+Allowed lines are deliberately narrow: blank/comment lines, `G4 P0`–`G4 P60`,
+`M0`, `M1`, `M5`, and `M9`. Each macro is limited to 512 bytes and 8 lines.
+Motion, probing, spindle-on, coolant-on, tool changes, coordinate changes, and
+system commands are rejected with the line number. The inserted lines still
+pass the normal preflight and are shown in the generated program.
+
 ### Preflight
 
 `RUN` is refused unless every gate passes:

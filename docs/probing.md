@@ -73,6 +73,11 @@ result UI + optional offset update + height-map overlay
 - A completed tool-length result applies its delta with `G43.1 Z<current +
   delta>` or clears TLO with `G49`, after confirmation. The app verifies the
   reported `$#` TLO; a mismatch is `FAILED`, never `APPLIED`.
+- Pre/post probe macros are operator text inserted into the generated program
+  after the safety preamble and after the final retract. Only comments,
+  `G4 P0..60`, `M0`, `M1`, `M5`, and `M9` are accepted; each macro is capped at
+  512 bytes and 8 lines. The app validates them in `ghs-probe`, stores them per
+  profile, and still applies the normal preflight before any run.
 - The app owns the preflight and result sheet; the engine owns motion.
 
 ## Cycles

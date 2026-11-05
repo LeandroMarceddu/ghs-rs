@@ -159,7 +159,7 @@ implemented before its UI or hardware validation row is complete.
 | PROBE-06 | Rotation and straightness | M6 | partial | Reports angle; work rotation apply deferred |
 | PROBE-07 | XY touch plate offsets | M6 | done | Outside-edge plate workflow |
 | PROBE-08 | Probe verify and connected flow | M6 | done | No `PC` signal on this build |
-| PROBE-09 | Pre and post probe macros | M6 | todo | Bounded |
+| PROBE-09 | Pre and post probe macros | M6 | done | Bounded no-motion allowlist; per-profile editor |
 | PROBE-10 | Height map probing | M6 | done | Grid, feeds, safe Z, overlay, CSV |
 | PROBE-11 | Height map compensation and export | M6 | done | Explicit Apply rewrite, original preserved |
 | PROBE-12 | Probe-safe interlocks | M6 | done | Mandatory preflight |
