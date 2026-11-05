@@ -193,7 +193,7 @@ implemented before its UI or hardware validation row is complete.
 | UX-07 | Dark, light, high-contrast themes | M5 | partial | Shop-floor default |
 | UX-08 | Keyboard navigation and accessibility | M7 | partial | Machine keymap; full navigation/AccessKit open |
 | UX-09 | Localization, starting with en, it, de, nl | M7 | partial | Primary UI localized; long-form/secondary text English |
-| UX-10 | First-run safety onboarding | M7 | todo | Checklist |
+| UX-10 | First-run safety onboarding | M7 | done | Safety checklist + setup flag |
 | UX-11 | Error dialogs and notifications | M2 | partial | Actionable |
 | UX-12 | Crash-safe configuration and local logs | M5 | partial | Atomic writes |
 | UX-13 | Gamepad support | post-v1.0 | todo | Optional |
