@@ -794,6 +794,7 @@ mod tests {
             units: ghs_core::Units::Inch,
             locale: "pt-BR".into(),
             last_profile: Some(ProfileKey::from_controller(&info())),
+            setup_complete: true,
             window: crate::app::WindowLayout {
                 width: 1920,
                 height: 1080,

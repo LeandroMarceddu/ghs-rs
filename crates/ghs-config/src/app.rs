@@ -127,6 +127,13 @@ pub struct AppConfig {
     /// Profile that was active at the last successful connection or import.
     #[serde(default)]
     pub last_profile: Option<ProfileKey>,
+    /// Whether the first-run setup wizard has been completed.
+    ///
+    /// Configs written before this field existed load as `false`, so a new or
+    /// upgraded profile sees onboarding once. The shell saves the app config
+    /// after the wizard finishes.
+    #[serde(default)]
+    pub setup_complete: bool,
     /// Window geometry and panel sizes.
     #[serde(default)]
     pub window: WindowLayout,
@@ -140,6 +147,7 @@ impl Default for AppConfig {
             units: Units::default(),
             locale: default_locale(),
             last_profile: None,
+            setup_complete: false,
             window: WindowLayout::default(),
         }
     }
@@ -215,6 +223,7 @@ mod tests {
         assert_eq!(config.units, Units::Mm);
         assert_eq!(config.locale, "en");
         assert_eq!(config.last_profile, None);
+        assert!(!config.setup_complete);
         assert_eq!(config.window.width, 1280);
         assert_eq!(config.window.height, 800);
         assert_eq!(config.window.left_panel_width, 360);
@@ -246,6 +255,51 @@ mod tests {
         let decoded: AppConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, config);
         assert_eq!(decoded.locale, "pt-BR");
+        decoded.validate().expect("valid");
+    }
+
+    #[test]
+    fn setup_complete_defaults_to_false() {
+        assert!(!AppConfig::default().setup_complete);
+        let decoded: AppConfig = serde_json::from_str(r#"{"schema_version":1}"#).expect("parse");
+        assert!(!decoded.setup_complete);
+    }
+
+    #[test]
+    fn setup_complete_round_trips_both_values() {
+        for setup_complete in [false, true] {
+            let config = AppConfig {
+                setup_complete,
+                ..AppConfig::default()
+            };
+            let json = serde_json::to_string(&config).expect("serialize");
+            let decoded: AppConfig = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, config);
+            assert_eq!(decoded.setup_complete, setup_complete);
+            decoded.validate().expect("valid");
+        }
+    }
+
+    #[test]
+    fn old_json_without_setup_complete_loads_false() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "theme": "dark",
+            "units": "Mm",
+            "locale": "en",
+            "last_profile": null,
+            "window": {
+                "width": 1280,
+                "height": 800,
+                "x": null,
+                "y": null,
+                "maximized": false,
+                "left_panel_width": 360,
+                "bottom_panel_height": 240
+            }
+        });
+        let decoded: AppConfig = serde_json::from_value(value).expect("parse");
+        assert!(!decoded.setup_complete);
         decoded.validate().expect("valid");
     }
 

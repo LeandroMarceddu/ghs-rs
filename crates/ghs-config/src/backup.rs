@@ -343,6 +343,20 @@ mod tests {
     }
 
     #[test]
+    fn bundle_round_trips_setup_complete() {
+        let app = AppConfig {
+            setup_complete: true,
+            ..AppConfig::default()
+        };
+        let original = BackupBundle::new(app, &info(), data()).with_created_at(1_700_000_000);
+        let json = original.to_json_string().expect("encode");
+        assert!(json.contains("\"setup_complete\": true"));
+        let decoded = BackupBundle::from_json_str(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert!(decoded.app.setup_complete);
+    }
+
+    #[test]
     fn old_bundle_without_locale_uses_english() {
         let app = AppConfig {
             locale: "pt-BR".into(),
@@ -358,6 +372,7 @@ mod tests {
         let text = serde_json::to_string(&value).expect("json");
         let decoded = BackupBundle::from_json_str(&text).expect("decode");
         assert_eq!(decoded.app.locale, "en");
+        assert!(!decoded.app.setup_complete);
     }
 
     #[test]
