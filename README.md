@@ -9,6 +9,11 @@ The goal is a touch-first CNC sender with the ergonomics of
 feature set of [ioSender](https://github.com/terjeio/ioSender) — on Windows,
 macOS, and Linux.
 
+![ghs-rs Job workspace in Light and Dark themes](docs/images/theme-light-dark.png)
+
+*The same Job workspace split between Light and Dark themes. See the
+[gallery](docs/GALLERY.md) for setup, probing, utilities, and viewer captures.*
+
 > **Status: v0.6.0 pre-release published.** Protocol, simulator, serial, job
 > streaming, the 2D/3D viewer, generated settings, live offsets, tools,
 > profiles, backups, probing (including verified tool-length apply), height maps

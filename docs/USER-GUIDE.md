@@ -101,8 +101,9 @@ design-review shell and never sends commands.
 Useful layout and review flags: `--light`, `--high-contrast`, `--keypad`,
 `--size WxH` (for example `--size 1920x1080`), `--fullscreen`, `--viewer-3d`,
 `--settings`, `--offsets`, `--tools`, `--utility`, `--startup-lines`,
-`--macros`, `--probe`, `--demo-gantry`, and `--demo-gantry-card`. Demo job
-switches `--demo-m0` and `--demo-toolchange` are described in section 6.
+`--macros`, `--probe`, `--demo-gantry`, `--demo-gantry-card`, and
+`--demo-program-check`. Demo job switches `--demo-m0` and `--demo-toolchange`
+are described in section 6.
 
 ### Packaged builds
 
@@ -742,8 +743,15 @@ starts automatically.
 - `PROGRAM LIMITS` is read-only: work-coordinate X/Y/Z bounds, lines, segments,
   arcs, and tool changes. If `$20` soft limits and `$130`–`$132` travel are
   available it reports overruns; otherwise it says `NOT CHECKED` rather than
-  implying safety. The card itself never blocks START; the separate pre-run
-  confirmation can hold START when the loaded program exceeds reported travel.
+  implying safety. The card also shows `PROGRAM CHECK`:
+  feed/spindle ranges, `T` tools and `M6` changes, and warnings for a missing
+  feed before the first cut, zero/negative `F` or `S`, a tool absent from the
+  app table, `G38.x` probe moves, and `G53`/`G28`/`G30`. Missing tools are
+  warnings, not blockers. The check lists at most 50 warnings over the first
+  200,000 lines and says `INFORMATIONAL - START IS NOT BLOCKED. NOT A
+  MACHINE/TRAVEL CHECK.` The card itself never blocks START; the separate
+  pre-run confirmation can hold START when the loaded program exceeds reported
+  travel.
 - `SOURCE TRANSFORMS` adds line numbers (`N10` step 10 by default) or strips
   `(...)`/`;` comments. Preview first, then `LOAD AS PROGRAM`. Loading replaces
   the current job source and clears any height-map Apply/Revert state for the

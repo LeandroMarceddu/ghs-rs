@@ -13,6 +13,10 @@ until the next release is cut.
 
 ### Added
 
+- **Program check** — the read-only program-limits card now shows feed/spindle
+  ranges, tools, and warnings for a missing feed, zero/negative `F`/`S`, a tool
+  absent from the app table, probe moves, and machine-coordinate moves. It is
+  informational and never blocks START.
 - **Controller reset** — Utility → `CONTROLLER RESET` covers `$RST=#`, `$RST=$`,
   `$RST=&`, and `$RST=*`. Each target requires a backup prompt or explicit
   data-loss acknowledgement and a two-step confirmation; the reset is

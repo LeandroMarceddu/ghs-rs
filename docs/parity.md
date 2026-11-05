@@ -102,7 +102,7 @@ implemented before its UI or hardware validation row is complete.
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
 | JOB-01 | Open, drag-and-drop, recent files | M3 | done | Bounded browser, recent list, one-file drop |
-| JOB-02 | Validate program before streaming | M3 | partial | Syntax, tools, feeds |
+| JOB-02 | Validate program before streaming | M3 | partial | Syntax/tools/feeds check card; blocking validation open |
 | JOB-03 | Character-counting streaming with `Bf` top-up | M3 | done | Uses the reported RX buffer |
 | JOB-04 | Pause, resume, stop | M3 | done | Hold, resume, reset semantics |
 | JOB-05 | Manual tool change prompt and resume | M3 | done | `TC`, persistent tool plugin |
@@ -140,7 +140,7 @@ implemented before its UI or hardware validation row is complete.
 | SETUP-03 | Setting write, read-back verification, backup and restore | M5 | done | EEPROM caution |
 | SETUP-04 | Stepper and axis calibration | M5 | done | Steps/mm wizard; backlash open |
 | SETUP-05 | App settings and controller profiles | M5 | done | Keyed by `$I` identity |
-| SETUP-06 | Import and export settings, offsets, tools | M5 | partial | Backup bundle; offsets `.nc` open |
+| SETUP-06 | Import and export settings, offsets, tools | M5 | done | Backup bundle; `offsets.nc` export/restore |
 | SETUP-07 | Controller reset (`$RST`) with backup prompt | M5 | done | Four targets; backup + two-step confirm |
 | SETUP-08 | Keymap persistence | M5 | done | Machine actions; gamepad later |
 | SETUP-09 | Startup line persistence | M5 | done | `$N` read/edit/verify |
