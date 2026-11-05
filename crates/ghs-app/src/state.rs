@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ghs_config::{
     HeightMapRecord, JobHistoryRecord, JobHistoryResult, MAX_JOB_HISTORY_ELAPSED_S,
-    MAX_JOB_HISTORY_NAME_BYTES, Macro as ConfigMacro, ProbeOffsetRecord,
+    MAX_JOB_HISTORY_NAME_BYTES, Macro as ConfigMacro, ProbeOffsetRecord, ThemeMode,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
@@ -2266,7 +2266,8 @@ pub struct AppState {
     pub profile: Profile,
     pub mode: Mode,
     pub left_tab: LeftTab,
-    pub dark: bool,
+    /// Active colour theme for this session. Persisted in the app config.
+    pub theme_mode: ThemeMode,
     pub connection: ConnectionState,
     pub live: bool,
     pub machine_state: &'static str,
@@ -2393,7 +2394,7 @@ impl AppState {
             profile,
             mode: Mode::Job,
             left_tab: LeftTab::Console,
-            dark: true,
+            theme_mode: ThemeMode::Dark,
             connection: ConnectionState::Mock,
             live: false,
             machine_state: "Idle",

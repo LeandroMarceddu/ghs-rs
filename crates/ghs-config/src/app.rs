@@ -45,16 +45,72 @@ const MAX_LOCALE_LEN: usize = 16;
 const DEFAULT_LOCALE: &str = "en";
 
 /// Colour theme preference.
+///
+/// The variants persist as `snake_case` strings (`"system"`, `"dark"`,
+/// `"light"`, `"high_contrast"`). Configs written before the high-contrast
+/// theme existed keep loading unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
-    /// Follow the operating system.
+    /// Follow the operating system. The shell currently resolves this to the
+    /// dark palette, matching the pre-existing behaviour for old configs.
     #[default]
     System,
     /// Always use the dark theme.
     Dark,
     /// Always use the light theme.
     Light,
+    /// Maximum-contrast dark theme for low-vision and shop-floor use.
+    HighContrast,
+}
+
+impl ThemeMode {
+    /// Every persisted mode, including the legacy [`Self::System`] default.
+    ///
+    /// The order matches the historical enum order and is used by
+    /// round-trip and compatibility tests, not by the selector cycle.
+    pub const ALL: [Self; 4] = [Self::System, Self::Dark, Self::Light, Self::HighContrast];
+
+    /// Concrete modes offered by the top-bar theme selector, in cycle order.
+    ///
+    /// [`Self::System`] is deliberately absent: it is a legacy/default choice,
+    /// not a fourth button. A stored `System` value displays and cycles as
+    /// [`Self::Dark`].
+    pub const SELECTABLE: [Self; 3] = [Self::Dark, Self::Light, Self::HighContrast];
+
+    /// Return the next concrete mode for a one-tap theme cycle.
+    ///
+    /// Starting from [`Self::Dark`], the cycle is dark, light, high contrast,
+    /// then dark again. A legacy [`Self::System`] starts at dark so the first
+    /// tap still produces a concrete, persisted choice.
+    #[must_use]
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::System | Self::HighContrast => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::HighContrast,
+        }
+    }
+
+    /// Map a legacy [`Self::System`] choice onto a concrete selector mode.
+    ///
+    /// Every other mode is returned unchanged.
+    #[must_use]
+    pub fn selectable(self) -> Self {
+        match self {
+            Self::System => Self::Dark,
+            other => other,
+        }
+    }
+
+    /// Whether this mode uses a dark-toned palette.
+    ///
+    /// High contrast is a dark-toned variant, so it returns `true` here and in
+    /// the GPUI component theme mapping.
+    #[must_use]
+    pub fn is_dark(self) -> bool {
+        !matches!(self, Self::Light)
+    }
 }
 
 /// How a finished job ended, as stored in [`JobHistoryRecord`].
@@ -494,6 +550,98 @@ mod tests {
         assert_eq!(config.window.bottom_panel_height, 240);
         assert!(config.job_history.is_empty());
         config.validate().expect("defaults are valid");
+    }
+
+    #[test]
+    fn theme_modes_round_trip_all_variants_and_old_json_still_loads() {
+        let expected_names = [
+            (ThemeMode::System, "system"),
+            (ThemeMode::Dark, "dark"),
+            (ThemeMode::Light, "light"),
+            (ThemeMode::HighContrast, "high_contrast"),
+        ];
+        for (mode, name) in expected_names {
+            let config = AppConfig {
+                theme: mode,
+                ..AppConfig::default()
+            };
+            let json = serde_json::to_string(&config).expect("serialize");
+            assert!(
+                json.contains(&format!("\"theme\":\"{name}\"")),
+                "{mode:?} did not serialize as {name:?}: {json}"
+            );
+            let decoded: AppConfig = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded.theme, mode);
+            decoded.validate().expect("valid");
+        }
+
+        // Old files contain only the three pre-existing values. They must
+        // still load without a schema change.
+        for (raw, expected) in [
+            ("system", ThemeMode::System),
+            ("dark", ThemeMode::Dark),
+            ("light", ThemeMode::Light),
+        ] {
+            let decoded: AppConfig =
+                serde_json::from_str(&format!(r#"{{"schema_version":1,"theme":"{raw}"}}"#))
+                    .expect("parse old theme value");
+            assert_eq!(decoded.theme, expected);
+            decoded.validate().expect("valid");
+        }
+    }
+
+    #[test]
+    fn theme_mode_all_contains_every_variant_once() {
+        let mut seen = Vec::new();
+        for mode in ThemeMode::ALL {
+            assert!(!seen.contains(&mode), "{mode:?} appears twice");
+            seen.push(mode);
+        }
+        assert_eq!(seen.len(), 4);
+        for mode in [
+            ThemeMode::System,
+            ThemeMode::Dark,
+            ThemeMode::Light,
+            ThemeMode::HighContrast,
+        ] {
+            assert!(seen.contains(&mode), "{mode:?} is missing from ALL");
+        }
+    }
+
+    #[test]
+    fn theme_cycle_visits_each_selectable_mode_once() {
+        let mut seen = Vec::new();
+        let mut mode = ThemeMode::Dark;
+        for _ in 0..ThemeMode::SELECTABLE.len() {
+            assert!(!seen.contains(&mode), "{mode:?} appears twice in one cycle");
+            assert!(
+                ThemeMode::SELECTABLE.contains(&mode),
+                "{mode:?} is not a selector mode"
+            );
+            seen.push(mode);
+            mode = mode.cycle();
+        }
+        assert_eq!(mode, ThemeMode::Dark, "the cycle returns to its start");
+        assert_eq!(seen, ThemeMode::SELECTABLE.to_vec());
+
+        // A legacy System config starts the cycle at dark, so the first tap
+        // always persists a concrete mode.
+        assert_eq!(ThemeMode::System.selectable(), ThemeMode::Dark);
+        assert_eq!(ThemeMode::System.cycle(), ThemeMode::Dark);
+        for mode in ThemeMode::SELECTABLE {
+            assert_eq!(mode.selectable(), mode);
+        }
+    }
+
+    #[test]
+    fn theme_modes_report_their_tone() {
+        assert!(ThemeMode::System.is_dark());
+        assert!(ThemeMode::Dark.is_dark());
+        assert!(!ThemeMode::Light.is_dark());
+        assert!(
+            ThemeMode::HighContrast.is_dark(),
+            "high contrast is a dark-toned variant for the component theme"
+        );
     }
 
     #[test]

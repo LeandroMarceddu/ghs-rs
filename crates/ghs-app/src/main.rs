@@ -6,7 +6,8 @@
 //! only sends typed engine commands; it never writes controller bytes.
 //!
 //! Demo flags: `--mock` keeps the original mock-state shell for design review,
-//! `--light` starts in the light theme, `--keypad` opens the X keypad at
+//! `--light` starts in the light theme, `--high-contrast` starts in the
+//! high-contrast theme, `--keypad` opens the X keypad at
 //! startup, and `--connection-panel` (or `--connection-panel=serial`) opens
 //! the transport picker. `--demo-toolchange` preloads the two-tool demo that
 //! stops at `M6 T2`; `--demo-m0` preloads the same pocket with an `M0` pause;
@@ -162,9 +163,12 @@ fn main() {
         // `init` registers the GPUI Kit component layers. `open_window` mounts
         // the Base `Root`, which owns overlays, focus, and dialogs.
         init(cx);
-        // Demo switch for screenshots: `cargo run -p ghs-app -- --light`.
-        let light = std::env::args().any(|arg| arg == "--light");
-        theme::apply(!light, cx);
+        // Start with the screenshot/review flag or the dark-toned default.
+        // `Shell::new` applies the persisted mode from `app.json` before the
+        // first frame; this only prevents a flash with the wrong palette.
+        let launch = theme::launch_override(std::env::args().skip(1))
+            .unwrap_or(ghs_config::ThemeMode::System);
+        theme::apply(launch, cx);
 
         // Screenshot/layout-review override; defaults to the UX-01 size.
         let (width, height) = window_size_override().unwrap_or((1280.0, 800.0));

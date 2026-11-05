@@ -38,7 +38,7 @@ use chrono::TimeZone as _;
 
 use ghs_config::{
     JobHistoryRecord, JobHistoryResult, Keymap, MAX_HEIGHT_MAPS, MAX_JOB_HISTORY,
-    Macro as ConfigMacro, ToolRecord,
+    Macro as ConfigMacro, ThemeMode, ToolRecord,
 };
 use ghs_core::Units as CoreUnits;
 use ghs_engine::{
@@ -615,18 +615,12 @@ impl Shell {
         // well-formed tags stay in AppConfig and display English.
         crate::i18n::apply_startup_locale(state.config.app());
         // Demo-only switches used for screenshots and manual reviews. They do
-        // not affect normal startup and never touch the controller.
-        let forced_light = std::env::args().any(|arg| arg == "--light");
-        state.dark = if forced_light {
-            false
-        } else {
-            match state.config.app().theme {
-                ghs_config::ThemeMode::Dark => true,
-                ghs_config::ThemeMode::Light => false,
-                ghs_config::ThemeMode::System => true,
-            }
-        };
-        crate::theme::apply(state.dark, cx);
+        // not affect normal startup and never touch the controller. An explicit
+        // flag overrides the persisted mode for this run; the selector is what
+        // writes a choice back to app.json.
+        state.theme_mode = crate::theme::launch_override(std::env::args().skip(1))
+            .unwrap_or(state.config.app().theme);
+        crate::theme::apply(state.theme_mode, cx);
         let mock = std::env::args().any(|arg| arg == "--mock");
         if mock {
             state.connection = ConnectionState::Mock;
@@ -6377,7 +6371,91 @@ impl Shell {
         cx.notify();
     }
 
-    fn top_bar(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Apply and persist a theme choice from the top-bar selector.
+    ///
+    /// The mode and palette change before the config write, so a save failure
+    /// leaves the selected theme visible for the rest of the session. The
+    /// failure is logged and never silently claims the choice was persisted.
+    fn choose_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
+        self.state.theme_mode = mode;
+        crate::theme::apply(mode, cx);
+        if let Err(error) = self.state.config.set_theme_mode(mode) {
+            tracing::warn!(%error, "theme mode was not saved; keeping it for this session");
+        }
+        cx.notify();
+    }
+
+    /// Theme control: three segments on wide windows, one cycle button when
+    /// the top bar is tight.
+    ///
+    /// Each wide segment and the compact cycle button are one-tap 48 px
+    /// targets. The active mode is shown by the accent chip (wide) or the
+    /// button label (compact), and a stored legacy `System` mode displays as
+    /// `DARK`.
+    fn theme_selector(
+        &self,
+        p: Palette,
+        window_width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.state.theme_mode.selectable();
+        if window_width < px(1240.0) {
+            let next = active.cycle();
+            let label = theme_mode_label(active);
+            let view = cx.entity();
+            return Button::new("theme-cycle")
+                .label(label)
+                .flex_shrink_0()
+                .h(px(48.0))
+                .px_2()
+                .rounded_lg()
+                .text_size(px(10.0))
+                .custom(mode_variant(cx, p, true))
+                .tooltip(format!("Theme {label}; tap for {}", theme_mode_label(next)))
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.choose_theme_mode(next, cx));
+                })
+                .into_any_element();
+        }
+
+        let view = cx.entity();
+        let segments = ThemeMode::SELECTABLE
+            .iter()
+            .enumerate()
+            .map(|(index, mode)| {
+                let mode = *mode;
+                let selected = mode == active;
+                let view = view.clone();
+                let label = theme_mode_label(mode);
+                Button::new(format!("theme-{index}"))
+                    .label(label)
+                    .flex_shrink_0()
+                    .h(px(48.0))
+                    .px_2()
+                    .rounded_lg()
+                    .text_size(px(10.0))
+                    .custom(mode_variant(cx, p, selected))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.choose_theme_mode(mode, cx));
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        h_flex()
+            .id("theme-selector")
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(3.0))
+            .children(segments)
+            .into_any_element()
+    }
+
+    fn top_bar(
+        &self,
+        p: Palette,
+        window_width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let view = cx.entity();
 
         let modes = Mode::ALL.iter().enumerate().map(|(index, mode)| {
@@ -6400,7 +6478,6 @@ impl Shell {
                 })
         });
 
-        let theme_view = view.clone();
         let link_view = view.clone();
         let pill_view = view.clone();
         let reset_view = view.clone();
@@ -6436,7 +6513,7 @@ impl Shell {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap_3()
+            .gap(px(if window_width < px(1120.0) { 8.0 } else { 12.0 }))
             .px_3()
             .bg(p.panel)
             .border_b_1()
@@ -6486,21 +6563,7 @@ impl Shell {
                             .child(status_text),
                     ),
             )
-            .child(
-                Switch::new("theme-toggle")
-                    .checked(!self.state.dark)
-                    .label(t("Light"))
-                    .text_size(px(12.0))
-                    .on_change(move |checked, _, cx| {
-                        let dark = !*checked;
-                        theme_view.update(cx, |this, cx| {
-                            this.state.dark = dark;
-                            Palette::new(dark).apply(cx);
-                            this.state.config.set_theme(dark);
-                            cx.notify();
-                        });
-                    }),
-            )
+            .child(self.theme_selector(p, window_width, cx))
             .child(
                 Button::new("link")
                     .label(link_text)
@@ -21886,7 +21949,7 @@ impl viewer::HasViewer for Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = Palette::new(self.state.dark);
+        let p = Palette::for_mode(self.state.theme_mode);
         let width = window.viewport_size().width;
         let compact = width < px(1120.0);
 
@@ -21913,7 +21976,7 @@ impl Render for Shell {
             .bg(p.bg)
             .text_color(p.text)
             .font_family("sans-serif")
-            .child(self.top_bar(p, cx))
+            .child(self.top_bar(p, width, cx))
             .child(content)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.note_machine_key_down(event, cx)
@@ -22658,6 +22721,15 @@ fn demo_initial_screen_arg(arg: &str) -> bool {
                 | "--viewer-3d"
                 | "--viewer-stock-off"
         )
+}
+
+/// Short label for a concrete theme mode, including the resolved System case.
+fn theme_mode_label(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::HighContrast => "HIGH CONTRAST",
+        ThemeMode::Light => "LIGHT",
+        ThemeMode::Dark | ThemeMode::System => "DARK",
+    }
 }
 
 fn mode_variant(cx: &App, p: Palette, active: bool) -> ButtonCustomVariant {

@@ -898,14 +898,35 @@ impl ConfigModel {
         Ok(path)
     }
 
-    /// Persist the theme toggle immediately.
+    /// Persist the chosen colour theme immediately.
+    ///
+    /// The in-memory preference is updated before the write, so a failed save
+    /// leaves the selected mode active for this session and only prevents it
+    /// from being restored on the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::save_app`] error when no store is available or the
+    /// existing app file is corrupt.
+    pub fn set_theme_mode(&mut self, mode: ThemeMode) -> Result<PathBuf, String> {
+        self.app.theme = mode;
+        self.save_app()
+    }
+
+    /// Persist the legacy dark/light theme toggle.
+    ///
+    /// Kept as a compatibility shim for callers that only have a boolean; the
+    /// app selector uses [`Self::set_theme_mode`] so high contrast is
+    /// representable and save failures can be reported. The write error is
+    /// deliberately discarded here, matching the historical signature.
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, dark: bool) {
-        self.app.theme = if dark {
+        let mode = if dark {
             ThemeMode::Dark
         } else {
             ThemeMode::Light
         };
-        let _ = self.save_app();
+        let _ = self.set_theme_mode(mode);
     }
 
     /// Persist the UI locale for the next session.
@@ -1642,11 +1663,69 @@ mod tests {
     }
 
     #[test]
+    fn theme_mode_persists_and_survives_reload_for_every_mode() {
+        let dir = TempDir::new("theme-modes");
+        for mode in ThemeMode::ALL {
+            let mut model = ConfigModel::from_store(ConfigStore::new(&dir.path));
+            model
+                .set_theme_mode(mode)
+                .unwrap_or_else(|error| panic!("{mode:?} save failed: {error}"));
+            assert_eq!(model.app().theme, mode);
+
+            let reopened = ConfigModel::from_store(ConfigStore::new(&dir.path));
+            assert_eq!(reopened.app().theme, mode, "{mode:?} did not reload");
+        }
+    }
+
+    #[test]
+    fn set_theme_mode_save_failure_keeps_the_session_mode() {
+        let dir = TempDir::new("theme-save-failure");
+        let store = ConfigStore::new(&dir.path);
+        let app_path = store.app_config_path();
+        fs::create_dir_all(app_path.parent().expect("parent")).expect("mkdir");
+        fs::write(&app_path, b"{ this is not json").expect("write corrupt config");
+
+        let mut model = ConfigModel::from_store(store);
+        let error = model
+            .set_theme_mode(ThemeMode::HighContrast)
+            .expect_err("the corrupt app file refuses the save");
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(
+            model.app().theme,
+            ThemeMode::HighContrast,
+            "the selected mode stays active for this session"
+        );
+        assert_eq!(
+            fs::read(&app_path).expect("read app config"),
+            b"{ this is not json",
+            "a failed theme save never rewrites the corrupt file"
+        );
+    }
+
+    #[test]
+    fn legacy_set_theme_still_selects_dark_and_light() {
+        let dir = TempDir::new("theme-legacy");
+        let mut model = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        model.set_theme(true);
+        assert_eq!(model.app().theme, ThemeMode::Dark);
+        model.set_theme(false);
+        assert_eq!(model.app().theme, ThemeMode::Light);
+        assert_eq!(
+            ConfigModel::from_store(ConfigStore::new(&dir.path))
+                .app()
+                .theme,
+            ThemeMode::Light
+        );
+    }
+
+    #[test]
     fn app_preferences_round_trip() {
         let dir = TempDir::new("app");
         let mut model = ConfigModel::from_store(ConfigStore::new(&dir.path));
         model.app.units = CoreUnits::Inch;
-        model.set_theme(false);
+        model
+            .set_theme_mode(ThemeMode::Light)
+            .expect("save theme mode");
         assert_eq!(model.app().units, CoreUnits::Inch);
         assert_eq!(model.app().theme, ThemeMode::Light);
 
