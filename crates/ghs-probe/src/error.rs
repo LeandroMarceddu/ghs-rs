@@ -93,6 +93,96 @@ pub enum ValidationError {
     },
 }
 
+/// A rejected pre or post probe macro.
+///
+/// A macro is operator text inserted into a generated probe program. Only
+/// comments, a bounded `G4` dwell, and `M0`/`M1`/`M5`/`M9` are accepted; see
+/// [`crate::validate_probe_macro`] for the exact allowlist. The error keeps the
+/// original one-based line number and the offending text so the app can show
+/// it next to the macro editor.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum ProbeMacroError {
+    /// The macro text is longer than [`crate::MAX_PROBE_MACRO_BYTES`].
+    #[error("probe macro is {bytes} bytes; the limit is {max}")]
+    TooManyBytes {
+        /// Rejected byte length of the macro text.
+        bytes: usize,
+        /// Inclusive byte limit.
+        max: usize,
+    },
+    /// The macro has more non-blank lines than
+    /// [`crate::MAX_PROBE_MACRO_LINES`].
+    #[error("probe macro has {lines} lines; the limit is {max}")]
+    TooManyLines {
+        /// Number of cleaned, non-blank lines.
+        lines: usize,
+        /// Inclusive line limit.
+        max: usize,
+    },
+    /// A line is not a comment, a bounded dwell, or one of the allowed
+    /// M-codes.
+    #[error("probe macro line {line} is not allowed: {text:?}")]
+    ForbiddenLine {
+        /// One-based line number in the macro text.
+        line: usize,
+        /// Trimmed line text.
+        text: String,
+    },
+    /// A `G4` line has no `P` word.
+    #[error("probe macro line {line} must be `G4 P<seconds>`: {text:?}")]
+    DwellMissingP {
+        /// One-based line number in the macro text.
+        line: usize,
+        /// Trimmed line text.
+        text: String,
+    },
+    /// A `G4` dwell is outside `0..=60` seconds.
+    #[error("probe macro line {line} dwells {seconds} s; the range is 0..=60: {text:?}")]
+    DwellOutOfRange {
+        /// One-based line number in the macro text.
+        line: usize,
+        /// Trimmed line text.
+        text: String,
+        /// Parsed dwell, in seconds.
+        seconds: f64,
+    },
+    /// A `G4` dwell value is not a plain decimal number.
+    #[error("probe macro line {line} has an unreadable dwell: {text:?}")]
+    DwellInvalidValue {
+        /// One-based line number in the macro text.
+        line: usize,
+        /// Trimmed line text.
+        text: String,
+    },
+    /// A `G4` line has words other than `G4` and one `P`.
+    #[error("probe macro line {line} has extra words: {text:?}")]
+    DwellExtraWords {
+        /// One-based line number in the macro text.
+        line: usize,
+        /// Trimmed line text.
+        text: String,
+    },
+    /// A line contains a control character other than a tab.
+    #[error("probe macro line {line} contains the control character {character:?}")]
+    ControlCharacter {
+        /// One-based line number in the macro text.
+        line: usize,
+        /// Rejected control character.
+        character: char,
+    },
+    /// The plan does not start with the fixed safety preamble this crate emits.
+    #[error("probe plan does not start with the expected safety preamble")]
+    ProgramShape,
+    /// Inserting the macros would exceed the probe program line budget.
+    #[error("probe program would have {lines} lines; the limit is {max}")]
+    ProgramTooLong {
+        /// Resulting line count with both macros applied.
+        lines: usize,
+        /// Inclusive line limit.
+        max: usize,
+    },
+}
+
 /// A failed plan build or result computation.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ProbeError {

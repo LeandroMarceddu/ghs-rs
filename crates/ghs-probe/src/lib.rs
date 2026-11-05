@@ -127,17 +127,22 @@ mod cycle;
 mod error;
 mod gcode;
 mod heightmap;
+mod macros;
 mod math;
 mod params;
 mod result;
 
 pub use cycle::{CornerProbe, EdgeSpec, ProbeCycle, RotationProbe};
-pub use error::{ProbeError, ValidationError};
+pub use error::{ProbeError, ProbeMacroError, ValidationError};
 pub use gcode::{PlannedProbe, ProbeMoveCode, ProbePlan, ProbePreconditions, ProbeVector};
 pub use heightmap::{
     CompensatedToolpath, HEIGHT_MAP_POINT_OVERHEAD_SECONDS, HeightMap, HeightMapEstimate,
     HeightMapGrid, HeightMapSummary, MAX_COMPENSATED_SEGMENTS, MAX_HEIGHT_MAP_AXIS_POINTS,
     MAX_HEIGHT_MAP_POINTS, MAX_HEIGHT_MAP_Z_OFFSET_MM,
+};
+pub use macros::{
+    MAX_PROBE_MACRO_BYTES, MAX_PROBE_MACRO_DWELL_SECONDS, MAX_PROBE_MACRO_LINES,
+    validate_probe_macro,
 };
 pub use math::{
     CircleFit, RectangleFit, RotationAxis, RotationFit, circle_feature_radius, corner_work_zero,
