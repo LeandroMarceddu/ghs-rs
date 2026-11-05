@@ -3816,6 +3816,81 @@ impl AppState {
         Ok(UtilityLoad { name, command })
     }
 
+    /// Generate and store one rotation preview from the loaded job source.
+    ///
+    /// The source is the app's parsed copy of the current job; the loaded
+    /// program is not modified. This sends nothing and never starts the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns and caches a refusal when no program is loaded, the loaded
+    /// source is empty, a rotation field is invalid, or the transform rejects
+    /// the program (for example `G91`, probing, or a checksummed line).
+    pub fn preview_rotation(&mut self) -> Result<(), String> {
+        let Some(source) = self.job.source_text() else {
+            let message = "NO PROGRAM: load a program before rotating its source".to_string();
+            self.utilities.note_rotation_error(message.clone());
+            return Err(message);
+        };
+        if source.trim().is_empty() {
+            let message = "the loaded program source is empty".to_string();
+            self.utilities.note_rotation_error(message.clone());
+            return Err(message);
+        }
+        let name = self.job.name.clone();
+        self.utilities.generate_rotation(&name, &source)
+    }
+
+    /// Build the one load command for a confirmed rotation preview.
+    ///
+    /// This loads the previewed source and never starts, resumes, or jogs. The
+    /// normal program-load path registers the exact source and clears any
+    /// height-map Apply/Revert state for the previous source when the engine
+    /// reports `JobLoaded`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no preview exists, the operator has not
+    /// acknowledged the rotated-program warning, or the normal program-load
+    /// gate refuses (mock, not ready, or a job is active).
+    pub fn take_rotation_load(&mut self) -> Result<UtilityLoad, String> {
+        if !self.utilities.rotation_confirmed() {
+            return Err("confirm the rotated source before loading it".to_string());
+        }
+        let Some(preview) = self.utilities.rotation_preview() else {
+            return Err("preview the rotation before loading it".to_string());
+        };
+        let name = preview.name.clone();
+        let source = preview.source.clone();
+        let command = self
+            .program_load(&name, &source)
+            .map_err(|refusal| refusal.message().to_string())?;
+        Ok(UtilityLoad { name, command })
+    }
+
+    /// Fill the rotation-angle field with the correction for a measured probe
+    /// deviation: `-deviation_deg`.
+    ///
+    /// This is a local field edit only. It does not choose a pivot, generate a
+    /// preview, load anything, or send a controller command.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the deviation is not finite or the resulting
+    /// angle is outside the rotation limits.
+    pub fn set_rotation_angle_from_probe(&mut self, deviation_deg: f64) -> Result<(), String> {
+        if !deviation_deg.is_finite() {
+            return Err("PROBE DEVIATION must be finite".to_string());
+        }
+        let angle_deg = if deviation_deg.abs() < 0.000_05 {
+            0.0
+        } else {
+            -deviation_deg
+        };
+        self.utilities
+            .set_field_text(UtilityField::RotationAngle, format!("{angle_deg:.4}"))
+    }
+
     /// Reported steps/mm for one calibration axis.
     ///
     /// Only a finite value inside the wizard's accepted range is returned, so a
@@ -5614,6 +5689,150 @@ mod tests {
             state.job.program().expect("program remains loaded"),
             &program
         ));
+    }
+
+    fn rotation_state(source: &str, name: &str) -> AppState {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        let program = Arc::new(ghs_gcode::parse_program(source).expect("rotation source parses"));
+        state.job.loaded(
+            name.into(),
+            program,
+            u32::try_from(source.lines().count()).unwrap_or(0),
+        );
+        state
+            .utilities
+            .set_field_text(UtilityField::RotationAngle, "90")
+            .expect("angle");
+        state
+            .utilities
+            .set_field_text(UtilityField::RotationPivotX, "0")
+            .expect("pivot X");
+        state
+            .utilities
+            .set_field_text(UtilityField::RotationPivotY, "0")
+            .expect("pivot Y");
+        state
+    }
+
+    #[test]
+    fn rotation_preview_refuses_without_a_loaded_or_non_empty_program() {
+        let mut state = AppState::new();
+        state.begin_live("test transport");
+        state.connection = ConnectionState::Ready;
+        let error = state.preview_rotation().expect_err("no program");
+        assert!(error.contains("NO PROGRAM"), "{error}");
+        assert!(state.utilities.rotation_error().is_some());
+        assert!(state.utilities.rotation_preview().is_none());
+
+        let mut empty = AppState::new();
+        empty.begin_live("test transport");
+        empty.connection = ConnectionState::Ready;
+        let program = Arc::new(ghs_gcode::parse_program("").expect("empty program"));
+        empty.job.loaded("empty.nc".into(), program, 0);
+        let error = empty.preview_rotation().expect_err("empty source");
+        assert!(error.contains("empty"), "{error}");
+        assert!(empty.utilities.rotation_preview().is_none());
+    }
+
+    #[test]
+    fn rotation_preview_uses_the_loaded_source_and_changes_nothing() {
+        let source = "G21 G90\nG0 X10 Y0\nM30\n";
+        let mut state = rotation_state(source, "part.nc");
+        let program = state.job.program().expect("program").clone();
+        state.preview_rotation().expect("preview");
+        let preview = state.utilities.rotation_preview().expect("preview");
+        assert_eq!(
+            preview.source.lines().collect::<Vec<_>>(),
+            ["G21 G90", "G0 X0 Y10", "M30"]
+        );
+        assert_eq!(preview.name, "part.nc [rotated 90 deg]");
+        assert_eq!(state.job.name, "part.nc");
+        assert!(Arc::ptr_eq(
+            state.job.program().expect("same program"),
+            &program
+        ));
+        assert!(!state.job.is_active());
+    }
+
+    #[test]
+    fn rotation_load_requires_confirmation_and_builds_one_load_program() {
+        let mut state = rotation_state("G21 G90\nG0 X10 Y0\nM30\n", "part.nc");
+        state.preview_rotation().expect("preview");
+        assert!(
+            state.take_rotation_load().is_err(),
+            "confirmation is required"
+        );
+        state.utilities.set_rotation_confirmed(true);
+        let load = state.take_rotation_load().expect("confirmed load");
+        assert_eq!(load.name, "part.nc [rotated 90 deg]");
+        let Command::LoadProgram { name, source } = &load.command else {
+            panic!("rotation load must be LoadProgram, got {:?}", load.command);
+        };
+        assert_eq!(name, &load.name);
+        assert_eq!(
+            source.lines().collect::<Vec<_>>(),
+            ["G21 G90", "G0 X0 Y10", "M30"]
+        );
+        assert_eq!(state.job.state, JobState::Idle);
+        assert!(!state.job.is_active());
+        assert!(matches!(load.command, Command::LoadProgram { .. }));
+        assert!(!matches!(
+            load.command,
+            Command::StartProgram { .. }
+                | Command::StopProgram { .. }
+                | Command::Jog(_)
+                | Command::Mdi(_)
+        ));
+    }
+
+    #[test]
+    fn rotation_load_clears_height_map_revert_state_for_the_old_source() {
+        let source = "G21 G90\nG0 X10 Y0\nM30\n";
+        let mut state = rotation_state(source, "part.nc");
+        let program = state.job.program().expect("program").clone();
+        state
+            .height_map
+            .remember_exact_source("part.nc", source.to_string());
+        state.height_map.on_job_loaded("part.nc", &program, false);
+        assert!(state.height_map.adopt_current_program_for_map());
+        assert!(state.height_map.original().is_some());
+
+        state.preview_rotation().expect("preview");
+        state.utilities.set_rotation_confirmed(true);
+        let load = state.take_rotation_load().expect("confirmed load");
+        let Command::LoadProgram { name, source } = &load.command else {
+            panic!("rotation load must be LoadProgram");
+        };
+        let rotated = Arc::new(ghs_gcode::parse_program(source).expect("rotated program"));
+        state.height_map.on_job_loaded(name, &rotated, false);
+        assert!(state.height_map.original().is_none());
+        assert!(state.height_map.applied().is_none());
+        assert!(!state.job_compensated());
+    }
+
+    #[test]
+    fn probe_rotation_angle_fills_the_utility_field_without_loading() {
+        let mut state = AppState::new();
+        state
+            .set_rotation_angle_from_probe(0.5)
+            .expect("fill angle");
+        assert_eq!(
+            state.utilities.field_text(UtilityField::RotationAngle),
+            "-0.5000"
+        );
+        assert!(state.utilities.rotation_preview().is_none());
+        assert!(!state.job.has_program());
+        assert!(!state.job.is_active());
+
+        state
+            .set_rotation_angle_from_probe(f64::NAN)
+            .expect_err("non-finite deviation");
+        assert_eq!(
+            state.utilities.field_text(UtilityField::RotationAngle),
+            "-0.5000"
+        );
     }
 
     fn calibration_ready_state() -> AppState {

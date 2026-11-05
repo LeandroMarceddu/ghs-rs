@@ -29,6 +29,12 @@
 //! keymap section. `--demo-surfacing` opens the material surfacing wizard and
 //! generates a preview without loading or starting it; `--demo-transform` opens
 //! the line-number transform preview for the loaded demo program.
+//! `--demo-rotation` seeds the Utility rotate fields with a reproducible local
+//! sample and opens the rotation preview; the sample contains one `R` arc so
+//! the radius-to-center warning is visible. `--demo-rotation-card` seeds the
+//! same preview but leaves the sheet closed for the card capture, and
+//! `--demo-rotation-confirm` additionally checks the load confirmation. All
+//! three are local arithmetic: they load, start, and send nothing.
 //! `--demo-calibration` fills the stepper-calibration fields and shows the
 //! proposal without applying it; `--demo-calibration-confirm` opens the write
 //! confirmation. `--demo-gantry` loads a reproducible 500 mm / 0.250 mm sample

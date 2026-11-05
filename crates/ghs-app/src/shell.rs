@@ -113,7 +113,7 @@ use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::utilities::{
     CalibrationAxis, CalibrationField, GANTRY_CONVENTION_NOTE, GANTRY_SAFETY_NOTE, GantryField,
-    LimitsStatus, TransformKind, UtilityField,
+    LimitsStatus, ROTATION_FRAME_NOTE, TransformKind, UtilityField,
 };
 use crate::viewer;
 
@@ -153,6 +153,8 @@ const JOG_CANCEL_AFTER: Duration = Duration::from_millis(250);
 const GANTRY_CARD_INDEX: usize = 3;
 /// Position of the local job-history card in the Utility scroll list.
 const JOB_HISTORY_CARD_INDEX: usize = 2;
+/// Position of the source-rotation card in the Utility scroll list.
+const ROTATION_CARD_INDEX: usize = 8;
 
 /// What the shared settings text sheet is editing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +471,15 @@ pub struct Shell {
     /// Screenshot switch: open the line-number transform preview.
     demo_transform: bool,
     demo_transform_done: bool,
+    /// Source-rotation preview sheet is open. Opening sends nothing.
+    rotation_open: bool,
+    /// Screenshot switch: seed the rotation preview and open its sheet.
+    demo_rotation: bool,
+    demo_rotation_done: bool,
+    /// Screenshot switch: seed the rotation card with the sheet closed.
+    demo_rotation_card: bool,
+    /// Screenshot switch: also check the rotation load confirmation.
+    demo_rotation_confirm: bool,
     /// Screenshot switch: open Utility at the controller-reset card.
     demo_reset: bool,
     demo_reset_done: bool,
@@ -809,10 +820,16 @@ impl Shell {
         let demo_gantry = demo_gantry_card || std::env::args().any(|arg| arg == "--demo-gantry");
         let demo_surfacing = std::env::args().any(|arg| arg == "--demo-surfacing");
         let demo_transform = std::env::args().any(|arg| arg == "--demo-transform");
+        let demo_rotation_card = std::env::args().any(|arg| arg == "--demo-rotation-card");
+        let demo_rotation_confirm = std::env::args().any(|arg| arg == "--demo-rotation-confirm");
+        let demo_rotation = demo_rotation_card
+            || demo_rotation_confirm
+            || std::env::args().any(|arg| arg == "--demo-rotation");
         let demo_reset_confirm = std::env::args().any(|arg| arg == "--demo-reset-confirm");
         let demo_reset = demo_reset_confirm || std::env::args().any(|arg| arg == "--demo-reset");
         if demo_surfacing
             || demo_transform
+            || demo_rotation
             || demo_calibration
             || demo_calibration_confirm
             || demo_gantry
@@ -983,6 +1000,7 @@ impl Shell {
             surfacing_open: false,
             gantry_open: false,
             calibration_confirm_open: false,
+            rotation_open: false,
             demo_calibration,
             demo_calibration_done: false,
             demo_calibration_confirm,
@@ -993,6 +1011,10 @@ impl Shell {
             demo_surfacing_done: false,
             demo_transform,
             demo_transform_done: false,
+            demo_rotation,
+            demo_rotation_done: false,
+            demo_rotation_card,
+            demo_rotation_confirm,
             demo_reset,
             demo_reset_done: false,
             demo_reset_confirm,
@@ -1673,6 +1695,27 @@ impl Shell {
                 self.state
                     .push_console(ConsoleLevel::Warn, format!("Demo transform: {message}"));
             }
+            changed = true;
+        }
+        // Screenshot switch: seed the reproducible rotation preview. The sample
+        // has one `R` arc, so the sheet shows the radius-to-center warning. This
+        // is local arithmetic only: nothing is loaded, started, or sent.
+        if self.demo_rotation
+            && !self.demo_rotation_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_rotation_done = true;
+            self.state.mode = Mode::Utility;
+            self.state.keypad = None;
+            self.surfacing_open = false;
+            self.state.utilities.close_transform();
+            self.state.utilities.load_rotation_demo();
+            if self.demo_rotation_confirm {
+                self.state.utilities.set_rotation_confirmed(true);
+            }
+            self.rotation_open = !self.demo_rotation_card;
+            self.utility_scroll
+                .scroll_to_top_of_item(ROTATION_CARD_INDEX);
             changed = true;
         }
         // Screenshot switch: open Utility at the destructive reset card.
@@ -5926,6 +5969,121 @@ impl Shell {
             );
         } else {
             self.state.height_map.discard_exact_source(&load.name);
+        }
+        cx.notify();
+    }
+
+    /// Generate the rotation preview from the loaded job and open its sheet.
+    ///
+    /// The model validates the fields and transforms a local copy. Nothing is
+    /// loaded, started, or sent; a refusal stays on the card and in the console.
+    fn preview_rotation(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.surfacing_open = false;
+        self.state.utilities.close_transform();
+        match self.state.preview_rotation() {
+            Ok(()) => {
+                self.rotation_open = true;
+                self.state.mode = Mode::Utility;
+                self.utility_scroll
+                    .scroll_to_top_of_item(ROTATION_CARD_INDEX);
+                let summary = self
+                    .state
+                    .utilities
+                    .rotation_preview()
+                    .map(|preview| {
+                        format!(
+                            "Rotation preview ready: {} (not loaded)",
+                            preview.stats_text()
+                        )
+                    })
+                    .unwrap_or_else(|| "Rotation preview ready (not loaded)".to_string());
+                self.state.push_console(ConsoleLevel::Info, summary);
+            }
+            Err(message) => {
+                self.rotation_open = false;
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Rotation: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reopen an existing rotation preview without transforming again.
+    fn open_rotation_preview(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        if self.state.utilities.rotation_preview().is_some() {
+            self.surfacing_open = false;
+            self.state.utilities.close_transform();
+            self.rotation_open = true;
+            self.state.mode = Mode::Utility;
+        }
+        cx.notify();
+    }
+
+    /// Cancel the rotation review. Sends nothing and discards the preview.
+    fn close_rotation(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.rotation_open = false;
+        self.state.utilities.close_rotation();
+        cx.notify();
+    }
+
+    /// Load the confirmed rotation preview with exactly one `LoadProgram`.
+    ///
+    /// The command never starts, resumes, or jogs. A successful send switches
+    /// to Job -> Program so the rotated name and source are visible.
+    fn load_rotation(&mut self, cx: &mut Context<Self>) {
+        let load = match self.state.take_rotation_load() {
+            Ok(load) => load,
+            Err(message) => {
+                self.state.push_console(ConsoleLevel::Warn, message);
+                cx.notify();
+                return;
+            }
+        };
+        if self.send_command(load.command) {
+            self.rotation_open = false;
+            self.state.utilities.close_rotation();
+            self.state.mode = Mode::Job;
+            self.state.left_tab = LeftTab::Program;
+            self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Loaded rotated program {} (not started)", load.name),
+            );
+        } else {
+            self.state.height_map.discard_exact_source(&load.name);
+        }
+        cx.notify();
+    }
+
+    /// Copy a measured probe deviation into the Utility angle field as
+    /// `-deviation_deg`. No pivot is chosen, no preview is generated, and
+    /// nothing is loaded or sent.
+    fn use_probe_rotation_angle(&mut self, deviation_deg: f64, cx: &mut Context<Self>) {
+        match self.state.set_rotation_angle_from_probe(deviation_deg) {
+            Ok(()) => {
+                self.state.keypad = None;
+                self.state.mode = Mode::Utility;
+                self.utility_scroll
+                    .scroll_to_top_of_item(ROTATION_CARD_INDEX);
+                let angle = self
+                    .state
+                    .utilities
+                    .field_text(UtilityField::RotationAngle)
+                    .to_string();
+                self.state.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "Probe angle copied to Utility: {angle} deg about the work pivot; \
+                         not loaded"
+                    ),
+                );
+            }
+            Err(message) => self.state.push_console(
+                ConsoleLevel::Warn,
+                format!("Probe angle not copied: {message}"),
+            ),
         }
         cx.notify();
     }
@@ -12543,17 +12701,36 @@ impl Shell {
                 );
             }
             section = section.child(rows);
-        } else if let Some(note) = run
-            .outcome
-            .as_ref()
-            .and_then(|outcome| match &outcome.value {
-                ghs_probe::ProbeValue::Rotation { .. } => {
-                    Some("Rotation is reported only; applying work rotation is deferred.")
-                }
-                _ => None,
-            })
+        } else if let Some(deviation_deg) = run.outcome.as_ref().and_then(|outcome| match &outcome
+            .value
         {
-            section = section.child(div().text_size(px(10.0)).text_color(p.warning).child(note));
+            ghs_probe::ProbeValue::Rotation { deviation_deg, .. } => Some(*deviation_deg),
+            _ => None,
+        }) {
+            let use_view = cx.entity();
+            section = section.child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                        "Rotation is reported only. USE PROBE ANGLE fills the Utility \
+                                 angle with -deviation; the pivot stays in work coordinates and \
+                                 nothing is loaded or sent.",
+                    )))
+                    .child(
+                        Button::new("probe-use-angle")
+                            .label(t("USE PROBE ANGLE"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(190.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                use_view.update(cx, |this, cx| {
+                                    this.use_probe_rotation_angle(deviation_deg, cx);
+                                });
+                            }),
+                    ),
+            );
         }
 
         if run.kept {
@@ -15541,6 +15718,389 @@ impl Shell {
             })
     }
 
+    /// Non-destructive source rotation about a work-coordinate pivot.
+    fn rotation_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let loaded = self.state.job.has_program();
+        let name = self.state.job_title().to_string();
+        let error = self.state.utilities.rotation_error().map(str::to_string);
+        let preview = self.state.utilities.rotation_preview();
+        let stats = preview.map(crate::utilities::RotationPreview::stats_text);
+        let warnings = preview.map(crate::utilities::RotationPreview::warning_lines);
+        let preview_source = preview.map(|preview| preview.base_name.clone());
+        let has_preview = preview.is_some();
+        let fields = [
+            UtilityField::RotationAngle,
+            UtilityField::RotationPivotX,
+            UtilityField::RotationPivotY,
+        ]
+        .into_iter()
+        .map(|field| self.utility_field_cell(field, p, cx))
+        .collect::<Vec<_>>();
+        let view = cx.entity();
+        let preview_view = view.clone();
+        let review_view = view;
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("ROTATE PROGRAM"), p))
+                    .child(chip(t("WORK PIVOT / CCW +"), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                preview_source.map_or_else(
+                    || {
+                        format!(
+                            "Loaded source: {name}. Rotation rewrites a local copy; \
+                                 LOAD AS PROGRAM replaces the job with the previewed source and \
+                                 never starts it."
+                        )
+                    },
+                    |source| {
+                        format!(
+                            "Preview source: {source}. LOAD AS PROGRAM replaces the job with \
+                                 this previewed source and never starts it."
+                        )
+                    },
+                ),
+            ))
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .line_height(px(12.0))
+                    .text_color(p.warning)
+                    .child(t(ROTATION_FRAME_NOTE)),
+            )
+            .child(h_flex().flex_wrap().gap_1().children(fields))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("rotation-preview")
+                            .label(t("PREVIEW ROTATION"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(210.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                preview_view.update(cx, |this, cx| {
+                                    this.preview_rotation(cx);
+                                });
+                            }),
+                    )
+                    .when(has_preview, |this| {
+                        this.child(
+                            Button::new("rotation-review")
+                                .label(t("REVIEW PREVIEW"))
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(170.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .on_click(move |_, _, cx| {
+                                    review_view.update(cx, |this, cx| {
+                                        this.open_rotation_preview(cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .when(!loaded, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(p.warning)
+                                .child(t("NO PROGRAM: load a program before rotating its source")),
+                        )
+                    }),
+            )
+            .when_some(stats, |this, stats| {
+                this.child(
+                    div()
+                        .font_family(self.mono.clone())
+                        .text_size(px(10.0))
+                        .text_color(p.text_dim)
+                        .child(stats),
+                )
+            })
+            .when_some(warnings, |this, warnings| {
+                let mut rows = v_flex().gap_0();
+                for warning in warnings.iter().take(3) {
+                    rows = rows.child(
+                        div()
+                            .text_size(px(9.5))
+                            .line_height(px(12.0))
+                            .text_color(p.warning)
+                            .child(warning.clone()),
+                    );
+                }
+                if warnings.len() > 3 {
+                    rows = rows.child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                        format!("{} more warnings in the preview", warnings.len() - 3),
+                    ));
+                }
+                this.child(rows)
+            })
+            .when_some(error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+    }
+
+    /// Explicit rotation preview, warnings, and load confirmation sheet.
+    fn rotation_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(preview) = self.state.utilities.rotation_preview() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let load_view = view;
+        let mono = self.mono.clone();
+        let confirmed = self.state.utilities.rotation_confirmed();
+        let load_refusal = self.state.program_load_refusal();
+        let can_load = confirmed && load_refusal.is_none();
+        let warning_lines = preview.warning_lines();
+        let has_warnings = preview.has_warnings();
+        let stats = preview.stats_text();
+        let source_name = preview.base_name.clone();
+        let load_name = preview.name.clone();
+        let angle = preview.angle_text();
+        let pivot = preview.pivot_text();
+        let note = preview.note.clone();
+        let shown = preview.preview_lines.len();
+        let total = preview.output_lines;
+        let truncated = preview.preview_is_truncated();
+
+        let mut warnings = v_flex()
+            .id("rotation-warning-lines")
+            .gap_0()
+            .max_h(px(90.0))
+            .overflow_y_scrollbar();
+        if !has_warnings {
+            warnings = warnings.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(t("NO WARNINGS")),
+            );
+        } else {
+            for warning in &warning_lines {
+                warnings = warnings.child(
+                    div()
+                        .text_size(px(9.5))
+                        .line_height(px(12.0))
+                        .text_color(p.warning)
+                        .child(warning.clone()),
+                );
+            }
+        }
+
+        let mut lines = v_flex()
+            .id("rotation-preview-lines")
+            .gap_0()
+            .max_h(px(240.0))
+            .overflow_y_scrollbar();
+        for line in &preview.preview_lines {
+            lines = lines.child(
+                div()
+                    .font_family(mono.clone())
+                    .text_size(px(10.5))
+                    .line_height(px(14.0))
+                    .text_color(p.text_dim)
+                    .child(line.clone()),
+            );
+        }
+
+        let sheet =
+            v_flex()
+                .relative()
+                .w(px(820.0))
+                .max_w_full()
+                .max_h(px(700.0))
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(p.warning.opacity(0.6))
+                .bg(p.raised)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.text)
+                                .child(t("ROTATION PREVIEW")),
+                        )
+                        .child(chip(t("NOT LOADED"), p)),
+                )
+                .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                    "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new \
+                 program and never starts it.",
+                )))
+                .child(div().text_size(px(9.5)).text_color(p.text_faint).child(t(
+                    "Pivot is in work/program coordinates; a positive angle is \
+                 counter-clockwise. Unsupported programs are refused before any load.",
+                )))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_faint)
+                                        .child(format!("SOURCE   {source_name}")),
+                                )
+                                .child(chip(&angle, p))
+                                .child(chip(&pivot, p)),
+                        )
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(px(10.0))
+                                .text_color(p.accent)
+                                .child(format!("LOAD NAME   {load_name}")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(p.text_dim)
+                                .child(stats),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel_alt)
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.text_faint)
+                                .child(t("WARNINGS")),
+                        )
+                        .child(warnings),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel_alt)
+                        .child(lines)
+                        .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                            if truncated {
+                                format!("showing {shown} of {total} rotated lines")
+                            } else {
+                                format!("showing all {shown} rotated lines")
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(p.text_faint)
+                        .child(note),
+                )
+                .child(
+                    Switch::new("rotation-confirm")
+                        .checked(confirmed)
+                        .label(t(
+                            "I understand this loads the rotated source and does not start it",
+                        ))
+                        .text_size(px(11.0))
+                        .on_change(move |checked, _, cx| {
+                            confirm_view.update(cx, |this, cx| {
+                                this.state.utilities.set_rotation_confirmed(*checked);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .when_some(load_refusal, |this, refusal| {
+                    this.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.warning)
+                            .child(t(refusal.message())),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("rotation-load")
+                                .label(t("LOAD AS PROGRAM"))
+                                .primary()
+                                .h(px(48.0))
+                                .flex_1()
+                                .rounded_lg()
+                                .text_size(px(11.0))
+                                .disabled(!can_load)
+                                .on_click(move |_, _, cx| {
+                                    load_view.update(cx, |this, cx| this.load_rotation(cx));
+                                }),
+                        )
+                        .child(
+                            Button::new("rotation-cancel")
+                                .label(t("CANCEL"))
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(110.0))
+                                .rounded_lg()
+                                .text_size(px(11.0))
+                                .on_click(move |_, _, cx| {
+                                    cancel_view.update(cx, |this, cx| this.close_rotation(cx));
+                                }),
+                        ),
+                );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("rotation-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_rotation(cx));
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
     /// Explicit old/new confirmation for one `$10x` calibration write.
     fn calibration_confirm_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         if !self.calibration_confirm_open {
@@ -17822,6 +18382,7 @@ impl Shell {
             .child(self.surfacing_card(p, cx))
             .child(self.program_limits_card(p))
             .child(self.transform_card(p, cx))
+            .child(self.rotation_card(p, cx))
             .child(self.language_card(p, cx))
             .child(self.pins_card(p, cx))
             .child(self.keymap_card(p, cx))
@@ -22100,6 +22661,9 @@ impl Render for Shell {
         }
         if self.state.utilities.transform_preview().is_some() {
             root = root.child(self.transform_overlay(p, cx));
+        }
+        if self.rotation_open && self.state.utilities.rotation_preview().is_some() {
+            root = root.child(self.rotation_overlay(p, cx));
         }
         if self.state.macro_run_pending().is_some() {
             root = root.child(self.macro_run_overlay(p, cx));

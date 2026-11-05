@@ -15,6 +15,7 @@
 
 use ghs_core::Wcs;
 use ghs_engine::{Command, Program, SettingValue};
+use ghs_gcode::{MAX_ROTATION_ANGLE_DEG, RotationOptions, RotationWarning, apply_rotation};
 use ghs_i18n::t;
 
 /// Upper bound for one generated surfacing program.
@@ -37,6 +38,47 @@ pub const TRANSFORM_HEIGHT_MAP_NOTE: &str = "LOAD AS PROGRAM replaces the curren
 pub const LINE_NUMBER_SUFFIX: &str = " [line numbers]";
 /// Program name suffix for a comment-stripped transform.
 pub const STRIPPED_COMMENT_SUFFIX: &str = " [comments stripped]";
+
+/// Largest accepted absolute pivot coordinate for a source rotation, in
+/// millimetres.
+///
+/// This is deliberately tighter than the parser's coordinate range: a pivot is
+/// a setup point, not a machined coordinate.
+pub const MAX_ROTATION_PIVOT_MM: f64 = 1_000_000.0;
+/// Number of leading rotated lines kept for the preview sheet.
+pub const ROTATION_PREVIEW_LINE_LIMIT: usize = 40;
+/// Program name suffix prefix for a rotated source.
+pub const ROTATED_NAME_SUFFIX: &str = " [rotated";
+/// Height-map/original wording shown below a rotation preview.
+pub const ROTATION_NOTE: &str = "LOAD AS PROGRAM replaces the current job source. Any \
+     height-map Apply/Revert state for the previous source is cleared; a new map run adopts the \
+     rotated source. Keep an external copy if you need the pre-rotation original.";
+/// Coordinate-frame and rejection wording shown with the rotation fields.
+pub const ROTATION_FRAME_NOTE: &str = "Pivot is in work/program coordinates; rotation is \
+     counter-clockwise positive. Refused: incremental moves (G91), G53/G28/G30, probing, canned \
+     cycles, G10/G92, G18/G19 arcs, helical arcs, G93, scaling (G51), checksummed lines, and a \
+     work-coordinate-system switch.";
+/// Reproducible screenshot sample name for the rotation preview.
+pub const ROTATION_DEMO_NAME: &str = "demo-rotation.nc";
+/// Reproducible screenshot sample angle, in degrees.
+pub const ROTATION_DEMO_ANGLE_DEG: f64 = -12.345;
+/// Reproducible screenshot sample pivot, in work millimetres.
+pub const ROTATION_DEMO_PIVOT_MM: (f64, f64) = (20.0, 20.0);
+/// Reproducible screenshot sample with one `R` arc, so the preview shows the
+/// radius-to-center warning without touching the controller.
+pub const ROTATION_DEMO_SOURCE: &str = "\
+G21 G90 G54 G17
+G0 Z5
+G0 X20 Y20
+M3 S12000
+G1 Z-1 F200
+G1 X80 Y20 F800
+G2 X80 Y60 R20
+G1 X20 Y60
+G1 Y20
+M5
+M30
+";
 
 // ---------------------------------------------------------------- surfacing
 
@@ -71,11 +113,17 @@ pub enum UtilityField {
     LineStart,
     /// Increment for the numbering transform.
     LineStep,
+    /// Source-rotation angle, in degrees. Counter-clockwise is positive.
+    RotationAngle,
+    /// Source-rotation pivot X, in work/program millimetres.
+    RotationPivotX,
+    /// Source-rotation pivot Y, in work/program millimetres.
+    RotationPivotY,
 }
 
 impl UtilityField {
     /// Number of editable fields.
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 17;
 
     /// Every field, in edit order.
     pub const ALL: [UtilityField; UtilityField::COUNT] = [
@@ -93,11 +141,15 @@ impl UtilityField {
         UtilityField::SpindleRpm,
         UtilityField::LineStart,
         UtilityField::LineStep,
+        UtilityField::RotationAngle,
+        UtilityField::RotationPivotX,
+        UtilityField::RotationPivotY,
     ];
 
     /// Default text for every field.
     pub const DEFAULTS: [&'static str; UtilityField::COUNT] = [
-        "0", "0", "100", "80", "6", "40", "2", "1", "900", "200", "5", "12000", "10", "10",
+        "0", "0", "100", "80", "6", "40", "2", "1", "900", "200", "5", "12000", "10", "10", "0",
+        "0", "0",
     ];
 
     /// Stable zero-based index for the field array.
@@ -118,6 +170,9 @@ impl UtilityField {
             UtilityField::SpindleRpm => 11,
             UtilityField::LineStart => 12,
             UtilityField::LineStep => 13,
+            UtilityField::RotationAngle => 14,
+            UtilityField::RotationPivotX => 15,
+            UtilityField::RotationPivotY => 16,
         }
     }
 
@@ -139,6 +194,9 @@ impl UtilityField {
             UtilityField::SpindleRpm => "SPINDLE RPM",
             UtilityField::LineStart => "LINE START",
             UtilityField::LineStep => "LINE STEP",
+            UtilityField::RotationAngle => "ANGLE",
+            UtilityField::RotationPivotX => "PIVOT X WORK",
+            UtilityField::RotationPivotY => "PIVOT Y WORK",
         }
     }
 
@@ -158,6 +216,8 @@ impl UtilityField {
             UtilityField::Feed | UtilityField::PlungeFeed => "mm/min",
             UtilityField::SpindleRpm => "rpm",
             UtilityField::LineStart | UtilityField::LineStep => "",
+            UtilityField::RotationAngle => "deg",
+            UtilityField::RotationPivotX | UtilityField::RotationPivotY => "mm",
         }
     }
 
@@ -179,6 +239,9 @@ impl UtilityField {
             UtilityField::SpindleRpm => "spindle-rpm",
             UtilityField::LineStart => "line-start",
             UtilityField::LineStep => "line-step",
+            UtilityField::RotationAngle => "rotation-angle",
+            UtilityField::RotationPivotX => "rotation-pivot-x",
+            UtilityField::RotationPivotY => "rotation-pivot-y",
         }
     }
 
@@ -199,6 +262,17 @@ impl UtilityField {
                 | UtilityField::PlungeFeed
                 | UtilityField::SafeZ
                 | UtilityField::SpindleRpm
+        )
+    }
+
+    /// Whether this field belongs to the source-rotation transform.
+    #[must_use]
+    pub const fn is_rotation(self) -> bool {
+        matches!(
+            self,
+            UtilityField::RotationAngle
+                | UtilityField::RotationPivotX
+                | UtilityField::RotationPivotY
         )
     }
 }
@@ -2253,6 +2327,211 @@ fn has_checksum(line: &str) -> bool {
     line.contains('*')
 }
 
+// ------------------------------------------------------------------- rotation
+
+/// One non-destructive source rotation and its change summary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RotationPreview {
+    /// Name of the source program.
+    pub base_name: String,
+    /// Suggested name for the rotated program.
+    pub name: String,
+    /// Rotated source text.
+    pub source: String,
+    /// Counter-clockwise angle in degrees.
+    pub angle_deg: f64,
+    /// Pivot in work/program millimetres.
+    pub pivot_mm: (f64, f64),
+    /// Source line count.
+    pub input_lines: usize,
+    /// Output line count.
+    pub output_lines: usize,
+    /// Straight moves whose XY endpoint was rotated.
+    pub rotated_moves: usize,
+    /// Planar arcs whose endpoint or center was rotated.
+    pub rotated_arcs: usize,
+    /// Non-fatal transform warnings, including `R` arcs re-emitted as `I`/`J`.
+    pub warnings: Vec<RotationWarning>,
+    /// First [`ROTATION_PREVIEW_LINE_LIMIT`] rotated lines.
+    pub preview_lines: Vec<String>,
+    /// Height-map/original wording shown below the preview.
+    pub note: String,
+}
+
+impl RotationPreview {
+    /// Suggested program name for one rotation.
+    #[must_use]
+    pub fn transformed_name(base_name: &str, angle_deg: f64) -> String {
+        let base = base_name.trim();
+        let base = if base.is_empty() { "program.nc" } else { base };
+        format!("{base}{}", rotation_name_suffix(angle_deg))
+    }
+
+    /// Counter-clockwise angle text for the card, for example `-12.345 deg`.
+    #[must_use]
+    pub fn angle_text(&self) -> String {
+        format!("{} deg", compact(self.angle_deg))
+    }
+
+    /// Pivot text for the card, for example `X 20 Y 20 mm`.
+    #[must_use]
+    pub fn pivot_text(&self) -> String {
+        format!(
+            "X {} Y {} mm",
+            compact(self.pivot_mm.0),
+            compact(self.pivot_mm.1)
+        )
+    }
+
+    /// Whether the transform reported at least one warning.
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Every warning as one operator-facing line.
+    ///
+    /// All warnings are returned; the sheet scrolls rather than truncating the
+    /// model. A program-wide warning with line `0` omits the line prefix.
+    #[must_use]
+    pub fn warning_lines(&self) -> Vec<String> {
+        self.warnings
+            .iter()
+            .map(|warning| {
+                if warning.line == 0 {
+                    warning.message.clone()
+                } else {
+                    format!("line {}: {}", warning.line, warning.message)
+                }
+            })
+            .collect()
+    }
+
+    /// One compact stats line for the card and sheet.
+    #[must_use]
+    pub fn stats_text(&self) -> String {
+        format!(
+            "{} -> {} lines | {} moves rotated | {} arcs rotated | {} warnings",
+            self.input_lines,
+            self.output_lines,
+            self.rotated_moves,
+            self.rotated_arcs,
+            self.warnings.len()
+        )
+    }
+
+    /// Whether the bounded preview omits any rotated line.
+    #[must_use]
+    pub fn preview_is_truncated(&self) -> bool {
+        self.preview_lines.len() < self.output_lines
+    }
+}
+
+/// Program name suffix for a rotation, for example `" [rotated 90 deg]"`.
+#[must_use]
+pub fn rotation_name_suffix(angle_deg: f64) -> String {
+    format!("{ROTATED_NAME_SUFFIX} {} deg]", compact(angle_deg))
+}
+
+/// Validates one rotation angle in degrees.
+///
+/// # Errors
+///
+/// Returns an operator-facing message for a non-finite value or an angle
+/// outside +/-[`MAX_ROTATION_ANGLE_DEG`].
+pub fn validate_rotation_angle(angle_deg: f64) -> Result<(), String> {
+    if !angle_deg.is_finite() {
+        return Err("ANGLE must be finite".to_string());
+    }
+    if angle_deg.abs() > MAX_ROTATION_ANGLE_DEG {
+        return Err(format!(
+            "ANGLE must be within -{} ..= {} deg",
+            compact(MAX_ROTATION_ANGLE_DEG),
+            compact(MAX_ROTATION_ANGLE_DEG)
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one rotation pivot coordinate in millimetres.
+///
+/// # Errors
+///
+/// Returns an operator-facing message for a non-finite value or a coordinate
+/// outside +/-[`MAX_ROTATION_PIVOT_MM`].
+pub fn validate_rotation_pivot(label: &str, value_mm: f64) -> Result<(), String> {
+    if !value_mm.is_finite() {
+        return Err(format!("{label} must be finite"));
+    }
+    if value_mm.abs() > MAX_ROTATION_PIVOT_MM {
+        return Err(format!(
+            "{label} must be within -{} ..= {} mm",
+            compact(MAX_ROTATION_PIVOT_MM),
+            compact(MAX_ROTATION_PIVOT_MM)
+        ));
+    }
+    Ok(())
+}
+
+/// Rotate one program about an XY pivot and build its preview.
+///
+/// This is a pure source-to-source rewrite through
+/// [`ghs_gcode::apply_rotation`]. It never touches the loaded job, sends a
+/// command, or parses with a different controller profile.
+///
+/// # Errors
+///
+/// Returns an operator-facing message for an empty source, an invalid angle or
+/// pivot, any [`ghs_gcode::RotationError`], or a preview that would exceed the
+/// transform size bound. The source is never modified on error.
+pub fn generate_rotation(
+    source: &str,
+    angle_deg: f64,
+    pivot_x_mm: f64,
+    pivot_y_mm: f64,
+) -> Result<RotationPreview, String> {
+    if source.trim().is_empty() {
+        return Err("the loaded program source is empty".to_string());
+    }
+    validate_rotation_angle(angle_deg)?;
+    validate_rotation_pivot(UtilityField::RotationPivotX.label(), pivot_x_mm)?;
+    validate_rotation_pivot(UtilityField::RotationPivotY.label(), pivot_y_mm)?;
+
+    let options = RotationOptions {
+        angle_deg,
+        pivot_mm: (pivot_x_mm, pivot_y_mm),
+    };
+    let rotated = apply_rotation(source, &options).map_err(|error| error.to_string())?;
+    if rotated.source.len() > MAX_TRANSFORM_BYTES {
+        return Err(format!(
+            "rotated source exceeds the {} MiB limit",
+            MAX_TRANSFORM_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let preview_lines = rotated
+        .source
+        .lines()
+        .take(ROTATION_PREVIEW_LINE_LIMIT)
+        .map(str::to_string)
+        .collect();
+    let base_name = "program.nc";
+    Ok(RotationPreview {
+        base_name: base_name.to_string(),
+        name: RotationPreview::transformed_name(base_name, angle_deg),
+        source: rotated.source,
+        angle_deg,
+        pivot_mm: (pivot_x_mm, pivot_y_mm),
+        input_lines: rotated.stats.input_lines,
+        output_lines: rotated.stats.output_lines,
+        rotated_moves: rotated.stats.rotated_moves,
+        rotated_arcs: rotated.stats.rotated_arcs,
+        warnings: rotated.warnings,
+        preview_lines,
+        note: ROTATION_NOTE.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------- utility model
 
 /// Local utility wizard state. No preview is sent anywhere until the operator
@@ -2268,6 +2547,9 @@ pub struct UtilityModel {
     transform_preview: Option<TransformPreview>,
     transform_error: Option<String>,
     transform_confirmed: bool,
+    rotation_preview: Option<RotationPreview>,
+    rotation_error: Option<String>,
+    rotation_confirmed: bool,
     calibration: CalibrationModel,
     gantry: GantrySquaringModel,
 }
@@ -2288,6 +2570,9 @@ impl Default for UtilityModel {
             transform_preview: None,
             transform_error: None,
             transform_confirmed: false,
+            rotation_preview: None,
+            rotation_error: None,
+            rotation_confirmed: false,
             calibration: CalibrationModel::default(),
             gantry: GantrySquaringModel::default(),
         }
@@ -2305,6 +2590,9 @@ impl UtilityModel {
         self.transform_preview = None;
         self.transform_error = None;
         self.transform_confirmed = false;
+        self.rotation_preview = None;
+        self.rotation_error = None;
+        self.rotation_confirmed = false;
         self.calibration.reset_session();
     }
 
@@ -2368,6 +2656,10 @@ impl UtilityModel {
                 self.surfacing_preview = None;
                 self.surfacing_error = None;
                 self.surfacing_confirmed = false;
+            } else if field.is_rotation() {
+                self.rotation_preview = None;
+                self.rotation_error = None;
+                self.rotation_confirmed = false;
             } else {
                 self.transform_preview = None;
                 self.transform_error = None;
@@ -2581,6 +2873,95 @@ impl UtilityModel {
         self.transform_error = None;
     }
 
+    /// Generate and cache one rotation preview from the loaded source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the source is empty, an angle or pivot field is
+    /// invalid, or [`ghs_gcode::apply_rotation`] refuses the program. The
+    /// source and the loaded job are never modified.
+    pub fn generate_rotation(&mut self, base_name: &str, source: &str) -> Result<(), String> {
+        self.rotation_confirmed = false;
+        let result = (|| {
+            let angle_deg = self.number(UtilityField::RotationAngle)?;
+            let pivot_x_mm = self.number(UtilityField::RotationPivotX)?;
+            let pivot_y_mm = self.number(UtilityField::RotationPivotY)?;
+            generate_rotation(source, angle_deg, pivot_x_mm, pivot_y_mm)
+        })();
+        match result {
+            Ok(mut preview) => {
+                preview.base_name = base_name.to_string();
+                preview.name = RotationPreview::transformed_name(base_name, preview.angle_deg);
+                self.rotation_preview = Some(preview);
+                self.rotation_error = None;
+                Ok(())
+            }
+            Err(message) => {
+                self.rotation_preview = None;
+                self.rotation_error = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// Current rotation preview, if one was generated.
+    #[must_use]
+    pub fn rotation_preview(&self) -> Option<&RotationPreview> {
+        self.rotation_preview.as_ref()
+    }
+
+    /// Last rotation generation or load-refusal error.
+    #[must_use]
+    pub fn rotation_error(&self) -> Option<&str> {
+        self.rotation_error.as_deref()
+    }
+
+    /// Record a refusal that happened before the model could generate a
+    /// preview, such as no loaded program.
+    pub fn note_rotation_error(&mut self, message: impl Into<String>) {
+        self.rotation_preview = None;
+        self.rotation_confirmed = false;
+        self.rotation_error = Some(message.into());
+    }
+
+    /// Whether the operator acknowledged the rotated-program warning.
+    #[must_use]
+    pub fn rotation_confirmed(&self) -> bool {
+        self.rotation_confirmed
+    }
+
+    /// Set the rotation acknowledgement. It can only turn on with a preview.
+    pub fn set_rotation_confirmed(&mut self, confirmed: bool) {
+        self.rotation_confirmed = confirmed && self.rotation_preview.is_some();
+    }
+
+    /// Discard the rotation preview and its confirmation.
+    pub fn close_rotation(&mut self) {
+        self.rotation_preview = None;
+        self.rotation_confirmed = false;
+        self.rotation_error = None;
+    }
+
+    /// Fill the rotation fields with the reproducible screenshot sample and
+    /// generate its preview. Local arithmetic only: nothing is loaded or sent.
+    pub fn load_rotation_demo(&mut self) {
+        let _ = self.set_field_text(
+            UtilityField::RotationAngle,
+            ROTATION_DEMO_ANGLE_DEG.to_string(),
+        );
+        let _ = self.set_field_text(
+            UtilityField::RotationPivotX,
+            ROTATION_DEMO_PIVOT_MM.0.to_string(),
+        );
+        let _ = self.set_field_text(
+            UtilityField::RotationPivotY,
+            ROTATION_DEMO_PIVOT_MM.1.to_string(),
+        );
+        if let Err(message) = self.generate_rotation(ROTATION_DEMO_NAME, ROTATION_DEMO_SOURCE) {
+            self.note_rotation_error(message);
+        }
+    }
+
     fn number(&self, field: UtilityField) -> Result<f64, String> {
         let text = self.field_text(field).trim();
         if text.is_empty() {
@@ -2615,6 +2996,13 @@ fn validate_field_text(field: UtilityField, text: &str) -> Result<(), String> {
     if !value.is_finite() {
         return Err(format!("{} must be finite", field.label()));
     }
+    match field {
+        UtilityField::RotationAngle => return validate_rotation_angle(value),
+        UtilityField::RotationPivotX | UtilityField::RotationPivotY => {
+            return validate_rotation_pivot(field.label(), value);
+        }
+        _ => {}
+    }
     let (min, max, integer) = match field {
         UtilityField::OriginX | UtilityField::OriginY => (-MAX_ORIGIN_MM, MAX_ORIGIN_MM, false),
         UtilityField::StockWidth | UtilityField::StockDepth => (0.001, 100_000.0, false),
@@ -2626,6 +3014,9 @@ fn validate_field_text(field: UtilityField, text: &str) -> Result<(), String> {
         UtilityField::SpindleRpm => (0.0, 100_000.0, true),
         UtilityField::LineStart => (0.0, 999_999_999.0, true),
         UtilityField::LineStep => (1.0, 1_000_000.0, true),
+        UtilityField::RotationAngle
+        | UtilityField::RotationPivotX
+        | UtilityField::RotationPivotY => return Ok(()),
     };
     if value < min || value > max {
         return Err(format!(
@@ -3537,5 +3928,178 @@ mod tests {
         model.close_transform();
         assert!(model.transform_preview().is_none());
         assert!(!model.transform_confirmed());
+    }
+
+    fn rotation_model(angle: &str, pivot_x: &str, pivot_y: &str) -> UtilityModel {
+        let mut model = UtilityModel::default();
+        model
+            .set_field_text(UtilityField::RotationAngle, angle)
+            .expect("angle");
+        model
+            .set_field_text(UtilityField::RotationPivotX, pivot_x)
+            .expect("pivot X");
+        model
+            .set_field_text(UtilityField::RotationPivotY, pivot_y)
+            .expect("pivot Y");
+        model
+    }
+
+    #[test]
+    fn rotation_fields_validate_angle_and_pivot_bounds() {
+        let mut model = UtilityModel::default();
+        for good in ["0", "90", "-3600", "3600", "12.345"] {
+            model
+                .set_field_text(UtilityField::RotationAngle, good)
+                .unwrap_or_else(|error| panic!("angle {good} rejected: {error}"));
+        }
+        for bad in ["3600.001", "-3600.001", "NaN", "inf", "not a number", ""] {
+            assert!(
+                model
+                    .set_field_text(UtilityField::RotationAngle, bad)
+                    .is_err(),
+                "angle {bad:?} must be rejected"
+            );
+        }
+
+        for good in ["-1000000", "0", "1000000", "12.5"] {
+            model
+                .set_field_text(UtilityField::RotationPivotX, good)
+                .unwrap_or_else(|error| panic!("pivot {good} rejected: {error}"));
+        }
+        for bad in ["1000000.001", "-1000000.001", "NaN", "inf", ""] {
+            assert!(
+                model
+                    .set_field_text(UtilityField::RotationPivotY, bad)
+                    .is_err(),
+                "pivot {bad:?} must be rejected"
+            );
+        }
+        assert!(model.field_error(UtilityField::RotationPivotY).is_some());
+    }
+
+    #[test]
+    fn rotation_preview_rotates_a_ninety_degree_golden_source() {
+        let mut model = rotation_model("90", "0", "0");
+        model
+            .generate_rotation("part.nc", "G21 G90\nG0 X10 Y0\nM30\n")
+            .expect("rotation preview");
+        let preview = model.rotation_preview().expect("preview");
+        assert_eq!(preview.name, "part.nc [rotated 90 deg]");
+        assert_eq!(
+            preview.source.lines().collect::<Vec<_>>(),
+            ["G21 G90", "G0 X0 Y10", "M30"]
+        );
+        assert_eq!(preview.input_lines, 3);
+        assert_eq!(preview.output_lines, 3);
+        assert_eq!(preview.rotated_moves, 1);
+        assert_eq!(preview.rotated_arcs, 0);
+        assert!(!preview.has_warnings());
+        assert_eq!(preview.angle_text(), "90 deg");
+        assert_eq!(preview.pivot_text(), "X 0 Y 0 mm");
+    }
+
+    #[test]
+    fn rotation_preview_reports_stats_warnings_and_caps_the_line_preview() {
+        let mut source = String::from("G21 G90\nG0 X0 Y0\nG1 X0 Y0 F800\nG2 X20 Y0 R10\n");
+        for line in 0..60 {
+            source.push_str(&format!("G1 X{line} Y0\n"));
+        }
+        source.push_str("M30\n");
+        let preview = generate_rotation(&source, 45.0, 0.0, 0.0).expect("rotation");
+
+        assert_eq!(preview.rotated_arcs, 1);
+        assert_eq!(preview.rotated_moves, 62);
+        assert_eq!(preview.warnings.len(), 1);
+        assert!(preview.warning_lines()[0].contains("line 4"));
+        assert!(preview.warning_lines()[0].contains("R arc"));
+        assert_eq!(preview.preview_lines.len(), ROTATION_PREVIEW_LINE_LIMIT);
+        assert!(preview.preview_is_truncated());
+        assert!(preview.output_lines > ROTATION_PREVIEW_LINE_LIMIT);
+        assert!(preview.stats_text().contains("moves rotated"));
+        assert!(preview.stats_text().contains("1 warnings"));
+    }
+
+    #[test]
+    fn rotation_preview_rejects_empty_sources_and_unsupported_programs() {
+        let error = generate_rotation("   \n", 90.0, 0.0, 0.0).expect_err("empty source");
+        assert!(error.contains("empty"), "{error}");
+
+        let mut model = rotation_model("90", "0", "0");
+        let error = model
+            .generate_rotation("incremental.nc", "G21\nG91\nG0 X1\nM30\n")
+            .expect_err("incremental program");
+        assert!(error.contains("G91"), "{error}");
+        assert!(model.rotation_preview().is_none());
+        assert!(model.rotation_error().is_some());
+
+        let error = model
+            .generate_rotation("malformed.nc", "G1 X\n")
+            .expect_err("malformed program");
+        assert!(error.contains("parse"), "{error}");
+    }
+
+    #[test]
+    fn rotation_preview_rejects_invalid_options_without_panicking() {
+        for angle in [f64::NAN, f64::INFINITY, 3_600.001, -3_600.001] {
+            assert!(generate_rotation("G21 G90\nG0 X0 Y0\nM30\n", angle, 0.0, 0.0).is_err());
+        }
+        for pivot in [f64::NAN, f64::INFINITY, 1_000_000.001, -1_000_000.001] {
+            assert!(generate_rotation("G21 G90\nG0 X0 Y0\nM30\n", 0.0, pivot, 0.0).is_err());
+            assert!(generate_rotation("G21 G90\nG0 X0 Y0\nM30\n", 0.0, 0.0, pivot).is_err());
+        }
+    }
+
+    #[test]
+    fn rotation_name_suffix_is_stable_for_the_demo_angle() {
+        assert_eq!(rotation_name_suffix(-12.345), " [rotated -12.345 deg]");
+        assert_eq!(
+            RotationPreview::transformed_name("part.nc", 90.0),
+            "part.nc [rotated 90 deg]"
+        );
+        assert_eq!(
+            RotationPreview::transformed_name("", -0.5),
+            "program.nc [rotated -0.5 deg]"
+        );
+    }
+
+    #[test]
+    fn rotation_demo_preview_is_reproducible_and_has_the_radius_warning() {
+        let mut first = UtilityModel::default();
+        first.load_rotation_demo();
+        let mut second = UtilityModel::default();
+        second.load_rotation_demo();
+
+        let a = first.rotation_preview().expect("demo preview");
+        let b = second.rotation_preview().expect("demo preview");
+        assert_eq!(a, b);
+        assert_eq!(a.base_name, ROTATION_DEMO_NAME);
+        assert_eq!(a.name, "demo-rotation.nc [rotated -12.345 deg]");
+        assert_eq!(a.angle_deg, ROTATION_DEMO_ANGLE_DEG);
+        assert_eq!(a.pivot_mm, ROTATION_DEMO_PIVOT_MM);
+        assert!(a.has_warnings());
+        assert!(a.warning_lines()[0].contains("R arc"));
+        assert_eq!(
+            first.field_text(UtilityField::RotationAngle),
+            ROTATION_DEMO_ANGLE_DEG.to_string()
+        );
+        assert!(!first.rotation_confirmed());
+    }
+
+    #[test]
+    fn rotation_confirmation_requires_a_preview_and_cancel_clears_it() {
+        let mut model = UtilityModel::default();
+        model.set_rotation_confirmed(true);
+        assert!(!model.rotation_confirmed());
+
+        let mut model = rotation_model("90", "0", "0");
+        model
+            .generate_rotation("part.nc", "G21 G90\nG0 X0 Y0\nM30\n")
+            .expect("preview");
+        model.set_rotation_confirmed(true);
+        assert!(model.rotation_confirmed());
+        model.close_rotation();
+        assert!(!model.rotation_confirmed());
+        assert!(model.rotation_preview().is_none());
+        assert!(model.rotation_error().is_none());
     }
 }
