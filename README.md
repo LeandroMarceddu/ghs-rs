@@ -46,12 +46,13 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   wizard, program-limits check, non-destructive line-number/comment transforms,
   a confirmed stepper calibration wizard, a gantry-squaring calculator, and a
   backup-gated `$RST` controller reset.
-- **Jobs** — in-app program file browser and loading, streaming, pause/resume/
-  stop, tool-change sheet, optional-stop/single-block/block-delete run options,
-  breakpoints and run-to-line, an over-travel START confirmation based on
-  reported travel, progress, ETA and current line, a real parsed program list,
-  a bounded local job history, and job recovery that never auto-resumes after
-  an alarm or disconnect.
+- **Jobs** — in-app program file browser with recent files and one-file
+  drag-and-drop, streaming, pause/resume/stop, tool-change sheet,
+  optional-stop/single-block/block-delete run options, breakpoints and
+  run-to-line, an over-travel START confirmation based on reported travel,
+  progress, ETA and current line, a real parsed program list, a bounded local
+  job history, and job recovery that never auto-resumes after an alarm or
+  disconnect.
 - **Viewer** — parsed toolpath in 2D top or 3D orbit view, fit/pan/zoom/pinch,
   ground grid, inferred 3D stock box, work envelope, motion-style paths,
   height-map overlay, and a live tool marker.

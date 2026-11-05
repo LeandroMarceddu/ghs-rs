@@ -23,7 +23,7 @@ report the path **and** verify its pixel size with `identify`.
   `--demo-gantry`, `--demo-gantry-card`, `--demo-job-history`,
   `--demo-job-history-clear`, `--demo-job-history-sheet`, `--viewer-3d`,
   `--viewer-stock-off`, `--demo-probe-macros`, `--demo-probe-macros-saved`,
-  and `--demo-probe-macros-error`.
+  `--demo-probe-macros-error`, `--demo-recent-files`, and `--demo-drop-hint`.
 - Always verify the PNG with `identify`; a capture command can exit 0 and write
   nothing.
 - Kill the app and the compositor in a `trap`/cleanup step. Check

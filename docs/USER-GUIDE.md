@@ -298,6 +298,15 @@ directory at a time, type a path or use `UP`, and select a `.nc`, `.gcode`,
 non-UTF-8, empty, and files larger than 20 MiB are rejected with a clear
 message. Loading only parses and installs the program: it never starts the job.
 
+The sheet also lists up to ten `RECENT FILES`, newest first. Click a row to load
+it through the same bounded reader. A missing path is marked `MISSING` and stays
+selectable only for `REMOVE`; `CLEAR` removes the list. Recent entries are local
+`app.json` data and are never sent to the controller.
+
+You can drop one local program file onto the Job workspace. Directories,
+multiple files, and empty drops are refused. The drop uses the same bounded
+reader and guarded load path; it never starts the job.
+
 With the simulator, the bundled demo program still loads after connect:
 
 | Program | How to select it |
@@ -979,8 +988,9 @@ Exports are user-initiated. There is no telemetry and no network transport.
   from the beginning, and dry-run the whole program, but it cannot start
   mid-program; the engine rejects `from_line > 1` because it cannot synthesize
   a modal preamble.
-- **No drag-and-drop or recent-files list.** The in-app browser lists one
-  directory at a time and remembers the last folder only for the session.
+- **File loading is one file at a time.** Drag-drop accepts exactly one regular
+  program file, and the in-app browser lists one directory at a time. There is
+  no multi-file queue.
 - **Advanced macros are absent.** User macros are single-line MDI commands;
   no parameters, special words, multi-line bodies, or `$` system commands.
 - **Probe Apply is partial.** Rotation reports its measured angle, but work

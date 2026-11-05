@@ -20,6 +20,10 @@ until the next release is cut.
 - **3D stock mesh** — the 3D viewer draws an inferred translucent stock box
   from the program bounds, with a `STOCK ON/OFF` toggle and an explicit
   reminder that it is not a measured stock model.
+- **Recent files and drag-drop** — the load sheet lists up to ten recent
+  programs with missing/stale handling, `REMOVE`, and `CLEAR`. One program file
+  can be dropped onto the Job workspace. Both paths use the bounded reader and
+  guarded load; neither starts a job.
 - **Job history** — completed, stopped, aborted, failed, and interrupted runs
   record a local entry with start time, elapsed time, line count, result, and
   dry-run flag. The Utility card shows the newest ten, `OPEN HISTORY` shows all

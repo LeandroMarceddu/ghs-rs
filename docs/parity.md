@@ -101,7 +101,7 @@ implemented before its UI or hardware validation row is complete.
 
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
-| JOB-01 | Open, drag-and-drop, recent files | M3 | partial | In-app browser/load; drag-drop/recent open |
+| JOB-01 | Open, drag-and-drop, recent files | M3 | done | Bounded browser, recent list, one-file drop |
 | JOB-02 | Validate program before streaming | M3 | partial | Syntax, tools, feeds |
 | JOB-03 | Character-counting streaming with `Bf` top-up | M3 | done | Uses the reported RX buffer |
 | JOB-04 | Pause, resume, stop | M3 | done | Hold, resume, reset semantics |
