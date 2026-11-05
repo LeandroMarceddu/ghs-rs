@@ -635,6 +635,12 @@ preview and only loads it after confirmation; nothing starts automatically.
   `(...)`/`;` comments. Preview first, then `LOAD AS PROGRAM`. Loading replaces
   the current job source and clears any height-map Apply/Revert state for the
   previous source.
+- `STEPPER CALIBRATION` calculates a new `$100`/`$101`/`$102` steps/mm value
+  from the current value, commanded distance, and measured distance
+  (`new = old × commanded ÷ measured`). It does **not** move the machine: jog or
+  run the test move separately. `REVIEW & APPLY` requires confirmation, is
+  idle-only, and writes through the verified setting path. The proposal is
+  bounded to 1–10,000 steps/mm and shown with its delta.
 
 ### User macros
 

@@ -37,9 +37,10 @@ release section exists to diff against.
   and typed pins/limits diagnostics. All commands pass through one safety
   gateway.
 - **Utilities** — a bounded material-surfacing wizard, an informational
-  program-limits check, and non-destructive line-number/comment transforms.
-  Generated/transformed programs are loaded for review, never started
-  automatically.
+  program-limits check, non-destructive line-number/comment transforms, and a
+  stepper/axis calibration wizard that writes `$100`–`$102` only after
+  confirmation and read-back. Generated/transformed programs are loaded for
+  review, never started automatically.
 - **Jobs** — in-app program file browser and loading with a 20 MiB UTF-8
   bound; character-counting streaming against the reported receive buffer;
   pause, resume, and stop; a tool-change sheet; optional-stop, single-block, and

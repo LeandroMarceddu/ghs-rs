@@ -25,11 +25,11 @@ The remaining V1.0 gaps are hardware validation on the reference FlexiHAL;
 secondary localization (help, warnings, and other long-form text remain
 English); signed installers and notarization; the full release QA pass;
 start-from-line; the remaining utility/calibration set (gantry squaring,
-stepper/XY calibration, first-run machine setup, rotation/scale/translate
-transforms, and a pre-run limits confirmation — surfacing, limits display, and
-line-number/comment transforms are implemented); and the probe remainder (TLO
-apply, work-rotation apply/straightness, pre/post probe macros, retry strategy,
-and persisted cycle settings). The viewer remainder (3D stock mesh and a
+first-run machine setup, rotation/scale/translate transforms, and a pre-run
+limits confirmation — surfacing, limits display, line-number/comment
+transforms, and stepper calibration are implemented); and the probe remainder
+(TLO apply, work-rotation apply/straightness, pre/post probe macros, retry
+strategy, and persisted cycle settings). The viewer remainder (3D stock mesh and a
 pre-run limits confirmation), portrait reflow, high-contrast theme, first-run
 safety onboarding, session recording, `$RST` confirmation, and the optional
 Workbench mode are also open against the full checklist in
