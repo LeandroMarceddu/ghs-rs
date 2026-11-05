@@ -66,12 +66,13 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   atomic saves, rolling backups, export/validate/import, and identity-mismatch
   confirmation.
 - **Probing** — Z touch plate, edge X/Y, corner, center circle, center
-  rectangle, XY touch plate, plus rotation and tool-length reporting. Every run
+  rectangle, XY touch plate, plus rotation and tool-length probing. Every run
   has a mandatory preflight (link, Idle, spindle/coolant off, probe signal or
   explicit confirmation, and loaded offsets), ordered `PRB` binding, and a
-  confirmed `G10 L2` apply. The probe mount XY offset is persisted per profile;
-  entered positions are feature/probe-tip coordinates and plans shift the
-  controlled point.
+  confirmed `G10 L2` apply. Tool length adds a confirmed `G43.1` apply or `G49`
+  clear verified through `$#`. The probe mount XY offset is persisted per
+  profile; entered positions are feature/probe-tip coordinates and plans shift
+  the controlled point.
 - **Height map** — bounded grid probing with a point/time estimate, preflight,
   partial-map invalidation, 2D overlay, and CSV export. A constant map Z offset
   shifts effective heights without re-probing. Explicit Apply rewrites the

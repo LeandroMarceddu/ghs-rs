@@ -22,6 +22,10 @@ until the next release is cut.
   an over-travel sheet when the program's estimated machine bounds leave the
   reported travel. `NOT CHECKED` and within-travel programs keep the direct
   start. The check is informational, not controller soft-limit enforcement.
+- **Tool-length apply** — the tool-length probe result can apply its signed
+  delta with a confirmed `G43.1` write or clear it with `G49`. The write is
+  idle-only, sends no motion, and reports `APPLIED` only after `$#` verifies
+  the target TLO.
 - **First-run setup** — a four-page safety/setup wizard (safety checklist,
   display units, connection guidance, review) opens on first launch and is
   reopenable from Utility. `AppConfig.setup_complete` persists completion with

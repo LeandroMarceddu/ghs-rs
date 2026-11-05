@@ -152,7 +152,7 @@ implemented before its UI or hardware validation row is complete.
 | ID | Capability | Milestone | Status | Notes |
 |---|---|---|---|---|
 | PROBE-01 | Z touch plate | M6 | done | Safe Z, retries |
-| PROBE-02 | Tool length probing | M6 | partial | Reports delta; TLO apply deferred |
+| PROBE-02 | Tool length probing | M6 | done | Reports delta; confirmed `G43.1`/`G49`, `$#` verify |
 | PROBE-03 | Edge finder X/Y, inside and outside | M6 | done | Edge offset |
 | PROBE-04 | Corner finder | M6 | done | XY touch plate |
 | PROBE-05 | Center finder, circle and rectangle | M6 | done | Circle and rectangle UI |

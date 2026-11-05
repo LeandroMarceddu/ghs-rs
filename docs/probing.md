@@ -70,6 +70,9 @@ result UI + optional offset update + height-map overlay
   `G38.x` probe move and the app binds the next `Probe` event to it.
 - Results that update offsets use `G10 L20`/`G10 L2` through the engine after
   explicit confirmation; never silently.
+- A completed tool-length result applies its delta with `G43.1 Z<current +
+  delta>` or clears TLO with `G49`, after confirmation. The app verifies the
+  reported `$#` TLO; a mismatch is `FAILED`, never `APPLIED`.
 - The app owns the preflight and result sheet; the engine owns motion.
 
 ## Cycles

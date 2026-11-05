@@ -509,8 +509,9 @@ active.
 - A controller-reported tool table, when present, is shown separately and
   read-only. The reference board reports zero entries.
 - Setting the tool length with `$TLR` or a controlled MDI move remains a
-  manual step. The tool-length probe cycle reports a delta; applying TLO is
-  deferred.
+  manual step. The tool-length probe cycle offers a confirmed `G43.1` write
+  and a `G49` clear after the measured delta; the reported `$#` TLO verifies
+  the result.
 
 ## 10. Probing
 
@@ -571,8 +572,15 @@ OFFSET` opens `CONFIRM OFFSET WRITE` with the exact `G10 L2` line;
 `CONFIRM WRITE` sends it, and `$#` is refreshed after the write. `KEEP` leaves
 the offsets unchanged. Nothing is applied automatically.
 
-`ROTATION` and `TOOL LENGTH` report their measured angle/delta, but applying
-work rotation or TLO is deferred in this build.
+`TOOL LENGTH` reports reference Z, contact Z, and the signed delta, then offers
+`APPLY TLO` (`G43.1 Z<current + delta>`) and `CLEAR TLO` (`G49`). Both require
+an inline confirmation, are allowed only while the controller is `Idle`, and
+send no motion. The result shows `APPLIED` only after `$#` reports the target
+TLO; a missing or mismatched read-back, alarm, controller error, disconnect, or
+timeout shows `FAILED` and keeps the old value visible.
+
+`ROTATION` reports the measured angle and deviation. Applying work rotation is
+not supported in this build.
 
 ### PRB audit
 
@@ -910,8 +918,9 @@ Exports are user-initiated. There is no telemetry and no network transport.
   directory at a time and remembers the last folder only for the session.
 - **Advanced macros are absent.** User macros are single-line MDI commands;
   no parameters, special words, multi-line bodies, or `$` system commands.
-- **Probe Apply is partial.** Rotation and tool-length report values; work
-  rotation and TLO application are deferred.
+- **Probe Apply is partial.** Rotation reports its measured angle, but work
+  rotation is deferred. Tool-length probing can apply or clear TLO with a
+  confirmed `G43.1`/`G49` write verified through `$#`.
 - **3D is perspective only.** There is no orthographic toggle, no stock mesh,
   and the height overlay is a cell projection rather than a shaded surface.
 - **No SD, ATC, or MPG UI.** Their protocol fields are parsed for future use;

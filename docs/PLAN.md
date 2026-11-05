@@ -27,12 +27,12 @@ English); signed installers and notarization; the full release QA pass;
 start-from-line; the remaining utility/calibration set (gantry squaring and
 rotation/scale/translate transforms — surfacing, limits display and pre-run
 travel confirmation, line-number/comment transforms, stepper calibration, and
-the first-run safety/setup wizard are implemented); and the probe remainder (TLO apply,
-work-rotation apply/straightness, pre/post probe macros, retry strategy, and
-persisted cycle settings). The viewer remainder (3D stock mesh), portrait
-reflow, high-contrast theme, session recording, `$RST` confirmation, and the
-optional Workbench mode are also open against the full checklist in
-[parity.md](parity.md).
+the first-run safety/setup wizard are implemented); and the probe remainder
+(work-rotation apply/straightness, pre/post probe macros, retry strategy, and
+persisted cycle settings; tool-length apply is implemented). The viewer
+remainder (3D stock mesh), portrait reflow, high-contrast theme, session
+recording, `$RST` confirmation, and the optional Workbench mode are also open
+against the full checklist in [parity.md](parity.md).
 `v0.5.0` is an optional preview pre-release; it does not close the V1.0 gate.
 
 This is the canonical plan. The **protocol layer targets grblHAL generally**:
