@@ -113,7 +113,7 @@ use crate::theme::Palette;
 use crate::tools::{ControllerToolTable, ToolField, ToolTableModel};
 use crate::utilities::{
     CalibrationAxis, CalibrationField, GANTRY_CONVENTION_NOTE, GANTRY_SAFETY_NOTE, GantryField,
-    LimitsStatus, ROTATION_FRAME_NOTE, TransformKind, UtilityField,
+    LimitsStatus, ROTATION_FRAME_NOTE, SCALE_FRAME_NOTE, TransformKind, UtilityField,
 };
 use crate::viewer;
 
@@ -155,6 +155,8 @@ const GANTRY_CARD_INDEX: usize = 3;
 const JOB_HISTORY_CARD_INDEX: usize = 2;
 /// Position of the source-rotation card in the Utility scroll list.
 const ROTATION_CARD_INDEX: usize = 8;
+/// Position of the source-scale card in the Utility scroll list.
+const SCALE_CARD_INDEX: usize = 9;
 
 /// What the shared settings text sheet is editing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +482,15 @@ pub struct Shell {
     demo_rotation_card: bool,
     /// Screenshot switch: also check the rotation load confirmation.
     demo_rotation_confirm: bool,
+    /// Source-scale preview sheet is open. Opening sends nothing.
+    scale_open: bool,
+    /// Screenshot switch: seed the scale preview and open its sheet.
+    demo_scale: bool,
+    demo_scale_done: bool,
+    /// Screenshot switch: seed the scale card with the sheet closed.
+    demo_scale_card: bool,
+    /// Screenshot switch: also check the scale load confirmation.
+    demo_scale_confirm: bool,
     /// Screenshot switch: open Utility at the controller-reset card.
     demo_reset: bool,
     demo_reset_done: bool,
@@ -825,11 +836,17 @@ impl Shell {
         let demo_rotation = demo_rotation_card
             || demo_rotation_confirm
             || std::env::args().any(|arg| arg == "--demo-rotation");
+        let demo_scale_card = std::env::args().any(|arg| arg == "--demo-scale-card");
+        let demo_scale_confirm = std::env::args().any(|arg| arg == "--demo-scale-confirm");
+        let demo_scale = demo_scale_card
+            || demo_scale_confirm
+            || std::env::args().any(|arg| arg == "--demo-scale");
         let demo_reset_confirm = std::env::args().any(|arg| arg == "--demo-reset-confirm");
         let demo_reset = demo_reset_confirm || std::env::args().any(|arg| arg == "--demo-reset");
         if demo_surfacing
             || demo_transform
             || demo_rotation
+            || demo_scale
             || demo_calibration
             || demo_calibration_confirm
             || demo_gantry
@@ -1015,6 +1032,11 @@ impl Shell {
             demo_rotation_done: false,
             demo_rotation_card,
             demo_rotation_confirm,
+            scale_open: false,
+            demo_scale,
+            demo_scale_done: false,
+            demo_scale_card,
+            demo_scale_confirm,
             demo_reset,
             demo_reset_done: false,
             demo_reset_confirm,
@@ -1716,6 +1738,27 @@ impl Shell {
             self.rotation_open = !self.demo_rotation_card;
             self.utility_scroll
                 .scroll_to_top_of_item(ROTATION_CARD_INDEX);
+            changed = true;
+        }
+        // Screenshot switch: seed the reproducible scale preview. The sample
+        // has one `R` arc, so the sheet shows the radius-to-center warning.
+        // This is local arithmetic only: nothing is loaded, started, or sent.
+        if self.demo_scale
+            && !self.demo_scale_done
+            && self.state.connection == ConnectionState::Ready
+        {
+            self.demo_scale_done = true;
+            self.state.mode = Mode::Utility;
+            self.state.keypad = None;
+            self.surfacing_open = false;
+            self.rotation_open = false;
+            self.state.utilities.close_transform();
+            self.state.utilities.load_scale_demo();
+            if self.demo_scale_confirm {
+                self.state.utilities.set_scale_confirmed(true);
+            }
+            self.scale_open = !self.demo_scale_card;
+            self.utility_scroll.scroll_to_top_of_item(SCALE_CARD_INDEX);
             changed = true;
         }
         // Screenshot switch: open Utility at the destructive reset card.
@@ -6050,6 +6093,88 @@ impl Shell {
             self.state.push_console(
                 ConsoleLevel::Info,
                 format!("Loaded rotated program {} (not started)", load.name),
+            );
+        } else {
+            self.state.height_map.discard_exact_source(&load.name);
+        }
+        cx.notify();
+    }
+
+    /// Generate the scale preview from the loaded job and open its sheet.
+    ///
+    /// The model validates the fields and transforms a local copy. Nothing is
+    /// loaded, started, or sent; a refusal stays on the card and in the console.
+    fn preview_scale(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.surfacing_open = false;
+        self.rotation_open = false;
+        self.state.utilities.close_transform();
+        match self.state.preview_scale() {
+            Ok(()) => {
+                self.scale_open = true;
+                self.state.mode = Mode::Utility;
+                self.utility_scroll.scroll_to_top_of_item(SCALE_CARD_INDEX);
+                let summary = self
+                    .state
+                    .utilities
+                    .scale_preview()
+                    .map(|preview| {
+                        format!("Scale preview ready: {} (not loaded)", preview.stats_text())
+                    })
+                    .unwrap_or_else(|| "Scale preview ready (not loaded)".to_string());
+                self.state.push_console(ConsoleLevel::Info, summary);
+            }
+            Err(message) => {
+                self.scale_open = false;
+                self.state
+                    .push_console(ConsoleLevel::Warn, format!("Scale: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reopen an existing scale preview without transforming again.
+    fn open_scale_preview(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        if self.state.utilities.scale_preview().is_some() {
+            self.surfacing_open = false;
+            self.rotation_open = false;
+            self.state.utilities.close_transform();
+            self.scale_open = true;
+            self.state.mode = Mode::Utility;
+        }
+        cx.notify();
+    }
+
+    /// Cancel the scale review. Sends nothing and discards the preview.
+    fn close_scale(&mut self, cx: &mut Context<Self>) {
+        self.state.keypad = None;
+        self.scale_open = false;
+        self.state.utilities.close_scale();
+        cx.notify();
+    }
+
+    /// Load the confirmed scale preview with exactly one `LoadProgram`.
+    ///
+    /// The command never starts, resumes, or jogs. A successful send switches
+    /// to Job -> Program so the scaled name and source are visible.
+    fn load_scale(&mut self, cx: &mut Context<Self>) {
+        let load = match self.state.take_scale_load() {
+            Ok(load) => load,
+            Err(message) => {
+                self.state.push_console(ConsoleLevel::Warn, message);
+                cx.notify();
+                return;
+            }
+        };
+        if self.send_command(load.command) {
+            self.scale_open = false;
+            self.state.utilities.close_scale();
+            self.state.mode = Mode::Job;
+            self.state.left_tab = LeftTab::Program;
+            self.state.push_console(
+                ConsoleLevel::Info,
+                format!("Loaded scaled program {} (not started)", load.name),
             );
         } else {
             self.state.height_map.discard_exact_source(&load.name);
@@ -15854,6 +15979,142 @@ impl Shell {
             })
     }
 
+    /// Non-destructive uniform source scale about a work-coordinate pivot.
+    fn scale_card(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let loaded = self.state.job.has_program();
+        let name = self.state.job_title().to_string();
+        let error = self.state.utilities.scale_error().map(str::to_string);
+        let preview = self.state.utilities.scale_preview();
+        let stats = preview.map(crate::utilities::ScalePreview::stats_text);
+        let warnings = preview.map(crate::utilities::ScalePreview::warning_lines);
+        let preview_source = preview.map(|preview| preview.base_name.clone());
+        let has_preview = preview.is_some();
+        let fields = [
+            UtilityField::ScaleFactor,
+            UtilityField::ScalePivotX,
+            UtilityField::ScalePivotY,
+        ]
+        .into_iter()
+        .map(|field| self.utility_field_cell(field, p, cx))
+        .collect::<Vec<_>>();
+        let view = cx.entity();
+        let preview_view = view.clone();
+        let review_view = view;
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(p.panel_alt)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(section_label(t("SCALE PROGRAM"), p))
+                    .child(chip(t("UNIFORM / WORK PIVOT"), p)),
+            )
+            .child(div().text_size(px(10.0)).text_color(p.text_faint).child(
+                preview_source.map_or_else(
+                    || {
+                        format!(
+                            "Loaded source: {name}. Scaling rewrites a local copy; \
+                                 LOAD AS PROGRAM replaces the job with the previewed source and \
+                                 never starts it."
+                        )
+                    },
+                    |source| {
+                        format!(
+                            "Preview source: {source}. LOAD AS PROGRAM replaces the job with \
+                                 this previewed source and never starts it."
+                        )
+                    },
+                ),
+            ))
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .line_height(px(12.0))
+                    .text_color(p.warning)
+                    .child(t(SCALE_FRAME_NOTE)),
+            )
+            .child(h_flex().flex_wrap().gap_1().children(fields))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("scale-preview")
+                            .label(t("PREVIEW SCALE"))
+                            .primary()
+                            .h(px(48.0))
+                            .w(px(210.0))
+                            .rounded_lg()
+                            .text_size(px(10.0))
+                            .on_click(move |_, _, cx| {
+                                preview_view.update(cx, |this, cx| {
+                                    this.preview_scale(cx);
+                                });
+                            }),
+                    )
+                    .when(has_preview, |this| {
+                        this.child(
+                            Button::new("scale-review")
+                                .label(t("REVIEW PREVIEW"))
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(170.0))
+                                .rounded_lg()
+                                .text_size(px(10.0))
+                                .on_click(move |_, _, cx| {
+                                    review_view.update(cx, |this, cx| {
+                                        this.open_scale_preview(cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .when(!loaded, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(p.warning)
+                                .child(t("NO PROGRAM: load a program before scaling its source")),
+                        )
+                    }),
+            )
+            .when_some(stats, |this, stats| {
+                this.child(
+                    div()
+                        .font_family(self.mono.clone())
+                        .text_size(px(10.0))
+                        .text_color(p.text_dim)
+                        .child(stats),
+                )
+            })
+            .when_some(warnings, |this, warnings| {
+                let mut rows = v_flex().gap_0();
+                for warning in warnings.iter().take(3) {
+                    rows = rows.child(
+                        div()
+                            .text_size(px(9.5))
+                            .line_height(px(12.0))
+                            .text_color(p.warning)
+                            .child(warning.clone()),
+                    );
+                }
+                if warnings.len() > 3 {
+                    rows = rows.child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                        format!("{} more warnings in the preview", warnings.len() - 3),
+                    ));
+                }
+                this.child(rows)
+            })
+            .when_some(error, |this, error| {
+                this.child(div().text_size(px(10.0)).text_color(p.danger).child(error))
+            })
+    }
+
     /// Explicit rotation preview, warnings, and load confirmation sheet.
     fn rotation_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let Some(preview) = self.state.utilities.rotation_preview() else {
@@ -16095,6 +16356,254 @@ impl Shell {
                     .occlude()
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         scrim_view.update(cx, |this, cx| this.close_rotation(cx));
+                    }),
+            )
+            .child(sheet)
+            .into_any_element()
+    }
+
+    /// Explicit scale preview, warnings, and load confirmation sheet.
+    fn scale_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(preview) = self.state.utilities.scale_preview() else {
+            return div().into_any_element();
+        };
+        let view = cx.entity();
+        let scrim_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let load_view = view;
+        let mono = self.mono.clone();
+        let confirmed = self.state.utilities.scale_confirmed();
+        let load_refusal = self.state.program_load_refusal();
+        let can_load = confirmed && load_refusal.is_none();
+        let warning_lines = preview.warning_lines();
+        let has_warnings = preview.has_warnings();
+        let stats = preview.stats_text();
+        let source_name = preview.base_name.clone();
+        let load_name = preview.name.clone();
+        let factor = preview.factor_text();
+        let pivot = preview.pivot_text();
+        let note = preview.note.clone();
+        let shown = preview.preview_lines.len();
+        let total = preview.output_lines;
+        let truncated = preview.preview_is_truncated();
+
+        let mut warnings = v_flex()
+            .id("scale-warning-lines")
+            .gap_0()
+            .max_h(px(90.0))
+            .overflow_y_scrollbar();
+        if !has_warnings {
+            warnings = warnings.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(p.text_faint)
+                    .child(t("NO WARNINGS")),
+            );
+        } else {
+            for warning in &warning_lines {
+                warnings = warnings.child(
+                    div()
+                        .text_size(px(9.5))
+                        .line_height(px(12.0))
+                        .text_color(p.warning)
+                        .child(warning.clone()),
+                );
+            }
+        }
+
+        let mut lines = v_flex()
+            .id("scale-preview-lines")
+            .gap_0()
+            .max_h(px(240.0))
+            .overflow_y_scrollbar();
+        for line in &preview.preview_lines {
+            lines = lines.child(
+                div()
+                    .font_family(mono.clone())
+                    .text_size(px(10.5))
+                    .line_height(px(14.0))
+                    .text_color(p.text_dim)
+                    .child(line.clone()),
+            );
+        }
+
+        let sheet =
+            v_flex()
+                .relative()
+                .w(px(820.0))
+                .max_w_full()
+                .max_h(px(700.0))
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(p.warning.opacity(0.6))
+                .bg(p.raised)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.text)
+                                .child(t("SCALE PREVIEW")),
+                        )
+                        .child(chip(t("NOT LOADED"), p)),
+                )
+                .child(div().text_size(px(10.0)).text_color(p.warning).child(t(
+                    "The loaded source is unchanged until LOAD AS PROGRAM. This loads one new \
+                 program and never starts it.",
+                )))
+                .child(div().text_size(px(9.5)).text_color(p.text_faint).child(t(
+                    "Uniform positive factor about a pivot in work/program millimetres. Feeds, \
+                 speeds, and Z depths are unchanged. Unsupported programs are refused before \
+                 any load.",
+                )))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(p.text_faint)
+                                        .child(format!("SOURCE   {source_name}")),
+                                )
+                                .child(chip(&factor, p))
+                                .child(chip(&pivot, p)),
+                        )
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(px(10.0))
+                                .text_color(p.accent)
+                                .child(format!("LOAD NAME   {load_name}")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(p.text_dim)
+                                .child(stats),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel_alt)
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(p.text_faint)
+                                .child(t("WARNINGS")),
+                        )
+                        .child(warnings),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(6.0))
+                        .bg(p.panel_alt)
+                        .child(lines)
+                        .child(div().text_size(px(9.0)).text_color(p.text_faint).child(
+                            if truncated {
+                                format!("showing {shown} of {total} scaled lines")
+                            } else {
+                                format!("showing all {shown} scaled lines")
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(p.text_faint)
+                        .child(note),
+                )
+                .child(
+                    Switch::new("scale-confirm")
+                        .checked(confirmed)
+                        .label(t(
+                            "I understand this loads the scaled source and does not start it",
+                        ))
+                        .text_size(px(11.0))
+                        .on_change(move |checked, _, cx| {
+                            confirm_view.update(cx, |this, cx| {
+                                this.state.utilities.set_scale_confirmed(*checked);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .when_some(load_refusal, |this, refusal| {
+                    this.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(p.warning)
+                            .child(t(refusal.message())),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("scale-load")
+                                .label(t("LOAD AS PROGRAM"))
+                                .primary()
+                                .h(px(48.0))
+                                .flex_1()
+                                .rounded_lg()
+                                .text_size(px(11.0))
+                                .disabled(!can_load)
+                                .on_click(move |_, _, cx| {
+                                    load_view.update(cx, |this, cx| this.load_scale(cx));
+                                }),
+                        )
+                        .child(
+                            Button::new("scale-cancel")
+                                .label(t("CANCEL"))
+                                .secondary()
+                                .h(px(48.0))
+                                .w(px(110.0))
+                                .rounded_lg()
+                                .text_size(px(11.0))
+                                .on_click(move |_, _, cx| {
+                                    cancel_view.update(cx, |this, cx| this.close_scale(cx));
+                                }),
+                        ),
+                );
+
+        div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_3()
+            .child(
+                div()
+                    .id("scale-scrim")
+                    .absolute()
+                    .inset_0()
+                    .bg(p.scrim)
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        scrim_view.update(cx, |this, cx| this.close_scale(cx));
                     }),
             )
             .child(sheet)
@@ -17901,6 +18410,11 @@ impl Shell {
             self.utility_scroll
                 .scroll_to_top_of_item(JOB_HISTORY_CARD_INDEX);
         }
+        if self.demo_scale_card {
+            // Screenshot switch: keep the scale card at the top of the list so
+            // the 1280x800 card capture does not depend on a manual scroll.
+            self.utility_scroll.scroll_to_top_of_item(SCALE_CARD_INDEX);
+        }
         let view = cx.entity();
         let config = &self.state.config;
         let profile_path = config
@@ -18383,6 +18897,7 @@ impl Shell {
             .child(self.program_limits_card(p))
             .child(self.transform_card(p, cx))
             .child(self.rotation_card(p, cx))
+            .child(self.scale_card(p, cx))
             .child(self.language_card(p, cx))
             .child(self.pins_card(p, cx))
             .child(self.keymap_card(p, cx))
@@ -22664,6 +23179,9 @@ impl Render for Shell {
         }
         if self.rotation_open && self.state.utilities.rotation_preview().is_some() {
             root = root.child(self.rotation_overlay(p, cx));
+        }
+        if self.scale_open && self.state.utilities.scale_preview().is_some() {
+            root = root.child(self.scale_overlay(p, cx));
         }
         if self.state.macro_run_pending().is_some() {
             root = root.child(self.macro_run_overlay(p, cx));

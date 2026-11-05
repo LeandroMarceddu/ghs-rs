@@ -35,6 +35,12 @@
 //! same preview but leaves the sheet closed for the card capture, and
 //! `--demo-rotation-confirm` additionally checks the load confirmation. All
 //! three are local arithmetic: they load, start, and send nothing.
+//! `--demo-scale` seeds the Utility scale fields with a reproducible local
+//! sample and opens the scale preview; the sample contains one `R` arc so the
+//! radius-to-center warning is visible. `--demo-scale-card` seeds the same
+//! preview but leaves the sheet closed for the card capture, and
+//! `--demo-scale-confirm` additionally checks the load confirmation. All three
+//! are local arithmetic: they load, start, and send nothing.
 //! `--demo-calibration` fills the stepper-calibration fields and shows the
 //! proposal without applying it; `--demo-calibration-confirm` opens the write
 //! confirmation. `--demo-gantry` loads a reproducible 500 mm / 0.250 mm sample

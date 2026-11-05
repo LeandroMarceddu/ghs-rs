@@ -15,7 +15,10 @@
 
 use ghs_core::Wcs;
 use ghs_engine::{Command, Program, SettingValue};
-use ghs_gcode::{MAX_ROTATION_ANGLE_DEG, RotationOptions, RotationWarning, apply_rotation};
+use ghs_gcode::{
+    MAX_ROTATION_ANGLE_DEG, MAX_SCALE_FACTOR, MIN_SCALE_FACTOR, RotationOptions, RotationWarning,
+    ScaleOptions, ScaleWarning, apply_rotation, apply_scale,
+};
 use ghs_i18n::t;
 
 /// Upper bound for one generated surfacing program.
@@ -80,6 +83,50 @@ M5
 M30
 ";
 
+// ---------------------------------------------------------------------- scale
+
+/// Largest accepted absolute pivot coordinate for a source scale, in
+/// millimetres.
+///
+/// This mirrors the rotation pivot bound: a pivot is a setup point, not a
+/// machined coordinate.
+pub const MAX_SCALE_PIVOT_MM: f64 = 1_000_000.0;
+/// Number of leading scaled lines kept for the preview sheet.
+pub const SCALE_PREVIEW_LINE_LIMIT: usize = 40;
+/// Program name suffix prefix for a scaled source.
+pub const SCALED_NAME_SUFFIX: &str = " [scale x";
+/// Height-map/original wording shown below a scale preview.
+pub const SCALE_NOTE: &str = "LOAD AS PROGRAM replaces the current job source. Any height-map \
+     Apply/Revert state for the previous source is cleared; a new map run adopts the scaled \
+     source. Keep an external copy if you need the pre-scale original.";
+/// Coordinate-frame and rejection wording shown with the scale fields.
+pub const SCALE_FRAME_NOTE: &str = "Factor must be positive and uniform on X and Y; 1.0 leaves \
+     the source unchanged. Pivot is in work/program millimetres. Only XY geometry changes: \
+     feeds, speeds, Z depths, and dwells are unchanged. Refused: incremental moves (G91), \
+     G53/G28/G30, probing, canned cycles, G10/G92, G18/G19 arcs, helical arcs, G93, scaling \
+     (G51), checksummed lines, and a work-coordinate-system switch.";
+/// Reproducible screenshot sample name for the scale preview.
+pub const SCALE_DEMO_NAME: &str = "demo-scale.nc";
+/// Reproducible screenshot sample uniform factor.
+pub const SCALE_DEMO_FACTOR: f64 = 0.5;
+/// Reproducible screenshot sample pivot, in work millimetres.
+pub const SCALE_DEMO_PIVOT_MM: (f64, f64) = (20.0, 20.0);
+/// Reproducible screenshot sample with one `R` arc, so the preview shows the
+/// radius-to-center warning without touching the controller.
+pub const SCALE_DEMO_SOURCE: &str = "\
+G21 G90 G54 G17
+G0 Z5
+G0 X20 Y20
+M3 S12000
+G1 Z-1 F200
+G1 X80 Y20 F800
+G2 X80 Y60 R20
+G1 X20 Y60
+G1 Y20
+M5
+M30
+";
+
 // ---------------------------------------------------------------- surfacing
 
 /// One editable surfacing wizard field.
@@ -119,11 +166,17 @@ pub enum UtilityField {
     RotationPivotX,
     /// Source-rotation pivot Y, in work/program millimetres.
     RotationPivotY,
+    /// Uniform source-scale factor applied to both XY axes.
+    ScaleFactor,
+    /// Source-scale pivot X, in work/program millimetres.
+    ScalePivotX,
+    /// Source-scale pivot Y, in work/program millimetres.
+    ScalePivotY,
 }
 
 impl UtilityField {
     /// Number of editable fields.
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 20;
 
     /// Every field, in edit order.
     pub const ALL: [UtilityField; UtilityField::COUNT] = [
@@ -144,12 +197,15 @@ impl UtilityField {
         UtilityField::RotationAngle,
         UtilityField::RotationPivotX,
         UtilityField::RotationPivotY,
+        UtilityField::ScaleFactor,
+        UtilityField::ScalePivotX,
+        UtilityField::ScalePivotY,
     ];
 
     /// Default text for every field.
     pub const DEFAULTS: [&'static str; UtilityField::COUNT] = [
         "0", "0", "100", "80", "6", "40", "2", "1", "900", "200", "5", "12000", "10", "10", "0",
-        "0", "0",
+        "0", "0", "1", "0", "0",
     ];
 
     /// Stable zero-based index for the field array.
@@ -173,6 +229,9 @@ impl UtilityField {
             UtilityField::RotationAngle => 14,
             UtilityField::RotationPivotX => 15,
             UtilityField::RotationPivotY => 16,
+            UtilityField::ScaleFactor => 17,
+            UtilityField::ScalePivotX => 18,
+            UtilityField::ScalePivotY => 19,
         }
     }
 
@@ -197,6 +256,9 @@ impl UtilityField {
             UtilityField::RotationAngle => "ANGLE",
             UtilityField::RotationPivotX => "PIVOT X WORK",
             UtilityField::RotationPivotY => "PIVOT Y WORK",
+            UtilityField::ScaleFactor => "SCALE FACTOR",
+            UtilityField::ScalePivotX => "PIVOT X WORK",
+            UtilityField::ScalePivotY => "PIVOT Y WORK",
         }
     }
 
@@ -218,6 +280,8 @@ impl UtilityField {
             UtilityField::LineStart | UtilityField::LineStep => "",
             UtilityField::RotationAngle => "deg",
             UtilityField::RotationPivotX | UtilityField::RotationPivotY => "mm",
+            UtilityField::ScaleFactor => "",
+            UtilityField::ScalePivotX | UtilityField::ScalePivotY => "mm",
         }
     }
 
@@ -242,6 +306,9 @@ impl UtilityField {
             UtilityField::RotationAngle => "rotation-angle",
             UtilityField::RotationPivotX => "rotation-pivot-x",
             UtilityField::RotationPivotY => "rotation-pivot-y",
+            UtilityField::ScaleFactor => "scale-factor",
+            UtilityField::ScalePivotX => "scale-pivot-x",
+            UtilityField::ScalePivotY => "scale-pivot-y",
         }
     }
 
@@ -273,6 +340,15 @@ impl UtilityField {
             UtilityField::RotationAngle
                 | UtilityField::RotationPivotX
                 | UtilityField::RotationPivotY
+        )
+    }
+
+    /// Whether this field belongs to the source-scale transform.
+    #[must_use]
+    pub const fn is_scale(self) -> bool {
+        matches!(
+            self,
+            UtilityField::ScaleFactor | UtilityField::ScalePivotX | UtilityField::ScalePivotY
         )
     }
 }
@@ -2532,6 +2608,238 @@ pub fn generate_rotation(
     })
 }
 
+// ---------------------------------------------------------------------- scale
+
+/// One non-destructive uniform source scale and its change summary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScalePreview {
+    /// Name of the source program.
+    pub base_name: String,
+    /// Suggested name for the scaled program.
+    pub name: String,
+    /// Scaled source text.
+    pub source: String,
+    /// Uniform factor applied to both XY axes.
+    pub factor: f64,
+    /// Pivot in work/program millimetres.
+    pub pivot_mm: (f64, f64),
+    /// Source line count.
+    pub input_lines: usize,
+    /// Output line count.
+    pub output_lines: usize,
+    /// Straight moves whose XY endpoint was scaled.
+    pub scaled_moves: usize,
+    /// Planar arcs whose endpoint or center was scaled.
+    pub scaled_arcs: usize,
+    /// Non-fatal transform warnings, including `R` arcs re-emitted as `I`/`J`.
+    pub warnings: Vec<ScaleWarning>,
+    /// First [`SCALE_PREVIEW_LINE_LIMIT`] scaled lines.
+    pub preview_lines: Vec<String>,
+    /// Height-map/original wording shown below the preview.
+    pub note: String,
+}
+
+impl ScalePreview {
+    /// Suggested program name for one scale.
+    #[must_use]
+    pub fn transformed_name(base_name: &str, factor: f64) -> String {
+        let base = base_name.trim();
+        let base = if base.is_empty() { "program.nc" } else { base };
+        format!("{base}{}", scale_name_suffix(factor))
+    }
+
+    /// Positive uniform factor text for the card, for example `0.500`.
+    #[must_use]
+    pub fn factor_text(&self) -> String {
+        scale_factor_text(self.factor)
+    }
+
+    /// Pivot text for the card, for example `X 20 Y 20 mm`.
+    #[must_use]
+    pub fn pivot_text(&self) -> String {
+        format!(
+            "X {} Y {} mm",
+            compact(self.pivot_mm.0),
+            compact(self.pivot_mm.1)
+        )
+    }
+
+    /// Whether the transform reported at least one warning.
+    #[must_use]
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Every warning as one operator-facing line.
+    ///
+    /// All warnings are returned; the sheet scrolls rather than truncating the
+    /// model. A program-wide warning with line `0` omits the line prefix.
+    #[must_use]
+    pub fn warning_lines(&self) -> Vec<String> {
+        self.warnings
+            .iter()
+            .map(|warning| {
+                if warning.line == 0 {
+                    warning.message.clone()
+                } else {
+                    format!("line {}: {}", warning.line, warning.message)
+                }
+            })
+            .collect()
+    }
+
+    /// One compact stats line for the card and sheet.
+    #[must_use]
+    pub fn stats_text(&self) -> String {
+        format!(
+            "{} -> {} lines | {} moves scaled | {} arcs scaled | {} warnings",
+            self.input_lines,
+            self.output_lines,
+            self.scaled_moves,
+            self.scaled_arcs,
+            self.warnings.len()
+        )
+    }
+
+    /// Whether the bounded preview omits any scaled line.
+    #[must_use]
+    pub fn preview_is_truncated(&self) -> bool {
+        self.preview_lines.len() < self.output_lines
+    }
+}
+
+/// Program name suffix for a scale, for example `" [scale x0.500]"`.
+#[must_use]
+pub fn scale_name_suffix(factor: f64) -> String {
+    format!("{SCALED_NAME_SUFFIX}{}]", scale_factor_text(factor))
+}
+
+/// Stable factor text used by the name suffix and the card.
+///
+/// Ordinary factors keep three decimals so a `0.5` scale reads `0.500`. A
+/// factor below `0.001` keeps enough decimals to stay meaningful instead of
+/// rounding to `0.000`.
+#[must_use]
+pub fn scale_factor_text(factor: f64) -> String {
+    if !factor.is_finite() {
+        return "0.000".to_string();
+    }
+    if factor.abs() >= 0.001 {
+        return format!("{factor:.3}");
+    }
+    let mut text = format!("{factor:.6}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    if text == "-0" {
+        text = "0".to_string();
+    }
+    text
+}
+
+/// Validates one uniform scale factor.
+///
+/// # Errors
+///
+/// Returns an operator-facing message for a non-finite value or a factor
+/// outside [`MIN_SCALE_FACTOR`]..=[`MAX_SCALE_FACTOR`].
+pub fn validate_scale_factor(factor: f64) -> Result<(), String> {
+    if !factor.is_finite() {
+        return Err("SCALE FACTOR must be finite".to_string());
+    }
+    if !(MIN_SCALE_FACTOR..=MAX_SCALE_FACTOR).contains(&factor) {
+        return Err(format!(
+            "SCALE FACTOR must be within {} ..= {}",
+            compact(MIN_SCALE_FACTOR),
+            compact(MAX_SCALE_FACTOR)
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one scale pivot coordinate in millimetres.
+///
+/// # Errors
+///
+/// Returns an operator-facing message for a non-finite value or a coordinate
+/// outside +/-[`MAX_SCALE_PIVOT_MM`].
+pub fn validate_scale_pivot(label: &str, value_mm: f64) -> Result<(), String> {
+    if !value_mm.is_finite() {
+        return Err(format!("{label} must be finite"));
+    }
+    if value_mm.abs() > MAX_SCALE_PIVOT_MM {
+        return Err(format!(
+            "{label} must be within -{} ..= {} mm",
+            compact(MAX_SCALE_PIVOT_MM),
+            compact(MAX_SCALE_PIVOT_MM)
+        ));
+    }
+    Ok(())
+}
+
+/// Scale one program uniformly about an XY pivot and build its preview.
+///
+/// This is a pure source-to-source rewrite through [`ghs_gcode::apply_scale`].
+/// It never touches the loaded job, sends a command, or parses with a
+/// different controller profile. The pivot is always in work/program
+/// millimetres; controller offsets are not applied.
+///
+/// # Errors
+///
+/// Returns an operator-facing message for an empty source, an invalid factor or
+/// pivot, any [`ghs_gcode::ScaleError`], or a preview that would exceed the
+/// transform size bound. The source is never modified on error.
+pub fn generate_scale(
+    source: &str,
+    factor: f64,
+    pivot_x_mm: f64,
+    pivot_y_mm: f64,
+) -> Result<ScalePreview, String> {
+    if source.trim().is_empty() {
+        return Err("the loaded program source is empty".to_string());
+    }
+    validate_scale_factor(factor)?;
+    validate_scale_pivot(UtilityField::ScalePivotX.label(), pivot_x_mm)?;
+    validate_scale_pivot(UtilityField::ScalePivotY.label(), pivot_y_mm)?;
+
+    let options = ScaleOptions {
+        factor,
+        pivot_mm: (pivot_x_mm, pivot_y_mm),
+    };
+    let scaled = apply_scale(source, &options).map_err(|error| error.to_string())?;
+    if scaled.source.len() > MAX_TRANSFORM_BYTES {
+        return Err(format!(
+            "scaled source exceeds the {} MiB limit",
+            MAX_TRANSFORM_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let preview_lines = scaled
+        .source
+        .lines()
+        .take(SCALE_PREVIEW_LINE_LIMIT)
+        .map(str::to_string)
+        .collect();
+    let base_name = "program.nc";
+    Ok(ScalePreview {
+        base_name: base_name.to_string(),
+        name: ScalePreview::transformed_name(base_name, factor),
+        source: scaled.source,
+        factor,
+        pivot_mm: (pivot_x_mm, pivot_y_mm),
+        input_lines: scaled.stats.input_lines,
+        output_lines: scaled.stats.output_lines,
+        scaled_moves: scaled.stats.scaled_moves,
+        scaled_arcs: scaled.stats.scaled_arcs,
+        warnings: scaled.warnings,
+        preview_lines,
+        note: SCALE_NOTE.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------- utility model
 
 /// Local utility wizard state. No preview is sent anywhere until the operator
@@ -2550,6 +2858,9 @@ pub struct UtilityModel {
     rotation_preview: Option<RotationPreview>,
     rotation_error: Option<String>,
     rotation_confirmed: bool,
+    scale_preview: Option<ScalePreview>,
+    scale_error: Option<String>,
+    scale_confirmed: bool,
     calibration: CalibrationModel,
     gantry: GantrySquaringModel,
 }
@@ -2573,6 +2884,9 @@ impl Default for UtilityModel {
             rotation_preview: None,
             rotation_error: None,
             rotation_confirmed: false,
+            scale_preview: None,
+            scale_error: None,
+            scale_confirmed: false,
             calibration: CalibrationModel::default(),
             gantry: GantrySquaringModel::default(),
         }
@@ -2593,6 +2907,9 @@ impl UtilityModel {
         self.rotation_preview = None;
         self.rotation_error = None;
         self.rotation_confirmed = false;
+        self.scale_preview = None;
+        self.scale_error = None;
+        self.scale_confirmed = false;
         self.calibration.reset_session();
     }
 
@@ -2660,6 +2977,10 @@ impl UtilityModel {
                 self.rotation_preview = None;
                 self.rotation_error = None;
                 self.rotation_confirmed = false;
+            } else if field.is_scale() {
+                self.scale_preview = None;
+                self.scale_error = None;
+                self.scale_confirmed = false;
             } else {
                 self.transform_preview = None;
                 self.transform_error = None;
@@ -2962,6 +3283,86 @@ impl UtilityModel {
         }
     }
 
+    /// Generate and cache one scale preview from the loaded source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the source is empty, a factor or pivot field is
+    /// invalid, or [`ghs_gcode::apply_scale`] refuses the program. The source
+    /// and the loaded job are never modified.
+    pub fn generate_scale(&mut self, base_name: &str, source: &str) -> Result<(), String> {
+        self.scale_confirmed = false;
+        let result = (|| {
+            let factor = self.number(UtilityField::ScaleFactor)?;
+            let pivot_x_mm = self.number(UtilityField::ScalePivotX)?;
+            let pivot_y_mm = self.number(UtilityField::ScalePivotY)?;
+            generate_scale(source, factor, pivot_x_mm, pivot_y_mm)
+        })();
+        match result {
+            Ok(mut preview) => {
+                preview.base_name = base_name.to_string();
+                preview.name = ScalePreview::transformed_name(base_name, preview.factor);
+                self.scale_preview = Some(preview);
+                self.scale_error = None;
+                Ok(())
+            }
+            Err(message) => {
+                self.scale_preview = None;
+                self.scale_error = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// Current scale preview, if one was generated.
+    #[must_use]
+    pub fn scale_preview(&self) -> Option<&ScalePreview> {
+        self.scale_preview.as_ref()
+    }
+
+    /// Last scale generation or load-refusal error.
+    #[must_use]
+    pub fn scale_error(&self) -> Option<&str> {
+        self.scale_error.as_deref()
+    }
+
+    /// Record a refusal that happened before the model could generate a
+    /// preview, such as no loaded program.
+    pub fn note_scale_error(&mut self, message: impl Into<String>) {
+        self.scale_preview = None;
+        self.scale_confirmed = false;
+        self.scale_error = Some(message.into());
+    }
+
+    /// Whether the operator acknowledged the scaled-program warning.
+    #[must_use]
+    pub fn scale_confirmed(&self) -> bool {
+        self.scale_confirmed
+    }
+
+    /// Set the scale acknowledgement. It can only turn on with a preview.
+    pub fn set_scale_confirmed(&mut self, confirmed: bool) {
+        self.scale_confirmed = confirmed && self.scale_preview.is_some();
+    }
+
+    /// Discard the scale preview and its confirmation.
+    pub fn close_scale(&mut self) {
+        self.scale_preview = None;
+        self.scale_confirmed = false;
+        self.scale_error = None;
+    }
+
+    /// Fill the scale fields with the reproducible screenshot sample and
+    /// generate its preview. Local arithmetic only: nothing is loaded or sent.
+    pub fn load_scale_demo(&mut self) {
+        let _ = self.set_field_text(UtilityField::ScaleFactor, SCALE_DEMO_FACTOR.to_string());
+        let _ = self.set_field_text(UtilityField::ScalePivotX, SCALE_DEMO_PIVOT_MM.0.to_string());
+        let _ = self.set_field_text(UtilityField::ScalePivotY, SCALE_DEMO_PIVOT_MM.1.to_string());
+        if let Err(message) = self.generate_scale(SCALE_DEMO_NAME, SCALE_DEMO_SOURCE) {
+            self.note_scale_error(message);
+        }
+    }
+
     fn number(&self, field: UtilityField) -> Result<f64, String> {
         let text = self.field_text(field).trim();
         if text.is_empty() {
@@ -3001,6 +3402,10 @@ fn validate_field_text(field: UtilityField, text: &str) -> Result<(), String> {
         UtilityField::RotationPivotX | UtilityField::RotationPivotY => {
             return validate_rotation_pivot(field.label(), value);
         }
+        UtilityField::ScaleFactor => return validate_scale_factor(value),
+        UtilityField::ScalePivotX | UtilityField::ScalePivotY => {
+            return validate_scale_pivot(field.label(), value);
+        }
         _ => {}
     }
     let (min, max, integer) = match field {
@@ -3017,6 +3422,9 @@ fn validate_field_text(field: UtilityField, text: &str) -> Result<(), String> {
         UtilityField::RotationAngle
         | UtilityField::RotationPivotX
         | UtilityField::RotationPivotY => return Ok(()),
+        UtilityField::ScaleFactor | UtilityField::ScalePivotX | UtilityField::ScalePivotY => {
+            return Ok(());
+        }
     };
     if value < min || value > max {
         return Err(format!(
@@ -4101,5 +4509,213 @@ mod tests {
         assert!(!model.rotation_confirmed());
         assert!(model.rotation_preview().is_none());
         assert!(model.rotation_error().is_none());
+    }
+
+    fn scale_model(factor: &str, pivot_x: &str, pivot_y: &str) -> UtilityModel {
+        let mut model = UtilityModel::default();
+        model
+            .set_field_text(UtilityField::ScaleFactor, factor)
+            .expect("factor");
+        model
+            .set_field_text(UtilityField::ScalePivotX, pivot_x)
+            .expect("pivot X");
+        model
+            .set_field_text(UtilityField::ScalePivotY, pivot_y)
+            .expect("pivot Y");
+        model
+    }
+
+    #[test]
+    fn scale_fields_validate_factor_and_pivot_bounds() {
+        let mut model = UtilityModel::default();
+        for good in ["0.000001", "0.5", "1", "2", "1000000"] {
+            model
+                .set_field_text(UtilityField::ScaleFactor, good)
+                .unwrap_or_else(|error| panic!("factor {good} rejected: {error}"));
+        }
+        for bad in [
+            "0",
+            "-1",
+            "0.0000001",
+            "1000000.1",
+            "NaN",
+            "inf",
+            "not a number",
+            "",
+        ] {
+            assert!(
+                model
+                    .set_field_text(UtilityField::ScaleFactor, bad)
+                    .is_err(),
+                "factor {bad:?} must be rejected"
+            );
+        }
+
+        for good in ["-1000000", "0", "1000000", "12.5"] {
+            model
+                .set_field_text(UtilityField::ScalePivotX, good)
+                .unwrap_or_else(|error| panic!("pivot {good} rejected: {error}"));
+        }
+        for bad in ["1000000.001", "-1000000.001", "NaN", "inf", ""] {
+            assert!(
+                model
+                    .set_field_text(UtilityField::ScalePivotY, bad)
+                    .is_err(),
+                "pivot {bad:?} must be rejected"
+            );
+        }
+        assert!(model.field_error(UtilityField::ScalePivotY).is_some());
+    }
+
+    #[test]
+    fn scale_preview_halves_a_golden_source_about_a_work_pivot() {
+        let mut model = scale_model("0.5", "20", "20");
+        model
+            .generate_scale("part.nc", "G21 G90\nG0 X40 Y20\nM30\n")
+            .expect("scale preview");
+        let preview = model.scale_preview().expect("preview");
+        assert_eq!(preview.name, "part.nc [scale x0.500]");
+        assert_eq!(
+            preview.source.lines().collect::<Vec<_>>(),
+            ["G21 G90", "G0 X30 Y20", "M30"]
+        );
+        assert_eq!(preview.input_lines, 3);
+        assert_eq!(preview.output_lines, 3);
+        assert_eq!(preview.scaled_moves, 1);
+        assert_eq!(preview.scaled_arcs, 0);
+        assert!(!preview.has_warnings());
+        assert_eq!(preview.factor_text(), "0.500");
+        assert_eq!(preview.pivot_text(), "X 20 Y 20 mm");
+    }
+
+    #[test]
+    fn scale_preview_doubles_a_golden_source() {
+        let preview =
+            generate_scale("G21 G90\nG0 X10 Y0\nM30\n", 2.0, 0.0, 0.0).expect("scale preview");
+        assert_eq!(preview.name, "program.nc [scale x2.000]");
+        assert_eq!(
+            preview.source.lines().collect::<Vec<_>>(),
+            ["G21 G90", "G0 X20 Y0", "M30"]
+        );
+        assert_eq!(preview.scaled_moves, 1);
+        assert_eq!(preview.scaled_arcs, 0);
+        assert_eq!(preview.output_lines, 3);
+    }
+
+    #[test]
+    fn scale_preview_reports_stats_warnings_and_caps_the_line_preview() {
+        let mut source = String::from("G21 G90\nG0 X0 Y0\nG1 X0 Y0 F800\nG2 X20 Y0 R10\n");
+        for line in 0..60 {
+            source.push_str(&format!("G1 X{line} Y0\n"));
+        }
+        source.push_str("M30\n");
+        let preview = generate_scale(&source, 2.0, 0.0, 0.0).expect("scale");
+
+        assert_eq!(preview.scaled_arcs, 1);
+        assert_eq!(preview.scaled_moves, 62);
+        assert_eq!(preview.warnings.len(), 1);
+        assert!(preview.warning_lines()[0].contains("line 4"));
+        assert!(preview.warning_lines()[0].contains("R arc"));
+        assert_eq!(preview.preview_lines.len(), SCALE_PREVIEW_LINE_LIMIT);
+        assert!(preview.preview_is_truncated());
+        assert!(preview.output_lines > SCALE_PREVIEW_LINE_LIMIT);
+        assert!(preview.stats_text().contains("moves scaled"));
+        assert!(preview.stats_text().contains("1 warnings"));
+    }
+
+    #[test]
+    fn scale_preview_rejects_empty_sources_and_incremental_programs() {
+        let error = generate_scale("   \n", 2.0, 0.0, 0.0).expect_err("empty source");
+        assert!(error.contains("empty"), "{error}");
+
+        let mut model = scale_model("2", "0", "0");
+        let error = model
+            .generate_scale("incremental.nc", "G21\nG91\nG0 X1\nM30\n")
+            .expect_err("incremental program");
+        assert!(error.contains("G91"), "{error}");
+        assert!(model.scale_preview().is_none());
+        assert!(model.scale_error().is_some());
+
+        let error = model
+            .generate_scale("malformed.nc", "G1 X\n")
+            .expect_err("malformed program");
+        assert!(error.contains("parse"), "{error}");
+    }
+
+    #[test]
+    fn scale_preview_rejects_invalid_options_without_panicking() {
+        for factor in [
+            f64::NAN,
+            f64::INFINITY,
+            0.0,
+            -1.0,
+            MIN_SCALE_FACTOR / 2.0,
+            MAX_SCALE_FACTOR * 2.0,
+        ] {
+            assert!(
+                generate_scale("G21 G90\nG0 X0 Y0\nM30\n", factor, 0.0, 0.0).is_err(),
+                "factor {factor}"
+            );
+        }
+        for pivot in [f64::NAN, f64::INFINITY, 1_000_000.001, -1_000_000.001] {
+            assert!(generate_scale("G21 G90\nG0 X0 Y0\nM30\n", 2.0, pivot, 0.0).is_err());
+            assert!(generate_scale("G21 G90\nG0 X0 Y0\nM30\n", 2.0, 0.0, pivot).is_err());
+        }
+    }
+
+    #[test]
+    fn scale_name_suffix_is_stable_for_the_demo_factor() {
+        assert_eq!(scale_name_suffix(0.5), " [scale x0.500]");
+        assert_eq!(scale_name_suffix(2.0), " [scale x2.000]");
+        assert_eq!(scale_name_suffix(MIN_SCALE_FACTOR), " [scale x0.000001]");
+        assert_eq!(
+            ScalePreview::transformed_name("part.nc", 0.5),
+            "part.nc [scale x0.500]"
+        );
+        assert_eq!(
+            ScalePreview::transformed_name("", 2.0),
+            "program.nc [scale x2.000]"
+        );
+    }
+
+    #[test]
+    fn scale_demo_preview_is_reproducible_and_has_the_radius_warning() {
+        let mut first = UtilityModel::default();
+        first.load_scale_demo();
+        let mut second = UtilityModel::default();
+        second.load_scale_demo();
+
+        let a = first.scale_preview().expect("demo preview");
+        let b = second.scale_preview().expect("demo preview");
+        assert_eq!(a, b);
+        assert_eq!(a.base_name, SCALE_DEMO_NAME);
+        assert_eq!(a.name, "demo-scale.nc [scale x0.500]");
+        assert_eq!(a.factor, SCALE_DEMO_FACTOR);
+        assert_eq!(a.pivot_mm, SCALE_DEMO_PIVOT_MM);
+        assert!(a.has_warnings());
+        assert!(a.warning_lines()[0].contains("R arc"));
+        assert_eq!(
+            first.field_text(UtilityField::ScaleFactor),
+            SCALE_DEMO_FACTOR.to_string()
+        );
+        assert!(!first.scale_confirmed());
+    }
+
+    #[test]
+    fn scale_confirmation_requires_a_preview_and_cancel_clears_it() {
+        let mut model = UtilityModel::default();
+        model.set_scale_confirmed(true);
+        assert!(!model.scale_confirmed());
+
+        let mut model = scale_model("2", "0", "0");
+        model
+            .generate_scale("part.nc", "G21 G90\nG0 X0 Y0\nM30\n")
+            .expect("preview");
+        model.set_scale_confirmed(true);
+        assert!(model.scale_confirmed());
+        model.close_scale();
+        assert!(!model.scale_confirmed());
+        assert!(model.scale_preview().is_none());
+        assert!(model.scale_error().is_none());
     }
 }
