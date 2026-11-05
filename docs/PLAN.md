@@ -28,9 +28,9 @@ start-from-line; the remaining utility/calibration set (gantry squaring and
 rotation/scale/translate transforms — surfacing, limits display and pre-run
 travel confirmation, line-number/comment transforms, stepper calibration, and
 the first-run safety/setup wizard are implemented); and the probe remainder
-(work-rotation apply/straightness, pre/post probe macros, retry strategy, and
-persisted cycle settings; tool-length apply is implemented). The viewer
-remainder (3D stock mesh), portrait reflow, high-contrast theme, session
+(work-rotation apply/straightness, pre/post probe macros, and retry strategy;
+tool-length apply and persisted shared cycle defaults are implemented). The
+viewer remainder (3D stock mesh), portrait reflow, high-contrast theme, session
 recording, and the optional Workbench mode are also open against the full
 checklist in [parity.md](parity.md).
 `v0.6.0` is an optional preview pre-release; it does not close the V1.0 gate.

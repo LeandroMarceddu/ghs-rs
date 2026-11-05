@@ -15,7 +15,7 @@ localization are tracked globally**, not repeated on every row: no row meets the
 full release definition until the FlexiHAL gate passes. See
 [PARITY-AUDIT.md](PARITY-AUDIT.md) for the evidence-based audit snapshot.
 
-## Layer status (2026-11-03)
+## Layer status (2026-11-05)
 
 | Layer | State | Evidence |
 |---|---|---|
@@ -30,7 +30,7 @@ full release definition until the FlexiHAL gate passes. See
 | Viewer UI | Implemented | 2D/3D toolpath, marker, pan/zoom, height-map overlay |
 | Settings UI | Implemented | generated `$ES`/`$EG`, verified writes |
 | Offsets/tools | Implemented | live `$#`, G10, goto/clear, offsets.nc, app/controller tool tables |
-| Probing | Implemented | Z/edge/corner/circle/rectangle/XY plate; height map Apply/Revert |
+| Probing | Implemented | Z/edge/corner/circle/rectangle/XY plate; TLO apply; height map Apply/Revert |
 | Config/backup | Implemented | profiles, atomic saves, backup bundles, locale/keymap |
 | Localization | Primary UI | en/it/de/nl; secondary help/warning text remains English |
 | Hardware | Pending | board offline in the shed; simulator-first validation |
@@ -163,7 +163,7 @@ implemented before its UI or hardware validation row is complete.
 | PROBE-10 | Height map probing | M6 | done | Grid, feeds, safe Z, overlay, CSV |
 | PROBE-11 | Height map compensation and export | M6 | done | Explicit Apply rewrite, original preserved |
 | PROBE-12 | Probe-safe interlocks | M6 | done | Mandatory preflight |
-| PROBE-13 | Probe feed, step, and retry settings | M6 | partial | Offset persisted; feed/search per run |
+| PROBE-13 | Probe feed, step, and retry settings | M6 | partial | Shared defaults persisted per profile; retry strategy open |
 | PROBE-14 | Probe results display and log | M6 | done | PRB history |
 | PROBE-15 | Probe mount XY offset | M6 | done | Persisted per profile; feature vs controlled point |
 | PROBE-16 | Height-map Z offset | M6 | done | Effective map; raw samples retained |
@@ -206,7 +206,7 @@ implemented before its UI or hardware validation row is complete.
 | REL-02 | Unit, golden, and property tests | M1 | done | Per crate |
 | REL-03 | Simulator scenario suite | M1 | partial | Alarm/tool/probe/reconnect coverage |
 | REL-04 | Hardware-in-the-loop checklist | M2 | partial | FlexiHAL |
-| REL-05 | Windows, macOS, Linux packaging | M7 | partial | Draft archives; signed installers open |
+| REL-05 | Windows, macOS, Linux packaging | M7 | partial | v0.6.0 published; signing/notarization open |
 | REL-06 | Code signing and notarization | M7 | todo | Best effort |
 | REL-07 | User manual and troubleshooting guide | M7 | done | Docs site or mdBook |
 | REL-08 | Versioning and changelog | M7 | done | Semver |

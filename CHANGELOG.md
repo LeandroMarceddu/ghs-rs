@@ -19,7 +19,8 @@ until the next release is cut.
   idle-only and never changes local profiles or backups.
 - **Probe defaults** — safe Z, search, feed, retract, diameter, edge offset,
   and plate thickness are stored per controller profile with validation and
-  backward-compatible defaults. UI wiring follows.
+  backward-compatible defaults. The Probe `SAVE DEFAULTS` action writes only
+  the local profile and reloads the values on the next profile load.
 
 ## [0.6.0] - 2026-11-05
 

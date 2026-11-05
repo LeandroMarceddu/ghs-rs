@@ -545,6 +545,18 @@ positions, centres, and the height-map grid origin are **feature/probe-tip**
 coordinates. Generated plan `FROM`/`TO` values and `PRB` results are
 **controlled-point** coordinates: `controlled = feature - probe offset`.
 
+### Probe defaults
+
+The `PROBE DEFAULTS` bar owns the seven shared values: safe Z, search, feed,
+retract, probe diameter, edge offset, and plate thickness. They are stored per
+controller profile and prefill a newly loaded profile. Edit the fields on any
+cycle, then press `SAVE DEFAULTS`; the app writes only the local profile JSON
+and sends no controller command. Per-cycle anchors and expected values
+(expected Z/X/Y, centre, radius, touches, separation, reference Z, grid
+origin/step, rectangle size, plate X/Y) stay per run and are not saved.
+`SAVE DEFAULTS` is refused while a probe run is active or a shared field is
+invalid.
+
 ### Preflight
 
 `RUN` is refused unless every gate passes:
