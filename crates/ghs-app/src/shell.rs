@@ -8015,6 +8015,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.warning.opacity(0.6))
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -8301,6 +8302,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -8499,6 +8501,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -8687,6 +8690,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.warning)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -9480,6 +9484,7 @@ impl Shell {
             .border_1()
             .border_color(p.border_strong)
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .h(px(48.0))
@@ -10088,6 +10093,7 @@ impl Shell {
                     .border_1()
                     .border_color(border)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -14173,6 +14179,8 @@ impl Shell {
             .border_1()
             .border_color(accent.opacity(0.6))
             .bg(p.raised)
+            .relative()
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -14393,6 +14401,7 @@ impl Shell {
             .border_1()
             .border_color(p.warning.opacity(0.6))
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -15567,6 +15576,7 @@ impl Shell {
             .border_1()
             .border_color(p.border_strong)
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -16475,6 +16485,7 @@ impl Shell {
                 .border_1()
                 .border_color(p.warning.opacity(0.6))
                 .bg(p.raised)
+                .occlude()
                 .child(
                     h_flex()
                         .items_center()
@@ -16722,6 +16733,7 @@ impl Shell {
                 .border_1()
                 .border_color(p.warning.opacity(0.6))
                 .bg(p.raised)
+                .occlude()
                 .child(
                     h_flex()
                         .items_center()
@@ -16971,6 +16983,7 @@ impl Shell {
             .border_1()
             .border_color(p.accent)
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -17186,6 +17199,7 @@ impl Shell {
             .border_1()
             .border_color(p.border_strong)
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -17423,6 +17437,7 @@ impl Shell {
             .border_1()
             .border_color(p.warning.opacity(0.6))
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -17966,6 +17981,7 @@ impl Shell {
             .border_1()
             .border_color(p.border_strong)
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -18622,6 +18638,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -20047,6 +20064,7 @@ impl Shell {
                     .border_1()
                     .border_color(if capturing { p.accent } else { p.border_strong })
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         div()
                             .text_size(px(10.0))
@@ -20241,6 +20259,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         div()
                             .text_size(px(10.0))
@@ -20369,6 +20388,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -20505,6 +20525,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -20646,6 +20667,7 @@ impl Shell {
                     .border_1()
                     .border_color(action_color.opacity(0.70))
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -20947,6 +20969,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -22172,6 +22195,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -22292,6 +22316,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -22492,6 +22517,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -22628,6 +22654,7 @@ impl Shell {
                     .border_1()
                     .border_color(p.border_strong)
                     .bg(p.raised)
+                    .occlude()
                     .child(
                         h_flex()
                             .items_center()
@@ -22732,6 +22759,8 @@ impl Shell {
             .border_1()
             .border_color(p.warning.opacity(0.6))
             .bg(p.raised)
+            .relative()
+            .occlude()
             .child(
                 h_flex()
                     .items_center()
@@ -22975,6 +23004,7 @@ impl Shell {
             .border_1()
             .border_color(p.border_strong)
             .bg(p.raised)
+            .occlude()
             .child(
                 h_flex()
                     .items_center()

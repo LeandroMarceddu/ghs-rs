@@ -137,6 +137,7 @@ pub fn overlay(
         .border_1()
         .border_color(palette.border_strong)
         .bg(palette.raised)
+        .occlude()
         .child(header);
 
     if matches!(target, KeypadTarget::Mdi) {
