@@ -1721,4 +1721,79 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
          richtingen.",
     ),
     ("SENT", "VERZONDEN"),
+    (
+        "NO PROGRAM: load a program before rotating its source",
+        "GEEN PROGRAMMA: laad een programma voordat je de bron draait",
+    ),
+    (
+        "NO PROGRAM: load a program before scaling its source",
+        "GEEN PROGRAMMA: laad een programma voordat je de bron schaalt",
+    ),
+    ("NO WARNINGS", "GEEN WAARSCHUWINGEN"),
+    (
+        "No program loaded: the source check has nothing to scan.",
+        "Geen programma geladen: de broncontrole heeft niets te controleren.",
+    ),
+    ("PREVIEW ROTATION", "VOORBEELD DRAAIEN"),
+    ("PREVIEW SCALE", "VOORBEELD SCHALEN"),
+    ("PROGRAM CHECK", "PROGRAMMACONTROLE"),
+    ("REVIEW PREVIEW", "VOORBEELD CONTROLEREN"),
+    ("ROTATE PROGRAM", "PROGRAMMA DRAAIEN"),
+    ("ROTATION PREVIEW", "DRAAIVOORBEELD"),
+    ("SCALE PREVIEW", "SCHAALVOORBEELD"),
+    ("SCALE PROGRAM", "PROGRAMMA SCHALEN"),
+    ("UNIFORM / WORK PIVOT", "UNIFORM / DRAAIPUNT WERKSTUK"),
+    ("USE PROBE ANGLE", "TASTHOEK GEBRUIKEN"),
+    ("WARNINGS", "WAARSCHUWINGEN"),
+    ("WORK PIVOT / CCW +", "DRAAIPUNT WERKSTUK / LINKSOM +"),
+    (
+        "I understand this loads the rotated source and does not start it",
+        "Ik begrijp dat dit de gedraaide bron laadt en niet start",
+    ),
+    (
+        "I understand this loads the scaled source and does not start it",
+        "Ik begrijp dat dit de geschaalde bron laadt en niet start",
+    ),
+    (
+        "INFORMATIONAL - START IS NOT BLOCKED. NOT A MACHINE/TRAVEL CHECK.",
+        "INFORMATIEF - START WORDT NIET GEBLOKKEERD. GEEN MACHINE-/VERPLAATSINGSCONTROLE.",
+    ),
+    (
+        "Missing app tool-table entries are warnings, not blockers. The check reads source text \
+         and parsed counts only; it cannot verify controller state, offsets, tool length, \
+         fixtures, or actual travel. No controller command is sent.",
+        "Ontbrekende regels in de gereedschapstabel van de app zijn waarschuwingen, geen \
+         blokkades. De controle leest alleen brontekst en getelde waarden; zij kan de \
+         controllerstatus, offsets, gereedschaplengte, opspanningen of de werkelijke verplaatsing \
+         niet verifiëren. Er wordt geen controlleropdracht verzonden.",
+    ),
+    (
+        "No feed, spindle, tool, machine-coordinate, or probe warnings in this program.",
+        "Geen waarschuwingen voor voeding, spindel, gereedschap, machinecoördinaten of taster in \
+         dit programma.",
+    ),
+    (
+        "Pivot is in work/program coordinates; a positive angle is counter-clockwise. Unsupported \
+         programs are refused before any load.",
+        "Het draaipunt ligt in werkstuk-/programmacoördinaten; een positieve hoek is linksom. \
+         Niet-ondersteunde programma's worden vóór het laden geweigerd.",
+    ),
+    (
+        "Rotation is reported only. USE PROBE ANGLE fills the Utility angle with -deviation; the \
+         pivot stays in work coordinates and nothing is loaded or sent.",
+        "De rotatie wordt alleen gemeld. TASTHOEK GEBRUIKEN vult de hoek in Hulpprogramma's met \
+         -afwijking; het draaipunt blijft in werkstukcoördinaten en er wordt niets geladen of \
+         verzonden.",
+    ),
+    (
+        "SOURCE SCAN WAS TRUNCATED: the check did not read every line.",
+        "BRONSCAN AFGEKAPT: de controle heeft niet elke regel gelezen.",
+    ),
+    (
+        "Uniform positive factor about a pivot in work/program millimetres. Feeds, speeds, and Z \
+         depths are unchanged. Unsupported programs are refused before any load.",
+        "Uniforme positieve factor om een draaipunt in werkstuk-/programmamillimeters. Voedingen, \
+         toerentallen en Z-dieptes blijven ongewijzigd. Niet-ondersteunde programma's worden vóór \
+         het laden geweigerd.",
+    ),
 ];

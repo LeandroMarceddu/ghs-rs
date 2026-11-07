@@ -1661,4 +1661,75 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
          with the centre fixed, each end moves half the delta in opposite directions.",
     ),
     ("SENT", "SENT"),
+    (
+        "NO PROGRAM: load a program before rotating its source",
+        "NO PROGRAM: load a program before rotating its source",
+    ),
+    (
+        "NO PROGRAM: load a program before scaling its source",
+        "NO PROGRAM: load a program before scaling its source",
+    ),
+    ("NO WARNINGS", "NO WARNINGS"),
+    (
+        "No program loaded: the source check has nothing to scan.",
+        "No program loaded: the source check has nothing to scan.",
+    ),
+    ("PREVIEW ROTATION", "PREVIEW ROTATION"),
+    ("PREVIEW SCALE", "PREVIEW SCALE"),
+    ("PROGRAM CHECK", "PROGRAM CHECK"),
+    ("REVIEW PREVIEW", "REVIEW PREVIEW"),
+    ("ROTATE PROGRAM", "ROTATE PROGRAM"),
+    ("ROTATION PREVIEW", "ROTATION PREVIEW"),
+    ("SCALE PREVIEW", "SCALE PREVIEW"),
+    ("SCALE PROGRAM", "SCALE PROGRAM"),
+    ("UNIFORM / WORK PIVOT", "UNIFORM / WORK PIVOT"),
+    ("USE PROBE ANGLE", "USE PROBE ANGLE"),
+    ("WARNINGS", "WARNINGS"),
+    ("WORK PIVOT / CCW +", "WORK PIVOT / CCW +"),
+    (
+        "I understand this loads the rotated source and does not start it",
+        "I understand this loads the rotated source and does not start it",
+    ),
+    (
+        "I understand this loads the scaled source and does not start it",
+        "I understand this loads the scaled source and does not start it",
+    ),
+    (
+        "INFORMATIONAL - START IS NOT BLOCKED. NOT A MACHINE/TRAVEL CHECK.",
+        "INFORMATIONAL - START IS NOT BLOCKED. NOT A MACHINE/TRAVEL CHECK.",
+    ),
+    (
+        "Missing app tool-table entries are warnings, not blockers. The check reads source text \
+         and parsed counts only; it cannot verify controller state, offsets, tool length, \
+         fixtures, or actual travel. No controller command is sent.",
+        "Missing app tool-table entries are warnings, not blockers. The check reads source text \
+         and parsed counts only; it cannot verify controller state, offsets, tool length, \
+         fixtures, or actual travel. No controller command is sent.",
+    ),
+    (
+        "No feed, spindle, tool, machine-coordinate, or probe warnings in this program.",
+        "No feed, spindle, tool, machine-coordinate, or probe warnings in this program.",
+    ),
+    (
+        "Pivot is in work/program coordinates; a positive angle is counter-clockwise. Unsupported \
+         programs are refused before any load.",
+        "Pivot is in work/program coordinates; a positive angle is counter-clockwise. Unsupported \
+         programs are refused before any load.",
+    ),
+    (
+        "Rotation is reported only. USE PROBE ANGLE fills the Utility angle with -deviation; the \
+         pivot stays in work coordinates and nothing is loaded or sent.",
+        "Rotation is reported only. USE PROBE ANGLE fills the Utility angle with -deviation; the \
+         pivot stays in work coordinates and nothing is loaded or sent.",
+    ),
+    (
+        "SOURCE SCAN WAS TRUNCATED: the check did not read every line.",
+        "SOURCE SCAN WAS TRUNCATED: the check did not read every line.",
+    ),
+    (
+        "Uniform positive factor about a pivot in work/program millimetres. Feeds, speeds, and Z \
+         depths are unchanged. Unsupported programs are refused before any load.",
+        "Uniform positive factor about a pivot in work/program millimetres. Feeds, speeds, and Z \
+         depths are unchanged. Unsupported programs are refused before any load.",
+    ),
 ];

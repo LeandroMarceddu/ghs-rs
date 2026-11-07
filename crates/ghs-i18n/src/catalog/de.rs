@@ -1744,4 +1744,79 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
          entgegengesetzte Richtungen.",
     ),
     ("SENT", "GESENDET"),
+    (
+        "NO PROGRAM: load a program before rotating its source",
+        "KEIN PROGRAMM: Lade ein Programm, bevor du dessen Quelle drehst",
+    ),
+    (
+        "NO PROGRAM: load a program before scaling its source",
+        "KEIN PROGRAMM: Lade ein Programm, bevor du dessen Quelle skalierst",
+    ),
+    ("NO WARNINGS", "KEINE WARNUNGEN"),
+    (
+        "No program loaded: the source check has nothing to scan.",
+        "Kein Programm geladen: Die Quellprüfung hat nichts zu prüfen.",
+    ),
+    ("PREVIEW ROTATION", "VORSCHAU DREHEN"),
+    ("PREVIEW SCALE", "VORSCHAU SKALIEREN"),
+    ("PROGRAM CHECK", "PROGRAMMPRÜFUNG"),
+    ("REVIEW PREVIEW", "VORSCHAU PRÜFEN"),
+    ("ROTATE PROGRAM", "PROGRAMM DREHEN"),
+    ("ROTATION PREVIEW", "DREHVORSCHAU"),
+    ("SCALE PREVIEW", "SKALIERUNGSVORSCHAU"),
+    ("SCALE PROGRAM", "PROGRAMM SKALIEREN"),
+    ("UNIFORM / WORK PIVOT", "GLEICHMÄSSIG / DREHPUNKT WERKSTÜCK"),
+    ("USE PROBE ANGLE", "TASTWINKEL VERWENDEN"),
+    ("WARNINGS", "WARNUNGEN"),
+    ("WORK PIVOT / CCW +", "DREHPUNKT WERKSTÜCK / LINKS +"),
+    (
+        "I understand this loads the rotated source and does not start it",
+        "Mir ist klar, dass dies die gedrehte Quelle lädt und sie nicht startet",
+    ),
+    (
+        "I understand this loads the scaled source and does not start it",
+        "Mir ist klar, dass dies die skalierte Quelle lädt und sie nicht startet",
+    ),
+    (
+        "INFORMATIONAL - START IS NOT BLOCKED. NOT A MACHINE/TRAVEL CHECK.",
+        "INFORMATIV - START IST NICHT BLOCKIERT. KEINE MASCHINEN-/VERFAHRWEGSPRÜFUNG.",
+    ),
+    (
+        "Missing app tool-table entries are warnings, not blockers. The check reads source text \
+         and parsed counts only; it cannot verify controller state, offsets, tool length, \
+         fixtures, or actual travel. No controller command is sent.",
+        "Fehlende Einträge in der App-Werkzeugtabelle sind Warnungen, keine Sperren. Die Prüfung \
+         liest nur Quelltext und geparste Zählungen; sie kann Controllerstatus, Offsets, \
+         Werkzeuglänge, Vorrichtungen oder den tatsächlichen Verfahrweg nicht verifizieren. Es \
+         wird kein Controllerbefehl gesendet.",
+    ),
+    (
+        "No feed, spindle, tool, machine-coordinate, or probe warnings in this program.",
+        "Keine Warnungen zu Vorschub, Spindel, Werkzeug, Maschinenkoordinaten oder Taster in \
+         diesem Programm.",
+    ),
+    (
+        "Pivot is in work/program coordinates; a positive angle is counter-clockwise. Unsupported \
+         programs are refused before any load.",
+        "Der Drehpunkt liegt in Werkstück-/Programmkoordinaten; ein positiver Winkel ist gegen den \
+         Uhrzeigersinn. Nicht unterstützte Programme werden vor dem Laden abgelehnt.",
+    ),
+    (
+        "Rotation is reported only. USE PROBE ANGLE fills the Utility angle with -deviation; the \
+         pivot stays in work coordinates and nothing is loaded or sent.",
+        "Die Drehung wird nur gemeldet. TASTWINKEL VERWENDEN trägt -Abweichung in den Winkel unter \
+         Dienstprogramme ein; der Drehpunkt bleibt in Werkstückkoordinaten und es wird nichts \
+         geladen oder gesendet.",
+    ),
+    (
+        "SOURCE SCAN WAS TRUNCATED: the check did not read every line.",
+        "QUELLTEXT-PRÜFUNG ABGESCHNITTEN: Die Prüfung hat nicht jede Zeile gelesen.",
+    ),
+    (
+        "Uniform positive factor about a pivot in work/program millimetres. Feeds, speeds, and Z \
+         depths are unchanged. Unsupported programs are refused before any load.",
+        "Gleichmäßiger positiver Faktor um einen Drehpunkt in Werkstück-/Programmmillimetern. \
+         Vorschübe, Drehzahlen und Z-Tiefen bleiben unverändert. Nicht unterstützte Programme \
+         werden vor dem Laden abgelehnt.",
+    ),
 ];

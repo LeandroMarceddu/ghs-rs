@@ -1756,4 +1756,85 @@ pub(crate) static CATALOG: &[(&str, &str)] = &[
          con il centro fisso, ogni estremità si sposta di metà delta in direzioni opposte.",
     ),
     ("SENT", "INVIATO"),
+    (
+        "NO PROGRAM: load a program before rotating its source",
+        "NESSUN PROGRAMMA: carica un programma prima di ruotarne il sorgente",
+    ),
+    (
+        "NO PROGRAM: load a program before scaling its source",
+        "NESSUN PROGRAMMA: carica un programma prima di scalarne il sorgente",
+    ),
+    ("NO WARNINGS", "NESSUN AVVISO"),
+    (
+        "No program loaded: the source check has nothing to scan.",
+        "Nessun programma caricato: il controllo del sorgente non ha nulla da analizzare.",
+    ),
+    ("PREVIEW ROTATION", "ANTEPRIMA ROTAZIONE"),
+    ("PREVIEW SCALE", "ANTEPRIMA SCALA"),
+    ("PROGRAM CHECK", "CONTROLLO PROGRAMMA"),
+    ("REVIEW PREVIEW", "RIVEDI ANTEPRIMA"),
+    ("ROTATE PROGRAM", "RUOTA PROGRAMMA"),
+    ("ROTATION PREVIEW", "ANTEPRIMA ROTAZIONE"),
+    ("SCALE PREVIEW", "ANTEPRIMA SCALATURA"),
+    ("SCALE PROGRAM", "SCALA PROGRAMMA"),
+    (
+        "UNIFORM / WORK PIVOT",
+        "UNIFORME / CENTRO DI ROTAZIONE PEZZO",
+    ),
+    ("USE PROBE ANGLE", "USA ANGOLO SONDA"),
+    ("WARNINGS", "AVVISI"),
+    (
+        "WORK PIVOT / CCW +",
+        "CENTRO DI ROTAZIONE PEZZO / ANTIORARIO +",
+    ),
+    (
+        "I understand this loads the rotated source and does not start it",
+        "Comprendo che questo carica il sorgente ruotato e non lo avvia",
+    ),
+    (
+        "I understand this loads the scaled source and does not start it",
+        "Comprendo che questo carica il sorgente scalato e non lo avvia",
+    ),
+    (
+        "INFORMATIONAL - START IS NOT BLOCKED. NOT A MACHINE/TRAVEL CHECK.",
+        "INFORMATIVO - AVVIO NON BLOCCATO. NON È UN CONTROLLO MACCHINA/CORSA.",
+    ),
+    (
+        "Missing app tool-table entries are warnings, not blockers. The check reads source text \
+         and parsed counts only; it cannot verify controller state, offsets, tool length, \
+         fixtures, or actual travel. No controller command is sent.",
+        "Le voci mancanti nella tabella utensili dell'app sono avvisi, non blocchi. Il controllo \
+         legge solo il testo del sorgente e i conteggi analizzati; non può verificare lo stato del \
+         controller, le origini, la lunghezza utensile, i fissaggi o la corsa effettiva. Non viene \
+         inviato alcun comando al controller.",
+    ),
+    (
+        "No feed, spindle, tool, machine-coordinate, or probe warnings in this program.",
+        "Nessun avviso di avanzamento, mandrino, utensile, coordinate macchina o sonda in questo \
+         programma.",
+    ),
+    (
+        "Pivot is in work/program coordinates; a positive angle is counter-clockwise. Unsupported \
+         programs are refused before any load.",
+        "Il centro di rotazione è in coordinate pezzo/programma; un angolo positivo è antiorario. \
+         I programmi non supportati vengono rifiutati prima di qualsiasi caricamento.",
+    ),
+    (
+        "Rotation is reported only. USE PROBE ANGLE fills the Utility angle with -deviation; the \
+         pivot stays in work coordinates and nothing is loaded or sent.",
+        "La rotazione è solo riportata. USA ANGOLO SONDA inserisce -deviazione nell'angolo di \
+         Utilità; il centro di rotazione resta in coordinate pezzo e non viene caricato né inviato \
+         nulla.",
+    ),
+    (
+        "SOURCE SCAN WAS TRUNCATED: the check did not read every line.",
+        "SCANSIONE SORGENTE TRONCATA: il controllo non ha letto ogni riga.",
+    ),
+    (
+        "Uniform positive factor about a pivot in work/program millimetres. Feeds, speeds, and Z \
+         depths are unchanged. Unsupported programs are refused before any load.",
+        "Fattore positivo uniforme attorno a un centro di rotazione in millimetri pezzo/programma. \
+         Avanzamenti, velocità e profondità Z restano invariati. I programmi non supportati \
+         vengono rifiutati prima di qualsiasi caricamento.",
+    ),
 ];
