@@ -138,13 +138,17 @@
 //! flags write only the app config and never send a controller command.
 //! `--size WxH` (or `--size=WxH`)
 //! opens at an explicit logical size for layout review, e.g. `--size 1920x1080`
-//! or `--size 1080x1920`; `--fullscreen` pins the shell to the current output.
+//! or `--size 1080x1920`; `--portrait` is the 1080x1920 shorthand for portrait
+//! screenshots, and `--size` wins when both are present. `--fullscreen` pins
+//! the shell to the current output.
 //!
 //! Window policy:
 //! - 1280x800 default (UX-01), 1920x1080 works by widening the centre column.
-//! - 1024x600 minimum; below 1120 px the right rail collapses.
-//! - Resizable, so a developer can drag it to portrait and inspect the reflow
-//!   plan documented at the top of `shell.rs`.
+//! - 1024x600 minimum; below 1120 px the landscape right rail collapses.
+//! - A viewport at least 1.15x taller than it is wide reflows to one vertical
+//!   scrolling column with a two-row top bar (portrait, UX-03). The layout is
+//!   computed from width and height, not from a device name.
+//! - Resizable, so a developer can drag it between the three classes.
 
 mod config;
 mod connection;
@@ -156,6 +160,7 @@ mod height_map_library;
 mod i18n;
 mod keymap;
 mod keypad;
+mod layout;
 mod live;
 mod macros;
 mod offsets;
@@ -227,14 +232,27 @@ fn main() {
 ///
 /// Returns `None` for a missing or malformed value so the caller keeps the
 /// default 1280x800 window. Values below 320 px are ignored: the shell cannot
-/// render anything useful below that.
+/// render anything useful below that. `--portrait` is the 1080x1920 shorthand
+/// used by portrait screenshots; an explicit `--size` takes precedence.
 fn window_size_override() -> Option<(f32, f32)> {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(size) = size_argument(&args) {
+        return Some(size);
+    }
+    if args.iter().any(|arg| arg == "--portrait") {
+        return Some((1080.0, 1920.0));
+    }
+    None
+}
+
+/// Parse the first well-formed `--size` argument from `args`.
+fn size_argument(args: &[String]) -> Option<(f32, f32)> {
+    let mut args = args.iter();
     while let Some(arg) = args.next() {
         let raw = if arg == "--size" {
             args.next()?
         } else if let Some(value) = arg.strip_prefix("--size=") {
-            value.to_string()
+            value
         } else {
             continue;
         };

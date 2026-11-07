@@ -20,14 +20,17 @@
 //! has one flexible cell plus a 112 px Spindle cell, which makes its tall cell
 //! end exactly on the MDI/DRO baseline.
 //!
-//! Portrait / narrow behaviour plan (UX-03, deferred to M7):
-//! - At < 1120 px the right rail collapses and the centre column takes the
-//!   space; the layout stays landscape-shaped.
-//! - At < 760 px the window should reflow to a single column: mode bar, active
-//!   workspace, then a paged bottom dock (DRO / Jog / MDI / Spindle). The
-//!   keypad becomes a full-width bottom sheet.
-//! - Every panel keeps its 48 px targets in portrait; the dock scrolls rather
-//!   than shrinking controls.
+//! Portrait / narrow behaviour (UX-03):
+//! - At < 1120 px the landscape right rail collapses and the centre column
+//!   takes the space; 1024x600 keeps that approved compact shape.
+//! - A viewport whose height is at least 1.15x its width reflows to one
+//!   column: the active workspace first, then DRO/Jog/MDI/Feed, the
+//!   Console/Program card, and the auxiliary rail. The page scrolls vertically.
+//! - The portrait top bar uses two 48 px rows so RESET/STOP and all six
+//!   workspace buttons stay visible without horizontal panning.
+//! - Every panel keeps its 48 px targets in portrait; the page scrolls rather
+//!   than shrinking controls. Modal sheets start below the top bar and use a
+//!   vertical scroller when the viewport is short.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,7 +63,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, ExternalPaths, FocusHandle,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
-    ParentElement as _, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString,
+    ParentElement as _, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
     Window, div, px, uniform_list,
 };
@@ -88,6 +91,7 @@ use crate::keymap::{
     unbind_for,
 };
 use crate::keypad;
+use crate::layout::{ColumnLayout, ShellLayout, TopBarLayout};
 use crate::live::{DemoProgram, LinkMode, LiveLink};
 use crate::macros::MacroRunRequest;
 use crate::offsets::{OffsetAction, OffsetGate, OffsetStatus};
@@ -122,8 +126,8 @@ const STEP_SIZES: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
 
 /// Height of the MDI/DRO and Feed/Jog/Spindle rows.
 const ROW_H: f32 = 112.0;
-/// Gap between cards and between columns.
-const GAP: f32 = 12.0;
+/// Gap between cards and between columns (shared with the layout module).
+const GAP: f32 = crate::layout::GAP;
 /// Fixed column widths for the local job-history rows.
 const JOB_HISTORY_TIME_W: f32 = 118.0;
 const JOB_HISTORY_RESULT_W: f32 = 70.0;
@@ -377,6 +381,8 @@ const DEMO_PROBE_INVALID_PRE_MACRO: &str = "(pre-probe)\nG4 P1\nG0 X0";
 
 pub struct Shell {
     pub state: AppState,
+    /// Resolved viewport layout, refreshed at the start of every render.
+    layout: ShellLayout,
     feed_slider: Entity<SliderState>,
     spindle_slider: Entity<SliderState>,
     mono: SharedString,
@@ -975,6 +981,7 @@ impl Shell {
 
         let mut shell = Self {
             state,
+            layout: ShellLayout::for_viewport(1280.0, 800.0),
             feed_slider,
             spindle_slider,
             mono,
@@ -6864,39 +6871,73 @@ impl Shell {
             .into_any_element()
     }
 
-    fn top_bar(
-        &self,
-        p: Palette,
-        window_width: Pixels,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let view = cx.entity();
+    /// GHS identity lockup. The portrait bar drops the subtitle to reserve
+    /// width for status and the safety actions.
+    fn identity_lockup(&self, p: Palette, compact: bool) -> Div {
+        let lockup = v_flex()
+            .gap_0()
+            .w(px(if compact { 56.0 } else { 116.0 }))
+            .child(
+                div()
+                    .text_size(px(22.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text)
+                    .child("GHS"),
+            );
+        if compact {
+            lockup
+        } else {
+            lockup.child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(p.text_faint)
+                    .child("grblHAL Sender"),
+            )
+        }
+    }
 
+    /// Workspace selector. In portrait each button stretches to an equal cell
+    /// so all six workspaces stay at least 48 px wide at the minimum window.
+    fn mode_bar(&self, p: Palette, cx: &mut Context<Self>, stretch: bool) -> Div {
+        let view = cx.entity();
+        let text_size = if stretch && self.layout.mode_slot_width() < 80.0 {
+            12.0
+        } else {
+            14.0
+        };
         let modes = Mode::ALL.iter().enumerate().map(|(index, mode)| {
             let mode = *mode;
             let active = self.state.mode == mode;
             let view = view.clone();
             let variant = mode_variant(cx, p, active);
-            Button::new(format!("mode-{index}"))
+            let button = Button::new(format!("mode-{index}"))
                 .label(t(mode.label()))
                 .h(px(48.0))
-                .px_3()
                 .rounded_lg()
-                .text_size(px(14.0))
+                .text_size(px(text_size))
                 .custom(variant)
                 .on_click(move |_, _, cx| {
                     view.update(cx, |this, cx| {
                         this.state.mode = mode;
                         cx.notify();
                     });
-                })
+                });
+            if stretch {
+                button.flex_1().px_2()
+            } else {
+                button.px_3()
+            }
         });
+        h_flex()
+            .items_center()
+            .gap_1()
+            .when(stretch, |this| this.w_full())
+            .children(modes)
+    }
 
-        let link_view = view.clone();
-        let pill_view = view.clone();
-        let reset_view = view.clone();
-        let stop_view = view.clone();
-
+    /// Connection/status pill. `stretch` lets the portrait action row shrink
+    /// the label instead of pushing RESET and STOP off screen.
+    fn status_pill(&self, p: Palette, cx: &mut Context<Self>, stretch: bool) -> AnyElement {
         let (dot_color, link_label) = match &self.state.connection {
             ConnectionState::Mock => (p.text_faint, self.state.connection.label()),
             ConnectionState::Connecting => (p.warning, self.state.connection.label()),
@@ -6913,6 +6954,37 @@ impl Shell {
             self.state.profile.capabilities.axes.len(),
             self.state.machine_state
         );
+        let pill_view = cx.entity();
+        h_flex()
+            .id("link-pill")
+            .cursor_pointer()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .rounded(px(999.0))
+            .bg(p.panel_alt)
+            .border_1()
+            .border_color(p.border)
+            .hover(|style| style.bg(p.raised_hover))
+            .when(stretch, |this| this.flex_1().min_w(px(0.0)))
+            .on_click(move |_, _, cx| {
+                pill_view.update(cx, |this, cx| this.open_connection(cx));
+            })
+            .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(dot_color))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.text_dim)
+                    .when(stretch, |this| this.min_w(px(0.0)).truncate())
+                    .child(status_text),
+            )
+            .into_any_element()
+    }
+
+    fn link_button(&self, cx: &mut Context<Self>, width: f32) -> Button {
+        let view = cx.entity();
         let link_text = if matches!(
             self.state.connection,
             ConnectionState::Connecting | ConnectionState::Ready
@@ -6921,108 +6993,116 @@ impl Shell {
         } else {
             t("CONNECT")
         };
+        Button::new("link")
+            .label(link_text)
+            .secondary()
+            .h(px(48.0))
+            .w(px(width))
+            .rounded_lg()
+            .text_size(px(12.0))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| {
+                    if matches!(
+                        this.state.connection,
+                        ConnectionState::Connecting | ConnectionState::Ready
+                    ) {
+                        this.disconnect(cx);
+                    } else {
+                        this.open_connection(cx);
+                    }
+                });
+            })
+    }
 
+    fn reset_button(&self, cx: &mut Context<Self>) -> Button {
+        let view = cx.entity();
+        Button::new("reset")
+            .label(t("RESET"))
+            .danger()
+            .h(px(48.0))
+            .w(px(84.0))
+            .rounded_lg()
+            .text_size(px(13.0))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| this.reset(cx));
+            })
+    }
+
+    fn stop_button(&self, cx: &mut Context<Self>) -> Button {
+        let view = cx.entity();
+        Button::new("stop")
+            .label(t("STOP"))
+            .warning()
+            .h(px(48.0))
+            .w(px(84.0))
+            .rounded_lg()
+            .text_size(px(13.0))
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| this.stop(cx));
+            })
+    }
+
+    /// Top bar. Landscape keeps the approved one-row layout; portrait uses two
+    /// rows so RESET/STOP and all six workspaces remain visible.
+    fn top_bar(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if self.layout.top_bar == TopBarLayout::TwoRows {
+            return self.portrait_top_bar(p, cx).into_any_element();
+        }
+        let gap = if self.layout.width < crate::layout::WIDE_MIN_WIDTH {
+            8.0
+        } else {
+            12.0
+        };
         div()
-            .h(px(56.0))
+            .h(px(self.layout.top_bar_height))
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(if window_width < px(1120.0) { 8.0 } else { 12.0 }))
+            .gap(px(gap))
             .px_3()
             .bg(p.panel)
             .border_b_1()
             .border_color(p.border)
-            .child(
-                v_flex()
-                    .gap_0()
-                    .w(px(116.0))
-                    .child(
-                        div()
-                            .text_size(px(22.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(p.text)
-                            .child("GHS"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(p.text_faint)
-                            .child("grblHAL Sender"),
-                    ),
-            )
-            .child(div().flex().items_center().gap_1().children(modes))
+            .child(self.identity_lockup(p, false))
+            .child(self.mode_bar(p, cx, false))
             .child(div().flex_1())
+            .child(self.status_pill(p, cx, false))
+            .child(self.theme_selector(p, px(self.layout.width), cx))
+            .child(self.link_button(cx, 120.0))
+            .child(self.reset_button(cx))
+            .child(self.stop_button(cx))
+            .into_any_element()
+    }
+
+    /// Two-row portrait top bar: status and safety actions above, workspace
+    /// selection below. Both rows are 48 px targets.
+    fn portrait_top_bar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let link_width = if self.layout.action_row_fits() {
+            96.0
+        } else {
+            72.0
+        };
+        v_flex()
+            .h(px(self.layout.top_bar_height))
+            .flex_shrink_0()
+            .gap_1()
+            .py_1()
+            .px_2()
+            .bg(p.panel)
+            .border_b_1()
+            .border_color(p.border)
             .child(
                 h_flex()
-                    .id("link-pill")
-                    .cursor_pointer()
                     .items_center()
                     .gap_2()
-                    .h(px(36.0))
-                    .px_3()
-                    .rounded(px(999.0))
-                    .bg(p.panel_alt)
-                    .border_1()
-                    .border_color(p.border)
-                    .hover(|style| style.bg(p.raised_hover))
-                    .on_click(move |_, _, cx| {
-                        pill_view.update(cx, |this, cx| this.open_connection(cx));
-                    })
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(999.0)).bg(dot_color))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(p.text_dim)
-                            .child(status_text),
-                    ),
+                    .child(self.identity_lockup(p, true))
+                    .child(self.status_pill(p, cx, true))
+                    .child(self.theme_selector(p, px(self.layout.width), cx))
+                    .child(self.link_button(cx, link_width))
+                    .child(self.reset_button(cx))
+                    .child(self.stop_button(cx)),
             )
-            .child(self.theme_selector(p, window_width, cx))
-            .child(
-                Button::new("link")
-                    .label(link_text)
-                    .secondary()
-                    .h(px(48.0))
-                    .w(px(120.0))
-                    .rounded_lg()
-                    .text_size(px(12.0))
-                    .on_click(move |_, _, cx| {
-                        link_view.update(cx, |this, cx| {
-                            if matches!(
-                                this.state.connection,
-                                ConnectionState::Connecting | ConnectionState::Ready
-                            ) {
-                                this.disconnect(cx);
-                            } else {
-                                this.open_connection(cx);
-                            }
-                        });
-                    }),
-            )
-            .child(
-                Button::new("reset")
-                    .label(t("RESET"))
-                    .danger()
-                    .h(px(48.0))
-                    .w(px(84.0))
-                    .rounded_lg()
-                    .text_size(px(13.0))
-                    .on_click(move |_, _, cx| {
-                        reset_view.update(cx, |this, cx| this.reset(cx));
-                    }),
-            )
-            .child(
-                Button::new("stop")
-                    .label(t("STOP"))
-                    .warning()
-                    .h(px(48.0))
-                    .w(px(84.0))
-                    .rounded_lg()
-                    .text_size(px(13.0))
-                    .on_click(move |_, _, cx| {
-                        stop_view.update(cx, |this, cx| this.stop(cx));
-                    }),
-            )
+            .child(self.mode_bar(p, cx, true))
     }
 
     /// Left column: console/program (flex), MDI, Feed.
@@ -7983,15 +8063,7 @@ impl Shell {
             t("SET BREAKPOINT")
         };
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -8270,15 +8342,7 @@ impl Shell {
             |refusal| t(refusal.message()),
         );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -8469,15 +8533,7 @@ impl Shell {
         let name = self.state.job.name.clone();
         let total = self.state.job.total;
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -8658,15 +8714,7 @@ impl Shell {
             .map_or_else(|| "NOT REPORTED".to_string(), |bounds| bounds.format_all());
         let run_to_line = self.state.pending_start_run_to_line();
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -9701,15 +9749,7 @@ impl Shell {
                 ),
         );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -10058,15 +10098,7 @@ impl Shell {
             )
         );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -14310,15 +14342,7 @@ impl Shell {
             );
 
         let scrim_view = cx.entity();
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -14503,15 +14527,7 @@ impl Shell {
             );
 
         let scrim_view = cx.entity();
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -15706,15 +15722,7 @@ impl Shell {
                     ),
             );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -16630,15 +16638,7 @@ impl Shell {
                         ),
                 );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -16879,15 +16879,7 @@ impl Shell {
                         ),
                 );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -17099,15 +17091,7 @@ impl Shell {
                     ),
             );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -17351,15 +17335,7 @@ impl Shell {
                     ),
             );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -17548,15 +17524,7 @@ impl Shell {
                     ),
             );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -18018,15 +17986,7 @@ impl Shell {
             })
             .child(footer);
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_3()
             .child(
                 div()
@@ -18604,15 +18564,7 @@ impl Shell {
             }
         }
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -20028,15 +19980,7 @@ impl Shell {
             );
         }
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -20227,15 +20171,7 @@ impl Shell {
         let cancel_view = view.clone();
         let scrim_view = view;
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -20356,15 +20292,7 @@ impl Shell {
         let confirm_view = view.clone();
         let scrim_view = view;
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -20493,15 +20421,7 @@ impl Shell {
         let confirm_view = view.clone();
         let scrim_view = view;
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -20633,15 +20553,7 @@ impl Shell {
             confirm_button.warning()
         };
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -20936,15 +20848,7 @@ impl Shell {
                 .child(pins_empty(pins.last_events_note(), p)),
         };
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -22159,15 +22063,7 @@ impl Shell {
             }
         }
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -22280,15 +22176,7 @@ impl Shell {
         let confirm = editor.confirm;
         let error = editor.error.clone();
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -22485,15 +22373,7 @@ impl Shell {
         let run_view = view.clone();
         let scrim_view = view;
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -22622,15 +22502,7 @@ impl Shell {
         let delete_view = view.clone();
         let scrim_view = view;
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -22719,7 +22591,7 @@ impl Shell {
 
     /// Manual tool-change sheet.
     ///
-    /// It starts below the 56 px top bar so RESET and STOP stay visible and
+    /// It starts below the top bar so RESET and STOP stay visible and
     /// reachable, and it never resumes the job without a second explicit press.
     fn tool_change_overlay(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let Some(change) = self.state.job.tool_change else {
@@ -22901,15 +22773,7 @@ impl Shell {
                     }),
             );
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 // Dim, but do not occlude: jogging stays available while the
@@ -22926,7 +22790,7 @@ impl Shell {
 
     // ------------------------------------------------------ connection panel
 
-    /// Transport picker overlay. It starts below the 56 px top bar so RESET
+    /// Transport picker overlay. It starts below the top bar so RESET
     /// and STOP stay visible and reachable while a serial link is opening.
     fn connection_overlay(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
@@ -23124,15 +22988,7 @@ impl Shell {
 
         sheet = sheet.child(footer);
 
-        div()
-            .absolute()
-            .top(px(56.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .flex()
-            .items_center()
-            .justify_center()
+        overlay_layer(self.layout.overlay_top(), self.layout.overlay_scroll())
             .p_4()
             .child(
                 div()
@@ -23336,32 +23192,52 @@ impl Shell {
             )
     }
 
-    /// Three columns with shared row guides. The right column is dropped below
-    /// 1120 px; a full portrait reflow is deferred to M7.
-    fn workspace(
-        &self,
-        p: Palette,
-        cx: &mut Context<Self>,
-        width: Pixels,
-        compact: bool,
-    ) -> impl IntoElement {
-        let (left_w, right_w) = if width >= px(1600.0) {
-            (400.0, 260.0)
-        } else {
-            (340.0, 220.0)
-        };
-
-        let mut row = h_flex()
-            .gap(px(GAP))
-            .flex_1()
-            .min_h(px(0.0))
-            .child(self.left_column(p, cx, left_w))
-            .child(self.center_column(p, cx));
-
-        if !compact {
-            row = row.child(self.aux_column(p, cx, right_w));
+    /// Workspace columns. Landscape keeps the approved three-column guide
+    /// layout (or two columns below 1120 px); portrait stacks every panel into
+    /// one vertical scroller instead of shrinking the columns.
+    fn workspace(&self, p: Palette, cx: &mut Context<Self>, layout: ShellLayout) -> AnyElement {
+        debug_assert!(
+            layout.fits_without_horizontal_overflow(),
+            "layout at {}x{} leaves only {} px for the workspace",
+            layout.width,
+            layout.height,
+            layout.centre_width()
+        );
+        match layout.columns {
+            ColumnLayout::Three => h_flex()
+                .gap(px(GAP))
+                .flex_1()
+                .min_h(px(0.0))
+                .child(self.left_column(p, cx, layout.left_width))
+                .child(self.center_column(p, cx))
+                .child(self.aux_column(p, cx, layout.right_width))
+                .into_any_element(),
+            ColumnLayout::Two => h_flex()
+                .gap(px(GAP))
+                .flex_1()
+                .min_h(px(0.0))
+                .child(self.left_column(p, cx, layout.left_width))
+                .child(self.center_column(p, cx))
+                .into_any_element(),
+            ColumnLayout::One => self.portrait_workspace(p, cx, layout).into_any_element(),
         }
-        row
+    }
+
+    /// Portrait stack: the active workspace first, then the manual-control
+    /// cards, the Console/Program card, and the auxiliary rail. Each cell keeps
+    /// its 48 px controls; the page scrolls, not the controls.
+    fn portrait_workspace(&self, p: Palette, cx: &mut Context<Self>, layout: ShellLayout) -> Div {
+        v_flex()
+            .w(px(layout.content_width()))
+            .gap(px(GAP))
+            .child(stack_cell(layout.viewer_height, self.viewer_card(p, cx)))
+            .child(self.dro_card(p, cx))
+            .child(self.jog_card(p, cx))
+            .child(self.mdi_card(p, cx))
+            .child(self.feed_card(p, cx))
+            .child(stack_cell(layout.console_height, self.console_card(p, cx)))
+            .child(stack_cell(layout.aux_height, self.aux_panel(p, cx)))
+            .child(self.spindle_card(p, cx))
     }
 }
 
@@ -23374,8 +23250,10 @@ impl viewer::HasViewer for Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::for_mode(self.state.theme_mode);
-        let width = window.viewport_size().width;
-        let compact = width < px(1120.0);
+        let viewport = window.viewport_size();
+        let layout =
+            ShellLayout::for_viewport(f32::from(viewport.width), f32::from(viewport.height));
+        self.layout = layout;
 
         // A demo-opened sheet has no window in the poll that opened it; copy
         // its draft into the two textareas here, once. This is a local text
@@ -23384,13 +23262,29 @@ impl Render for Shell {
             self.sync_probe_macro_inputs(window, cx);
         }
 
-        let content = div()
-            .flex_1()
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .p(px(GAP))
-            .child(self.workspace(p, cx, width, compact));
+        let content = if layout.content_scroll {
+            div()
+                .id("shell-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scrollbar()
+                .child(
+                    div()
+                        .w_full()
+                        .p(px(GAP))
+                        .child(self.workspace(p, cx, layout)),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .p(px(GAP))
+                .child(self.workspace(p, cx, layout))
+                .into_any_element()
+        };
 
         let mut root = div()
             .relative()
@@ -23400,7 +23294,7 @@ impl Render for Shell {
             .bg(p.bg)
             .text_color(p.text)
             .font_family("sans-serif")
-            .child(self.top_bar(p, width, cx))
+            .child(self.top_bar(p, cx))
             .child(content)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.note_machine_key_down(event, cx)
@@ -24514,6 +24408,42 @@ fn card(p: &Palette) -> Div {
         .border_1()
         .border_color(p.border)
         .bg(p.panel)
+}
+
+/// Fixed-height cell in the portrait stack. The outer box is a flex container
+/// so a card that normally uses `flex_1` fills the reserved height.
+fn stack_cell(height: f32, child: impl IntoElement) -> Div {
+    div()
+        .h(px(height))
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .child(child)
+}
+
+/// Full-window modal layer below the top bar.
+///
+/// On short viewports the sheet is top-aligned inside a vertical scroller so a
+/// tall confirmation can be read without clipping; taller viewports keep the
+/// approved centred placement. Every sheet still uses `max_w_full`, so the
+/// layer never needs horizontal panning.
+fn overlay_layer(top: f32, scroll: bool) -> Stateful<Div> {
+    let layer = div()
+        .absolute()
+        .top(px(top))
+        .left(px(0.0))
+        .right(px(0.0))
+        .bottom(px(0.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_4()
+        .id("overlay-layer");
+    if scroll {
+        layer.items_start().overflow_y_scroll()
+    } else {
+        layer
+    }
 }
 
 /// Header row shared by the job-history card and sheet.
@@ -25815,6 +25745,21 @@ mod tests {
     use crate::keymap::JOG_CANCEL_AFTER;
 
     use super::*;
+
+    #[test]
+    fn every_workspace_has_a_unique_top_bar_entry() {
+        assert_eq!(Mode::ALL.len(), 6);
+        let mut labels = std::collections::BTreeSet::new();
+        for mode in Mode::ALL {
+            assert!(!mode.label().is_empty(), "{mode:?} label");
+            assert!(!mode.title().is_empty(), "{mode:?} title");
+            assert!(labels.insert(mode.label()), "{mode:?} label is unique");
+        }
+        assert_eq!(
+            labels.into_iter().collect::<Vec<_>>(),
+            vec!["Job", "Offset", "Probe", "Settings", "Tools", "Utility"]
+        );
+    }
 
     #[test]
     fn program_rows_map_source_numbers_and_current_line() {
