@@ -11,7 +11,33 @@ until the next release is cut.
 
 ## [Unreleased]
 
-No changes yet after `v0.7.0`.
+No changes yet after `v0.7.1`.
+
+## [0.7.1] - 2026-11-07
+
+Patch release for the post-0.7.0 fixes and features. It is unsigned, not
+notarized, and not hardware-validated.
+
+### Added
+
+- **Session recording** — the Console can record new entries to
+  `exports/session.jsonl` (versioned JSONL, monotonic offsets, 8 MiB/100k
+  entries) and replay them as `[REPLAY]` text. Replay never sends a command.
+- **Portrait layout** — 1080×1920 reflows to one vertically scrolling page with
+  a two-row top bar, while 1024×600 and landscape layouts stay byte-identical.
+- **G-code parameters and expressions** — numeric and named `#` parameters,
+  assignments, and `[...]` arithmetic in word values, with bounded evaluation.
+  Flow control and subprograms remain unsupported.
+
+### Fixed
+
+- **Modal buttons** — every overlay card now occludes its scrim, so clicks on a
+  popup action are no longer swallowed by the dismiss layer.
+
+### Changed
+
+- Italian, German, and Dutch catalogs now cover the rotation, scale, program
+  check, and remaining utility strings.
 
 ## [0.7.0] - 2026-11-05
 
@@ -22,11 +48,6 @@ simulator-first release: unsigned, not notarized, and not hardware-validated.
 
 ### Added
 
-- **Session recording** — the Console can record new entries to
-  `exports/session.jsonl` (versioned JSONL, monotonic offsets, 8 MiB/100k
-  entries) and replay them as `[REPLAY]` text. Replay never sends a command.
-- **Portrait layout** — 1080×1920 reflows to one vertically scrolling page with
-  a two-row top bar, while 1024×600 and landscape layouts stay byte-identical.
 - **Program check** — the read-only program-limits card now shows feed/spindle
   ranges, tools, and warnings for a missing feed, zero/negative `F`/`S`, a tool
   absent from the app table, probe moves, and machine-coordinate moves. It is

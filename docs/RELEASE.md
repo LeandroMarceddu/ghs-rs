@@ -27,11 +27,11 @@ whether to publish.
 - [ ] Refresh the lock file with `cargo check --workspace`, then commit
       `Cargo.toml` and `Cargo.lock` in the release commit.
 - [ ] Confirm the tag equals the workspace version with a leading `v`
-      (`0.7.0` -> `v0.7.0`). The workflow accepts
+      (`0.7.1` -> `v0.7.1`). The workflow accepts
       `vMAJOR.MINOR[.PATCH][-pre]` and rejects anything else.
 - [ ] Create an annotated tag on the exact commit that passed CI:
 
-      git tag -a v0.7.0 -m "ghs-rs v0.7.0"
+      git tag -a v0.7.1 -m "ghs-rs v0.7.1"
 
 - [ ] Never move, force-push, or reuse a published tag. If the tag is wrong and
       nothing has been published or downloaded, delete it and start over.
@@ -132,7 +132,7 @@ that settings writes remain idle-only. These are non-negotiable rules in
 
 ## 7. Run the release workflow
 
-- [ ] Push the tag: `git push origin v0.7.0`.
+- [ ] Push the tag: `git push origin v0.7.1`.
 - [ ] Alternatively, open Actions -> `Release` -> `Run workflow` from `main`
       and enter the existing tag in the `tag` input. The workflow does not
       create tags.
@@ -157,17 +157,17 @@ that settings writes remain idle-only. These are non-negotiable rules in
 
 ## 8. Artifact inspection
 
-Expected assets for tag `v0.7.0`. The tar.gz archives contain `README.md`,
+Expected assets for tag `v0.7.1`. The tar.gz archives contain `README.md`,
 `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE`, and `PACKAGING.md`; the table lists
 only the differences.
 
 | Platform | Asset | Contents |
 |---|---|---|
-| Linux x86_64 | `ghs-rs-v0.7.0-linux-x86_64.tar.gz` | `ghs-app`, `ghs-rs.desktop`, `ghs-rs.svg` |
-| Linux x86_64 | `ghs-rs_0.7.0_amd64.deb` | `usr/bin/ghs-app`, desktop entry and icon, docs |
-| Linux x86_64 | `ghs-rs-v0.7.0-x86_64.AppImage` | AppDir payload plus `AppRun` |
-| Windows x86_64 | `ghs-rs-v0.7.0-windows-x86_64.zip` | `ghs-app.exe` |
-| macOS | `ghs-rs-v0.7.0-macos-<arch>.tar.gz` | `ghs-rs.app` bundle |
+| Linux x86_64 | `ghs-rs-v0.7.1-linux-x86_64.tar.gz` | `ghs-app`, `ghs-rs.desktop`, `ghs-rs.svg` |
+| Linux x86_64 | `ghs-rs_0.7.1_amd64.deb` | `usr/bin/ghs-app`, desktop entry and icon, docs |
+| Linux x86_64 | `ghs-rs-v0.7.1-x86_64.AppImage` | AppDir payload plus `AppRun` |
+| Windows x86_64 | `ghs-rs-v0.7.1-windows-x86_64.zip` | `ghs-app.exe` |
+| macOS | `ghs-rs-v0.7.1-macos-<arch>.tar.gz` | `ghs-rs.app` bundle |
 
 - [ ] Download every asset from the draft release, not from a local build.
 - [ ] List each archive and confirm the layout above. The tar.gz archives must
@@ -180,13 +180,13 @@ only the differences.
       same binary via `Exec=ghs-app`.
 - [ ] Linux `.deb`: `ar t` reports exactly `debian-binary`, `control.tar.gz`,
       and `data.tar.gz`. On a disposable VM or container,
-      `sudo apt install ./ghs-rs_0.7.0_amd64.deb` installs `/usr/bin/ghs-app`,
+      `sudo apt install ./ghs-rs_0.7.1_amd64.deb` installs `/usr/bin/ghs-app`,
       the desktop entry, and the icon; `sudo apt remove ghs-rs` removes them.
-      `sudo dpkg -i ghs-rs_0.7.0_amd64.deb` plus `sudo apt-get install -f` is
+      `sudo dpkg -i ghs-rs_0.7.1_amd64.deb` plus `sudo apt-get install -f` is
       the fallback when dependencies are missing. If `dpkg` is unavailable,
       record that the package was only structurally validated.
 - [ ] Linux `.AppImage`: after `chmod +x`, running
-      `./ghs-rs-v0.7.0-x86_64.AppImage --appimage-extract` works without
+      `./ghs-rs-v0.7.1-x86_64.AppImage --appimage-extract` works without
       FUSE. The extracted `.DirIcon` is a relative symlink to `ghs-rs.svg`;
       the root desktop entry and icon exist; `usr/bin/ghs-app` is mode 755;
       `desktop-file-validate` passes. Run it on a host without `libfuse2`
