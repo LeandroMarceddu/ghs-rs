@@ -99,7 +99,8 @@ gateway used for a real controller; only the transport differs. `--mock` is a
 design-review shell and never sends commands.
 
 Useful layout and review flags: `--light`, `--high-contrast`, `--keypad`,
-`--size WxH` (for example `--size 1920x1080`), `--fullscreen`, `--viewer-3d`,
+`--size WxH` (for example `--size 1920x1080`), `--portrait`, `--fullscreen`,
+`--viewer-3d`,
 `--settings`, `--offsets`, `--tools`, `--utility`, `--startup-lines`,
 `--macros`, `--probe`, `--demo-gantry`, `--demo-gantry-card`, and
 `--demo-program-check`. Demo job switches `--demo-m0` and `--demo-toolchange`
@@ -171,7 +172,11 @@ silently adopt local profile data. Review the message and use
 ## 4. Screen map
 
 The shell has a fixed three-column layout at 1280×800 and wider. Below
-1120 px the right rail collapses; a full portrait reflow is not implemented.
+1120 px the right rail collapses. Portrait viewports (height at least 1.15×
+width) reflow to one vertically scrolling page: workspace, DRO, Jog, MDI, feed,
+Console/Program, then Coolant/Macros/Signals/Work and spindle. The portrait top
+bar uses two rows so all six workspace buttons and RESET/STOP stay reachable.
+`--portrait` starts at 1080×1920 for review; `--size` still takes precedence.
 
 ### Top bar
 

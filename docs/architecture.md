@@ -272,9 +272,10 @@ Hard rules:
 - Design tokens and shared shell helpers live in `ghs-app/src/theme.rs` and
   `ghs-app/src/shell.rs`. There is no separate `ghs-ui` crate; ADR 0004 keeps
   that facade as an option if GPUI Kit churn grows.
-- Layout modes: **Touch** (implemented at 1280×800 and 1920×1080) and
-  **Workbench** (optional dockable panels, not implemented; UX-06). Portrait
-  reflow is deferred (UX-03).
+- Layout modes: **Touch** (implemented at 1280×800, 1920×1080, and
+  1080×1920 portrait) and **Workbench** (optional dockable panels, not
+  implemented; UX-06). Portrait uses a single vertically scrolling stack and a
+  two-row top bar.
 - The numeric keypad is an in-app bottom sheet; no dependency on an OS keyboard.
 - The machine keymap binds ten actions (six jog, start, pause, resume, stop) and
   is persisted per profile. Full keyboard navigation, screen-reader support, and

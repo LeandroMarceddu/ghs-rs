@@ -57,6 +57,13 @@ is a third persisted theme; see the Utility captures below.
 |---|---|
 | ![3D stock mesh](images/gallery/3d-stock.png) | ![High contrast](images/gallery/high-contrast.png) |
 
+## Portrait
+
+The same shell in a 1080×1920 portrait viewport: one vertically scrolling page,
+two-row top bar, and all six workspaces plus RESET/STOP reachable.
+
+![Portrait Job workspace](images/gallery/portrait-job.png)
+
 ## What the captures do not prove
 
 - No FlexiHAL hardware validation, probing sign-off, or spindle/travel check.

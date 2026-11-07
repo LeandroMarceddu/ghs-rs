@@ -22,6 +22,8 @@ simulator-first release: unsigned, not notarized, and not hardware-validated.
 
 ### Added
 
+- **Portrait layout** — 1080×1920 reflows to one vertically scrolling page with
+  a two-row top bar, while 1024×600 and landscape layouts stay byte-identical.
 - **Program check** — the read-only program-limits card now shows feed/spindle
   ranges, tools, and warnings for a missing feed, zero/negative `F`/`S`, a tool
   absent from the app table, probe moves, and machine-coordinate moves. It is

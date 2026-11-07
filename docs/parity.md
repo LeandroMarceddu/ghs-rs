@@ -186,7 +186,7 @@ implemented before its UI or hardware validation row is complete.
 |---|---|---|---|---|
 | UX-01 | Touch layout at 1280×800 | M2 | done | Default |
 | UX-02 | Touch layout at 1920×1080 | M2 | done | Scaled |
-| UX-03 | Portrait layout | M7 | todo | 1080×1920 |
+| UX-03 | Portrait layout | M7 | done | 1080×1920 one-column stack; tests + captures |
 | UX-04 | In-app numeric and text keypad | M2 | done | No OS keyboard dependency |
 | UX-05 | 48 px targets, no hover-only actions | M2 | done | Touch audit |
 | UX-06 | Dockable Workbench layout | M7 | todo | Optional mode |

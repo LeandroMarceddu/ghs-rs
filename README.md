@@ -91,8 +91,8 @@ See [docs/parity.md](docs/parity.md) for the feature checklist and
   labels the compensated job. Maps are saved per controller profile and
   reloaded with a WCS/G92/TLO frame check.
 - **Touch shell** — approved C1/C2/C3 layout, 48 px primary controls,
-  dark/light/high-contrast themes, and a resizable desktop layout from 1024×600
-  up.
+  dark/light/high-contrast themes, a resizable desktop layout from 1024×600 up,
+  and a one-column 1080×1920 portrait reflow.
 
 ## In progress
 
