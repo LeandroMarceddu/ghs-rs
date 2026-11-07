@@ -8,8 +8,9 @@
 //! # Pipeline
 //!
 //! ```text
-//! source line -> lexer::lex_line -> Block -> Planner (validate + plan)
-//!             -> Parser::execute (modal state + Toolpath emission)
+//! source line -> lexer (parameters + expressions) -> Block
+//!             -> Planner (validate + plan) -> Parser::execute
+//!             (modal state + Toolpath emission)
 //! ```
 //!
 //! A block is validated in full before it is applied, so an error never leaves
@@ -46,19 +47,39 @@
 //! `M0`-`M9`, `M30`; `N`, `T`, `S`, `F`; `( )` and `;` comments; `/` block
 //! delete; `*` checksums; and a lone `%` marker.
 //!
+//! # Parameters and expressions
+//!
+//! Numbered parameters `#1` through `#100` and named parameters `#<name>` are
+//! supported. Named parameters are case-insensitive, ASCII, at most 32 bytes,
+//! and limited to 64 distinct names. An assignment such as `#1=5`,
+//! `#<feed>=250`, or `#2=[#1*3]` updates the parser's table and produces no
+//! motion. Reading an unassigned numbered parameter or an unknown named
+//! parameter is a structured error.
+//!
+//! A numeric word value may be a parameter or a bracketed arithmetic
+//! expression, for example `X[#1+2.5]`, `F[#<feed>*2]`, and `S[#100]`.
+//! Expressions support `+`, `-`, `*`, `/`, unary signs, parentheses, nested
+//! `[`/`]` groups, decimal literals, and parameter references. They are
+//! evaluated with `f64`; division by zero, non-finite results, unresolved
+//! parameters, expressions deeper than 32 nesting levels, and expressions
+//! longer than 512 bytes are rejected. Expressions are not allowed in `G`,
+//! `M`, `N`, or `O` words. Assignment values use the same value syntax; use
+//! brackets for compound arithmetic, as in `#1=[2+3*4]`, so a trailing `*`
+//! keeps its checksum meaning.
+//!
 //! Unsupported codes are rejected with a structured error instead of being
 //! silently ignored, so a validation view can explain why a program will not
 //! run.
 //!
 //! # Deferred (rejected, not emulated)
 //!
-//! Expressions (`#` parameters, `[...]`), `IF`/`WHILE` flow control, `O`-word
-//! subprograms, `M98`/`M99`, cutter radius compensation (`G41`/`G42`), lathe
-//! cycles, `G84`/`G87`/`G88` tapping, `G90.1`/`G91.1` absolute arc centers,
-//! and extra axes (`A`, `B`, `C`, `U`, `V`, `W`). These return
-//! [`ParseErrorKind::UnsupportedExpression`] or
-//! [`ParseErrorKind::UnsupportedCode`]. VIEW-02 adds an expression evaluator as
-//! a pre-pass over [`LexedLine`] words; [`Parser::parse_lexed`] is the hook.
+//! Flow control (`IF`/`WHILE`/`GOTO`/`DO`/`ENDIF`/`SUB`/`M98`/`M99`), `O`-word
+//! subprograms, cutter radius compensation (`G41`/`G42`), lathe cycles,
+//! `G84`/`G87`/`G88` tapping, `G90.1`/`G91.1` absolute arc centers, and extra
+//! axes (`A`, `B`, `C`, `U`, `V`, `W`) remain unsupported. Flow control returns
+//! [`ParseErrorKind::UnsupportedExpression`]; subprograms and the other forms
+//! return [`ParseErrorKind::UnsupportedCode`] or
+//! [`ParseErrorKind::UnsupportedWord`].
 //!
 //! # Height-map compensation
 //!
@@ -145,6 +166,7 @@ mod block;
 mod compensation;
 mod config;
 mod error;
+mod expression;
 mod lexer;
 mod parser;
 mod planner;
@@ -162,7 +184,13 @@ pub use compensation::{
 };
 pub use config::{MAX_COORDINATE_MM, MIN_ARC_RADIUS_MM, ParserConfig};
 pub use error::{ParseError, ParseErrorKind, ParseWarning, WarningKind};
-pub use lexer::{DEFAULT_MAX_WORDS, LexedLine, Word, checksum_xor, lex_line};
+pub use expression::{
+    MAX_EXPRESSION_BYTES, MAX_EXPRESSION_DEPTH, MAX_NAMED_PARAMETERS, MAX_NUMERIC_PARAMETERS,
+    MAX_PARAMETER_NAME_BYTES, ParameterError, Parameters,
+};
+pub use lexer::{
+    DEFAULT_MAX_WORDS, LexedLine, Word, checksum_xor, lex_line, lex_line_with_parameters,
+};
 pub use parser::{Parser, parse_program, parse_program_with};
 pub use program::{Program, ProgramLine, ProgramStats};
 pub use rotate::{

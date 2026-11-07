@@ -70,15 +70,19 @@ fn motion_and_parameter_errors_are_specific() {
 }
 
 #[test]
-fn expressions_and_flow_control_are_deferred_not_silently_accepted() {
-    assert_eq!(kind("#1=5"), ParseErrorKind::UnsupportedExpression);
-    assert_eq!(kind("[1+2]"), ParseErrorKind::UnsupportedExpression);
+fn flow_control_is_deferred_not_silently_accepted() {
     assert_eq!(kind("IF [#1 GT 2]"), ParseErrorKind::UnsupportedExpression);
     assert_eq!(
         kind("WHILE [#1 LT 2]"),
         ParseErrorKind::UnsupportedExpression
     );
-    assert_eq!(kind("X[#1] G0"), ParseErrorKind::UnsupportedExpression);
+    assert_eq!(kind("GOTO 10"), ParseErrorKind::UnsupportedExpression);
+    assert_eq!(kind("N10 GOTO 20"), ParseErrorKind::UnsupportedExpression);
+    assert_eq!(kind("DO 1"), ParseErrorKind::UnsupportedExpression);
+    assert_eq!(kind("ENDIF"), ParseErrorKind::UnsupportedExpression);
+    assert_eq!(kind("SUB 100"), ParseErrorKind::UnsupportedExpression);
+    assert_eq!(kind("M98 P1"), ParseErrorKind::UnsupportedCode);
+    assert_eq!(kind("O1000"), ParseErrorKind::UnsupportedWord);
 }
 
 #[test]

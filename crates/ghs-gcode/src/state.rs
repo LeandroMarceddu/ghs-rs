@@ -412,6 +412,11 @@ pub struct CannedCycleParams {
 ///
 /// The default is the state a freshly booted grblHAL controller reports:
 /// `G0 G17 G21 G54 G90 G94 G98`, no tool, no feed, no spindle.
+///
+/// Parameter and expression state is not modal: it lives in the owning
+/// [`Parser`](crate::Parser) as a bounded
+/// [`Parameters`](crate::Parameters) table, so this snapshot stays `Copy` and
+/// can be replaced from a controller `$G` report.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ParserState {
     /// Active motion mode (the `G0`/`G1`/`G2`/`G3`/cycle group).

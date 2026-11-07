@@ -1,23 +1,31 @@
 //! Line lexer for the grblHAL G-code dialect.
 //!
-//! The lexer is deliberately independent of modal state: it turns one source
-//! line into ordered [`Word`]s, comment text, a block-delete flag, and an
-//! optional `*` checksum. Modal interpretation lives in the planner.
+//! The lexer turns one source line into ordered [`Word`]s, comment text, a
+//! block-delete flag, and an optional `*` checksum. Modal interpretation lives
+//! in the planner. Parameter references and `[...]` expressions are evaluated
+//! while lexing against a [`Parameters`] table.
 //!
 //! Accepted syntax:
 //!
 //! - `G`, `M`, axis, and parameter words with optional sign and decimal point.
 //! - `N` line numbers, `T`/`S`/`F` words.
+//! - Numbered and named `#` parameters, including `#1=<value>` assignments.
+//! - `[...]` arithmetic expressions in numeric word values.
 //! - `( ... )` and `;` comments.
 //! - A leading `/` block-delete marker.
 //! - A trailing `*nn` XOR checksum over the bytes before `*`.
 //! - A lone `%` program marker.
 //!
-//! Expressions (`#`, `[...]`) and flow control (`IF`, `WHILE`, ...) are
-//! rejected with [`ParseErrorKind::UnsupportedExpression`]; they are a
-//! documented follow-up (VIEW-02), not silently accepted.
+//! Flow control (`IF`, `WHILE`, `GOTO`, `DO`, `SUB`, ...) is still rejected
+//! with [`ParseErrorKind::UnsupportedExpression`]; it is a documented
+//! follow-up (VIEW-02), not silently accepted.
+//!
+//! [`lex_line`] uses a fresh, empty parameter table for each call.
+//! [`lex_line_with_parameters`] persists assignments in the caller's table, so
+//! a whole program can share one parameter environment.
 
 use crate::error::{ParseError, ParseErrorKind};
+use crate::expression::{Parameters, evaluate_value, parse_parameter_key};
 
 /// Safety cap on words per line when the caller does not set one.
 pub const DEFAULT_MAX_WORDS: usize = 256;
@@ -27,7 +35,7 @@ pub const DEFAULT_MAX_WORDS: usize = 256;
 pub struct Word {
     /// Upper-case word letter, `A` through `Z`.
     pub letter: char,
-    /// Numeric value as written in the program.
+    /// Numeric value after evaluating any parameter reference or expression.
     pub value: f64,
     /// 1-based byte column of the letter in the source line.
     pub column: usize,
@@ -62,6 +70,8 @@ pub struct LexedLine {
 
 impl LexedLine {
     /// Returns `true` when the line has no executable words.
+    ///
+    /// Parameter-assignment and comment-only lines have no words.
     #[must_use]
     pub fn has_words(&self) -> bool {
         !self.words.is_empty()
@@ -74,7 +84,11 @@ const CONTROL_KEYWORDS: [&str; 11] = [
     "IF", "WHILE", "GOTO", "DO", "ENDIF", "ENDWHILE", "ELSE", "SUB", "ENDSUB", "CALL", "RETURN",
 ];
 
-/// Lexes one source line.
+/// Lexes one source line with a fresh, empty parameter table.
+///
+/// Assignments on this line are visible to later words on the same line but do
+/// not persist to another call. Use [`lex_line_with_parameters`] when a
+/// program needs a shared parameter environment.
 ///
 /// `line` is used only to label errors. `max_words` is a safety bound; values
 /// below one are treated as [`DEFAULT_MAX_WORDS`].
@@ -84,17 +98,36 @@ const CONTROL_KEYWORDS: [&str; 11] = [
 /// Returns every lexing error found on the line. The line is not partially
 /// returned.
 pub fn lex_line(line: usize, source: &str, max_words: usize) -> Result<LexedLine, Vec<ParseError>> {
+    let mut parameters = Parameters::new();
+    lex_line_with_parameters(line, source, max_words, &mut parameters)
+}
+
+/// Lexes one source line against a shared parameter table.
+///
+/// Assignments on the line update `parameters` in source order. The caller is
+/// responsible for making the update transactional: clone the table, lex, and
+/// only keep the clone when the block validates.
+///
+/// # Errors
+///
+/// Returns every lexing and expression error found on the line. The line is
+/// not partially returned.
+pub fn lex_line_with_parameters(
+    line: usize,
+    source: &str,
+    max_words: usize,
+    parameters: &mut Parameters,
+) -> Result<LexedLine, Vec<ParseError>> {
     let max_words = max_words.max(1);
     let mut errors = Vec::new();
 
-    if let Some(keyword) = leading_control_keyword(source) {
+    if let Some((column, keyword)) = leading_control_keyword(source) {
         errors.push(ParseError::new(
             line,
-            keyword.0,
+            column,
             ParseErrorKind::UnsupportedExpression,
             format!(
-                "{keyword_name} flow control is not supported yet; expressions and flow control are a documented follow-up",
-                keyword_name = keyword.1
+                "{keyword} flow control is not supported yet; parameters and expressions are implemented without it (VIEW-02 follow-up)"
             ),
         ));
         return Err(errors);
@@ -173,14 +206,30 @@ pub fn lex_line(line: usize, source: &str, max_words: usize) -> Result<LexedLine
                     index += 1;
                 }
             }
-            b'#' | b'[' | b']' => {
+            b'#' => match parse_assignment(line, source, index, parameters) {
+                Ok(next) => index = next,
+                Err(error) => {
+                    errors.push(error);
+                    break;
+                }
+            },
+            b'[' => {
                 errors.push(ParseError::new(
                     line,
                     index + 1,
-                    ParseErrorKind::UnsupportedExpression,
-                    "expressions, parameters, and flow control are not supported yet (VIEW-02 follow-up)",
+                    ParseErrorKind::ExpressionNotAllowed,
+                    "an expression must be the value of a word, for example X[1+2]",
                 ));
-                index += 1;
+                break;
+            }
+            b']' => {
+                errors.push(ParseError::new(
+                    line,
+                    index + 1,
+                    ParseErrorKind::MalformedExpression,
+                    "unexpected ']' without a matching '['",
+                ));
+                break;
             }
             _ if byte.is_ascii_alphabetic() => {
                 let letter = char::from(byte).to_ascii_uppercase();
@@ -195,49 +244,64 @@ pub fn lex_line(line: usize, source: &str, max_words: usize) -> Result<LexedLine
                     ));
                     break;
                 }
-                let next = bytes[index];
-                if !(next.is_ascii_digit() || next == b'+' || next == b'-' || next == b'.') {
-                    if next == b'#' || next == b'[' {
+                if let Some(expression_start) = expression_value_start(bytes, index) {
+                    if matches!(letter, 'G' | 'M' | 'O' | 'N') {
                         errors.push(ParseError::new(
                             line,
                             column,
-                            ParseErrorKind::UnsupportedExpression,
-                            "parameter expressions are not supported yet (VIEW-02 follow-up)",
+                            ParseErrorKind::ExpressionNotAllowed,
+                            format!(
+                                "expressions are not allowed in {letter} words; use a plain number"
+                            ),
                         ));
-                    } else {
+                        break;
+                    }
+                    match lex_value_expression(line, source, expression_start, parameters) {
+                        Ok((value, consumed)) => {
+                            index = expression_start + consumed;
+                            lexed.words.push(Word::new(letter, value, column));
+                        }
+                        Err(error) => {
+                            errors.push(error);
+                            break;
+                        }
+                    }
+                } else {
+                    let next = bytes[index];
+                    if !(next.is_ascii_digit() || next == b'+' || next == b'-' || next == b'.') {
                         errors.push(ParseError::new(
                             line,
                             column,
                             ParseErrorKind::MissingValue,
                             format!("'{letter}' is not followed by a number"),
                         ));
-                    }
-                    break;
-                }
-                let start = index;
-                while index < bytes.len() {
-                    let candidate = bytes[index];
-                    if candidate.is_ascii_digit()
-                        || candidate == b'.'
-                        || candidate == b'+'
-                        || candidate == b'-'
-                    {
-                        index += 1;
-                    } else {
                         break;
                     }
-                }
-                let token = &source[start..index];
-                match parse_number(token) {
-                    Some(value) => lexed.words.push(Word::new(letter, value, column)),
-                    None => {
-                        errors.push(ParseError::new(
-                            line,
-                            column,
-                            ParseErrorKind::InvalidNumber,
-                            format!("'{token}' is not a valid decimal number"),
-                        ));
-                        break;
+                    let start = index;
+                    while index < bytes.len() {
+                        let candidate = bytes[index];
+                        if candidate.is_ascii_digit()
+                            || candidate == b'.'
+                            || candidate == b'+'
+                            || candidate == b'-'
+                        {
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let token = &source[start..index];
+                    match parse_number(token) {
+                        Some(value) => lexed.words.push(Word::new(letter, value, column)),
+                        None => {
+                            errors.push(ParseError::new(
+                                line,
+                                column,
+                                ParseErrorKind::InvalidNumber,
+                                format!("'{token}' is not a valid decimal number"),
+                            ));
+                            break;
+                        }
                     }
                 }
                 if lexed.words.len() > max_words {
@@ -268,6 +332,96 @@ pub fn lex_line(line: usize, source: &str, max_words: usize) -> Result<LexedLine
     } else {
         Err(errors)
     }
+}
+
+/// Returns the start of an expression value after a word letter.
+///
+/// A value expression starts with `#`, `[`, or one or more signs followed by
+/// one of those. A plain signed decimal is handled by the numeric path.
+fn expression_value_start(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index).copied()? {
+        b'#' | b'[' => Some(index),
+        b'+' | b'-' => {
+            let mut probe = index;
+            while matches!(bytes.get(probe), Some(b'+' | b'-')) {
+                probe += 1;
+            }
+            matches!(bytes.get(probe), Some(b'#' | b'[')).then_some(index)
+        }
+        _ => None,
+    }
+}
+
+/// Evaluates one `#` parameter or `[...]` word value.
+fn lex_value_expression(
+    line: usize,
+    source: &str,
+    start: usize,
+    parameters: &Parameters,
+) -> Result<(f64, usize), ParseError> {
+    let slice = source.get(start..).unwrap_or_default();
+    evaluate_value(slice, parameters).map_err(|error| {
+        ParseError::new(
+            line,
+            start + error.offset + 1,
+            error.parse_kind(),
+            error.message,
+        )
+    })
+}
+
+/// Parses one `#` parameter assignment and updates the working table.
+///
+/// Returns the byte index just after the assigned value.
+fn parse_assignment(
+    line: usize,
+    source: &str,
+    start: usize,
+    parameters: &mut Parameters,
+) -> Result<usize, ParseError> {
+    let bytes = source.as_bytes();
+    let (key, mut index) = parse_parameter_key(source, start).map_err(|error| {
+        ParseError::new(line, error.offset + 1, error.parse_kind(), error.message)
+    })?;
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'=') {
+        return Err(ParseError::new(
+            line,
+            index + 1,
+            ParseErrorKind::MissingAssignment,
+            format!("parameter {} assignment requires '='", key.label()),
+        ));
+    }
+    index += 1;
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r')) {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return Err(ParseError::new(
+            line,
+            index + 1,
+            ParseErrorKind::MalformedExpression,
+            format!("parameter {} assignment needs a value", key.label()),
+        ));
+    }
+    let slice = source.get(index..).unwrap_or_default();
+    let (value, consumed) = evaluate_value(slice, parameters).map_err(|error| {
+        ParseError::new(
+            line,
+            index + error.offset + 1,
+            error.parse_kind(),
+            error.message,
+        )
+    })?;
+    let assignment = match &key {
+        crate::expression::ParameterKey::Numeric(number) => parameters.set_numeric(*number, value),
+        crate::expression::ParameterKey::Named(name) => parameters.set_named(name, value),
+    };
+    assignment
+        .map_err(|error| ParseError::new(line, start + 1, error.parse_kind(), error.to_string()))?;
+    Ok(index + consumed)
 }
 
 /// Parses a value token that has already been restricted to digits, `.`, `+`,
@@ -330,11 +484,29 @@ pub fn checksum_xor(bytes: &[u8]) -> u8 {
 }
 
 /// Returns the column and name of a leading flow-control keyword.
+///
+/// An optional `/` block-delete marker and `N` line number are skipped so a
+/// numbered flow-control line still produces the clear deferral message.
 fn leading_control_keyword(source: &str) -> Option<(usize, &'static str)> {
     let trimmed = source.trim_start();
-    let column = source.len() - trimmed.len() + 1;
+    let mut offset = source.len() - trimmed.len();
+    let mut rest = trimmed;
+    if let Some(after) = rest.strip_prefix('/') {
+        offset += 1;
+        rest = after;
+    }
+    let rest_trimmed = rest.trim_start();
+    offset += rest.len() - rest_trimmed.len();
+    rest = rest_trimmed;
+    if let Some(skip) = line_number_prefix_len(rest) {
+        offset += skip;
+        rest = &rest[skip..];
+        let rest_trimmed = rest.trim_start();
+        offset += rest.len() - rest_trimmed.len();
+        rest = rest_trimmed;
+    }
     let mut end = 0usize;
-    for (index, ch) in trimmed.char_indices() {
+    for (index, ch) in rest.char_indices() {
         if ch.is_ascii_alphabetic() {
             end = index + ch.len_utf8();
         } else {
@@ -344,19 +516,32 @@ fn leading_control_keyword(source: &str) -> Option<(usize, &'static str)> {
     if end == 0 {
         return None;
     }
-    let candidate = trimmed[..end].to_ascii_uppercase();
-    let rest = &trimmed[end..];
-    let boundary = rest.is_empty()
-        || rest.starts_with(char::is_whitespace)
-        || rest.starts_with('[')
-        || rest.starts_with('(');
+    let candidate = rest[..end].to_ascii_uppercase();
+    let tail = &rest[end..];
+    let boundary = tail.is_empty()
+        || tail.starts_with(char::is_whitespace)
+        || tail.starts_with('[')
+        || tail.starts_with('(');
     if !boundary {
         return None;
     }
     CONTROL_KEYWORDS
         .iter()
         .find(|keyword| **keyword == candidate)
-        .map(|keyword| (column, *keyword))
+        .map(|keyword| (offset + 1, *keyword))
+}
+
+/// Returns the byte length of a leading `N` line number, if present.
+fn line_number_prefix_len(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if !matches!(bytes.first(), Some(b'N' | b'n')) {
+        return None;
+    }
+    let mut end = 1usize;
+    while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
+        end += 1;
+    }
+    (end > 1).then_some(end)
 }
 
 /// Returns `true` when the only non-space, non-comment content is `%`.
@@ -384,6 +569,7 @@ fn is_lone_percent(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expression::{MAX_EXPRESSION_DEPTH, MAX_NUMERIC_PARAMETERS};
 
     #[test]
     fn words_and_comments() {
@@ -442,8 +628,16 @@ mod tests {
             ParseErrorKind::UnterminatedComment
         );
         assert_eq!(
-            lex_line(1, "#1=5", DEFAULT_MAX_WORDS).expect_err("expr")[0].kind,
-            ParseErrorKind::UnsupportedExpression
+            lex_line(1, "G0 X[#1]", DEFAULT_MAX_WORDS).expect_err("unresolved")[0].kind,
+            ParseErrorKind::UnresolvedParameter
+        );
+        assert_eq!(
+            lex_line(1, "#1 5", DEFAULT_MAX_WORDS).expect_err("assignment")[0].kind,
+            ParseErrorKind::MissingAssignment
+        );
+        assert_eq!(
+            lex_line(1, "[1+2]", DEFAULT_MAX_WORDS).expect_err("bare expression")[0].kind,
+            ParseErrorKind::ExpressionNotAllowed
         );
         assert_eq!(
             lex_line(1, "IF [#1 GT 2]", DEFAULT_MAX_WORDS).expect_err("flow")[0].kind,
@@ -457,6 +651,67 @@ mod tests {
             lex_line(1, "G0 @", DEFAULT_MAX_WORDS).expect_err("char")[0].kind,
             ParseErrorKind::UnexpectedCharacter
         );
+    }
+
+    #[test]
+    fn assignments_and_expressions_are_lexed() {
+        let lexed = lex_line(1, "#1=5 X[#1*2] Y#1", DEFAULT_MAX_WORDS).expect("lex");
+        assert_eq!(
+            lexed.words,
+            vec![Word::new('X', 10.0, 6), Word::new('Y', 5.0, 14)]
+        );
+
+        let named = lex_line(1, "#<feed>=100 F[#<feed>/2]", DEFAULT_MAX_WORDS).expect("lex");
+        assert_eq!(named.words, vec![Word::new('F', 50.0, 13)]);
+    }
+
+    #[test]
+    fn a_multiplication_inside_brackets_leaves_a_trailing_checksum_alone() {
+        let body = "#1=3 X[[#1*2]]";
+        let sum = checksum_xor(body.as_bytes());
+        let line = format!("{body}*{sum:02}");
+        let mut parameters = Parameters::new();
+        let lexed =
+            lex_line_with_parameters(1, &line, DEFAULT_MAX_WORDS, &mut parameters).expect("lex");
+        assert_eq!(lexed.checksum, Some(sum));
+        assert_eq!(lexed.words, vec![Word::new('X', 6.0, 6)]);
+        assert_eq!(parameters.numeric(1), Some(3.0));
+    }
+
+    #[test]
+    fn an_assignment_line_keeps_its_checksum() {
+        let body = "#1=5";
+        let sum = checksum_xor(body.as_bytes());
+        let line = format!("{body}*{sum:02}");
+        let mut parameters = Parameters::new();
+        let lexed =
+            lex_line_with_parameters(1, &line, DEFAULT_MAX_WORDS, &mut parameters).expect("lex");
+        assert_eq!(lexed.checksum, Some(sum));
+        assert!(lexed.words.is_empty());
+        assert_eq!(parameters.numeric(1), Some(5.0));
+    }
+
+    #[test]
+    fn expressions_are_rejected_in_code_and_line_numbers() {
+        for line in ["G[1+2]", "M[3]", "N[1] G0", "O[1]"] {
+            let errors = lex_line(1, line, DEFAULT_MAX_WORDS).expect_err(line);
+            assert_eq!(errors[0].kind, ParseErrorKind::ExpressionNotAllowed);
+        }
+    }
+
+    #[test]
+    fn expression_bounds_are_reported_by_the_lexer() {
+        let deep = format!(
+            "G0 X{}1{}",
+            "[".repeat(MAX_EXPRESSION_DEPTH + 1),
+            "]".repeat(MAX_EXPRESSION_DEPTH + 1)
+        );
+        let errors = lex_line(1, &deep, DEFAULT_MAX_WORDS).expect_err("deep");
+        assert_eq!(errors[0].kind, ParseErrorKind::ExpressionTooDeep);
+
+        let errors = lex_line(1, "#101=1", DEFAULT_MAX_WORDS).expect_err("range");
+        assert_eq!(errors[0].kind, ParseErrorKind::ParameterOutOfRange);
+        assert_eq!(MAX_NUMERIC_PARAMETERS, 100);
     }
 
     #[test]

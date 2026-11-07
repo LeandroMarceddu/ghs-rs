@@ -22,7 +22,16 @@
 //! - Acceleration, rapid rate, and `G93` inverse-time timing.
 //! - Firmware-specific transforms such as skew compensation and backlash.
 //! - `G4`/`G82`/`G86`/`G89` dwell time (no geometry).
-//! - Expressions, parameters, and flow control (rejected; VIEW-02 follow-up).
+//! - Flow control (`IF`/`WHILE`/`GOTO`/`M98`); parameters and `[...]`
+//!   expressions are evaluated, but they never emit geometry by themselves.
+//!
+//! # Parameter state
+//!
+//! The parser owns a bounded [`Parameters`] table shared by every line.
+//! Assignments are evaluated in source order and committed only after the
+//! whole block validates, so a failed block leaves the table untouched. Use
+//! [`Parser::parameters`], [`Parser::parameters_mut`], or
+//! [`Parser::set_parameters`] to inspect or seed the table.
 
 use ghs_core::Position;
 use ghs_viewer::{Point3, SegmentKind, Toolpath};
@@ -30,7 +39,8 @@ use ghs_viewer::{Point3, SegmentKind, Toolpath};
 use crate::block::Block;
 use crate::config::ParserConfig;
 use crate::error::{ParseError, ParseErrorKind, ParseWarning, WarningKind};
-use crate::lexer::{LexedLine, lex_line};
+use crate::expression::Parameters;
+use crate::lexer::{LexedLine, lex_line_with_parameters};
 use crate::planner::{Frame, Plan, PlannedMove, Planner};
 use crate::program::{Program, ProgramLine, ProgramStats};
 use crate::state::ParserState;
@@ -44,6 +54,7 @@ use crate::state::ParserState;
 pub struct Parser {
     config: ParserConfig,
     state: ParserState,
+    parameters: Parameters,
     offsets: [Position; 9],
     homes: [Option<[f64; 3]>; 2],
     machine: [f64; 3],
@@ -83,6 +94,7 @@ impl Parser {
         Self {
             config,
             state,
+            parameters: Parameters::new(),
             offsets,
             homes,
             machine,
@@ -106,6 +118,27 @@ impl Parser {
     #[must_use]
     pub fn state(&self) -> &ParserState {
         &self.state
+    }
+
+    /// Returns the current `#` parameter table.
+    #[must_use]
+    pub fn parameters(&self) -> &Parameters {
+        &self.parameters
+    }
+
+    /// Returns the `#` parameter table for direct mutation.
+    pub fn parameters_mut(&mut self) -> &mut Parameters {
+        &mut self.parameters
+    }
+
+    /// Replaces the `#` parameter table.
+    pub fn set_parameters(&mut self, parameters: Parameters) {
+        self.parameters = parameters;
+    }
+
+    /// Clears every `#` parameter.
+    pub fn clear_parameters(&mut self) {
+        self.parameters.clear();
     }
 
     /// Replaces the modal state, for example from a controller's `$G` report.
@@ -202,16 +235,21 @@ impl Parser {
                 ),
             )]);
         }
-        let lexed = lex_line(line, source, self.config.max_words)?;
-        self.parse_lexed(line, source, lexed)
+        let mut parameters = self.parameters.clone();
+        let lexed = lex_line_with_parameters(line, source, self.config.max_words, &mut parameters)?;
+        let program_line = self.parse_lexed(line, source, lexed)?;
+        // Commit assignments only after the whole block validated.
+        self.parameters = parameters;
+        Ok(program_line)
     }
 
     /// Applies an already-lexed line.
     ///
-    /// This is the extension point for the deferred expression and flow-control
-    /// pass (VIEW-02): a preprocessor can rewrite the word list of a
-    /// [`LexedLine`] and then feed it here. The method itself has no knowledge
-    /// of parameters or expressions.
+    /// This is an extension point for callers that preprocess or rewrite a
+    /// [`LexedLine`] before parsing. Word values are expected to be already
+    /// evaluated, so this method does not read or change the `#` parameter
+    /// table; use [`Parser::parse_line`] or [`Parser::parse_line_at`] when a
+    /// line contains assignments or unresolved expressions.
     ///
     /// # Errors
     ///
@@ -298,6 +336,7 @@ impl Parser {
             bounds,
             stats: self.stats,
             state: self.state,
+            parameters: self.parameters,
             offsets: self.offsets,
             warnings: self.warnings,
         }

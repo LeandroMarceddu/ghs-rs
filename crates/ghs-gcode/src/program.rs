@@ -6,6 +6,7 @@ use ghs_core::Position;
 use ghs_viewer::{Bounds3, Toolpath};
 
 use crate::error::ParseWarning;
+use crate::expression::Parameters;
 use crate::lexer::Word;
 use crate::state::ParserState;
 
@@ -148,6 +149,11 @@ pub struct Program {
     pub stats: ProgramStats,
     /// Modal state after the last line.
     pub state: ParserState,
+    /// `#` parameter table after the last line.
+    ///
+    /// Assignments are committed per validated block, so this is the table a
+    /// controller would hold after running the program.
+    pub parameters: Parameters,
     /// Work coordinate offsets in `G54`..`G59.3` order at the end of the
     /// program, including any `G10` changes, in millimetres.
     pub offsets: [Position; 9],

@@ -96,8 +96,28 @@ pub enum ParseErrorKind {
     NoMotionMode,
     /// Arc geometry is invalid (radius mismatch, zero radius, bad sweep).
     InvalidArc,
-    /// `#` parameters, `[` expressions, or IF/WHILE flow control.
+    /// Flow control (`IF`, `WHILE`, `GOTO`, `DO`, `SUB`, ...) is not supported.
     UnsupportedExpression,
+    /// A numbered `#` parameter was read before it was assigned.
+    UnresolvedParameter,
+    /// A named `#<...>` parameter was never assigned.
+    UnknownNamedParameter,
+    /// A `#` parameter number is outside `#1`..`#100`.
+    ParameterOutOfRange,
+    /// A `#` parameter assignment is missing its `=`.
+    MissingAssignment,
+    /// The bounded named-parameter table is full.
+    TooManyParameters,
+    /// A `[...]` expression is malformed.
+    MalformedExpression,
+    /// An expression nests deeper than the supported limit.
+    ExpressionTooDeep,
+    /// An expression is longer than the supported limit.
+    ExpressionTooLong,
+    /// An expression divided by zero or produced a non-finite value.
+    InvalidExpressionValue,
+    /// An expression appeared where only a plain number is allowed.
+    ExpressionNotAllowed,
     /// A tool number cannot be represented by the viewer.
     ToolNumberOutOfRange,
     /// Error collection stopped at the configured limit.
