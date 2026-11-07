@@ -57,7 +57,7 @@ implemented before its UI or hardware validation row is complete.
 | COM-13 | Probe result (`PRB`) parsing | M1 | done | Used by the probing suite |
 | COM-14 | Disable controller auto-reporting on connect | M1 | todo | Setting `$481` when present |
 | COM-15 | Hotplug, reconnect, and status watchdog | M2 | done | Never auto-resume a job |
-| COM-16 | Session recording and replay | M1 | todo | Real captures become fixtures |
+| COM-16 | Session recording and replay | M1 | partial | Console JSONL record/replay; raw transport/fixtures open |
 | COM-17 | Check mode (`$C`) | M3 | done | Dry run with engine state machine |
 | COM-18 | In-process loopback simulator for demo and tests | M1 | done | Not a user-facing network transport |
 | COM-19 | Runtime alarm/error code sets (`$EA`, `$EE`) | M1 | done | Fallback tables only when unavailable |

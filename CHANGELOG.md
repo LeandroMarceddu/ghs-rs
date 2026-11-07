@@ -22,6 +22,9 @@ simulator-first release: unsigned, not notarized, and not hardware-validated.
 
 ### Added
 
+- **Session recording** — the Console can record new entries to
+  `exports/session.jsonl` (versioned JSONL, monotonic offsets, 8 MiB/100k
+  entries) and replay them as `[REPLAY]` text. Replay never sends a command.
 - **Portrait layout** — 1080×1920 reflows to one vertically scrolling page with
   a two-row top bar, while 1024×600 and landscape layouts stay byte-identical.
 - **Program check** — the read-only program-limits card now shows feed/spindle

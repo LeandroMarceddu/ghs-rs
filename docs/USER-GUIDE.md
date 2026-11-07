@@ -205,6 +205,9 @@ per-monitor DPI setting.
 - `Console` is the live protocol log (commands, `ok`, messages, errors,
   alarms). It keeps the last 200 lines; `ALL/CMD/INFO/OK/WARN/ERROR` filter the
   view, and `SAVE LOG` writes a snapshot to the config exports directory.
+  `START RECORDING` writes new Console entries to `exports/session.jsonl`
+  (8 MiB / 100,000 lines); `LOAD RECORDING` replays that file as `[REPLAY]`
+  text only, never through the engine.
 - `Program` is the parsed program list, with search and the highlighted
   current line.
 - `MDI`: one-line command field, `SEND`, and a 10-entry `HIST` recall.
@@ -1001,8 +1004,16 @@ link.
 - The in-app **Console** tab is the live log; it keeps the last 200 lines.
   `SAVE LOG` writes the current buffer (or the active filter) to
   `<config>/exports/console.log`, overwriting the previous snapshot. The file
-  has a timestamped header, is capped at 64 KiB, and is not a continuous
-  session recording.
+  has a timestamped header, is capped at 64 KiB, and is not a full session
+  recording.
+- `START RECORDING` writes new Console entries to
+  `<config>/exports/session.jsonl` in versioned JSONL, with monotonic
+  millisecond offsets and the original levels. The file is capped at 8 MiB /
+  100,000 entries and ends with a truncation marker if a bound is reached.
+  `LOAD RECORDING` validates that file and appends its entries as `[REPLAY]`
+  text. Replay never calls the engine, sends a command, changes machine state,
+  or starts a job. It is sender-side Console text, not a raw serial TX/RX
+  trace.
 - Launch the app from a terminal to see stderr startup and window errors.
 - Configuration, profiles, exports, and rolling backups live under the
   platform config directory:
@@ -1043,7 +1054,6 @@ Exports are user-initiated. There is no telemetry and no network transport.
   the v1.0 shell does not expose them.
 - **No Park quick action.** A machine-specific park position is not configured;
   use the confirmed `GOTO G28` / `GOTO G30` actions in **Offsets**.
-- **No continuous session recording or replay.** The Console keeps a bounded
-  in-memory log and `SAVE LOG` exports a 64 KiB snapshot; there is no
-  start/stop recorder, sequence-numbered trace, or replay mode. There is no
-  telemetry or network transport.
+- **Session replay is text-only.** The Console can record new entries to
+  `exports/session.jsonl` and replay them as `[REPLAY]` text, but this is not a
+  raw transport trace, timed playback, or a parser fixture import.

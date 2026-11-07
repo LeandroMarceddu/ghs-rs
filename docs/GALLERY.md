@@ -57,6 +57,13 @@ is a third persisted theme; see the Utility captures below.
 |---|---|
 | ![3D stock mesh](images/gallery/3d-stock.png) | ![High contrast](images/gallery/high-contrast.png) |
 
+## Console
+
+Local session recording and replay: versioned JSONL under the config export
+directory, replayed as `[REPLAY]` text only.
+
+![Console session replay](images/gallery/session-replay.png)
+
 ## Portrait
 
 The same shell in a 1080×1920 portrait viewport: one vertically scrolling page,

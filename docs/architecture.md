@@ -263,7 +263,9 @@ Hard rules:
 - Work offsets export as WCS-only G-code (`offsets.nc`); it is not a JSON or CSV
   export and deliberately omits G92, G28/G30, HOME, TLO/TLR, G51, and PRB.
 - Atomic writes: write to a temporary file, fsync, rename.
-- No telemetry. The console log export is user-initiated and local.
+- No telemetry. The console log export and the versioned
+  `exports/session.jsonl` recorder/replay are user-initiated and local. Replay
+  is text-only and never feeds the engine.
 
 ## UI
 
