@@ -28,8 +28,16 @@
 //! # Parameter state
 //!
 //! The parser owns a bounded [`Parameters`] table shared by every line.
-//! Assignments are evaluated in source order and committed only after the
-//! whole block validates, so a failed block leaves the table untouched. Use
+//! Assignment values are a signed decimal, a parameter reference, or a
+//! bracketed expression: `#1=5`, `#1=#2`, and `#1=[2+3*4]` are accepted, while
+//! compound arithmetic without brackets (`#1=2+3`) is a
+//! [`MalformedExpression`](ParseErrorKind::MalformedExpression). A trailing
+//! `*` after an unbracketed value is the line checksum, and a top-level `(`
+//! starts a comment, so assignment grouping uses `[...]`.
+//!
+//! Assignments are evaluated in source order into an overlay and committed
+//! only after the whole block validates. A block that fails while lexing,
+//! parsing, or planning therefore leaves the table untouched. Use
 //! [`Parser::parameters`], [`Parser::parameters_mut`], or
 //! [`Parser::set_parameters`] to inspect or seed the table.
 
@@ -39,8 +47,8 @@ use ghs_viewer::{Point3, SegmentKind, Toolpath};
 use crate::block::Block;
 use crate::config::ParserConfig;
 use crate::error::{ParseError, ParseErrorKind, ParseWarning, WarningKind};
-use crate::expression::Parameters;
-use crate::lexer::{LexedLine, lex_line_with_parameters};
+use crate::expression::{ParameterOverlay, Parameters};
+use crate::lexer::{LexedLine, lex_line_with_overlay};
 use crate::planner::{Frame, Plan, PlannedMove, Planner};
 use crate::program::{Program, ProgramLine, ProgramStats};
 use crate::state::ParserState;
@@ -208,7 +216,8 @@ impl Parser {
     /// Parses one line with an explicit 1-based source line number.
     ///
     /// The line number is used in diagnostics and stored in the returned
-    /// [`ProgramLine`].
+    /// [`ProgramLine`]. Parameter assignments are committed only when the
+    /// whole block validates.
     ///
     /// # Errors
     ///
@@ -235,11 +244,17 @@ impl Parser {
                 ),
             )]);
         }
-        let mut parameters = self.parameters.clone();
-        let lexed = lex_line_with_parameters(line, source, self.config.max_words, &mut parameters)?;
+        let mut overlay = ParameterOverlay::default();
+        let lexed = lex_line_with_overlay(
+            line,
+            source,
+            self.config.max_words,
+            &self.parameters,
+            &mut overlay,
+        )?;
         let program_line = self.parse_lexed(line, source, lexed)?;
-        // Commit assignments only after the whole block validated.
-        self.parameters = parameters;
+        // Commit staged assignments only after the whole block validated.
+        overlay.commit(&mut self.parameters);
         Ok(program_line)
     }
 

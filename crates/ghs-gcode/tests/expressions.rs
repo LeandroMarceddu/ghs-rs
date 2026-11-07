@@ -2,7 +2,7 @@
 
 use ghs_gcode::{
     MAX_EXPRESSION_BYTES, MAX_EXPRESSION_DEPTH, MAX_NAMED_PARAMETERS, MAX_NUMERIC_PARAMETERS,
-    ParseErrorKind, Parser, parse_program,
+    Parameters, ParseErrorKind, Parser, lex_line_with_parameters, parse_program,
 };
 use ghs_viewer::Point3;
 
@@ -131,6 +131,44 @@ fn an_assignment_without_equals_is_rejected() {
 }
 
 #[test]
+fn compound_assignment_values_must_be_bracketed() {
+    for source in [
+        "#1=2+3\n",
+        "#1=2-3\n",
+        "#1=2/3\n",
+        "#1=2 + 3\n",
+        "#1=2 / 3\n",
+    ] {
+        let errors = parse_program(source).expect_err(source);
+        assert_eq!(errors[0].kind, ParseErrorKind::MalformedExpression);
+        assert!(
+            errors[0].message.contains("bracketed"),
+            "unexpected message: {}",
+            errors[0].message
+        );
+    }
+
+    let errors = parse_program("#2=1\n#1=#2+3\n").expect_err("parameter compound");
+    assert_eq!(errors[0].kind, ParseErrorKind::MalformedExpression);
+    assert_eq!(errors[0].line, 2);
+
+    let program = parse_program("#1=[2+3*4]\nG0 X#1\n").expect("bracketed");
+    assert_eq!(
+        program.toolpath.segments()[0].end,
+        Point3::new(14.0, 0.0, 0.0)
+    );
+
+    // An unbracketed `*` is the line checksum, not multiplication.
+    let errors = parse_program("#1=5*2\n").expect_err("checksum");
+    assert_eq!(errors[0].kind, ParseErrorKind::ChecksumMismatch);
+
+    // A top-level '(' is a comment, not an assignment expression.
+    let errors = parse_program("#1=(2+3)\n").expect_err("comment parenthesis");
+    assert_eq!(errors[0].kind, ParseErrorKind::MalformedExpression);
+    assert!(errors[0].message.contains("brackets"));
+}
+
+#[test]
 fn malformed_brackets_are_rejected() {
     assert_eq!(
         first_kind("G0 X[1+2\n"),
@@ -214,6 +252,36 @@ fn a_failed_block_does_not_commit_its_assignments() {
         .expect_err("unknown code");
     assert_eq!(parser.parameters().numeric(2), None);
     assert_eq!(parser.parameters().numeric(1), Some(5.0));
+}
+
+#[test]
+fn a_lexing_failure_does_not_commit_assignments() {
+    let mut parser = Parser::new();
+    parser
+        .parse_line_at(1, "#1=5 #2=6 X[#3]")
+        .expect_err("unresolved parameter");
+    assert_eq!(parser.parameters().numeric(1), None);
+    assert_eq!(parser.parameters().numeric(2), None);
+}
+
+#[test]
+fn a_planning_failure_does_not_commit_assignments() {
+    let mut parser = Parser::new();
+    parser
+        .parse_line_at(1, "#1=5 G1 X1")
+        .expect_err("feed rate undefined");
+    assert_eq!(parser.parameters().numeric(1), None);
+}
+
+#[test]
+fn lex_line_with_parameters_is_line_transactional() {
+    let mut parameters = Parameters::new();
+    lex_line_with_parameters(1, "#1=5 #<", 64, &mut parameters).expect_err("malformed");
+    assert_eq!(parameters.numeric(1), None);
+
+    lex_line_with_parameters(1, "#1=5 #2=6", 64, &mut parameters).expect("valid");
+    assert_eq!(parameters.numeric(1), Some(5.0));
+    assert_eq!(parameters.numeric(2), Some(6.0));
 }
 
 #[test]

@@ -9,7 +9,9 @@
 //!
 //! - `G`, `M`, axis, and parameter words with optional sign and decimal point.
 //! - `N` line numbers, `T`/`S`/`F` words.
-//! - Numbered and named `#` parameters, including `#1=<value>` assignments.
+//! - Numbered and named `#` parameters, including assignments. Simple values
+//!   (`#1=5`, `#1=#2`) are accepted; compound arithmetic must be bracketed
+//!   (`#1=[2+3*4]`).
 //! - `[...]` arithmetic expressions in numeric word values.
 //! - `( ... )` and `;` comments.
 //! - A leading `/` block-delete marker.
@@ -25,7 +27,7 @@
 //! a whole program can share one parameter environment.
 
 use crate::error::{ParseError, ParseErrorKind};
-use crate::expression::{Parameters, evaluate_value, parse_parameter_key};
+use crate::expression::{ParameterOverlay, Parameters, evaluate_value, parse_parameter_key};
 
 /// Safety cap on words per line when the caller does not set one.
 pub const DEFAULT_MAX_WORDS: usize = 256;
@@ -98,15 +100,17 @@ const CONTROL_KEYWORDS: [&str; 11] = [
 /// Returns every lexing error found on the line. The line is not partially
 /// returned.
 pub fn lex_line(line: usize, source: &str, max_words: usize) -> Result<LexedLine, Vec<ParseError>> {
-    let mut parameters = Parameters::new();
-    lex_line_with_parameters(line, source, max_words, &mut parameters)
+    let parameters = Parameters::new();
+    let mut overlay = ParameterOverlay::default();
+    lex_line_with_overlay(line, source, max_words, &parameters, &mut overlay)
 }
 
 /// Lexes one source line against a shared parameter table.
 ///
-/// Assignments on the line update `parameters` in source order. The caller is
-/// responsible for making the update transactional: clone the table, lex, and
-/// only keep the clone when the block validates.
+/// Assignments on the line update `parameters` in source order only when the
+/// whole line lexes successfully. A failed line leaves the table untouched.
+/// [`Parser`](crate::Parser) stages the same overlay through planning, so a
+/// block that fails after lexing also leaves the table untouched.
 ///
 /// # Errors
 ///
@@ -117,6 +121,22 @@ pub fn lex_line_with_parameters(
     source: &str,
     max_words: usize,
     parameters: &mut Parameters,
+) -> Result<LexedLine, Vec<ParseError>> {
+    let mut overlay = ParameterOverlay::default();
+    let lexed = lex_line_with_overlay(line, source, max_words, parameters, &mut overlay)?;
+    overlay.commit(parameters);
+    Ok(lexed)
+}
+
+/// Lexes one line, staging assignments in `overlay` instead of `base`.
+///
+/// The caller commits the overlay after the block validates.
+pub(crate) fn lex_line_with_overlay(
+    line: usize,
+    source: &str,
+    max_words: usize,
+    base: &Parameters,
+    overlay: &mut ParameterOverlay,
 ) -> Result<LexedLine, Vec<ParseError>> {
     let max_words = max_words.max(1);
     let mut errors = Vec::new();
@@ -206,7 +226,7 @@ pub fn lex_line_with_parameters(
                     index += 1;
                 }
             }
-            b'#' => match parse_assignment(line, source, index, parameters) {
+            b'#' => match parse_assignment(line, source, index, base, overlay) {
                 Ok(next) => index = next,
                 Err(error) => {
                     errors.push(error);
@@ -256,7 +276,7 @@ pub fn lex_line_with_parameters(
                         ));
                         break;
                     }
-                    match lex_value_expression(line, source, expression_start, parameters) {
+                    match lex_value_expression(line, source, expression_start, base, overlay) {
                         Ok((value, consumed)) => {
                             index = expression_start + consumed;
                             lexed.words.push(Word::new(letter, value, column));
@@ -357,10 +377,11 @@ fn lex_value_expression(
     line: usize,
     source: &str,
     start: usize,
-    parameters: &Parameters,
+    base: &Parameters,
+    overlay: &ParameterOverlay,
 ) -> Result<(f64, usize), ParseError> {
     let slice = source.get(start..).unwrap_or_default();
-    evaluate_value(slice, parameters).map_err(|error| {
+    evaluate_value(slice, base, overlay).map_err(|error| {
         ParseError::new(
             line,
             start + error.offset + 1,
@@ -370,14 +391,17 @@ fn lex_value_expression(
     })
 }
 
-/// Parses one `#` parameter assignment and updates the working table.
+/// Parses one `#` parameter assignment and stages it in `overlay`.
 ///
-/// Returns the byte index just after the assigned value.
+/// Returns the byte index just after the assigned value. Simple values are a
+/// signed number or a parameter reference; compound arithmetic must be
+/// bracketed. A trailing `*` is left for the checksum parser.
 fn parse_assignment(
     line: usize,
     source: &str,
     start: usize,
-    parameters: &mut Parameters,
+    base: &Parameters,
+    overlay: &mut ParameterOverlay,
 ) -> Result<usize, ParseError> {
     let bytes = source.as_bytes();
     let (key, mut index) = parse_parameter_key(source, start).map_err(|error| {
@@ -406,8 +430,28 @@ fn parse_assignment(
             format!("parameter {} assignment needs a value", key.label()),
         ));
     }
+    // In G-code a top-level '(' starts a comment, so it cannot introduce an
+    // assignment value. Brackets are the expression form.
+    let mut first = index;
+    loop {
+        while matches!(bytes.get(first), Some(b' ' | b'\t' | b'\r')) {
+            first += 1;
+        }
+        match bytes.get(first) {
+            Some(b'+' | b'-') => first += 1,
+            Some(b'(') => {
+                return Err(ParseError::new(
+                    line,
+                    first + 1,
+                    ParseErrorKind::MalformedExpression,
+                    "parentheses start a comment in G-code; use brackets for an assignment expression, for example #1=[2+3]",
+                ));
+            }
+            _ => break,
+        }
+    }
     let slice = source.get(index..).unwrap_or_default();
-    let (value, consumed) = evaluate_value(slice, parameters).map_err(|error| {
+    let (value, consumed) = evaluate_value(slice, base, overlay).map_err(|error| {
         ParseError::new(
             line,
             index + error.offset + 1,
@@ -415,13 +459,30 @@ fn parse_assignment(
             error.message,
         )
     })?;
+    let end = index + consumed;
+    let mut probe = end;
+    while matches!(bytes.get(probe), Some(b' ' | b'\t' | b'\r')) {
+        probe += 1;
+    }
+    if let Some(operator @ (b'+' | b'-' | b'/')) = bytes.get(probe).copied() {
+        let label = key.label();
+        return Err(ParseError::new(
+            line,
+            probe + 1,
+            ParseErrorKind::MalformedExpression,
+            format!(
+                "compound assignment value for {label} must be bracketed, for example {label}=[2+3*4]; found '{}'",
+                char::from(operator)
+            ),
+        ));
+    }
     let assignment = match &key {
-        crate::expression::ParameterKey::Numeric(number) => parameters.set_numeric(*number, value),
-        crate::expression::ParameterKey::Named(name) => parameters.set_named(name, value),
+        crate::expression::ParameterKey::Numeric(number) => overlay.set_numeric(*number, value),
+        crate::expression::ParameterKey::Named(name) => overlay.set_named(base, name, value),
     };
     assignment
         .map_err(|error| ParseError::new(line, start + 1, error.parse_kind(), error.to_string()))?;
-    Ok(index + consumed)
+    Ok(end)
 }
 
 /// Parses a value token that has already been restricted to digits, `.`, `+`,

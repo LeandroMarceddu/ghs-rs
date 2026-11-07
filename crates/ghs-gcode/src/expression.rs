@@ -20,6 +20,15 @@
 //! A word value is one `value`; compound arithmetic needs brackets, for
 //! example `X[[#1+2]*3]`, so a trailing `*` keeps its checksum meaning.
 //!
+//! # Assignment values
+//!
+//! An assignment accepts exactly one `value`: a signed decimal (`#1=5`,
+//! `#1=-2.5`), a parameter reference (`#1=#2`, `#1=#<feed>`), or a bracketed
+//! expression (`#1=[2+3*4]`). Compound arithmetic without brackets
+//! (`#1=2+3`) is rejected by the lexer; `*` after an unbracketed value is
+//! parsed as the line checksum. A top-level `(` starts a G-code comment, so
+//! assignment grouping uses `[...]`.
+//!
 //! # Bounds
 //!
 //! Numbered parameters are `#1` through `#100`; named parameters are limited
@@ -249,6 +258,106 @@ fn bounded_name(name: &str) -> String {
     bounded
 }
 
+/// Pending assignments for one block.
+///
+/// The lexer writes assignments here instead of mutating [`Parameters`], so a
+/// block that fails at any stage leaves the real table untouched. Lookups read
+/// the newest pending value first, which gives assignments in one block the
+/// expected source-order semantics. [`ParameterOverlay::commit`] applies the
+/// overlay only after the whole block validates.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ParameterOverlay {
+    numeric: BTreeMap<u32, f64>,
+    named: BTreeMap<String, f64>,
+}
+
+impl ParameterOverlay {
+    /// Returns a pending numbered parameter.
+    pub(crate) fn numeric(&self, index: u32) -> Option<f64> {
+        self.numeric.get(&index).copied()
+    }
+
+    /// Returns a pending named parameter. `name` must be upper case.
+    pub(crate) fn named(&self, name: &str) -> Option<f64> {
+        self.named.get(name).copied()
+    }
+
+    /// Stages one numbered assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParameterError::IndexOutOfRange`] outside `#1`..`#100` and
+    /// [`ParameterError::NonFinite`] for a non-finite value.
+    pub(crate) fn set_numeric(&mut self, index: u32, value: f64) -> Result<(), ParameterError> {
+        if !(1..=MAX_NUMERIC_PARAMETERS).contains(&index) {
+            return Err(ParameterError::IndexOutOfRange {
+                index,
+                max: MAX_NUMERIC_PARAMETERS,
+            });
+        }
+        if !value.is_finite() {
+            return Err(ParameterError::NonFinite);
+        }
+        self.numeric.insert(index, value);
+        Ok(())
+    }
+
+    /// Stages one named assignment, creating the name when it is new.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParameterError::InvalidName`] for a bad name,
+    /// [`ParameterError::NamedTableFull`] when the union of committed and
+    /// pending names would exceed the bound, and [`ParameterError::NonFinite`]
+    /// for a non-finite value.
+    pub(crate) fn set_named(
+        &mut self,
+        base: &Parameters,
+        name: &str,
+        value: f64,
+    ) -> Result<(), ParameterError> {
+        validate_parameter_name(name).map_err(|reason| ParameterError::InvalidName {
+            name: bounded_name(name),
+            reason,
+        })?;
+        if !value.is_finite() {
+            return Err(ParameterError::NonFinite);
+        }
+        let key = name.to_ascii_uppercase();
+        if !self.named.contains_key(&key) && !base.named.contains_key(&key) {
+            let pending_new = self
+                .named
+                .keys()
+                .filter(|name| !base.named.contains_key(*name))
+                .count();
+            if base.named.len() + pending_new >= MAX_NAMED_PARAMETERS {
+                return Err(ParameterError::NamedTableFull {
+                    max: MAX_NAMED_PARAMETERS,
+                });
+            }
+        }
+        self.named.insert(key, value);
+        Ok(())
+    }
+
+    /// Applies every pending assignment to `parameters`.
+    ///
+    /// Values were validated when staged, so this cannot fail. It runs only
+    /// after the block lexes, parses, and plans successfully.
+    pub(crate) fn commit(self, parameters: &mut Parameters) {
+        for (index, value) in self.numeric {
+            if let Some(slot) = usize::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|slot| parameters.numeric.get_mut(slot))
+            {
+                *slot = Some(value);
+            }
+        }
+        parameters.named.extend(self.named);
+    }
+}
+
 /// A parsed `#` parameter reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParameterKey {
@@ -400,14 +509,16 @@ pub(crate) fn parse_parameter_key(
 /// bracket keeps its checksum meaning.
 pub(crate) fn evaluate_value(
     source: &str,
-    parameters: &Parameters,
+    base: &Parameters,
+    overlay: &ParameterOverlay,
 ) -> Result<(f64, usize), ExpressionError> {
     let mut parser = Parser {
         source,
         bytes: source.as_bytes(),
         pos: 0,
         depth: 0,
-        parameters,
+        base,
+        overlay,
     };
     let value = parser.parse_unary()?;
     Ok((value, parser.pos))
@@ -418,14 +529,16 @@ pub(crate) fn evaluate_value(
 #[cfg(test)]
 pub(crate) fn evaluate_expression(
     source: &str,
-    parameters: &Parameters,
+    base: &Parameters,
+    overlay: &ParameterOverlay,
 ) -> Result<(f64, usize), ExpressionError> {
     let mut parser = Parser {
         source,
         bytes: source.as_bytes(),
         pos: 0,
         depth: 0,
-        parameters,
+        base,
+        overlay,
     };
     let value = parser.parse_expression()?;
     parser.skip_whitespace()?;
@@ -438,7 +551,8 @@ struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     depth: usize,
-    parameters: &'a Parameters,
+    base: &'a Parameters,
+    overlay: &'a ParameterOverlay,
 }
 
 impl Parser<'_> {
@@ -569,20 +683,28 @@ impl Parser<'_> {
         self.pos = next;
         self.check_length()?;
         match &key {
-            ParameterKey::Numeric(index) => self.parameters.numeric(*index).ok_or_else(|| {
-                ExpressionError::new(
-                    offset,
-                    ExpressionErrorKind::UnresolvedParameter,
-                    format!("parameter {} is not set", key.label()),
-                )
-            }),
-            ParameterKey::Named(name) => self.parameters.named(name).ok_or_else(|| {
-                ExpressionError::new(
-                    offset,
-                    ExpressionErrorKind::UnknownNamedParameter,
-                    format!("named parameter {} is not set", key.label()),
-                )
-            }),
+            ParameterKey::Numeric(index) => self
+                .overlay
+                .numeric(*index)
+                .or_else(|| self.base.numeric(*index))
+                .ok_or_else(|| {
+                    ExpressionError::new(
+                        offset,
+                        ExpressionErrorKind::UnresolvedParameter,
+                        format!("parameter {} is not set", key.label()),
+                    )
+                }),
+            ParameterKey::Named(name) => self
+                .overlay
+                .named(name)
+                .or_else(|| self.base.named.get(name).copied())
+                .ok_or_else(|| {
+                    ExpressionError::new(
+                        offset,
+                        ExpressionErrorKind::UnknownNamedParameter,
+                        format!("named parameter {} is not set", key.label()),
+                    )
+                }),
         }
     }
 
@@ -685,6 +807,14 @@ fn finite(value: f64, offset: usize) -> Result<f64, ExpressionError> {
 mod tests {
     use super::*;
 
+    fn eval(source: &str, parameters: &Parameters) -> Result<(f64, usize), ExpressionError> {
+        evaluate_expression(source, parameters, &ParameterOverlay::default())
+    }
+
+    fn eval_value(source: &str, parameters: &Parameters) -> Result<(f64, usize), ExpressionError> {
+        evaluate_value(source, parameters, &ParameterOverlay::default())
+    }
+
     #[test]
     fn numeric_parameters_are_bounded_and_reject_non_finite_values() {
         let mut parameters = Parameters::new();
@@ -752,25 +882,25 @@ mod tests {
         parameters.set_numeric(1, 2.0).expect("set");
         parameters.set_numeric(2, 3.0).expect("set");
 
-        let (value, used) = evaluate_expression("#1+#2*4", &parameters).expect("eval");
+        let (value, used) = eval("#1+#2*4", &parameters).expect("eval");
         assert_eq!(value, 14.0);
         assert_eq!(used, 7);
 
-        let (value, _) = evaluate_expression("[(#1+#2)*2]", &parameters).expect("eval");
+        let (value, _) = eval("[(#1+#2)*2]", &parameters).expect("eval");
         assert_eq!(value, 10.0);
 
-        let (value, _) = evaluate_expression("-+#1 + +5", &parameters).expect("eval");
+        let (value, _) = eval("-+#1 + +5", &parameters).expect("eval");
         assert_eq!(value, 3.0);
     }
 
     #[test]
     fn evaluation_rejects_division_by_zero_and_non_finite_results() {
         let parameters = Parameters::new();
-        let error = evaluate_expression("1/0", &parameters).expect_err("zero");
+        let error = eval("1/0", &parameters).expect_err("zero");
         assert_eq!(error.kind, ExpressionErrorKind::DivisionByZero);
 
         let huge = "9".repeat(400);
-        let error = evaluate_expression(&huge, &parameters).expect_err("infinite literal");
+        let error = eval(&huge, &parameters).expect_err("infinite literal");
         assert_eq!(error.kind, ExpressionErrorKind::NonFinite);
     }
 
@@ -782,11 +912,11 @@ mod tests {
             "[".repeat(MAX_EXPRESSION_DEPTH + 1),
             "]".repeat(MAX_EXPRESSION_DEPTH + 1)
         );
-        let error = evaluate_expression(&deep, &parameters).expect_err("deep");
+        let error = eval(&deep, &parameters).expect_err("deep");
         assert_eq!(error.kind, ExpressionErrorKind::TooDeep);
 
         let long = format!("{}{}", "1+".repeat(MAX_EXPRESSION_BYTES), "1");
-        let error = evaluate_expression(&long, &parameters).expect_err("long");
+        let error = eval(&long, &parameters).expect_err("long");
         assert_eq!(error.kind, ExpressionErrorKind::TooLong);
     }
 
@@ -794,7 +924,7 @@ mod tests {
     fn value_evaluation_does_not_consume_binary_operators() {
         let mut parameters = Parameters::new();
         parameters.set_numeric(1, 4.0).expect("set");
-        let (value, used) = evaluate_value("[#1+2]*7", &parameters).expect("value");
+        let (value, used) = eval_value("[#1+2]*7", &parameters).expect("value");
         assert_eq!(value, 6.0);
         assert_eq!(used, 6);
     }
@@ -803,12 +933,56 @@ mod tests {
     fn malformed_parameter_references_are_rejected() {
         let parameters = Parameters::new();
         for text in ["#", "#<", "#<>", "#<9x>", "#1.5", "#abc"] {
-            let error = evaluate_expression(text, &parameters).expect_err(text);
+            let error = eval(text, &parameters).expect_err(text);
             assert_eq!(
                 error.kind,
                 ExpressionErrorKind::Malformed,
                 "unexpected kind for {text}"
             );
         }
+    }
+
+    #[test]
+    fn an_overlay_shadows_the_base_and_commits_only_when_asked() {
+        let mut base = Parameters::new();
+        base.set_numeric(1, 1.0).expect("base");
+        base.set_named("feed", 100.0).expect("base");
+
+        let mut overlay = ParameterOverlay::default();
+        overlay.set_numeric(1, 2.0).expect("numeric");
+        overlay.set_named(&base, "feed", 250.0).expect("named");
+        overlay.set_named(&base, "speed", 50.0).expect("new name");
+
+        assert_eq!(overlay.numeric(1), Some(2.0));
+        assert_eq!(overlay.named("FEED"), Some(250.0));
+        assert_eq!(overlay.named("SPEED"), Some(50.0));
+        assert_eq!(base.numeric(1), Some(1.0));
+        assert_eq!(base.named("FEED"), Some(100.0));
+
+        let (value, _) =
+            evaluate_expression("#1+#<feed>+#<speed>", &base, &overlay).expect("overlay eval");
+        assert_eq!(value, 302.0);
+
+        overlay.commit(&mut base);
+        assert_eq!(base.numeric(1), Some(2.0));
+        assert_eq!(base.named("FEED"), Some(250.0));
+        assert_eq!(base.named("SPEED"), Some(50.0));
+    }
+
+    #[test]
+    fn an_overlay_enforces_the_named_table_bound_before_commit() {
+        let mut base = Parameters::new();
+        for index in 0..MAX_NAMED_PARAMETERS - 1 {
+            base.set_named(&format!("P{index}"), 1.0).expect("base");
+        }
+        let mut overlay = ParameterOverlay::default();
+        overlay.set_named(&base, "LAST", 2.0).expect("last slot");
+        assert_eq!(
+            overlay.set_named(&base, "OVERFLOW", 3.0),
+            Err(ParameterError::NamedTableFull {
+                max: MAX_NAMED_PARAMETERS
+            })
+        );
+        assert_eq!(base.named_len(), MAX_NAMED_PARAMETERS - 1);
     }
 }

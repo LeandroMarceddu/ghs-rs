@@ -63,9 +63,21 @@
 //! evaluated with `f64`; division by zero, non-finite results, unresolved
 //! parameters, expressions deeper than 32 nesting levels, and expressions
 //! longer than 512 bytes are rejected. Expressions are not allowed in `G`,
-//! `M`, `N`, or `O` words. Assignment values use the same value syntax; use
-//! brackets for compound arithmetic, as in `#1=[2+3*4]`, so a trailing `*`
-//! keeps its checksum meaning.
+//! `M`, `N`, or `O` words.
+//!
+//! An assignment value is deliberately one of:
+//!
+//! - a signed decimal: `#1=5`, `#1=-2.5`;
+//! - a parameter reference: `#1=#2`, `#1=#<feed>`;
+//! - a bracketed expression: `#1=[2+3*4]`.
+//!
+//! Compound arithmetic must be bracketed. `#1=2+3` is a
+//! [`ParseErrorKind::MalformedExpression`], not an implicit expression.
+//! Because `*` after a value is the line checksum, always put the whole
+//! calculation inside brackets. A top-level `(` starts a G-code comment, so
+//! assignment grouping also uses `[...]`. Assignments are staged while a block
+//! is lexed and committed only after the block validates; a failed block
+//! leaves the parameter table untouched.
 //!
 //! Unsupported codes are rejected with a structured error instead of being
 //! silently ignored, so a validation view can explain why a program will not

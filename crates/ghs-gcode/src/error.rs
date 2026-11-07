@@ -108,7 +108,9 @@ pub enum ParseErrorKind {
     MissingAssignment,
     /// The bounded named-parameter table is full.
     TooManyParameters,
-    /// A `[...]` expression is malformed.
+    /// A `[...]` expression is malformed, or a compound assignment value was
+    /// not bracketed (for example `#1=2+3` instead of `#1=[2+3]`). A
+    /// top-level `(` in an assignment is a comment, not an expression.
     MalformedExpression,
     /// An expression nests deeper than the supported limit.
     ExpressionTooDeep,
