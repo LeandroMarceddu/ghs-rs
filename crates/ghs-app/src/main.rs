@@ -130,6 +130,15 @@
 //! reveals the Console after the demo program loads (a load normally shows the
 //! Program tab); `--console-filter` implies it. Normal startup filters nothing,
 //! writes no log file, and keeps the load behaviour unchanged.
+//! `--demo-session-record` starts the local `<config>/exports/session.jsonl`
+//! recorder through the same START RECORDING action and pushes three fixed
+//! local text entries for the active-indicator capture.
+//! `--demo-session-replay` writes a byte-reproducible fixed recording and reads
+//! it back through the normal LOAD RECORDING validator, which prefixes each
+//! recovered entry with `[REPLAY]` at its original level. Both flags are
+//! Console text only: they send no command, change no machine state, and start
+//! no job. The recorder is capped at 8 MiB / 100,000 lines; replay is
+//! read-only and refuses oversized, wrong-version, or malformed files.
 //! `--demo-job-history` seeds three fixed records through the normal local
 //! `app.json` save path and opens Utility at the `JOB HISTORY` card;
 //! `--demo-job-history-clear` seeds the same records and opens the inline
@@ -167,6 +176,7 @@ mod offsets;
 mod offsets_export;
 mod pins;
 mod probe;
+mod session;
 mod settings;
 mod setup;
 mod shell;

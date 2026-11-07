@@ -37,6 +37,10 @@ use crate::offsets::OffsetModel;
 use crate::offsets_export::{OffsetsBackupModel, OffsetsExport};
 use crate::pins::PinsModel;
 use crate::probe::{ProbeField, ProbeModel, ToolLengthAction, ToolLengthGate, ToolLengthWrite};
+use crate::session::{
+    RecordingStatus, SESSION_MAX_BYTES, SESSION_MAX_ENTRIES, SessionError, SessionRecorder,
+    SessionReplay, SessionReplayError, SessionReplayStatus,
+};
 use crate::settings::{SettingKind, SettingsModel};
 use crate::setup::{SafetyItem, SetupModel, SetupStep};
 use crate::startup::{StartupLinesModel, StartupWriteGate};
@@ -2316,6 +2320,10 @@ pub struct AppState {
     pub console_filter: ConsoleFilter,
     /// Last `SAVE LOG` result shown under the filter chips.
     pub console_log_status: Option<ConsoleLogStatus>,
+    /// Local Console session recorder. It has no engine or transport handle.
+    pub session: SessionRecorder,
+    /// Last `LOAD RECORDING` result shown under the recording controls.
+    pub session_replay_status: Option<SessionReplayStatus>,
     pub program: Vec<ProgramLine>,
     pub active_line: usize,
     pub progress: f32,
@@ -2431,6 +2439,8 @@ impl AppState {
             console: seed_console(),
             console_filter: ConsoleFilter::All,
             console_log_status: None,
+            session: SessionRecorder::default(),
+            session_replay_status: None,
             program: PROGRAM
                 .iter()
                 .enumerate()
@@ -2509,6 +2519,9 @@ impl AppState {
         // result. Telemetry polling never changes the filter.
         self.console_filter = ConsoleFilter::All;
         self.console_log_status = None;
+        // A replay result belongs to the view that produced it. Recording, once
+        // started, deliberately spans a reconnect until the operator stops it.
+        self.session_replay_status = None;
         self.mpos = vec![0.0; self.profile.capabilities.axes.len()];
         self.dro = vec![0.0; self.profile.capabilities.axes.len()];
         self.wco = vec![0.0; self.profile.capabilities.axes.len()];
@@ -4986,10 +4999,170 @@ impl AppState {
     }
 
     pub fn push_console(&mut self, level: ConsoleLevel, text: impl Into<String>) {
+        let text = text.into();
+        // The recorder only appends text. It owns a local file and has no
+        // engine, transport, or command handle.
+        self.session.record_now(level, &text);
+        self.push_console_ring(level, text);
+    }
+
+    /// Append one Console line without feeding the session recorder.
+    ///
+    /// Replay uses this path: a replayed line is historical text, not new
+    /// machine traffic, and copying it back into a live recording would
+    /// duplicate an older session.
+    fn push_console_ring(&mut self, level: ConsoleLevel, text: String) {
         self.console.push(ConsoleLine::new(level, text));
         if self.console.len() > CONSOLE_LINE_LIMIT {
             let excess = self.console.len() - CONSOLE_LINE_LIMIT;
             self.console.drain(..excess);
+        }
+    }
+
+    // ------------------------------------------------------- session recording
+
+    /// Fixed `exports/session.jsonl` path for the current configuration root.
+    #[must_use]
+    pub fn session_recording_path(&self) -> Option<PathBuf> {
+        self.config
+            .store_root()
+            .map(crate::session::session_recording_path)
+    }
+
+    /// Start the local Console session recorder.
+    ///
+    /// The recorder writes only `<config>/exports/session.jsonl`. A second call
+    /// while recording is an idempotent no-op. It never opens a transport,
+    /// builds a controller command, or starts motion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the configuration root is unavailable or
+    /// the fixed file cannot be written. The refusal is also appended to the
+    /// Console.
+    pub fn start_session_recording(
+        &mut self,
+        now_unix_s: u64,
+    ) -> Result<RecordingStatus, SessionError> {
+        if self.session.is_recording() {
+            return Ok(self.session.status());
+        }
+        let root = self.config.store_root().map(std::path::Path::to_path_buf);
+        match self
+            .session
+            .start(root.as_deref(), env!("CARGO_PKG_VERSION"), now_unix_s)
+        {
+            Ok(status) => {
+                let path = status
+                    .path
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string());
+                self.push_console(
+                    ConsoleLevel::Info,
+                    format!(
+                        "Session recording started: {path} \
+                         (local only; max {} MiB / {} lines)",
+                        SESSION_MAX_BYTES / (1024 * 1024),
+                        SESSION_MAX_ENTRIES
+                    ),
+                );
+                Ok(self.session.status())
+            }
+            Err(error) => {
+                self.push_console(
+                    ConsoleLevel::Error,
+                    format!("Session recording not started: {error}"),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Stop and flush the local Console recording.
+    ///
+    /// Returns `false` when no recording was active, so a second STOP is a
+    /// no-op. The status line is appended after the file is closed and is not
+    /// itself recorded.
+    pub fn stop_session_recording(&mut self) -> bool {
+        let status = self.session.status();
+        if !self.session.stop() {
+            return false;
+        }
+        self.push_console(
+            ConsoleLevel::Info,
+            format!(
+                "Session recording stopped: {} lines, {} bytes at {}",
+                status.entries,
+                status.bytes,
+                status
+                    .path
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            ),
+        );
+        true
+    }
+
+    /// Read the fixed recording and append its entries as `[REPLAY]` text.
+    ///
+    /// Replay is read-only: it only reads `exports/session.jsonl` and appends
+    /// Console text at the entry's original level. It never calls the engine,
+    /// sends a command, changes machine state, or starts anything. A job may
+    /// remain active; the result says explicitly that replay is text only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionReplayError`] for a missing root or file, an oversized
+    /// file, a wrong version, or a malformed line. The refusal is also appended
+    /// to the Console.
+    pub fn load_session_recording(&mut self) -> Result<SessionReplay, SessionReplayError> {
+        // Reading while recording is allowed, but first make every accepted
+        // entry visible to the reader; this is a local flush, not a command.
+        self.session.flush();
+        let root = self.config.store_root().map(std::path::Path::to_path_buf);
+        let job_active = self.job.is_active();
+        match crate::session::read_session_recording(root.as_deref()) {
+            Ok(replay) => {
+                for entry in &replay.entries {
+                    self.push_console_ring(entry.level, format!("[REPLAY] {}", entry.text));
+                }
+                let truncated = replay
+                    .truncated
+                    .as_ref()
+                    .map_or_else(String::new, |marker| {
+                        format!(" | file truncated at {}", marker.reason)
+                    });
+                let job_note = if job_active {
+                    " | job active: text only"
+                } else {
+                    ""
+                };
+                let text = format!(
+                    "REPLAYED {} ENTRIES | TEXT ONLY | NO COMMAND SENT{truncated}{job_note}",
+                    replay.entries.len()
+                );
+                self.session_replay_status = Some(SessionReplayStatus {
+                    ok: true,
+                    text: text.clone(),
+                    path: Some(replay.path.clone()),
+                    job_active,
+                });
+                self.push_console_ring(
+                    ConsoleLevel::Info,
+                    format!("[REPLAY] {text} from {}", replay.path.display()),
+                );
+                Ok(replay)
+            }
+            Err(error) => {
+                self.session_replay_status = Some(SessionReplayStatus {
+                    ok: false,
+                    text: format!("REPLAY REFUSED: {error}"),
+                    path: error.path().map(std::path::Path::to_path_buf),
+                    job_active,
+                });
+                self.push_console_ring(ConsoleLevel::Error, format!("[REPLAY] REFUSED: {error}"));
+                Err(error)
+            }
         }
     }
 
@@ -6640,6 +6813,174 @@ mod tests {
                 .any(|line| line.level == ConsoleLevel::Error && line.text.contains("not saved")),
             "the refusal is surfaced in the Console"
         );
+    }
+
+    #[test]
+    fn session_recording_captures_new_console_lines_and_replay_does_not_echo() {
+        let dir = TempRoot::new("session-record");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        state.console.clear();
+
+        let status = state
+            .start_session_recording(1_700_000_000)
+            .expect("start recording");
+        assert!(status.is_recording());
+        assert_eq!(
+            status.path.as_ref().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new("session.jsonl"))
+        );
+        state.push_console(ConsoleLevel::Info, "recorded one");
+        state.push_console(ConsoleLevel::Warn, "recorded two");
+        assert!(state.session.is_recording());
+        assert_eq!(
+            state.session.status().entries,
+            3,
+            "the start status line is recorded too"
+        );
+        assert!(state.stop_session_recording());
+        assert!(!state.stop_session_recording(), "a second stop is a no-op");
+
+        let recording = crate::session::read_session_recording(Some(&dir.path)).expect("recording");
+        assert_eq!(recording.entries.len(), 3);
+        assert_eq!(recording.entries[1].text, "recorded one");
+        assert_eq!(recording.entries[2].level, ConsoleLevel::Warn);
+
+        let bytes_before = fs::read(&recording.path).expect("before replay");
+        let replay = state.load_session_recording().expect("replay");
+        assert_eq!(replay.entries.len(), 3);
+        let bytes_after = fs::read(&recording.path).expect("after replay");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "replay is read-only and must not append to the file"
+        );
+
+        let replay_lines: Vec<&ConsoleLine> = state
+            .console
+            .iter()
+            .filter(|line| line.text.starts_with("[REPLAY]"))
+            .collect();
+        assert_eq!(
+            replay_lines.len(),
+            4,
+            "three entries plus the result line are appended"
+        );
+        assert_eq!(replay_lines[1].level, ConsoleLevel::Info);
+        assert_eq!(replay_lines[1].text, "[REPLAY] recorded one");
+        assert_eq!(replay_lines[2].level, ConsoleLevel::Warn);
+        assert!(
+            replay_lines[3].text.contains("NO COMMAND SENT"),
+            "{}",
+            replay_lines[3].text
+        );
+        let status = state.session_replay_status.as_ref().expect("status");
+        assert!(status.ok);
+        assert!(status.text.contains("REPLAYED 3 ENTRIES"));
+        assert!(!status.job_active);
+    }
+
+    #[test]
+    fn replay_while_recording_flushes_accepted_entries_and_keeps_recording() {
+        let dir = TempRoot::new("session-replay-while-record");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        state.console.clear();
+        state
+            .start_session_recording(1_700_000_000)
+            .expect("start recording");
+        state.push_console(ConsoleLevel::Info, "already buffered");
+
+        let replay = state
+            .load_session_recording()
+            .expect("replay while recording");
+        assert!(
+            replay
+                .entries
+                .iter()
+                .any(|entry| entry.text == "already buffered"),
+            "a local flush exposes accepted entries to replay"
+        );
+        assert!(state.session.is_recording(), "replay never stops recording");
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.text == "[REPLAY] already buffered")
+        );
+        assert!(state.stop_session_recording());
+    }
+
+    #[test]
+    fn replay_while_a_job_is_active_is_explicitly_text_only() {
+        let dir = TempRoot::new("session-replay-job");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        state.console.clear();
+        let mut recorder = SessionRecorder::default();
+        recorder
+            .start(Some(&dir.path), "test", 1_700_000_000)
+            .expect("start");
+        recorder.record(ConsoleLevel::Info, "old telemetry", 0);
+        recorder.record(ConsoleLevel::Command, "> $I+", 10);
+        recorder.stop();
+
+        // A running job is visible to the app but replay must not touch it.
+        state.live = true;
+        state.machine_state = "Run";
+        state.job.state = JobState::Running;
+        state.job.current_line = 7;
+        state.job.completed = 3;
+        state.job.total = 10;
+        let console_before = state.console.len();
+
+        let replay = state.load_session_recording().expect("replay");
+        assert_eq!(replay.entries.len(), 2);
+        assert_eq!(state.job.state, JobState::Running);
+        assert_eq!(state.job.current_line, 7);
+        assert_eq!(state.job.completed, 3);
+        assert_eq!(state.job.total, 10);
+        assert_eq!(state.machine_state, "Run");
+        assert!(state.console.len() > console_before);
+
+        let status = state.session_replay_status.as_ref().expect("status");
+        assert!(status.ok);
+        assert!(status.job_active);
+        assert!(status.text.contains("TEXT ONLY"), "{}", status.text);
+        assert!(status.text.contains("job active"), "{}", status.text);
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.text == "[REPLAY] > $I+" && line.level == ConsoleLevel::Command)
+        );
+    }
+
+    #[test]
+    fn replay_refuses_a_malformed_file_without_changing_machine_state() {
+        let dir = TempRoot::new("session-replay-bad");
+        let mut state = AppState::new();
+        state.config = ConfigModel::from_store(ConfigStore::new(&dir.path));
+        state.console.clear();
+        let exports = dir.path.join("exports");
+        fs::create_dir_all(&exports).expect("exports");
+        fs::write(exports.join("session.jsonl"), b"not json\n").expect("bad file");
+        state.job.state = JobState::Running;
+        state.machine_state = "Run";
+
+        let error = state.load_session_recording().expect_err("malformed");
+        assert!(error.to_string().contains("malformed"), "{error}");
+        let status = state.session_replay_status.as_ref().expect("status");
+        assert!(!status.ok);
+        assert!(status.text.contains("REPLAY REFUSED"), "{}", status.text);
+        assert!(
+            state
+                .console
+                .iter()
+                .any(|line| line.level == ConsoleLevel::Error
+                    && line.text.starts_with("[REPLAY] REFUSED:"))
+        );
+        assert_eq!(state.job.state, JobState::Running);
+        assert_eq!(state.machine_state, "Run");
     }
 
     #[test]

@@ -104,6 +104,10 @@ use crate::probe::{
     ProbeRun, ProbeTarget, RowState, ToolLengthAction, ToolLengthWriteStatus, format_duration,
     format_estimate, format_mm, height_map_summary, outcome_summary,
 };
+use crate::session::{
+    DEMO_SESSION_LIVE_ENTRIES, RecordingState, SESSION_MAX_BYTES, SESSION_MAX_ENTRIES,
+    SESSION_RECORDING_FILE_NAME, SessionReplayStatus,
+};
 use crate::settings::{GroupRow, RowStatus, SettingKind, SettingRow, SettingsScope};
 use crate::setup::{SafetyItem, SetupStep};
 use crate::startup::{StartupRequest, StartupStatus};
@@ -411,6 +415,12 @@ pub struct Shell {
     /// Screenshot switch: reveal the Console tab after the demo program loads.
     demo_console_tab: bool,
     demo_console_tab_done: bool,
+    /// Screenshot switch: start a local session recording once.
+    demo_session_record: bool,
+    demo_session_record_done: bool,
+    /// Screenshot switch: write a fixed recording and replay it once.
+    demo_session_replay: bool,
+    demo_session_replay_done: bool,
     program_scroll: UniformListScrollHandle,
     program_search_input: Entity<InputState>,
     /// Open in-app program file browser, when the modal is visible.
@@ -1004,6 +1014,10 @@ impl Shell {
             demo_console_tab: std::env::args().any(|arg| arg == "--console-tab")
                 || std::env::args().any(|arg| arg.starts_with("--console-filter=")),
             demo_console_tab_done: false,
+            demo_session_record: std::env::args().any(|arg| arg == "--demo-session-record"),
+            demo_session_record_done: false,
+            demo_session_replay: std::env::args().any(|arg| arg == "--demo-session-replay"),
+            demo_session_replay_done: false,
             program_scroll: UniformListScrollHandle::new(),
             program_search_input,
             file_browser,
@@ -1451,6 +1465,38 @@ impl Shell {
         {
             self.demo_console_save_done = true;
             self.save_console_log(cx);
+            changed = true;
+        }
+        // Screenshot switch: start the local recorder through the same action
+        // as START RECORDING, then push three fixed local text entries so the
+        // active indicator and file have a reproducible shape. Nothing is sent.
+        if self.demo_session_record
+            && !self.demo_session_record_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+            && self.state.console.len() >= 12
+        {
+            self.demo_session_record_done = true;
+            self.state.left_tab = LeftTab::Console;
+            if self.state.start_session_recording(now_unix_s()).is_ok() {
+                for (level, text) in DEMO_SESSION_LIVE_ENTRIES {
+                    self.state.push_console(level, text);
+                }
+            }
+            self.console_scroll.scroll_to_bottom();
+            changed = true;
+        }
+        // Screenshot switch: write a byte-reproducible fixed recording, then
+        // read it through the normal LOAD RECORDING validator. Text only.
+        if self.demo_session_replay
+            && !self.demo_session_replay_done
+            && self.state.connection == ConnectionState::Ready
+            && self.state.job.has_program()
+            && self.state.console.len() >= 12
+        {
+            self.demo_session_replay_done = true;
+            self.state.left_tab = LeftTab::Console;
+            self.replay_demo_session(cx);
             changed = true;
         }
         // `--demo-start` presses the same action as the toolbar button, once.
@@ -4622,6 +4668,48 @@ impl Shell {
         cx.notify();
     }
 
+    /// Toggle the local Console session recorder.
+    ///
+    /// This writes one fixed local file or flushes it. It never sends a
+    /// command, changes machine state, or starts a job.
+    fn toggle_session_recording(&mut self, cx: &mut Context<Self>) {
+        if self.state.session.is_recording() {
+            self.state.stop_session_recording();
+        } else {
+            let _ = self.state.start_session_recording(now_unix_s());
+        }
+        self.state.left_tab = LeftTab::Console;
+        cx.notify();
+    }
+
+    /// Load the fixed recording as read-only Console text.
+    fn load_session_recording(&mut self, cx: &mut Context<Self>) {
+        let _ = self.state.load_session_recording();
+        self.state.left_tab = LeftTab::Console;
+        self.console_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Write the fixed demo recording and replay it through the normal path.
+    ///
+    /// Demo aid only: the helper writes `exports/session.jsonl`, then the same
+    /// validator and text-only replay a LOAD RECORDING tap uses. It sends
+    /// nothing and never starts a job.
+    fn replay_demo_session(&mut self, cx: &mut Context<Self>) {
+        let root = self.state.config.store_root().map(Path::to_path_buf);
+        match crate::session::write_demo_session_recording(root.as_deref()) {
+            Ok(_) => {
+                let _ = self.state.load_session_recording();
+            }
+            Err(error) => {
+                self.state
+                    .push_console(ConsoleLevel::Error, format!("Demo session replay: {error}"));
+            }
+        }
+        self.console_scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
     /// Fixed `exports/offsets.nc` path for the current configuration root.
     fn offsets_export_path(&self) -> Option<PathBuf> {
         self.state
@@ -7303,10 +7391,194 @@ impl Shell {
             .w_full()
             .min_w(px(0.0))
             .child(self.console_filter_bar(p, cx))
+            .child(self.console_session_bar(p, cx))
             .when_some(status, |this, status| {
                 this.child(console_log_status_row(p, &status, self.mono.clone()))
             })
             .child(scroll)
+    }
+
+    /// Local session recording controls and read-only replay.
+    ///
+    /// Two 48 px actions share one row without a minimum width, so the Console
+    /// card has no horizontal scroll at 1280x800. The path wraps instead of
+    /// widening the card. The fixed bound is always visible, including while
+    /// idle.
+    fn console_session_bar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let status = self.state.session.status();
+        let replay = self.state.session_replay_status.clone();
+        let active = status.is_recording();
+        let view = cx.entity();
+        let toggle_view = view.clone();
+        let toggle_label = if active {
+            t("STOP RECORDING")
+        } else {
+            t("START RECORDING")
+        };
+        let toggle = if active {
+            Button::new("console-session-toggle")
+                .label(toggle_label)
+                .danger()
+                .h(px(48.0))
+                .flex_1()
+                .min_w(px(0.0))
+                .rounded_lg()
+                .text_size(px(9.0))
+                .on_click(move |_, _, cx| {
+                    toggle_view.update(cx, |shell, cx| shell.toggle_session_recording(cx));
+                })
+        } else {
+            Button::new("console-session-toggle")
+                .label(toggle_label)
+                .secondary()
+                .h(px(48.0))
+                .flex_1()
+                .min_w(px(0.0))
+                .rounded_lg()
+                .text_size(px(9.0))
+                .on_click(move |_, _, cx| {
+                    toggle_view.update(cx, |shell, cx| shell.toggle_session_recording(cx));
+                })
+        };
+        let load_view = view;
+        let load = Button::new("console-session-load")
+            .label(t("LOAD RECORDING"))
+            .secondary()
+            .h(px(48.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .rounded_lg()
+            .text_size(px(9.0))
+            .on_click(move |_, _, cx| {
+                load_view.update(cx, |shell, cx| shell.load_session_recording(cx));
+            });
+        let path = status
+            .path
+            .clone()
+            .or_else(|| self.state.session_recording_path())
+            .map_or_else(
+                || {
+                    format!(
+                        "{}/{SESSION_RECORDING_FILE_NAME}",
+                        crate::offsets_export::EXPORT_DIRECTORY
+                    )
+                },
+                |path| path.display().to_string(),
+            );
+        let indicator_color = match status.state {
+            RecordingState::Recording => p.danger,
+            RecordingState::Truncated => p.warning,
+            RecordingState::Stopped => p.success,
+            RecordingState::Idle => p.text_faint,
+        };
+        let line_count = format!("{} LINES", status.entries);
+        let bound = format!(
+            "BOUND: {} MiB / {} LINES",
+            SESSION_MAX_BYTES / (1024 * 1024),
+            SESSION_MAX_ENTRIES
+        );
+
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .px_2()
+            .pb_1()
+            .child(
+                h_flex()
+                    .h(px(48.0))
+                    .w_full()
+                    .gap_1()
+                    .child(toggle)
+                    .child(load),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded(px(999.0))
+                            .bg(indicator_color),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.0))
+                            .line_height(px(11.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(indicator_color)
+                            .child(status.state.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.0))
+                            .line_height(px(11.0))
+                            .text_color(p.text_dim)
+                            .child(line_count),
+                    )
+                    .child(div().flex_1().min_w(px(0.0)))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(8.5))
+                            .line_height(px(11.0))
+                            .text_color(p.text_faint)
+                            .child(bound),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .font_family(self.mono.clone())
+                    .text_size(px(8.5))
+                    .line_height(px(10.5))
+                    .text_color(p.text_dim)
+                    .child(format!("PATH: {path}")),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_size(px(8.5))
+                    .line_height(px(10.5))
+                    .text_color(p.text_faint)
+                    .child(t(
+                        "LOAD RECORDING is text only; it never sends or starts anything.",
+                    )),
+            )
+            .when_some(status.last_error, |this, error| {
+                this.child(
+                    div()
+                        .w_full()
+                        .text_size(px(8.5))
+                        .line_height(px(10.5))
+                        .text_color(p.danger)
+                        .child(format!("RECORDING ERROR: {error}")),
+                )
+            })
+            .when_some(status.truncation, |this, marker| {
+                this.child(
+                    div()
+                        .w_full()
+                        .text_size(px(8.5))
+                        .line_height(px(10.5))
+                        .text_color(p.warning)
+                        .child(format!(
+                            "TRUNCATED AT BOUND: {} ({} lines, {} bytes)",
+                            marker.reason, marker.entries, marker.bytes
+                        )),
+                )
+            })
+            .when_some(replay, |this, status| {
+                this.child(session_replay_status_row(p, &status, self.mono.clone()))
+            })
     }
 
     /// Six 48 px filter chips with live per-level counts.
@@ -24993,6 +25265,33 @@ fn console_filter_chip(
                 .text_color(if selected { tint } else { p.text_faint })
                 .child(counts.count(filter).to_string()),
         )
+}
+
+/// Result of the last `LOAD RECORDING`: text-only status plus the fixed path.
+fn session_replay_status_row(p: Palette, status: &SessionReplayStatus, mono: SharedString) -> Div {
+    let color = if status.ok { p.success } else { p.danger };
+    v_flex()
+        .w_full()
+        .flex_shrink_0()
+        .gap_0()
+        .child(
+            div()
+                .text_size(px(8.5))
+                .line_height(px(10.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(status.text.clone()),
+        )
+        .when_some(status.path.clone(), |this, path| {
+            this.child(
+                div()
+                    .font_family(mono)
+                    .text_size(px(8.0))
+                    .line_height(px(10.0))
+                    .text_color(p.text_dim)
+                    .child(format!("REPLAY FILE: {}", path.display())),
+            )
+        })
 }
 
 /// Result of the last `SAVE LOG`: scope/status plus the full target path.

@@ -1948,6 +1948,7 @@ dependencies = [
  "ghs-serial",
  "ghs-viewer",
  "gpui-kit",
+ "serde_json",
  "tracing",
 ]
 
